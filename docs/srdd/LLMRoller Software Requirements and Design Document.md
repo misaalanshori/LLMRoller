@@ -1,7 +1,7 @@
+<!-- Generated file - edit the numbered parts -->
 # LLMRoller: Software Requirements and Design Document
 
-Version 1.1 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, and TDD specification.
-
+Version 1.2 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, concurrency/recovery model, and TDD specification.
 
 ## 0. Introduction
 
@@ -11,17 +11,17 @@ LLMRoller is a self-hosted Rust gateway that pools upstream coding-plan and aggr
 
 This document specifies the software requirements and system design for LLMRoller version 1.0 (dated 19 October 2026). Engineers use this specification to build, test, and run the proxy, router, model catalog, usage pipeline, and web interface.
 
-Sections 1 through 8 define what the system must do, who uses it, and how security boundaries work. Sections 9 through 19 define the data model, internal architecture, algorithms, interfaces, and test governance. Section 20 lists the primary sources verified on 19 October 2026.
+Sections 1 through 8 define what the system must do, who uses it, and how security boundaries work. Sections 9 through 19 define the data model, internal architecture, algorithms, interfaces, and test governance. Section 20 lists the primary sources verified on 19 October 2026, and Section 21 consolidates the cross-cutting concurrency, resource lifecycle, and failure-recovery architecture.
 
 | In scope for version 1.0 | Out of scope for version 1.0 |
 | --- | --- |
 | Proxy for OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages | Image generation, audio transcription, and vector embedding endpoints |
 | Providers: OpenCode Go, Command Code, Open Design AMR, OpenRouter, and custom OpenAI or Anthropic compatible endpoints | OAuth consumer browser logins for ChatGPT Plus or Claude Pro web accounts |
-| Global providers managed by admins and personal providers managed and shared by any user | Commercial billing, customer invoicing, or public resale to external third parties |
+| Global providers managed by admins and personal providers managed and shared by any user with explicit grantee acceptance | Commercial billing, customer invoicing, or public resale to external third parties |
 | Admin and standard user roles with full role-based access control | Multi-node clustering and distributed consensus across hosts |
-| Session pinning, smooth weighted round-robin, and per-model key priority overrides | Automatic cross-protocol request translation in the base release |
-| Local cost accounting plus source provider `/usage` polling, reconciliation, and pass-through | Unconditional or silent prompt logging (content recording is off by default and strictly opt-in) |
-| Admin opt-in content traceability mode with encrypted turn storage and read-only session chat preview | Automatic cross-tenant prompt inspection on shared personal keys |
+| Session pinning, response-link session inheritance, smooth weighted round-robin, and per-model key priority overrides | Automatic cross-protocol request translation in the base release |
+| Local cost accounting plus source provider `/usage` polling, decaying observation reconciliation, and pass-through | Unconditional or silent prompt logging (content recording is off by default and strictly opt-in) |
+| Admin opt-in content traceability mode with content-addressed encrypted turn storage and read-only session chat preview | Automatic cross-tenant prompt inspection on shared personal keys |
 | Single static Rust binary, SQLite in WAL mode, and an embedded HTMX web interface | External single-page JavaScript build pipelines or CDN asset dependencies |
 
 ### 0.2 Requirement priorities and conventions
@@ -38,55 +38,57 @@ Requirement identifiers use a short prefix for each subsystem. Functional prefix
 
 ### 0.3 Definitions and glossary
 
-The terms in the table below have one fixed meaning throughout all twenty-one sections of this specification.
+The terms in the table below have one fixed meaning throughout all twenty-two sections of this specification.
 
 | Term | Definition |
 | --- | --- |
 | Provider | An upstream inference service with defined endpoints, authentication rules, and session behavior, such as OpenCode Go or OpenRouter. |
 | Global provider | A provider record created by an admin. Its upstream keys are available to all authorized users on the instance. |
-| Personal provider | A provider record created by an individual user or admin for their own account. Only the owner and explicitly selected grantees can route through it. |
-| Provider share | A permission grant from a personal provider owner that allows another specific user on the instance to route through that personal provider or key. |
-| Upstream key | One API credential for one provider account. Each upstream key carries a default priority weight, a health state, and budget windows. |
+| Personal provider | A provider record created by an individual user or admin for their own account. Only the owner and explicitly selected grantees who have accepted the share can route through it. |
+| Provider share | A permission grant from a personal provider owner that allows another specific user on the instance to route through that personal provider or key once accepted by the grantee. |
+| Upstream key | One API credential for one provider account. Each upstream key carries a default priority weight, a versioned health state, and budget windows. |
 | Client | A coding agent or SDK that calls LLMRoller, such as Claude Code, Codex CLI, opencode, or Hermes. |
 | Client key | A credential (`llr_...`) that LLMRoller issues to an admin or standard user. Clients send it to LLMRoller; LLMRoller never forwards it upstream. |
-| Session | One multi-turn conversation or agent task identified by a client-supplied session header, body field, or derived message fingerprint. |
-| Pin | The stored binding from `(client_key_id, canonical_model_id, session_hash)` to one `upstream_key_id`. |
-| Canonical model | The normalized model identifier that LLMRoller exposes to clients across providers, such as `deepseek-v4.1-flash`. |
-| Route | The pairing of one `upstream_key_id` and one `canonical_model_id`, holding the raw upstream model name, supported protocols, and optional priority override. |
-| Candidate | A route that passes all ownership, share, protocol, health, circuit breaker, and budget checks for the current request. |
+| Session | One multi-turn conversation or agent task identified by a client-supplied session header, body field, inherited response link, or derived opening-message fingerprint. |
+| Pin | The stored binding from `(client_key_id, model_pk, session_hash)` to one `upstream_key_id`, `pool_tier`, and monotonic `generation`. |
+| Canonical model | The normalized model identifier that LLMRoller exposes to clients across providers, such as `deepseek-v4.1-flash`, backed by an immutable surrogate primary key (`model_pk`). |
+| Route | The pairing of one `upstream_key_id` and one `model_pk` (`canonical_id`), holding the raw upstream model name, vendor prefix, lifecycle status, supported protocols, and optional priority override. |
+| Candidate | A route that passes all request gates (`G1` through `G7`) and candidate checks (`C1` through `C8`) for the current request. |
 | Protocol | One of three wire formats: `chat` (OpenAI Chat Completions), `responses` (OpenAI Responses), or `messages` (Anthropic Messages). |
-| Affinity hint | The session identifier field or header that LLMRoller writes into an outbound request according to the target provider's session profile. |
-| Upstream usage snapshot | The quota, credit, and reset-time record retrieved from a source provider's native usage or key endpoint. |
-| Content traceability mode | An admin-controlled opt-in setting that records compressed, encrypted request and response contents (prompts, reasoning, tool calls, and completions) per turn. |
+| Affinity hint | The session identifier field or header that LLMRoller writes into an outbound request according to the target provider's session profile and tier isolation rules. |
+| Upstream usage snapshot | The quota, credit, and reset-time record retrieved from a source provider's native usage or key endpoint, feeding a time-bounded `UpstreamObservation`. |
+| Content traceability mode | An admin-controlled opt-in setting that records compressed, encrypted request and response contents (prompts, reasoning, tool calls, and completions) using content-addressed blocks (`trace_blocks`) and turn records (`trace_records`). |
 | Session chat preview | A read-only dashboard view that reconstructs and renders the multi-turn conversation timeline across all traced requests sharing a pinned `session_hash`. |
 
 ### 0.4 Document map
 
-The specification is split into twenty-one numbered Markdown files (`0` through `20`) so engineers can review and trace individual subsystems.
+The specification is split into twenty-two numbered Markdown files (`0` through `21`) plus the machine-readable `requirements.toml` registry so engineers can review and trace individual subsystems. The numbered split files and `requirements.toml` are the single authoritative source of truth. The combined file (`LLMRoller Software Requirements and Design Document.md`) is a generated bundle produced by `cargo xtask docs-bundle`. CI checks that concatenating the numbered files with shifted heading levels produces zero diff.
 
 | File | Title | Focus |
 | --- | --- | --- |
-| `0. SRDD - Introduction.md` | Introduction | Scope, priority conventions, glossary, and document map |
+| `0. SRDD - Introduction.md` | Introduction | Scope, priority conventions, glossary, and authoritative document map |
 | `1. SRDD - Summary.md` | Summary | Problem statement, product vision, and core architectural choices |
 | `2. SRDD - Research Findings.md` | Research findings | Empirical data on session headers, provider limits, and `/usage` endpoints |
-| `3. SRDD - Goals, Non-Goals, and Assumptions.md` | Goals, non-goals, and assumptions | Targets, boundaries, and sizing assumptions |
-| `4. SRDD - Users, Roles, and Provider Ownership.md` | Users, roles, and provider ownership | Admin and standard user roles, global and personal providers, and user sharing |
-| `5. SRDD - System Architecture.md` | System architecture | Component layout, request flow, hot-path state, and listeners |
+| `3. SRDD - Goals, Non-Goals, and Assumptions.md` | Goals, non-goals, and assumptions | Targets, boundaries, and memory and disk sizing assumptions |
+| `4. SRDD - Users, Roles, and Provider Ownership.md` | Users, roles, and provider ownership | Admin, user, and system actor scopes, three-tier pools, and consented user sharing |
+| `5. SRDD - System Architecture.md` | System architecture | Component layout, request flow, hot-path state, CLI contracts, and listeners |
 | `6. SRDD - Functional Requirements.md` | Functional requirements | Testable P0, P1, and P2 functional specifications |
-| `7. SRDD - Non-Functional Requirements.md` | Non-functional requirements | Latency, memory, streaming, compatibility, and operational targets |
-| `8. SRDD - Security and Privacy.md` | Security and privacy | Threat model, cryptography, isolation, and supply-chain controls |
-| `9. SRDD - Data Model.md` | Data model | SQLite WAL schema, encryption rules, and retention policies |
-| `10. SRDD - Routing Design.md` | Routing design | Eligibility, smooth weighted round-robin, pinning, and failover |
-| `11. SRDD - Session Identification and Hints.md` | Session identification and hints | Inbound session extraction, hashing, and outbound provider hints |
-| `12. SRDD - Protocol Handling and Transparent Proxying.md` | Protocol handling and transparent proxying | Header policy, body edits, streaming tee, and token extraction |
-| `13. SRDD - Pricing, Limits, and Source Provider Usage Engine.md` | Pricing, limits, and source provider usage engine | Price book math, rolling windows, and upstream `/usage` sync and pass-through |
-| `14. SRDD - API and Web UI Specification.md` | API and web UI specification | Proxy routes, user and admin JSON APIs, and HTMX dashboard screens |
-| `15. SRDD - Technology Choices and Workspace Layout.md` | Technology choices and workspace layout | Rust crates, versions, and multi-crate repository structure |
+| `7. SRDD - Non-Functional Requirements.md` | Non-functional requirements | Latency, memory budgets, streaming, compatibility, and operational targets |
+| `8. SRDD - Security and Privacy.md` | Security and privacy | Threat model, key hierarchy, SSRF connector, isolation, and supply-chain controls |
+| `9. SRDD - Data Model.md` | Data model | 31-table SQLite WAL schema, canonical AAD encryption rules, dual-queue writer, and retention policies |
+| `10. SRDD - Routing Design.md` | Routing design | Request gates, candidate checks, per-group smooth WRR, pin state machine, error classifier, and failover |
+| `11. SRDD - Session Identification and Hints.md` | Session identification and hints | Eight-step inbound session extraction, response-link inheritance, hashing, and outbound hints |
+| `12. SRDD - Protocol Handling and Transparent Proxying.md` | Protocol handling and transparent proxying | Request and response header policies, surgical body edits, streaming tee, and token extraction |
+| `13. SRDD - Pricing, Limits, and Source Provider Usage Engine.md` | Pricing, limits, and source provider usage engine | Price book math, generalized rolling and anchored windows, reservations, and `/usage` observation sync |
+| `14. SRDD - API and Web UI Specification.md` | API and web UI specification | Proxy routes, error envelopes, user and admin JSON APIs, and HTMX dashboard screens |
+| `15. SRDD - Technology Choices and Workspace Layout.md` | Technology choices and workspace layout | Rust crates, versions, `xtask` tooling, and multi-crate repository structure |
 | `16. SRDD - Testing Plan and TDD Governance.md` | Testing plan and TDD governance | Strict TDD, boundary rules, failure taxonomy, mocking, mutation tests, and traceability |
 | `17. SRDD - Roadmap and Milestones.md` | Roadmap and milestones | Dependency-ordered delivery milestones and exit criteria |
 | `18. SRDD - Risks and Mitigations.md` | Risks and mitigations | Technical, vendor, and operational risk register |
 | `19. SRDD - Architectural Decisions and Open Questions.md` | Architectural decisions and open questions | Resolved design trade-offs and operator configuration choices |
 | `20. SRDD - Sources.md` | Sources | Verified primary links for providers, clients, gateways, and standards |
+| `21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md` | Concurrency, lifecycle, and failure-recovery model | Memory budgets, lock hierarchy, reloader ordering, writer durability queues, `RequestLifecycle`, and supervision |
+| `requirements.toml` | Machine-readable requirement registry | Authoritative TOML mapping of requirement IDs to priorities, milestones, and delivering sub-phases |
 
 ## 1. Summary
 
@@ -94,15 +96,15 @@ LLMRoller is a self-hosted LLM proxy and API key router written in Rust. It sits
 
 ### 1.1 The problem
 
-Subscription coding plans such as [OpenCode Go](https://opencode.ai/docs/go), [Command Code GOAT](https://commandcode.ai/docs/plans/goat), and [Open Design](https://open-design.ai/pricing/) sell monthly tiers with rolling five-hour, seven-day, and monthly dollar caps. Heavy users and small engineering teams often hold several keys across these providers alongside pay-as-you-go aggregators like [OpenRouter](https://openrouter.ai/docs/api_reference/limits).
+Subscription coding plans such as [OpenCode Go](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo), [Command Code GOAT](https://www.google.com/search?q=https%3A%2F%2Fcommandcode.ai%2Fdocs%2Fplans%2Fgoat), and [Open Design](https://www.google.com/search?q=https%3A%2F%2Fopen-design.ai%2Fpricing%2F) sell monthly tiers with rolling five-hour, seven-day, and monthly dollar caps. Heavy users and small engineering teams often hold several keys across these providers alongside pay-as-you-go aggregators like [OpenRouter](https://www.google.com/search?q=https%3A%2F%2Fopenrouter.ai%2Fdocs%2Fapi_reference%2Flimits).
 
 Managing these keys by hand causes two failures. First, switching keys or providers mid-conversation destroys prompt cache locality, which multiplies input token costs up to tenfold and slows responses. Second, different providers give different monthly dollar limits to the same model, so static key rotation wastes high-allowance tiers on the wrong models.
 
 ### 1.2 The solution
 
-LLMRoller solves both problems in one single-binary gateway. It reads the session identifier that coding agents already send and pins each conversation to one upstream key for its entire lifetime. Recognized fields include `x-claude-code-session-id`, `session_id`, `x-session-affinity`, `x-opencode-session`, and `prompt_cache_key`.
+LLMRoller solves both problems in one single-binary gateway. It reads the session identifier that coding agents already send, or inherits the parent session across `previous_response_id` chains. It then pins each conversation to one upstream key for its entire lifetime. Recognized fields include `x-claude-code-session-id`, `session_id`, `x-session-affinity`, `x-opencode-session`, and `prompt_cache_key`.
 
-When a new session starts, LLMRoller selects an eligible upstream key using smooth weighted round-robin. Each upstream key has a default priority weight. Operators and users can override that weight per model to match each provider's per-model dollar allowance.
+When a new session starts, LLMRoller selects an eligible upstream key using smooth weighted round-robin within the caller's active pool tier. Each upstream key has a default priority weight. Operators and users can override that weight per model to match each provider's per-model dollar allowance.
 
 ### 1.3 Core architectural pillars
 
@@ -110,15 +112,15 @@ The system design rests on nine engineering decisions that govern every module i
 
 | Pillar | Design decision |
 | --- | --- |
-| Transparent forwarding | Forward inbound requests and streamed SSE chunks without buffering. Rewrite only authentication headers, the model identifier, provider session fields, and usage-reporting flags. |
-| Native session pinning | Extract the client's existing session identifier, bind `(client_key, model, session)` to one upstream key, and emit the exact affinity field that the chosen provider expects. |
-| Per-model priority overrides | Use the upstream key's default priority weight unless the route defines a per-model override. Route new sessions with nginx-style smooth weighted round-robin. |
-| Dual provider scopes | Support both admin-managed `global` providers (usable by all authorized users) and user-managed `personal` providers (usable by the owner and explicitly shared grantees). |
-| First-class standard users | Ship full role-based access control in version 1.0 for both `admin` and `user` accounts, giving standard users self-service personal providers, sharing controls, client keys, and scoped analytics. |
-| Hybrid usage and `/usage` pass-through | Compute request cost locally in integer micro-USD while polling and reconciling source provider `/usage` endpoints where available, and expose upstream usage via pass-through APIs. |
-| Opt-in content traceability | Record prompts, reasoning, tool calls, and responses when enabled by an admin, and render a read-only session chat preview in the dashboard. |
+| Transparent forwarding | Buffer each inbound request body once in reference-counted memory (`bytes::Bytes`, shared zero-copy across pre-first-byte failover retries) to parse `model` and session fields, forward the body byte-identically except for surgical top-level edits, and stream response SSE chunks without buffering after the first valid frame. |
+| Native session pinning | Extract the client's existing session identifier (or inherit the session across `response_links`), bind `(client_key_id, model_pk, session_hash)` to one upstream key, and emit the exact affinity field that the chosen provider expects. |
+| Per-model priority overrides | Use the upstream key's default priority weight unless the route or user defines a per-model override. Route new sessions with nginx-style smooth weighted round-robin inside per-user selection groups. |
+| Dual provider scopes and three-tier pools | Support both admin-managed `global` providers and user-managed `personal` providers across three ordered tiers (`Own`, `Shared`, `Global`) so grantees spend their own keys before consented shared keys under `personal_first`. |
+| First-class standard users | Ship full role-based access control in version 1.0 for both `admin` and `user` accounts, giving standard users self-service personal providers, consented sharing controls, client keys, and scoped analytics. |
+| Hybrid usage and `/usage` pass-through | Compute request cost locally in integer micro-USD while polling source provider `/usage` endpoints to update time-bounded `UpstreamObservation` projections, and expose upstream usage via role-sanitized pass-through APIs. |
+| Opt-in content traceability | Record prompts, reasoning, tool calls, and responses when enabled by an admin using content-addressed blocks (`trace_blocks`) and a bounded two-thread compression pool, and render a read-only session chat preview in the dashboard. |
 | Zero-dependency operations | Ship one static Rust binary with an embedded HTMX web interface and one SQLite database in WAL mode. |
-| Strict TDD and mutation testing | Develop all controlled logic under Red-Green-Refactor discipline with full requirement-to-test traceability and automated mutation testing via [cargo-mutants](https://mutants.rs/). |
+| Strict TDD and mutation testing | Develop all controlled logic under Red-Green-Refactor discipline with full requirement-to-test traceability (`cargo xtask traceability`) and automated mutation testing via [cargo-mutants](https://mutants.rs/). |
 
 ## 2. Research findings
 
@@ -218,15 +220,15 @@ LLMRoller pursues nine measurable engineering goals in version 1.0.
 
 | ID | Goal | Success measure |
 | --- | --- | --- |
-| G1 | Preserve upstream prompt cache locality across multi-turn coding sessions. | Requests carrying a valid session ID stay on their pinned upstream key while that route remains eligible. |
-| G2 | Pool global, personal, and shared upstream keys with predictable session distribution. | Over 100,000 new sessions, smooth weighted round-robin matches configured route weights within 1%. |
-| G3 | Support both admin-managed global providers and user-managed personal providers with granular user-to-user sharing. | Standard users can add personal providers, share them with specific peers, and route traffic without admin intervention. |
-| G4 | Stay transparent to coding agents and upstream providers. | Streaming chunks incur under 1 ms of forwarding delay, and request bodies keep their exact key and message order. |
-| G5 | Provide accurate cost, token, and quota visibility by combining local price-book math with source provider `/usage` endpoints. | Local window counters reconcile automatically with upstream `/usage` snapshots, and clients can query `/v1/usage` directly. |
-| G6 | Protect upstream secrets, client keys, and user privacy at rest, in memory, and in logs. | Zero secret leaks in canary log tests, XChaCha20-Poly1305 encryption at rest, and zero prompt storage unless content traceability is enabled. |
+| G1 | Preserve upstream prompt cache locality across multi-turn coding sessions. | Requests carrying a valid session ID (or `previous_response_id` link) stay on their pinned upstream key while that route remains eligible, and recovery repins wait until the session has been idle for at least `recovery_repin_min_idle_secs` (default 300 s). |
+| G2 | Pool global, personal, and shared upstream keys with predictable session distribution. | Within any single selection group whose candidate set is constant for 100,000 consecutive selections, each route's share of selections stays within 0.5% of `W_eff_i / sum(W_eff)`; across a run in which candidates leave and rejoin, each route's share over all selections in which it was a candidate stays within 1% of its weight share over those same selections. |
+| G3 | Support both admin-managed global providers and user-managed personal providers with granular, consented user-to-user sharing. | Standard users can add personal providers, share them with specific peers who accept the endpoint disclosure, and route traffic across ordered `Own`, `Shared`, and `Global` tiers without admin intervention. |
+| G4 | Stay transparent to coding agents and upstream providers. | Streaming chunks incur under 1 ms of forwarding delay per complete frame, and request bodies on own personal keys keep their exact key and message order. |
+| G5 | Provide accurate cost, token, and quota visibility by combining local price-book math with source provider `/usage` endpoints. | Local window counters combine with time-bounded `UpstreamObservation` projections from `/usage` snapshots without permanent stale-baseline lockouts, and clients can query `/v1/usage` directly. |
+| G6 | Protect upstream secrets, client keys, and user privacy at rest, in memory, and in logs. | Zero secret leaks in canary log tests, XChaCha20-Poly1305 encryption at rest with canonical length-prefixed AAD, and zero prompt storage unless content traceability is enabled. |
 | G7 | Operate as a single, low-overhead static Rust binary with an embedded web interface. | Idle memory stays under 50 MB, and p99 proxy overhead before first upstream byte stays under 5 ms at 500 req/s. |
-| G8 | Enforce strict Test-Driven Development and mutation testing across all controlled logic. | Every requirement maps to automated tests, and `cargo-mutants` reports zero surviving mutants in core routing and protocol crates. |
-| G9 | Support admin opt-in content traceability and a read-only session chat preview. | When enabled by an admin, traced sessions render prompts, reasoning, tool calls, and responses in chronological order with zero XSS risk. |
+| G8 | Enforce strict Test-Driven Development and mutation testing across all controlled logic. | Every requirement maps to automated tests in `requirements.toml`, and `cargo-mutants` reports zero unannotated surviving mutants in core routing and protocol crates. |
+| G9 | Support admin opt-in content traceability and a read-only session chat preview. | When enabled by an admin, traced sessions store deduplicated content-addressed blocks and render prompts, reasoning, tool calls, and responses in chronological `(ts, request_id)` order with zero XSS risk. |
 
 ### 3.2 Non-goals for version 1.0
 
@@ -236,7 +238,7 @@ Eight capabilities are intentionally excluded from version 1.0 to keep the attac
 | --- | --- | --- |
 | NG1 | Client or TLS fingerprint impersonation | LLMRoller never spoofs another vendor's `User-Agent` or JA3/JA4 TLS fingerprint. It forwards the caller's real headers or a neutral default. |
 | NG2 | Public commercial resale or multi-organization billing | Subscription coding plans forbid public reselling. LLMRoller targets a single person or a trusted internal team. |
-| NG3 | Automatic cross-protocol translation in Milestone 1 | Translating between `chat`, `responses`, and `messages` can drop reasoning blocks ([open-design#8687](https://github.com/nexu-io/open-design/issues/8687)). Base routing matches native support; opt-in translation is deferred to a later milestone. |
+| NG3 | Automatic cross-protocol translation in Milestone 1 | Translating between `chat`, `responses`, and `messages` can drop reasoning blocks ([open-design#8687](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fnexu-io%2Fopen-design%2Fissues%2F8687)). Base routing matches native support; opt-in translation is deferred to a later milestone. |
 | NG4 | Multi-node active-active clustering | A single Rust process with SQLite WAL handles 500 req/s and 2,000 open streams, which exceeds single-team coding-agent load. |
 | NG5 | Payment processing, invoicing, or Stripe integration | Budget tracking exists to prevent quota exhaustion and monitor spend, not to bill external customers. |
 | NG6 | Unconditional or silent prompt logging | Prompt and response recording is strictly off by default and activates only when an admin enables content traceability mode (`TRC-1`). |
@@ -245,51 +247,72 @@ Eight capabilities are intentionally excluded from version 1.0 to keep the attac
 
 ### 3.3 Assumptions and constraints
 
-The design relies on five operational assumptions listed in the table below.
+The design relies on six operational assumptions listed in the table below.
 
 | ID | Assumption | Operational impact |
 | --- | --- | --- |
-| A1 | Terms of use compliance | The instance operator and individual users hold valid accounts with each configured provider and comply with each provider's terms ([Open Design Terms](https://download.open-design.ai/terms/), [OpenCode Go Docs](https://opencode.ai/docs/go)). |
-| A2 | Sizing envelope | One instance supports up to 200 users, 500 upstream keys, 1,000 client keys, 500 req/s at peak, and 2,000 open SSE streams on 2 vCPU and 2 GB RAM. |
+| A1 | Terms of use compliance | The instance operator and individual users hold valid accounts with each configured provider and comply with each provider's terms ([Open Design Terms](https://www.google.com/search?q=https%3A%2F%2Fdownload.open-design.ai%2Fterms%2F), [OpenCode Go Docs](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo)). |
+| A2 | Sizing and memory envelope | One instance on a 2 vCPU, 2 GB RAM reference host supports up to 200 users, 500 upstream keys, 1,000 client keys, 2,000 open SSE streams, and 500 req/s at peak for requests with bodies up to 256 KiB (or `preflight_body_budget / (mean_body * ttff)` in general, bounded by `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB = min(1024, floor(0.40 * memory_limit_mb))`, which is 819 MiB on a 2 GB host). |
 | A3 | Configurable client base URL | Every target client tool (Claude Code, Codex CLI, opencode, Hermes, and standard OpenAI or Anthropic SDKs) lets the user configure a custom base URL and API key. |
-| A4 | TLS endpoint handling | Production deployments handle HTTPS either at an upstream reverse proxy (Caddy, nginx, or Traefik) with response buffering off, or via LLMRoller's built-in `rustls` listener. |
+| A4 | TLS endpoint handling | Production deployments handle HTTPS either at an upstream reverse proxy (Caddy, nginx, or Traefik) listed in `LLMROLLER_TRUSTED_PROXIES` with response buffering off, or via LLMRoller's built-in `rustls` listener (`LLMROLLER_TLS_CERT` and `LLMROLLER_TLS_KEY`). |
 | A5 | Rust toolchain and runtime | The project compiles with a pinned stable Rust toolchain (Rust 2024 edition) and runs on Linux (`x86_64` and `aarch64`) and macOS without external runtime dependencies. |
+| A6 | Disk capacity budget | The data directory provides at least `daily_requests * retention_days * 600 B * 1.3` bytes for raw `usage_events` (default 30-day retention capped at 50,000,000 rows) plus `usage_rollups_5min`, `usage_rollups_hourly`, and opt-in `trace_records` and `trace_blocks` storage; the web UI displays projected disk usage. |
 
 ## 4. Users, roles, and provider ownership
 
-LLMRoller is a multi-user system in version 1.0. It defines two human user classes (`admin` and `user`) and one machine caller class (`client`). It also defines two provider ownership scopes (`global` and `personal`) with explicit user-to-user sharing.
+LLMRoller is a multi-user system in version 1.0. It defines two human user classes (`admin` and `user`), one internal system actor class (`SystemTask`), and one machine caller class (`client`). It also defines two provider ownership scopes (`global` and `personal`) with explicit, consented user-to-user sharing across three ordered routing tiers (`Own`, `Shared`, and `Global`).
 
-### 4.1 User classes
+### 4.1 User classes and `ActorScope`
 
-Every human account has a `role` column set to either `admin` or `user`. Machine callers authenticate to the data plane with a client key owned by a human account.
+Every human account has a `role` column set to either `admin` or `user`. Machine callers authenticate to the data plane with a client key owned by a human account. Internal background jobs and CLI maintenance commands run under a sealed `ActorScope::System` variant so system operations never masquerade as a synthetic admin user.
 
-| User class | Version 1.0 status | Summary of capabilities |
+```rust
+pub enum ActorScope {
+    User { user_id: UserId, role: Role },
+    System { task: SystemTask },
+}
+
+pub enum SystemTask {
+    Writer,
+    Reloader,
+    Discovery,
+    UsagePoller,
+    RetentionSweeper,
+    DataPlaneUsage,
+    Cli(CliCommand),
+}
+```
+
+`ActorScope::System` constructors are restricted (`pub(crate)`) so only `crates/server` and `crates/store` can construct them; `crates/admin` handlers can construct only `ActorScope::User`. Audit rows written by `ActorScope::System` set `actor_user_id = NULL` and record `detail_json.system_task`.
+
+| User or actor class | Version 1.0 status | Summary of capabilities |
 | --- | --- | --- |
-| Admin (`admin`) | P0 (full support) | Manages instance settings, user accounts, global providers, global upstream keys, canonical model catalog, global price book, all personal providers, all pins, and system-wide usage analytics. |
-| Standard user (`user`) | P0 (full support) | Manages own account credentials, own client keys, own personal providers and upstream keys, sharing grants to other users, per-model priority overrides on own keys, own active pins, and own usage analytics. |
-| Client agent (`client`) | P0 (full support) | Calls `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, `/v1/usage`, and `/v1/key` using a client key (`llr_...`). Has no web UI or control-plane access. |
+| Admin (`admin`) | P0 (full support) | Manages instance settings, user accounts, global providers, global upstream keys, canonical model catalog, global price book, all personal providers and shares (via explicit `/admin/api/*` routes), all pins, and system-wide usage analytics. |
+| Standard user (`user`) | P0 (full support) | Manages own account credentials, own client keys, own personal providers and upstream keys, outgoing and incoming sharing grants (including explicit share acceptance), per-model priority overrides on own personal and shared keys, own active pins, and own usage analytics. |
+| System task (`SystemTask`) | P0 (internal only) | Runs scheduled `/models` discovery, `/usage` polling, retention sweeps, snapshot reloading, data-plane usage batching, and offline CLI maintenance with explicit audit attribution. |
+| Client agent (`client`) | P0 (full support) | Calls `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, `/v1/usage`, `/v1/usage/raw`, and `/v1/key` using a client key (`llr_...`). Has no web UI or control-plane access. |
 
 ### 4.2 Role-based access control matrix
 
-The control plane enforces strict authorization checks on every HTTP handler and database query using an explicit `ActorScope` passed from the authentication middleware.
+The control plane enforces strict authorization checks on every HTTP handler and database query using the `&ActorScope` passed from the authentication middleware. Every user-facing API and HTML template projects upstream key metadata through `crates/admin::projection::project_key(viewer, key) -> KeyView`. When a non-admin views a `global` key, `upstream_key_id` becomes `null` and `upstream_key_label` becomes `"global pool"`. The projection also omits `priority`, `priority_override`, `secret_last4`, and `health_until`.
 
 | Resource or action | Admin (`admin`) | Standard user (`user`) | Client agent (`client`) |
 | --- | --- | --- | --- |
 | Complete initial first-admin setup | Yes (when zero users exist) | No | No |
-| Create, disable, delete users, or reset passwords | Yes (cannot delete last active admin) | No (can change own password and TOTP only) | No |
+| Create, disable, delete users, or reset passwords | Yes (cannot disable, demote, or delete the last active admin; deleting a user takes `?confirm=<username>` and records `deleted_users`) | No (can change own password and TOTP only) | No |
 | Create, edit, test, or delete `global` providers and keys | Yes | No | No |
-| View `global` provider availability and exposed models | Yes (full details and last-4 of secrets) | Yes (provider name and exposed models only; no key secrets or global key labels) | Via `GET /v1/models` |
-| Create, edit, test, calibrate, or delete `personal` providers and keys | Yes (own personal keys, plus admin override on any user's keys) | Yes (own personal providers and keys only) | No |
-| Share a `personal` provider or key with another user | Yes (for own personal keys or any key) | Yes (for own personal providers and keys only) | No |
-| View a `personal` provider or key shared by another user | Yes | Yes (grantee sees provider type, key label, health, allowed models, and own share usage or cap; never the secret) | Routes through it if eligible |
-| Poll or view source provider `/usage` for an upstream key | Yes (all global and personal keys) | Yes (own personal keys, plus summary window status on keys shared with them) | Via `GET /v1/usage` and `GET /v1/key` (scoped) |
-| Manage canonical model exposure (`auto`, `forced_on`, `forced_off`) and aliases | Yes | Read-only view of catalog; can enable or disable models on own personal routes | No |
-| Set per-model priority overrides on routes | Yes (global routes and own personal routes) | Yes (own personal routes and personal routing weights across eligible routes) | No |
+| View `global` provider availability and exposed models | Yes (full details and last-4 of secrets) | Yes (provider name, exposed models, and aggregated `"Global pool"` column in the routing matrix via `project_key`; never sees global key IDs, labels, priorities, or secret suffixes) | Via `GET /v1/models` |
+| Create, edit, test, calibrate, or delete `personal` providers and keys | Yes (own personal keys via `/api/user/*`, plus admin override on any user's keys via `/admin/api/users/{id}/providers` and `/admin/api/providers/{id}`) | Yes (own personal providers and keys only; receives HTTP 404 on any other user's resources) | No |
+| Share a `personal` provider or key with another user | Yes (for own personal keys or any personal key; approves `custom` provider shares via `POST /admin/api/shares/{id}/approve`) | Yes (for own personal providers and keys only; grantee must accept via `POST /api/user/shares/{id}/accept`) | No |
+| View or accept a `personal` provider or key shared by another user | Yes | Yes (grantee sees provider kind, base URL host, key label, health, allowed models, destination disclosure, and own share usage or cap; never the secret or `secret_last4`) | Routes through it once accepted and eligible |
+| Poll or view source provider `/usage` for an upstream key | Yes (all global and personal keys, including live `?fresh=1`) | Yes (own personal keys including live `?fresh=1`, plus cached sanitized window status on keys shared with them) | Via `GET /v1/usage`, `GET /v1/usage/raw`, and `GET /v1/key` (scoped) |
+| Manage canonical model exposure (`auto`, `forced_on`, `forced_off`), merges, splits, and aliases | Yes | Read-only view of catalog; can enable or disable models on own personal and shared routes | No |
+| Set per-model priority overrides on routes | Yes (global routes and own personal routes) | Yes (own personal and shared routes only via `user_route_preferences`; cannot override weights on global routes) | No |
 | Create, rotate, restrict, or revoke client keys (`llr_...`) | Yes (own keys and any user's keys) | Yes (own client keys only) | Uses key for bearer auth |
 | View usage dashboard, time series, and CSV or JSON exports | Yes (instance-wide and filtered by any user, key, provider, or model) | Yes (strictly scoped to own client keys and traffic served by own personal keys) | Via `GET /v1/usage` for own client key |
-| View, unpin, or move active session pins | Yes (all pins) | Yes (pins belonging to own client keys only) | Implicit via requests |
-| Enable, scope, or purge content traceability mode | Yes (instance-wide and scoped targets) | No (read-only visibility into whether traceability is active on own traffic) | No |
-| View read-only Session Chat Preview of recorded turns | Yes (all traced sessions, logged in `audit_log`) | Yes (traced sessions belonging to own client keys only; never sees grantee transcripts on shared keys) | No |
+| View, unpin, or move active session pins | Yes (all pins via `/admin/api/pins` and `/admin/api/users/{id}/pins`) | Yes (pins belonging to own client keys only) | Implicit via requests |
+| Enable, scope, or purge content traceability mode | Yes (instance-wide and scoped targets; lowering retention takes `"confirm_purge": true`) | No (read-only visibility into whether traceability is active on own traffic) | No |
+| View read-only Session Chat Preview of recorded turns | Yes (all traced sessions, logged once per 30 minutes per `(admin, session_hash)` in `audit_log`) | Yes (traced sessions belonging to own client keys only; never sees grantee transcripts on shared keys) | No |
 | View audit log | Yes (all instance events) | Yes (events where actor or target belongs to the user) | No |
 
 ### 4.3 Provider ownership scopes: global and personal
@@ -302,55 +325,59 @@ Only an admin can create, modify, or delete a `global` provider and its upstream
 
 #### 4.3.2 Personal providers
 
-Any authenticated user (`user` or `admin`) can create a `personal` provider and attach one or more personal upstream keys to it. A personal provider has a non-null `owner_user_id` referencing the user who created it.
+Any authenticated user (`user` or `admin`) can create a `personal` provider and attach one or more personal upstream keys to it. A personal provider has a non-null `owner_user_id` referencing the user who created it. Database triggers enforce `upstream_keys.owner_user_id == providers.owner_user_id` on every attached key.
 
-Personal providers let users bring their own OpenCode Go, Command Code, Open Design AMR, OpenRouter, or custom API keys into LLMRoller. Users get session pinning and per-model priority overrides across their own keys, and can combine personal keys with global keys.
+Personal providers let users bring their own OpenCode Go, Command Code, Open Design AMR, OpenRouter, or custom API keys into LLMRoller. Users get session pinning and per-model priority overrides across their own keys, and can combine personal keys with shared and global keys. Disabling a user account (`users.disabled = 1`) immediately makes that user's personal providers and keys ineligible for everyone. The underlying share rows stay in SQLite so re-enabling the user restores them.
 
 ### 4.4 Sharing personal providers and keys
 
-A personal provider owner can share a personal provider or a specific personal upstream key with other registered users on the same instance.
+A personal provider owner can share a personal provider or a specific personal upstream key with other registered users on the same instance. Routing through a personal provider sends the grantee's prompts and tool outputs to that provider's endpoint and account. Every share therefore needs explicit grantee consent, plus admin approval when the provider is `custom`.
 
 | Share attribute | Behavior and enforcement |
 | --- | --- |
-| Grantor (`owner_user_id`) | Must be the owner of the personal provider (or an admin). Cannot re-share a key that was only shared with them (no transitive sharing). |
-| Grantee (`grantee_user_id`) | Any active `user` or `admin` account on the instance, selected by username. |
-| Target scope | Either an entire `personal` provider (all enabled keys under it) or one specific `personal` upstream key. |
-| Model restriction (`allowed_models`) | Optional JSON list of canonical models that the grantee may invoke on the shared key. Defaults to all models the key serves. |
-| Monthly spend cap (`max_monthly_micro_usd`) | Optional micro-USD cap on how much the grantee's client keys can spend on this share in a calendar month. |
+| Grantor (`owner_user_id`) | Must be the active owner (`users.disabled = 0`) of the `personal` provider (or an admin). Cannot share a `global` provider and cannot re-share a key that was only shared with them (no transitive sharing, enforced by SQL trigger `trg_shares_integrity`). Personal providers with a cross-origin `usage_url` (`usage_url_cross_origin_ack = true`) cannot be shared (returns HTTP 409). |
+| Grantee (`grantee_user_id`) | Any active `user` or `admin` account on the instance other than `owner_user_id`, selected by username. |
+| Target scope and non-overlap invariant | Either an entire `personal` provider (`upstream_key_id IS NULL`) or one specific `personal` upstream key (`upstream_key_id IS NOT NULL`). Partial unique indexes `uq_share_key_active` and `uq_share_provider_active` prevent duplicate active grants, and `POST /api/user/shares` rejects creating a key-level share when an active provider-level share exists for the same `(grantee_user_id, provider_id)` (or vice versa) with HTTP 409 `share_overlap`. For any legacy or migrated rows, `effective_share(U, K)` deterministically selects the key-level share first, then the provider-level share. |
+| Grantee consent and config fingerprint (`accepted_at`, `accepted_config_fingerprint`) | Each provider stores `share_config_fingerprint = hex(SHA-256(canonical_json({kind, base_url, allow_private_network, paths, auth, strip_headers, add_headers, ua_policy, session_profile, usage_profile, response_header_allow})))`. A newly created share starts with `accepted_at = NULL` and is ineligible for routing until the grantee views the provider kind, `base_url` host, and destination disclosure in the UI and calls `POST /api/user/shares/{id}/accept` echoing the current `share_config_fingerprint`. Any edit to the provider's routing-relevant configuration changes `share_config_fingerprint` in the same transaction, automatically suspending all shares on that provider until each grantee re-accepts. |
+| Custom provider admin approval (`admin_approved_at`) | When `providers.kind == 'custom'`, the share also stays ineligible until an admin calls `POST /admin/api/shares/{id}/approve` to set `admin_approved_at`. |
+| Model restriction (`allowed_models`) | Optional JSON list of canonical model IDs that the grantee may invoke on the shared key. `NULL` permits all models served by the key. |
+| Monthly spend cap (`max_monthly_micro_usd`) | Optional micro-USD cap on how much the grantee's client keys can spend on this share in a UTC calendar month, enforced via the reservation ledger and UTC monthly accumulator. |
 | Permission level | Usage only. The grantee can route inference requests through the shared key and see its health badge and remaining share allowance, but cannot view the key's last four characters, edit its priority or settings, trigger calibration, or delete it. |
-| Revocation | The owner (or an admin) can revoke a share at any time. Revocation takes effect within 1 s on the in-memory config snapshot and immediately invalidates any active session pins where the grantee's client key was pinned to the revoked upstream key. |
+| Revocation | The owner (or an admin) can revoke a share at any time. Revocation deletes the grantee's `user_route_preferences` rows for the affected keys in the same transaction, updates the in-memory `ConfigSnapshot` via the reloader before returning, and invalidates any active session pins where the grantee's client key was pinned to the revoked upstream key. |
 
 ### 4.5 Routing interaction between personal, shared, and global providers
 
-When a client key owned by user `U` sends a request for canonical model `M`, the router builds candidates from three pools.
+When a client key owned by user `U` requests canonical model `M`, the router classifies eligible candidates into three ordered tiers. Grantees thus never drain a teammate's shared quota while their own personal key has headroom.
 
-| Pool name | Candidate membership criteria |
-| --- | --- |
-| Own personal pool | Enabled upstream keys on personal providers where `owner_user_id = U`. |
-| Shared personal pool | Enabled upstream keys on personal providers shared with `U` via an active share grant whose model filter includes `M` and whose monthly share spend is below `max_monthly_micro_usd`. |
-| Global pool | Enabled upstream keys on `global` providers, provided `U.can_use_global_providers = 1` and `U`'s monthly spend on global keys is below `U.global_budget_micro_usd_month` (when set). |
+| Tier (`PoolTier`) | Numeric code | Candidate membership criteria after eligibility filtering (`C1` through `C8`) |
+| --- | --- | --- |
+| `Own` | `0` | Routes whose provider has `ownership_scope == 'personal'` and `owner_user_id == U`. |
+| `Shared` | `1` | Routes reachable via `effective_share(U, K) == Some(s)` where `s` is enabled, not revoked, accepted against the current `share_config_fingerprint`, admin-approved if `custom`, permits model `M` (`s.allowed_models IS NULL` or contains `M`), and has remaining monthly share budget. |
+| `Global` | `2` | Routes whose provider has `ownership_scope == 'global'`, provided `U.can_use_global_providers == 1` and `U` has remaining monthly global budget. |
+| `Blended` | `3` | Combined tier code recorded on pins selected when `routing_scope == 'blended'` merges `Own`, `Shared`, and `Global` into a single WRR pool. |
 
-Each client key (and user account default) defines a `routing_scope` policy that controls how these three pools combine for new sessions.
+Each client key (and user account default) defines a `routing_scope` policy that maps to an ordered list of tier groups. The router evaluates the tier groups in order and runs smooth weighted round-robin inside the first non-empty group.
 
-| Routing scope mode | Candidate selection behavior |
-| --- | --- |
-| `personal_first` (default) | Selects among eligible routes in the user's own personal pool and shared personal pool using smooth weighted round-robin. Falls back to the global pool only when no personal or shared route is eligible for model `M`. |
-| `blended` | Combines eligible routes from the own personal, shared personal, and global pools into a single smooth weighted round-robin pool. |
-| `personal_only` | Restricts routing strictly to the user's own personal pool and shared personal pool. Returns `503 no_eligible_route` if neither can serve the request, never using global keys. |
-| `global_only` | Restricts routing strictly to the global pool, ignoring personal and shared keys. |
+| Routing scope mode | Ordered tier groups (first non-empty group wins) | Candidate selection behavior |
+| --- | --- | --- |
+| `personal_first` (default) | `[Own]`, then `[Shared]`, then `[Global]` | Routes through the user's own personal keys first; falls back to consented shared keys only when no `Own` route is eligible for model `M`; falls back to `Global` keys only when neither `Own` nor `Shared` has an eligible route. |
+| `blended` | `[Own U Shared U Global]` | Combines eligible routes from the `Own`, `Shared`, and `Global` tiers into a single smooth weighted round-robin pool (`PoolTier::Blended`). |
+| `personal_only` | `[Own]`, then `[Shared]` | Routes through `Own` keys first, then `Shared` keys; never uses `Global` keys. |
+| `own_only` | `[Own]` | Restricts routing strictly to the user's own personal keys (`Own`), ignoring both shared and global keys. |
+| `global_only` | `[Global]` | Restricts routing strictly to the `Global` pool, ignoring personal and shared keys. |
 
 ### 4.6 Visibility and accounting for shared personal keys
 
-When Grantee `B` routes a request through a personal key owned by Grantor `A`, the usage row records both `client_key_id` and `upstream_key_id`.
+When Grantee `B` routes a request through Grantor `A`'s personal key, the usage row records `client_key_id`, `upstream_key_id`, and `provider_scope = 'shared'`. It also records the deterministic `share_id` returned by `effective_share(B, K)`.
 
 | Actor | Visibility and privacy boundaries |
 | --- | --- |
-| Grantor `A` (key owner) | Sees the total tokens and cost consumed on their personal upstream key, plus a breakdown showing how much Grantee `B` consumed against the share grant. Grantor `A` never sees Grantee `B`'s client key labels, session hashes, or recorded chat transcripts (`TRC-8`). |
-| Grantee `B` (share recipient) | Sees all requests made by `B`'s own client keys, including which requests routed through the shared key (`shared: <owner_username>/<key_label>`), along with `B`'s remaining monthly share allowance. Grantee `B` never sees Grantor `A`'s own usage or other grantees' usage on that key. |
+| Grantor `A` (key owner) | Sees the total tokens and cost consumed on their personal upstream key, plus a per-grantee breakdown showing how much Grantee `B` consumed against the share grant (`SHR-6`). Grantor `A` never sees Grantee `B`'s client key labels, session hashes, or recorded chat transcripts inside LLMRoller (`TRC-8`). |
+| Grantee `B` (share recipient) | Sees the provider kind, `base_url` host, and upstream key label before accepting the share, and sees all requests made by `B`'s own client keys (`shared: <owner_username>/<key_label>`) along with `B`'s remaining monthly share allowance. Grantee `B` never sees Grantor `A`'s own usage, other grantees' usage, account-identifying response headers (`Section 12.1.1` / Section 12.1.1), or raw `/usage` account metadata (`SEC-18`). |
 
 ## 5. System architecture
 
-LLMRoller runs as one Rust process made of six internal subsystems. These subsystems share an atomic in-memory configuration snapshot and one SQLite database in Write-Ahead Logging (WAL) mode.
+LLMRoller runs as one Rust process made of six internal subsystems. These subsystems share an atomic in-memory configuration snapshot (`ArcSwap<ConfigSnapshot>`), a mutex-guarded in-memory pin store (`PinStore`), and one SQLite database in Write-Ahead Logging (WAL) mode.
 
 ### 5.1 High-level architecture diagram
 
@@ -363,33 +390,37 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 +============================= LLMRoller Process =============================+
 |                                                                             |
 |  +----------------------- Data Plane Listener (:8080) -------------------+  |
-|  | Proxy Edge -> Normalizer -> Model & Scope Resolver -> Session Resolver|  |
-|  |     -> Router (Pin Lookup / Smooth WRR / Failover)                    |  |
-|  |     -> Provider Adapter -> Stream Forwarder, Usage & Trace Tap        |  |
+|  | Proxy Edge (Preflight Body Budget) -> Request Gates (G1..G7)          |  |
+|  |     -> Model & Constraint Resolver -> Session & Link Resolver         |  |
+|  |     -> Router (PinStore / Per-Group Smooth WRR / Pre-Frame Failover)  |  |
+|  |     -> GuardedConnector -> Stream Forwarder (64 KiB Hold Buffer)      |  |
+|  |     -> Inline SseUsageTap, Bounded TraceTap & RequestLifecycle Guard  |  |
 |  |     -> /v1/usage & /v1/key Pass-Through Handler                       |  |
 |  +-----------------------------------------------------------------------+  |
 |                     |                                     ^                 |
-|                     v (lock-free read)                    | (atomic swap)   |
+|                     v (lock-free / short mutex read)      | (ordered swap)  |
 |  +-----------------------------------------------------------------------+  |
 |  | Hot-Path In-Memory State                                              |  |
-|  |  - ArcSwap<ConfigSnapshot> (users, keys, shares, models, routes)      |  |
-|  |  - Moka Pin Cache & Response-Link Cache (single-flight + sliding TTL) |  |
-|  |  - DashMap WRR Counters, Circuit Breakers, Window Ring Counters       |  |
-|  |  - Cached Upstream Usage Snapshots                                    |  |
+|  |  - ArcSwap<ConfigSnapshot> (per-domain slices + config_version)       |  |
+|  |  - PinStore (DashMap<PinKey, Arc<Mutex<PinEntry>>>, max 250k pins)    |  |
+|  |  - Moka Response-Link Cache (backed by SQLite response_links)         |  |
+|  |  - RuntimeState: WrrState Groups, OriginBreakers, Window Rings,       |  |
+|  |    UpstreamObservations, UTC Month Accumulators, Health Versions      |  |
 |  +-----------------------------------------------------------------------+  |
 |                     |                                     ^                 |
-|                     v (async mpsc batch)                  | (reload)        |
+|                     v (Control queue + 3 Data queues)     | (Reloader task) |
 |  +----------------------- Storage & Background Jobs ---------------------+  |
-|  |  - SQLite (WAL mode): 21 tables, single batching writer task          |  |
-|  |  - Jobs: Model Discovery, Upstream /usage Poller, Price Sync,         |  |
-|  |          Hourly Rollups, Retention Sweeper                            |  |
+|  |  - SQLite (WAL mode): 31 tables, dual-queue batching writer actor     |  |
+|  |  - 2-Thread OS Trace Sealer Pool (crossbeam bounded(64) + zstd bulk)  |  |
+|  |  - Supervised Jobs: Model Discovery, Single-Flight /usage Poller,     |  |
+|  |          Price Sync, 5-Min & Hourly Rollups, Retention & Checkpointer |  |
 |  +-----------------------------------------------------------------------+  |
 |                                       ^                                     |
 |  +------------------- Control Plane Listener (127.0.0.1:8081) -----------+  |
 |  |  - Admin UI & API (/admin/*): Setup, Users, Global Providers, Catalog |  |
 |  |  - User UI & API (/app/*, /api/user/*): Personal Providers, Shares,   |  |
 |  |    Client Keys, Personal Routing Overrides, Scoped Usage & Pins       |  |
-|  |  - Metrics Listener (127.0.0.1:9090): Prometheus /metrics             |  |
+|  |  - Metrics Listener (127.0.0.1:9090): Bounded Prometheus /metrics     |  |
 |  +-----------------------------------------------------------------------+  |
 +=============================================================================+
    |  HTTPS + Upstream API Key + Provider Affinity Hint
@@ -403,12 +434,12 @@ Each subsystem lives in a dedicated module or workspace crate with explicit trai
 
 | Subsystem | Core responsibilities | Primary Rust crates |
 | --- | --- | --- |
-| Proxy edge (`proxy`) | Authenticates client keys (`llr_...`), enforces body size and per-key rate limits, dispatches `/v1/*` inference and `/v1/usage` routes, and streams responses without buffering. | `axum`, `hyper-util`, `tower`, `reqwest` (`rustls`) |
-| Routing core (`core`) | Pure deterministic logic with zero I/O: resolves session IDs, filters candidate routes by ownership, share grants, protocol, health, and budgets, runs smooth weighted round-robin, and manages the pin state machine. | `arc-swap`, `moka`, `dashmap` |
-| Provider adapters (`proto`) | Implements `ProviderAdapter` per provider type: builds upstream URLs, headers, auth, and session hints, parses `/models` and source `/usage` responses, and classifies upstream HTTP errors. | `serde`, `serde_json`, `bytes` |
-| Usage and trace tap (`proto`, `store`) | Tees raw SSE chunks to a non-blocking parser, extracts token counts and costs, and (when content traceability is on) reassembles prompts, reasoning, tool calls, and completions into compressed, encrypted `trace_records`. | `tokio::sync::mpsc`, `async-compression`, `zstd`, `sqlx` |
-| Catalog, health, and `/usage` service (`server`) | Runs background tasks for `/models` discovery, upstream `/usage` endpoint polling and budget reconciliation, key cooldown timers, and circuit breaker state transitions. | `tokio`, `time` |
-| Control plane (`admin`) | Serves the JSON APIs and server-rendered HTMX web interface for both `admin` and `user` roles, handles cookie sessions, Argon2id logins, TOTP, CSRF verification, and hash-chained audit logging. | `askama`, `rust-embed`, `argon2`, `chacha20poly1305` |
+| Proxy edge (`proxy`) | Enforces `LLMROLLER_MAX_BODY_MB` and the `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` admission semaphore, evaluates request gates `G1` through `G7`, dispatches `/v1/*` routes through `GuardedConnector`, holds pre-first-frame bytes up to 64 KiB, and streams responses under an RAII `RequestLifecycle` completion guard. | `axum`, `hyper-util`, `tower`, `reqwest` (`rustls`), `async-compression` |
+| Routing core (`core`) | Pure deterministic logic with zero I/O: resolves eight-step session IDs and response-link inheritance, evaluates candidate checks `C1` through `C8` across `Own`, `Shared`, and `Global` tiers, runs per-group smooth WRR, and drives the `PinStore`, `OriginBreaker`, window ring, and reservation state machines. | `arc-swap`, `dashmap`, `parking_lot`, `smallvec` |
+| Provider adapters (`proto`) | Implements `ProviderAdapter` per provider type: validates top-level JSON without duplicate keys, applies surgical edits, enforces request and response header policies, runs inline `SseUsageTap` and bounded `TraceTap`, parses `/models` and `/usage` payloads, and runs the five-class error classifier. | `serde`, `serde_json`, `bytes` |
+| Storage, sealer pool, and writer (`store`) | Manages connection pragmas via `connect_options(role)`, seals secrets and content-addressed `trace_blocks` on a dedicated 2-thread `zstd::bulk::Compressor` pool, and serializes writes through a dual-queue writer (`Control` priority queue plus `durable_state`, `rollups`, and `raw_events` data queues). | `sqlx`, `crossbeam-channel`, `zstd`, `chacha20poly1305`, `hkdf` |
+| Catalog, health, and `/usage` service (`server`) | Supervises background tasks with exponential-backoff panic recovery: `/models` discovery, single-flight `/usage` polling (8-permit concurrency cap), 60 s pin/WRR/detector sweep, 30 s WAL checkpoint and retention sweeper, and the single `Reloader` task. | `tokio`, `time`, `moka` |
+| Control plane (`admin`) | Serves the JSON APIs and server-rendered HTMX web interface for `admin` and `user` roles, applies `project_key` tenant redaction, handles cookie sessions, Argon2id logins, TOTP, CSRF verification, and hash-chained audit logging. | `askama`, `rust-embed`, `argon2`, `pulldown-cmark`, `ammonia` |
 
 ### 5.3 Ten-step inference request lifecycle
 
@@ -416,63 +447,126 @@ Every inference request on `/v1/chat/completions`, `/v1/responses`, or `/v1/mess
 
 | Step | Stage | Action taken |
 | --- | --- | --- |
-| 1 | Authenticate client key | Hash the bearer or `x-api-key` token with SHA-256, look up the `ClientKey` in `ConfigSnapshot` in constant time, and verify rate limits. |
-| 2 | Parse envelope | Identify the wire protocol (`chat`, `responses`, or `messages`) from the URL path and read `model`, `stream`, and session fields without altering field order. |
-| 3 | Resolve canonical model | Map the requested model string to a `CanonicalModel` and verify that the model is exposed and permitted by `client_key.allowed_models`. |
-| 4 | Resolve session identity | Extract the session ID using the nine-level precedence order (Section 11.1) and compute the 128-bit `session_hash` using HMAC-SHA256. |
-| 5 | Check existing pin | Check `moka` for a pin matching `(client_key_id, canonical_model_id, session_hash)` (or `previous_response_id`). If confirmed and still eligible, select that route. |
-| 6 | Select new route on miss | Filter candidate routes across the owner's personal, shared, and global pools under `routing_scope`, run smooth WRR, and write a `provisional` single-flight pin. |
-| 7 | Build and send request | Build the outbound request via the provider adapter, inject the decrypted upstream key and session affinity hint, apply surgical body edits, and send upstream. |
-| 8 | Failover before first byte | If the upstream call fails before yielding the first body byte, update key health, delete or move the provisional pin, and retry on up to two other routes. |
-| 9 | Confirm pin and stream | When the first response byte arrives, promote the pin to `confirmed`, refresh its sliding TTL, and stream every chunk to the client while teeing the usage tap. |
-| 10 | Record usage, trace, and reconcile | Emit a `UsageEvent` (and an encrypted `TraceRecord` when content traceability is active) to the batch writer, update window counters, and trigger `/usage` polls when needed. |
+| 1 | Buffer body and evaluate request gates (`G1`..`G5`) | Read the request body up to `LLMROLLER_MAX_BODY_MB` into a shared `Bytes` buffer, acquire pre-first-byte memory permits from `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (up to `2,000 ms` queue wait, else `503 gateway_busy`), and evaluate gates `G1` (hash match including rotation grace), `G2` (key active), `G3` (owner active), `G4` (CIDR), and `G5` (RPM bucket). Failed `G1`..`G3` checks record in `auth_failure_counters` rather than `usage_events`. |
+| 2 | Validate JSON envelope (`WIRE`) | Identify the endpoint kind (`Inference`, `Auxiliary`, or `StateBound`) and wire protocol (`chat`, `responses`, or `messages`), scan top-level JSON spans rejecting duplicate keys (`400 invalid_request_error`), non-UTF-8 or BOM prefixes, and type-confused `model` or `stream` fields. |
+| 3 | Resolve canonical model and evaluate gates (`G6`, `G7`) | Normalize the requested model string, resolve through confirmed `model_aliases`, `model_redirects`, `models`, or unambiguous raw `upstream_model_id` to `model_pk`, and evaluate `G6` (`client_key.allowed_models`) and `G7` (client-key monthly accumulator reservation, returning `429 client_key_budget_exhausted` on exhaustion). |
+| 4 | Resolve session identity and routing constraint | Run `resolve_session_and_constraint` (Section 11.1.2): for `responses` requests with `previous_response_id` (or `/v1/responses/{id}/*`), look up `response_links` in `moka` or the SQLite read pool, verify `owner_user_id`, inherit `link.session_hash`, and set `RoutingConstraint::HardKey(link.upstream_key_id)`; otherwise extract the session ID via the eight-step precedence order and compute `session_hash`. |
+| 5 | Acquire pin ticket from `PinStore` | For `HardKey(K)`, validate `K` under the hard-route decision table (Section 10.4). Otherwise call `PinStore::acquire(req)` under the entry mutex: follow a valid `Confirmed` or `Provisional` pin (checking `repin_on_personal_recovery` after `recovery_repin_min_idle_secs`), or on miss/ineligibility select a route and insert `Provisional { K, gen, expires = now + 50s }`. |
+| 6 | Filter candidates (`C1`..`C8`) and run per-group smooth WRR | When selection runs inside `PinStore::acquire`, evaluate candidate checks `C1` through `C8` (including cache-aware `try_reserve` across key windows, route windows, share monthly cap, and user global cap) across the ordered tier groups for `routing_scope`, and select the winning route inside the `(user_id, canonical_id, protocol, pool_tier)` `WrrGroup` mutex. |
+| 7 | Build and send outbound request | Strip client credentials and (on `Shared` and `Global` tiers) all recognized client session carriers, inject the decrypted upstream credential and provider affinity hint, apply surgical JSON edits with `serde_json` string escaping, and connect through `GuardedConnector`. |
+| 8 | Hold pre-first-frame bytes and classify failures | Hold upstream status, headers, and up to `64 KiB` of initial bytes until the first valid non-comment frame is verified. If a failover-eligible failure occurs before commit (and constraint is not `HardKey`), record a `usage_attempts` item, update key/route health or `OriginBreaker`, and call `PinStore::pre_first_byte_failure` (adopting the leader's key if a concurrent turn already advanced `generation`) for up to two retries within `failover_wall_clock_budget_ms` (`60 s`). |
+| 9 | Commit response, confirm pin, and stream | Upon verifying the first valid frame, release the preflight body budget permit, call `PinStore::first_valid_frame(ticket)` to promote the pin to `Confirmed` and enqueue a durable `pins` upsert (plus a durable `response_links` row on `response.created`), apply the response-header policy (Section 12.1.1), flush the held bytes, and stream chunks to the client while running inline `SseUsageTap` and bounded `TraceTap`. |
+| 10 | Finalize via `RequestLifecycle` guard | When the stream completes or aborts (`Completed`, `UpstreamTruncated`, `ClientGone`, `IdleTimeout`, or `ShutdownCut`), `RequestLifecycle::drop` computes actual or estimated cost, updates window rings and monthly accumulators before releasing the in-flight reservation, enqueues `usage_events`, `usage_attempts`, and 5-minute/hourly rollup deltas, and submits any finished turn to the 2-thread trace sealer pool. |
 
-### 5.4 Hot-path state and listener isolation
+### 5.4 Hot-path state, `Reloader` ordering, and listener isolation
 
-To keep p99 routing latency under 5 ms, the inference hot path never queries SQLite. Only `GET /v1/usage*` endpoints and `response_links` cache misses may query the 8-connection read pool. Static configuration tables compile into an immutable `ConfigSnapshot` inside `ArcSwap` coordinated by a monotonic `snapshot_generation` mutex. Runtime mutable state (`RuntimeState` in `DashMap`) holds health, circuit breakers, and spend counters so runtime transitions never rebuild `ConfigSnapshot`. Control-plane deletes or revocations emit a `CacheInvalidationEvent` that immediately purges affected `moka` pins and `RuntimeState` entries.
+To keep p99 routing latency under 5 ms, the inference hot path never queries SQLite. Only `GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, `GET /v1/auth/key`, and `response_links` cache misses may query the 8-connection read pool.
+
+Static configuration tables compile into an immutable `ConfigSnapshot` made of per-domain `Arc` slices. These slices cover `users`, `providers`, `upstream_keys`, `client_keys_by_hash`, `models`, `aliases`, `redirects`, `routes`, `shares_by_grantee`, `user_route_prefs`, `prices`, `budget_windows`, `settings`, and `traceability`. A single background `Reloader` task owns snapshot publication:
+1. Whenever the writer commits a control-plane transaction that mutates configuration tables, it increments `instance_meta.config_version` in that same transaction and sends a `ReloadRequest { min_version, changed_domains, invalidations }` to the reloader.
+2. The reloader coalesces pending requests, reads `config_version` in one read transaction, rebuilds changed domain `Arc` slices, and stores the new snapshot when `v > published.version`.
+3. Immediately after the `ArcSwap` store, the reloader applies all coalesced `CacheInvalidationEvent` items to `PinStore`, `WrrState`, and `RuntimeState`. It then notifies awaiting control-plane HTTP handlers so revocations take effect before HTTP 2xx returns.
 
 LLMRoller binds three independent TCP listeners by default, as listed in the table below.
 
 | Listener | Default bind address | Served routes and purpose |
 | --- | --- | --- |
 | Data plane listener | `0.0.0.0:8080` | Serves `/v1/*`, `/healthz`, and `/readyz` for coding agents. |
-| Control plane listener | `127.0.0.1:8081` | Serves `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Loopback binding prevents accidental internet exposure. |
-| Metrics listener | `127.0.0.1:9090` | Serves `/metrics` in Prometheus text format on loopback. |
+| Control plane listener | `127.0.0.1:8081` | Serves `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Refuses to start on a non-loopback address without TLS unless `LLMROLLER_TRUSTED_PROXIES` is configured (exit code 2). |
+| Metrics listener | `127.0.0.1:9090` | Serves `/metrics` in Prometheus text format on loopback with a closed label allow-list. |
 
-### 5.5 Command-line interface (`llmroller`) contract and exit codes
+### 5.5 Command-line interface (`llmroller`) contract, lifecycle, and exit codes
 
-The `llmroller` binary in `crates/server` uses `clap` derive macros to expose one daemon command (`serve`) and four maintenance subcommands. Every subcommand returns a deterministic POSIX exit code so systemd units, Kubernetes probes, and cron scripts can automate recovery.
+The `llmroller` binary in `crates/server` uses `clap` derive macros to expose one daemon command (`serve`), five maintenance subcommands, and `--version`. Every subcommand opens SQLite through `crates/store::pool::connect_options(role)` and returns a deterministic POSIX exit code from the unified table below.
 
-| Subcommand and arguments | Operational behavior | Exit codes |
+| Subcommand and arguments | Operational behavior |
+| --- | --- |
+| `llmroller serve [--listen <addr>] [--admin-listen <addr>] [--metrics-listen <addr>] [--data-dir <path>] [--dev-insecure-cookies]` | Runs the ordered startup sequence (Section 5.5.2), binds listeners with `/readyz = 503` until preload completes, supervises background jobs with panic recovery, and on `SIGTERM` or `SIGINT` runs the eight-step graceful drain (Section 5.5.3). |
+| `llmroller backup --out <dest_path> [--overwrite] [--data-dir <path>]` | Refuses if `<dest_path>` exists unless `--overwrite` is passed. Opens the active SQLite WAL database in shared mode, runs the SQLite Online Backup API (`sqlite3_backup_init` / `step` / `finish`) into `<dest_path>.tmp` in the destination directory, calls `fsync` on `<dest_path>.tmp`, verifies `PRAGMA integrity_check`, atomically renames `<dest_path>.tmp` to `<dest_path>`, calls `fsync` on the destination directory, and outputs a JSON summary including `master_key_id` (`REL-6`). |
+| `llmroller rotate-master-key --old-key-env <VAR> --new-key-env <VAR> --new-key-id <id> [--data-dir <path>]` | Acquires `flock(LOCK_EX \| LOCK_NB)` on `llmroller.lock` (exiting with code `4` if `serve` is running). Verifies the old key unseals `instance_secrets`, sets `instance_meta.rotation_state = 'in_progress'`, and re-seals all rows in 500-row batched `BEGIN IMMEDIATE` transactions across `instance_secrets`, `users` (`totp_secret_enc`), `upstream_keys`, `upstream_usage_snapshots`, `trace_blocks`, and `trace_records`, advancing `rotation_cursor_table` and `rotation_cursor_id` after each batch so interrupted runs resume cleanly (`SEC-1`). Appends an `audit_log` row (`master_key.rotated`) using the unchanged `audit_hmac_key`, sets `active_master_key_id = new_id` and `rotation_state = 'idle'`, and prints reminder instructions to `stderr`. |
+| `llmroller verify-audit-log [--anchor-seq <N>] [--anchor-hash <H>] [--data-dir <path>] [--json]` | Unseals `audit_hmac_key` from `instance_secrets` using the master key, streams all rows from `audit_log` ordered by `seq ASC`, verifies that no `seq` gaps exist and that every row's `HMAC_SHA256` matches from the 64-ASCII-zero genesis `prev_hash`, and when `--anchor-seq N --anchor-hash H` is given, verifies that row `N` has hash `H` and `max(seq) >= N` (`SEC-13`). |
+| `llmroller reset-admin --username <name> [--data-dir <path>]` | Offline break-glass recovery command. Acquires `flock(LOCK_EX \| LOCK_NB)` on `llmroller.lock`, sets `role = 'admin'`, `disabled = 0`, and `must_change_password = 1` on `<name>`, generates a temporary password printed once to `stderr`, and appends an `audit_log` row (`action = 'admin.break_glass'`, `actor_user_id = NULL`). |
+| `llmroller generate-master-key` | Reads 32 bytes from `OsRng`, base64-encodes the key, writes it to `stdout` with a trailing newline, and zeroizes the buffer before exiting. |
+| `llmroller --version` | Prints `llmroller <semver> (<git_sha>, schema <n>)` to `stdout` and exits with code `0`. |
+
+#### 5.5.1 Unified CLI exit codes
+
+Every subcommand uses the following non-overlapping exit codes so supervisors and automation scripts can distinguish lock contention from schema or cryptographic errors.
+
+| Exit code | Meaning across all subcommands |
+| --- | --- |
+| `0` | Success (clean drain, verified backup, completed rotation, intact audit log, or completed admin reset) |
+| `2` | Invalid CLI flag, invalid environment variable, or non-loopback plaintext listener rejected at startup |
+| `3` | Master key missing, decoded length not equal to 32 bytes, insecure key-file permissions, `rotation_state == 'in_progress'`, `LLMROLLER_MASTER_KEY_ID != active_master_key_id`, or failure to unseal `instance_secrets` |
+| `4` | `llmroller.lock` held by another process |
+| `5` | TCP listener bind error |
+| `6` | Backup destination I/O error or target file already exists without `--overwrite` |
+| `7` | AEAD authentication failure on an existing row during `rotate-master-key` |
+| `8` | `audit_log` HMAC mismatch or `seq` gap detected |
+| `9` | `audit_log` tail truncation detected against `--anchor-seq` and `--anchor-hash` |
+| `10` | Target username not found (`reset-admin`) |
+| `11` | Graceful shutdown completed with unflushed items remaining in writer or sealer queues after timeout |
+| `12` | Controlled shutdown triggered by an unrecoverable SQLite writer panic |
+| `13` | SQLite migration run failure or `auto_vacuum != INCREMENTAL` |
+| `14` | Database `_llmroller_schema.version` is newer than this binary supports |
+
+#### 5.5.2 Ordered startup sequence (`llmroller serve`)
+
+The `serve` command runs ten startup steps in strict order before marking `/readyz` ready:
+1. Acquire `flock(LOCK_EX | LOCK_NB)` on `${LLMROLLER_DATA_DIR}/llmroller.lock` (exit `4` on contention).
+2. Validate listener TLS and proxy settings (`LLMROLLER_ADMIN_LISTEN`, `LLMROLLER_LISTEN`, `LLMROLLER_TRUSTED_PROXIES`, `LLMROLLER_REQUIRE_TLS`; exit `2` on invalid configuration) and load the 32-byte master key from `LLMROLLER_MASTER_KEY_FILE` or `LLMROLLER_MASTER_KEY` (exit `3` on error).
+3. Open the SQLite pool via `connect_options`, check `_llmroller_schema.version` (exit `14` if newer), run forward-only migrations, and assert `PRAGMA auto_vacuum == 2` (exit `13`).
+4. Load or initialize `instance_meta` and `instance_secrets`; exit `3` if `rotation_state == 'in_progress'`, if `LLMROLLER_MASTER_KEY_ID != active_master_key_id`, or if `instance_secrets` fails AEAD decryption.
+5. When `users` is empty and a setup token is needed, create or reuse `${LLMROLLER_DATA_DIR}/setup-token` (`0600`) and print only its path to `stderr`.
+6. Start the dual-queue SQLite writer actor, the 2-thread OS trace sealer pool, and the `Reloader` task, and build the initial `ArcSwap<ConfigSnapshot>`.
+7. Rebuild window states and UTC monthly accumulators from `usage_rollups_5min`, `budget_adjustments`, and `upstream_usage_snapshots` (`< 2 s`). Load persisted `exhausted` and `invalid` health states into `RuntimeState`.
+8. Preload up to `max_active_pins` (`250,000`) non-expired confirmed `pins` ordered by `last_used_at DESC` into `PinStore` and preload active `response_links` into `moka`.
+9. Bind the data-plane, control-plane, and metrics TCP listeners (exit `5` on bind error) with `/readyz` returning `503` until step 10 finishes.
+10. Spawn supervised background tasks (discovery, `/usage` poller, 60 s sweeper, 30 s WAL checkpointer/retention task) and flip `/readyz` to `200 OK`.
+
+#### 5.5.3 Ordered graceful shutdown (`SIGTERM` / `SIGINT`) and job supervision
+
+When `SIGTERM` or `SIGINT` arrives, the server runs an eight-step shutdown sequence:
+
+| Step | Action taken | Time bound |
 | --- | --- | --- |
-| `llmroller serve [--listen <addr>] [--admin-listen <addr>] [--metrics-listen <addr>] [--data-dir <path>] [--dev-insecure-cookies]` | Acquires an exclusive non-blocking file lock (`flock(LOCK_EX \| LOCK_NB)`) on `${LLMROLLER_DATA_DIR}/llmroller.lock`, validates `LLMROLLER_MASTER_KEY`, runs SQLite WAL migrations (21 tables), loads `ArcSwap<ConfigSnapshot>`, preloads active `confirmed` `pins` and `response_links` into `moka`, rebuilds 5 h window rings from `usage_events` and 7 d/1 mo counters from `usage_rollups_hourly`, spawns supervised background jobs with panic recovery, and binds the three TCP listeners until `SIGTERM` or `SIGINT`. | `0` clean drain; `2` invalid CLI flag or env var; `3` missing or invalid master key (`SEC-2`); `4` SQLite migration or `llmroller.lock` contention error; `5` listener bind error |
-| `llmroller backup --out <dest_path> [--data-dir <path>]` | Opens the active SQLite WAL database in shared mode and runs the SQLite Online Backup API (`sqlite3_backup_init` / `step` / `finish`) into `<dest_path>.tmp`, verifies `PRAGMA integrity_check` on the snapshot, and atomically renames it to `<dest_path>` (`REL-6`). | `0` verified backup written; `4` source DB locked or corrupt; `6` destination I/O error |
-| `llmroller rotate-master-key --old-key-env <VAR> --new-key-env <VAR> --new-key-id <id> [--data-dir <path>]` | Opens a `BEGIN IMMEDIATE` transaction on the writer connection, decrypts every `upstream_keys.secret_enc`, `users.totp_secret_enc`, and `trace_records.payload_enc` row using the old master key and row-specific `AAD`, re-encrypts each row with a fresh 24-byte random nonce under the new HKDF subkey, updates `master_key_id`, and appends a hash-chained `audit_log` entry (`SEC-1`). | `0` all rows rotated; `3` key decode or length error; `7` AEAD authentication failure on any existing row (transaction rolled back cleanly) |
-| `llmroller verify-audit-log [--data-dir <path>] [--json]` | Streams all rows from `audit_log` ordered by `ts ASC, id ASC`, recomputes the canonical length-prefixed SHA-256 chain from the genesis seed (`0x00 * 32`), and reports total verified rows or the exact first tampered `audit_log.id` (`SEC-13`). | `0` chain intact; `8` hash mismatch or missing predecessor detected |
-| `llmroller generate-master-key` | Reads 32 bytes from `OsRng`, base64-encodes the key, writes it to `stdout` with a trailing newline, and zeroizes the buffer before exiting. | `0` success |
+| 1 | Flip `/readyz` to HTTP 503 immediately while continuing to accept connections for `drain_grace_secs` (default `5 s`) so upstream load balancers stop routing new traffic. | `5 s` |
+| 2 | Stop accepting new TCP connections on the data-plane and control-plane listeners. | Immediate |
+| 3 | Wait for in-flight inference requests and SSE streams to complete naturally. | `drain_timeout_secs` (default `60 s`) |
+| 4 | Cancel any remaining open streams with `Termination::ShutdownCut` so `RequestLifecycle::drop` records estimated usage and releases reservations. | Immediate |
+| 5 | Stop background tasks (`Discovery`, `UsagePoller`, `RetentionSweeper`, and `Reloader`). | `5 s` |
+| 6 | Close the `crossbeam` sealer channel and wait for the 2 sealer threads to finish in-flight jobs. | `min(10 s, remaining drain budget)` |
+| 7 | Drain the writer's `Control`, `durable_state`, `rollups`, and `raw_events` queues in that strict priority order. | `15 s` |
+| 8 | Run `PRAGMA wal_checkpoint(TRUNCATE);`, close the SQLite pool, release `llmroller.lock`, and exit `0` (or `11` if any queue was not fully flushed). | Immediate |
+
+Each background task (`Discovery`, `UsagePoller`, `RetentionSweeper`, `Reloader`) runs inside `catch_unwind`. If a task panics, the supervisor logs the panic and restarts the task with exponential backoff starting at `1 s` and doubling up to `300 s`. Three panics within 10 minutes mark that job failed (`llmroller_job_failed{job}=1`) and leave it stopped until process restart. The SQLite writer actor is never restarted on panic: a writer panic flips `/readyz` to `503` and triggers immediate controlled shutdown with exit code `12`.
 
 ### 5.6 Environment variables and runtime `settings` registry
 
-LLMRoller separates static bootstrap parameters from dynamic runtime policies. Static bootstrap parameters come from environment variables or CLI flags at startup. Runtime policies live in the SQLite `settings` table and hot-reload into `ArcSwap<ConfigSnapshot>` within 1 s (`REL-4`).
+LLMRoller separates static bootstrap parameters from dynamic runtime policies. Static bootstrap parameters come from environment variables or CLI flags at startup. Runtime policies live in the SQLite `settings` table (Section 9.3.3) and hot-reload into `ArcSwap<ConfigSnapshot>` within 1 s (`REL-4`).
 
 | Environment variable | Type & default | Validation rule and architectural effect |
 | --- | --- | --- |
-| `LLMROLLER_MASTER_KEY` | Base64 string (mandatory unless `_FILE` set) | Must decode to at least 32 raw bytes (`SEC-2`). Used as the root IKM for `HKDF-SHA256` subkey derivation. |
-| `LLMROLLER_MASTER_KEY_FILE` | Filesystem path (`None`) | Path to a file (`0400` or `0600` permissions) containing the base64 master key; mutually exclusive with `LLMROLLER_MASTER_KEY`. |
-| `LLMROLLER_MASTER_KEY_ID` | ASCII string (`"mk_default"`) | Identifier recorded in `master_key_id` columns on newly sealed rows (`SEC-1`). |
-| `LLMROLLER_DATA_DIR` | Filesystem path (`"/var/lib/llmroller"`) | Directory holding `llmroller.db`, `llmroller.db-wal`, and `llmroller.db-shm`. |
+| `LLMROLLER_MASTER_KEY_FILE` | Filesystem path (`None`, preferred) | Path to a file with `0400` or `0600` permissions (group/other bits rejected with exit `3`) containing the base64 master key; mutually exclusive with `LLMROLLER_MASTER_KEY`. |
+| `LLMROLLER_MASTER_KEY` | Base64 string (mandatory unless `_FILE` set) | Must decode to **exactly** 32 raw bytes (`SEC-2`, exit `3` if shorter or longer). Because `std::env::remove_var` is `unsafe` in Rust 2024 and the workspace enforces `#![forbid(unsafe_code)]`, startup logs a one-time warning when this env var is used instead of `LLMROLLER_MASTER_KEY_FILE`. |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string (`"mk_default"`) | Identifier checked against `instance_meta.active_master_key_id` at startup (exit `3` on mismatch) and bound into AEAD `AAD` on newly sealed rows (`SEC-1`). |
+| `LLMROLLER_DATA_DIR` | Filesystem path (`"/var/lib/llmroller"`) | Directory holding `llmroller.db`, `llmroller.db-wal`, `llmroller.db-shm`, `llmroller.lock`, and `setup-token`. |
 | `LLMROLLER_LISTEN` | Socket address (`"0.0.0.0:8080"`) | Data-plane HTTP/HTTPS bind address serving `/v1/*`, `/healthz`, and `/readyz`. |
 | `LLMROLLER_ADMIN_LISTEN` | Socket address (`"127.0.0.1:8081"`) | Control-plane HTTP/HTTPS bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login` (`SEC-9`). |
 | `LLMROLLER_METRICS_LISTEN` | Socket address (`"127.0.0.1:9090"`) | Prometheus `/metrics` listener bind address (`OBS-1`, `SEC-9`). |
-| `LLMROLLER_SETUP_TOKEN` | ASCII string (auto-generated 32-char base62) | One-time bootstrap secret checked by `POST /admin/api/setup` (`AUTH-2`). |
+| `LLMROLLER_TRUSTED_PROXIES` | Comma-separated CIDR list (`""`) | When the TCP peer IP is inside this list, client IP is extracted as the right-most `X-Forwarded-For` entry not in the list, and `x-forwarded-proto: https` is honored (`SEC-5`, `SEC-12`). |
+| `LLMROLLER_REQUIRE_TLS` | Boolean (`false`) | When `true`, refuses to start (exit `2`) if `LLMROLLER_LISTEN` is non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES`. When `false`, logs an error every 10 minutes and sets `llmroller_plaintext_data_plane = 1`. |
+| `LLMROLLER_SETUP_TOKEN` | ASCII string (auto-generated to `${LLMROLLER_DATA_DIR}/setup-token`) | One-time bootstrap secret checked by `POST /admin/api/setup` (`AUTH-2`). |
 | `LLMROLLER_SETUP_TOKEN_REQUIRED` | Boolean (`true`) | When `false`, skips the setup token check during initial first-admin bootstrap (`AUTH-2`). |
-| `LLMROLLER_MAX_BODY_MB` | Integer `1..=128` (`32`) | Maximum inbound HTTP request body size in MiB enforced at the proxy edge (`SEC-8`). |
+| `LLMROLLER_MAX_BODY_MB` | Integer `1..=128` (`32`) | Maximum inbound HTTP request body size in MiB enforced at the proxy edge; must be `<= LLMROLLER_PREFLIGHT_BODY_BUDGET_MB / 4` (exit `2` otherwise) (`SEC-8`). |
+| `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` | Integer (`min(1024, floor(0.40 * memory_limit_mb))`, `819` on 2 GB host) | Total MiB of buffered request bodies allowed simultaneously in the pre-first-valid-frame phase (`PERF-3`, `SEC-8`). |
+| `LLMROLLER_SQLITE_SYNCHRONOUS` | Enum `NORMAL \| FULL` (`"NORMAL"`) | Sets `PRAGMA synchronous` on the writer connection (`NORMAL` for standard WAL speed; `FULL` for power-loss durability of every transaction, `REL-2`). |
 | `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY` | Filesystem paths (`None`) | Optional PEM certificate chain and private key enabling native `rustls` HTTPS on the listeners (`A4`). |
 | `LLMROLLER_LOG` | Filter string (`"info,llmroller=info"`) | Structured JSON log level filter passed to `tracing_subscriber::EnvFilter` (`OBS-1`). |
 
 ## 6. Functional requirements
 
-This section specifies all functional requirements for LLMRoller version 1.0. Every requirement has a unique ID, a priority (`P0`, `P1`, or `P2`), and a clear pass or fail condition linked to Section 16.
+This section specifies all functional requirements for LLMRoller version 1.0. Every requirement has a unique ID, a priority (`P0`, `P1`, or `P2`), and a clear pass or fail condition linked to Section 16 and `requirements.toml`.
 
 ### 6.1 Setup, accounts, and authentication (AUTH)
 
@@ -480,14 +574,14 @@ The authentication subsystem controls initial instance bootstrap, password and t
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| AUTH-1 | P0 | When zero rows exist in the `users` table, the control plane must serve a setup flow (`GET /setup`, `POST /admin/api/setup`) that creates the first `admin` account inside a serializable transaction so concurrent submissions cannot create two admins. |
-| AUTH-2 | P0 | Initial setup must validate a one-time setup token read from `LLMROLLER_SETUP_TOKEN` or generated and printed to standard output at startup (unless `LLMROLLER_SETUP_TOKEN_REQUIRED=false`). |
+| AUTH-1 | P0 | When zero rows exist in the `users` table, the control plane must serve a setup flow (`GET /setup`, `POST /admin/api/setup`) that creates the first `admin` account inside a serialized writer transaction so 20 concurrent submissions yield exactly one HTTP 201 and `SELECT COUNT(*) FROM users == 1`. |
+| AUTH-2 | P0 | Initial setup must validate a one-time setup token read from `LLMROLLER_SETUP_TOKEN` or auto-generated to `${LLMROLLER_DATA_DIR}/setup-token` with `0600` permissions (`O_EXCL`, reused across restarts until setup completes and deleted upon completion, printing only the file path to `stderr`), unless `LLMROLLER_SETUP_TOKEN_REQUIRED=false`. |
 | AUTH-3 | P0 | Once at least one user row exists in the database, all `/setup` routes must return HTTP 404 permanently, with no configuration flag able to re-enable them. |
-| AUTH-4 | P0 | An admin must be able to create, disable, enable, and delete user accounts with role `admin` or `user`, and set a temporary password that forces a password change at first login. |
-| AUTH-5 | P0 | The system must reject any request to disable, demote, or delete the last active `admin` account with HTTP 409. |
-| AUTH-6 | P0 | Passwords must be at least 12 characters long and hashed with Argon2id (`m >= 19456 KiB`, `t >= 2`, `p = 1`). |
-| AUTH-7 | P0 | Web login (`POST /api/auth/login`) must issue a 256-bit random session token in an `HttpOnly`, `SameSite=Strict` cookie (stored as a SHA-256 hash in `web_sessions`), and logout (`POST /api/auth/logout`) must delete the server-side session row immediately. |
-| AUTH-8 | P0 | Login and setup endpoints must enforce rate limiting per IP address and per username (default: five failed logins per 15 minutes). |
+| AUTH-4 | P0 | An admin must be able to create, disable, enable, and delete user accounts with role `admin` or `user`, and set a temporary password that forces a password change at first login. Deleting a user (`DELETE /admin/api/users/{id}?confirm=<username>`) must run in one transaction that disables all shares granted by that user, deletes their client keys, personal providers, keys, pins, traces, and web sessions, retains `usage_events` and rollups, and records a `deleted_users(user_id, username, deleted_at)` row. |
+| AUTH-5 | P0 | The writer transaction for any user role change, disable, or delete must verify `SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0` inside `BEGIN IMMEDIATE` and roll back with HTTP 409 (`last_admin`) if the count would reach zero. Offline recovery is provided by `llmroller reset-admin --username <name>`. |
+| AUTH-6 | P0 | Passwords must be at least 12 characters long and hashed with Argon2id (`m >= 19456 KiB`, `t >= 2`, `p = 1`), with concurrent verifications bounded by a semaphore (`max(2, available_parallelism)` permits, 5 s queue timeout returning `503 login_busy`). |
+| AUTH-7 | P0 | Web login (`POST /api/auth/login`) must issue a 256-bit random session token in an `HttpOnly`, `SameSite=Strict` cookie (stored as a SHA-256 hash in `web_sessions`) plus a random 256-bit CSRF token (stored as `csrf_hash = SHA-256(token)`), and logout (`POST /api/auth/logout`) must delete the server-side session row immediately. |
+| AUTH-8 | P0 | Login and setup endpoints must enforce rate limiting keyed by client IP (or `/64` for IPv6: 20 failures per 15 minutes -> HTTP 429) and by `(username, IP)` pair (5 failures per 15 minutes -> HTTP 429). Across all IPs for one username, exceeding 50 failures per hour must enforce TOTP (if enrolled) or add a 2 s constant delay rather than a hard username lockout so attackers cannot lock out an admin from a new IP. |
 | AUTH-9 | P1 | Both `admin` and `user` accounts should support TOTP two-factor authentication (`RFC 6238`) with recovery codes, and admins should be able to reset a user's password and revoke their active web sessions. |
 
 ### 6.2 User roles and access control (USR)
@@ -496,11 +590,11 @@ The user role subsystem enforces multi-tenant isolation between standard users a
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| USR-1 | P0 | The system must support two human user roles in version 1.0: `admin` and `user`. Every control-plane request must resolve an `ActorScope` containing `user_id` and `role`. |
-| USR-2 | P0 | A standard `user` must be able to create, view, edit, test, calibrate, and delete their own `personal` providers and upstream keys, manage shares on their own personal keys, manage their own client keys, and view their own usage and active pins. |
-| USR-3 | P0 | A standard `user` must receive HTTP 403 or 404 when requesting or mutating another user's client keys, personal providers (unless shared, in which case only read-only grantee metadata is visible), usage events, pins, or admin-only endpoints. |
-| USR-4 | P0 | A standard `user` must never see raw secrets, last-four secret suffixes, or administrative labels of `global` upstream keys or keys shared with them by another user. |
-| USR-5 | P0 | An `admin` must be able to set `can_use_global_providers` (boolean, default true) and `global_budget_micro_usd_month` (optional integer micro-USD cap) on each `user` account. |
+| USR-1 | P0 | The system must support two human user roles (`admin` and `user`) and one internal system actor variant (`ActorScope::System { task: SystemTask }`). Every control-plane request must resolve an `ActorScope::User { user_id, role }`. |
+| USR-2 | P0 | A standard `user` must be able to create, view, edit, test, calibrate, and delete their own `personal` providers and upstream keys, manage outgoing and incoming shares, set `user_route_preferences` on own and shared routes, manage their own client keys, and view their own usage and active pins. |
+| USR-3 | P0 | A standard `user` must receive HTTP 404 (`not_found`) for any resource they are not authorized to read (whether or not the ID exists, preventing existence oracles), and HTTP 403 (`permission_error`) only when trying to modify a resource they are authorized to read (such as a shared key or global catalog entry). |
+| USR-4 | P0 | Every user-facing API and template must pass upstream key metadata through `project_key(viewer, key)` so a standard `user` never sees raw secrets, `secret_last4`, key IDs, administrative labels, priorities, or `health_until` of `global` upstream keys (which render as `"global pool"`), nor `secret_last4` or raw `/usage` JSON of shared keys. |
+| USR-5 | P0 | An `admin` must be able to set `can_use_global_providers` (boolean, default true) and `global_budget_micro_usd_month` (optional integer micro-USD cap enforced via the UTC monthly accumulator) on each `user` account. |
 
 ### 6.3 Global and personal providers and upstream keys (PRV)
 
@@ -508,14 +602,14 @@ The provider subsystem manages both admin-owned global providers and user-owned 
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| PRV-1 | P0 | Every provider record must have an `ownership_scope` of `global` (creatable and editable only by `admin`) or `personal` (creatable and editable by its `owner_user_id`, whether `user` or `admin`). |
+| PRV-1 | P0 | Every provider record must have an `ownership_scope` of `global` (creatable and editable only by `admin`) or `personal` (creatable and editable by its `owner_user_id` or an `admin` via `/admin/api/*`), with unique names enforced by partial unique indexes `uq_providers_global_name` and `uq_providers_personal_name`. |
 | PRV-2 | P0 | Users and admins must be able to add providers from built-in presets (`opencode_go`, `command_code`, `open_design_amr`, `openrouter`) or as a `custom` OpenAI or Anthropic compatible provider with a configurable base URL. |
-| PRV-3 | P0 | Each provider record must store editable settings: base URL, protocol paths (`chat`, `responses`, `messages`), auth scheme per protocol (`Bearer` or `x-api-key`), `/models` path, `/usage` profile, header strip and add lists, fallback `User-Agent` policy, and session hint profile. |
-| PRV-4 | P0 | A provider must support multiple upstream keys. Each key has a label, encrypted secret, last-four suffix, enabled flag, default priority weight (`1` to `1000`), optional strict tier, and health state (`healthy`, `cooling_down`, `exhausted`, `invalid`). |
-| PRV-5 | P0 | Upstream key secrets must be encrypted at rest with XChaCha20-Poly1305 before database insertion and never returned in any API or UI response after creation. |
-| PRV-6 | P0 | A Test action on an upstream key must call the provider's `/models` endpoint (and `/usage` endpoint if configured) using that key and report HTTP status, discovered model count, and current upstream usage summary. |
-| PRV-7 | P0 | Custom provider base URLs must use `https://`, reject HTTP redirects, and block loopback, link-local, and RFC 1918 private IP ranges unless an admin explicitly enables `allow_private_network` on that provider. |
-| PRV-8 | P0 | Disabling an upstream key must immediately exclude it from new sessions and force sessions pinned to it to re-pin on their next request. |
+| PRV-3 | P0 | Each provider record must store editable settings in `ProviderConfigJson`: base URL, protocol paths (`chat`, `responses`, `messages`, `models`), `aux_endpoints` (`count_tokens`, `responses_compact`), auth scheme per protocol, `usage_reporting.chat_stream` (`inject`, `native`, `none`), `/usage` profile, `strip_headers`, `strip_header_tokens`, `add_headers`, `response_header_allow`, `ua_policy`, `session_profile`, `timeouts`, and five-class `error_classifiers`. |
+| PRV-4 | P0 | A provider must support multiple upstream keys. Each key has a label, encrypted secret, last-four suffix, enabled flag, default priority weight (`1` to `1000`), optional strict tier (`1` to `10`), and versioned health state (`healthy`, `cooling_down`, `exhausted`, `invalid` with `health_version`). |
+| PRV-5 | P0 | Upstream key secrets must be encrypted at rest with XChaCha20-Poly1305 using canonical length-prefixed `AAD` before database insertion and never returned in any API or UI response after creation. |
+| PRV-6 | P0 | A Test action on an upstream key must call the provider's `/models` endpoint (and `/usage` endpoint if configured, subject to a 10 s per-key minimum interval) using that key and report HTTP status, discovered model count, and current upstream usage summary. |
+| PRV-7 | P0 | Custom provider base URLs and usage URLs must use `https://`, reject non-standard IP encodings at save time, disable HTTP redirects, and validate every connected socket IP (both DNS-resolved names and IP literals) through `GuardedConnector` (`SEC-7`) unless an admin enables `allow_private_network = 1`. Cross-origin `usage_url` on a personal provider needs `usage_url_cross_origin_ack = true` and forbids sharing that provider. |
+| PRV-8 | P0 | Disabling a provider, disabling an upstream key, or disabling the owner account (`users.disabled = 1`) must immediately exclude affected routes from new sessions and purge or re-pin active sessions via `CacheInvalidationEvent`. |
 
 ### 6.4 Personal provider and key sharing (SHR)
 
@@ -523,12 +617,12 @@ The sharing subsystem lets any user share their personal providers or personal u
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| SHR-1 | P0 | The owner of a `personal` provider (or an `admin`) must be able to create a share grant (`provider_shares`) granting a specific `grantee_user_id` access to either the entire personal provider or one specific personal upstream key. |
-| SHR-2 | P0 | Each share grant must support an optional list of `allowed_models` and an optional monthly spend cap (`max_monthly_micro_usd`). |
-| SHR-3 | P0 | A grantee must be able to route inference requests through an active shared key (when eligible under `allowed_models` and `max_monthly_micro_usd`) and view the shared key's label, provider type, health state, and remaining share cap in the UI. |
-| SHR-4 | P0 | A grantee must not be able to re-share a shared key with a third user, edit the shared key's settings, view its secret or last-four characters, or view other users' usage on that key. |
-| SHR-5 | P0 | When a share grant is revoked or its monthly spend cap is reached, the in-memory `ConfigSnapshot` must update within 1 s, and any active session pin binding the grantee's client key to that shared upstream key must re-pin on the next request. |
-| SHR-6 | P0 | The personal key owner must see a per-grantee breakdown of requests, tokens, and cost consumed via each share grant on their key. |
+| SHR-1 | P0 | The owner of a `personal` provider (or an `admin`) must be able to create a share grant (`provider_shares`) granting a specific `grantee_user_id` access to either the entire personal provider (`upstream_key_id IS NULL`) or one specific personal upstream key. Creating a key-level share when an active provider-level share exists for the same grantee and provider (or vice versa) must be rejected with HTTP 409 `share_overlap`. |
+| SHR-2 | P0 | Each share grant must support an optional list of `allowed_models` (`NULL` means all models served) and an optional monthly spend cap (`max_monthly_micro_usd`). |
+| SHR-3 | P0 | A share grant must remain inactive until the grantee accepts it (`POST /api/user/shares/{id}/accept`) echoing the provider's current `share_config_fingerprint` (and until an admin approves it via `POST /admin/api/shares/{id}/approve` when `provider.kind == 'custom'`). Any change to the provider's routing-relevant configuration updates `share_config_fingerprint` and suspends active shares until re-accepted. |
+| SHR-4 | P0 | A grantee must not be able to re-share a shared key with a third user, edit the shared key's settings, view its secret or `secret_last4`, receive account-identifying upstream response headers, or view other users' usage on that key. |
+| SHR-5 | P0 | When a share grant is revoked, suspended by a config change, or reaches its monthly spend cap, the in-memory state must update within 1 s, deleting the grantee's `user_route_preferences` on revocation and forcing any session pinned via that share to re-pin on its next request. |
+| SHR-6 | P0 | The personal key owner must see a per-grantee breakdown of requests, tokens, and cost (including charged failed tries) consumed via each share grant (`effective_share(U, K)`) on their key. |
 
 ### 6.5 Client keys (CLK)
 
@@ -537,10 +631,10 @@ Client keys authenticate coding agents to the data plane and carry user-defined 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
 | CLK-1 | P0 | Any `admin` or `user` must be able to generate client keys (`llr_` followed by 32 base62-encoded random bytes) scoped to their account, with a label, optional expiry timestamp, and optional `allowed_models` list. |
-| CLK-2 | P0 | The full client key string must be displayed once at creation or rotation. The database stores only its SHA-256 hash (`key_hash`) and an 8-character prefix (`llr_xxxx`). Rotating a client key (`POST /api/user/client-keys/{id}/rotate`) updates `key_hash` and `prefix` in place on the same `client_key.id` (preserving active `pins` and `response_links`) and supports an optional `grace_period_secs` (default `300 s`) during which the previous hash remains valid. |
-| CLK-3 | P0 | Each client key must have a configurable `routing_scope` policy (`personal_first`, `blended`, `personal_only`, or `global_only`, defaulting to `personal_first`) that governs how the router combines the owner's personal, shared, and global upstream key pools. |
-| CLK-4 | P0 | Revoking or disabling a client key must take effect within 1 s via the atomic `ConfigSnapshot` swap and reject later data-plane calls with HTTP 401. |
-| CLK-5 | P1 | Each client key should support an optional request-per-minute rate limit, a monthly micro-USD budget cap, and an optional CIDR IP allow list. |
+| CLK-2 | P0 | The full client key string must be displayed once at creation or rotation. The database stores `key_hash`, `prefix`, and optional rotation grace columns `prev_key_hash` and `prev_key_expires_at` (with disjoint uniqueness enforced by `uq_client_keys_prev_hash` and `trg_client_keys_hash_disjoint`). Rotating a client key (`POST /api/user/client-keys/{id}/rotate`) updates `key_hash` in place on the same `client_key.id` (preserving active `pins` and `response_links`) and keeps the previous hash valid for `grace_period_secs` (`0..=86400`, default `300 s`) unless revoked or disabled. |
+| CLK-3 | P0 | Each client key must have a configurable `routing_scope` policy (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, or `global_only`, defaulting to `inherit` which resolves to `users.default_routing_scope`, default `personal_first`) that governs how the router orders the `Own`, `Shared`, and `Global` upstream key tiers. |
+| CLK-4 | P0 | Revoking or disabling a client key must clear `prev_key_hash`, update `ArcSwap<ConfigSnapshot>` via the reloader before the HTTP response returns (within 1 s), purge its pins, and reject later data-plane calls with HTTP 401. |
+| CLK-5 | P1 | Each client key should support an optional request-per-minute rate limit (`G5`, returning 429), a monthly micro-USD budget cap (`G7`, returning 429 `client_key_budget_exhausted` with `Retry-After` until next UTC month), and an optional CIDR IP allow list (`G4`, returning 403). |
 
 ### 6.6 Model catalog and discovery (MDL)
 
@@ -548,13 +642,13 @@ The model catalog normalizes model identifiers across providers and determines w
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| MDL-1 | P0 | LLMRoller must discover available models for each enabled upstream key by calling the provider's `/models` endpoint on key creation, on manual refresh, and every 6 hours. |
-| MDL-2 | P0 | Discovered upstream model IDs must be normalized to a `canonical_id` using the deterministic six-step algorithm in Section 10.6 (lowercase, vendor prefix and routing tags stripped, version separators unified without merging distinct version numbers) while preserving the exact `upstream_model_id` on the `model_routes` row for outbound requests. |
-| MDL-3 | P0 | For the global pool, a model with `exposed = NULL` (automatic mode) is exposed by default when at least one enabled global provider with an enabled key serves it (`global_exposure_mode = "union"`, configurable to `"intersection"` in `settings`). |
-| MDL-4 | P0 | An admin can force-enable (`exposed = 1`) any canonical model across the global catalog even if only a subset of global providers serve it, or force-disable (`exposed = 0`) any model, and can merge, split, or alias canonical model IDs. |
-| MDL-5 | P0 | For a user with personal or shared keys, any model served by an enabled personal or shared key available to that user is also exposed to that user's client keys (unless disabled on that personal route by the user). |
-| MDL-6 | P0 | Clients may request a canonical ID, a configured alias, or a raw upstream model ID; all three resolve to the same canonical model and route to the chosen upstream key's `upstream_model_id`. |
-| MDL-7 | P0 | `GET /v1/models` must return the models accessible to the caller's client key (under its `allowed_models` and `routing_scope`) in OpenAI list format, or in Anthropic list format when the `anthropic-version` header is present. |
+| MDL-1 | P0 | LLMRoller must discover available models for each enabled upstream key by calling the provider's `/models` endpoint on key creation, on manual refresh, and every 6 hours. Upstream model IDs not matching `^[!-~]{1,256}$` are skipped with a warning. Responses exceeding 2 MiB or 1,000 models are marked `partial` (adding/reactivating routes without marking absent routes `missing`). Complete responses transition absent routes to `status = 'missing'` (`missing_since = now`), and after 7 days to `retired`. |
+| MDL-2 | P0 | Discovered upstream model IDs must be normalized using the deterministic algorithm in Section 10.6 (preserving every dot between two ASCII digits, keeping `:free`, `:thinking`, `:extended`, and `:beta` as distinct suffixes, and resolving within-key collisions by keeping the vendor prefix with `--`). Cross-key merges with differing `vendor_prefix` values enter `merge_state = 'pending_review'` until confirmed by an admin. |
+| MDL-3 | P0 | For the global pool, a model with `exposed = NULL` is exposed by default when at least one enabled global provider with an enabled, non-`invalid` key serves it (`global_exposure_mode = "union"`, configurable to `"intersection"` in `settings`, where global providers with zero usable keys are ignored so they do not veto). |
+| MDL-4 | P0 | Each canonical model has an immutable surrogate primary key `model_pk` and a unique `canonical_id` string. An admin can force-enable (`exposed = 1`) or force-disable (`exposed = 0`, which acts as an instance-wide kill switch across `Own`, `Shared`, and `Global` tiers) any model, and can transactionally merge or split models over `model_pk` and `model_redirects` without cascading deletion of pins, windows, preferences, or response links. |
+| MDL-5 | P0 | Personal provider discovery creates `models` rows with `origin = 'personal'` (capped at 2,000 personal-origin models per user; upgraded to `origin = 'global'` if later discovered by a global provider). Models on enabled personal or shared keys are exposed to authorized users unless `exposed = 0` or disabled by the user. |
+| MDL-6 | P0 | Confirmed `model_aliases` (which cannot shadow an existing `canonical_id`) apply both during discovery route attachment and during request resolution. Client model strings are normalized first, then resolved via confirmed `model_aliases` -> `model_redirects` -> `models.canonical_id` -> unambiguous exact `upstream_model_id` (returning 409 if multiple canonicals share that raw ID). |
+| MDL-7 | P0 | `GET /v1/models` must return canonical models passing checks `C1` through `C5` for the caller (including `exposed = 1` models with no active route marked `"llmroller":{"available":false}`) plus confirmed aliases (`"llmroller":{"alias_of":"<canonical>"}`) in OpenAI list format, or in Anthropic list format when `anthropic-version` is present. |
 
 ### 6.7 Routing and session pinning (RTE)
 
@@ -562,65 +656,65 @@ The routing engine pins existing conversations to their upstream key and distrib
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| RTE-1 | P0 | Inbound session IDs must be resolved by the nine-step precedence order in Section 11.1 and hashed with HMAC-SHA256 (`session_hash`). |
-| RTE-2 | P0 | A session pin binds `(client_key_id, canonical_model_id, session_hash)` to one `upstream_key_id`. While the pinned route remains eligible for that client key, every turn in that session must route to that `upstream_key_id`. |
-| RTE-3 | P0 | A route is eligible for a request only when: (a) the client key's owner is authorized to use the upstream key under the active `routing_scope` (via own personal ownership, active within-cap share grant, or allowed global pool access), (b) the provider, upstream key, and route are enabled, (c) both `upstream_keys.health` and `model_routes.route_health` are `healthy` (or their cooldown `health_until` has expired), (d) no budget window on the key or route is exhausted, (e) the provider circuit breaker is closed or half-open for a probe, and (f) the route natively supports the inbound wire protocol (`chat`, `responses`, or `messages`). |
-| RTE-4 | P0 | When no usable pin exists, the router must select a route from the eligible pool (governed by `routing_scope`) using smooth weighted round-robin (`smooth_wrr`) weighted by effective priority. |
-| RTE-5 | P0 | A route's effective priority is resolved in three steps: (1) for `personal` and `shared` routes only, the caller's `user_route_preferences.priority_override` (`1` to `1000`) if set, (2) the route's `model_routes.priority_override` if set, and (3) the upstream key's default `priority`. Standard users cannot override weights on `global` routes. |
-| RTE-6 | P0 | Each canonical model must support two distribution modes: `weighted` (default smooth WRR across all eligible routes) and `strict` (filters candidates to the lowest numeric `strict_tier` value, where `1` is highest priority and `10` is lowest, before running smooth WRR within that tier). |
-| RTE-7 | P0 | Concurrent initial requests for the same `(client_key_id, canonical_model_id, session_hash)` must coalesce onto a single provisional pin (`single-flight`) so parallel startup requests do not scatter across different upstream keys. |
-| RTE-8 | P0 | A provisional pin tracks a monotonic `pin_generation` counter and is promoted to `confirmed` via compare-and-swap (`(upstream_key_id, pin_generation)`) only after the upstream returns HTTP 200 and its first non-comment SSE `data:` frame (or JSON body prefix) is verified free of an embedded upstream error object. Provisional pins exist only in memory and are never written to SQLite. |
-| RTE-9 | P0 | If an upstream call fails before the first valid response frame (connect error, per-try TTFB timeout of `30 s` when alternatives exist, 5xx, 429, auth error, quota error, or HTTP 200 with an initial error frame), LLMRoller must fail over to up to two other eligible routes within a global `45 s` pre-first-byte deadline and pin the session to the route that succeeds. After the first valid frame is flushed to the client, LLMRoller must never retry. |
-| RTE-10 | P0 | Confirmed pins must expire after a configurable sliding idle TTL (default 24 hours, refreshed on each served turn) and persist to SQLite so restarts do not drop active pins. |
-| RTE-11 | P0 | When a previously confirmed pin becomes ineligible, the next request must select a new eligible route, update the pin, increment `repin_count`, and mark the usage event with `pin_outcome = 'repin'`. |
-| RTE-12 | P0 | For stateful OpenAI Responses requests, LLMRoller must record `response.id -> upstream_key_id` in memory immediately upon observing `response.created` (and persist to SQLite `response_links` on completion) and route follow-up calls carrying `previous_response_id` (or `GET` and `DELETE /v1/responses/{id}`) to that upstream key after verifying caller ownership and key/share eligibility (Checks 1, 2, and 4). |
-| RTE-13 | P1 | Headroom mode should optionally scale each route's effective WRR weight by `max(0.05, remaining_budget_ratio)` so new sessions shift away from keys nearing a window cap. |
+| RTE-1 | P0 | Inbound session IDs must be resolved by the eight-step precedence order in Section 11.1 (with canonical byte-sliced opening-message fingerprinting at Step 8 and the 21-slot exact `ConstantSessionDetector` for Steps 4 through 7) after checking Response-link session inheritance (Section 11.1.2), and hashed with HMAC-SHA256 (`session_hash`). |
+| RTE-2 | P0 | A session pin in `PinStore` binds `PinKey = (client_key_id, canonical_id, session_hash)` (persisted with `model_pk`) to one `upstream_key_id`, `pool_tier`, and `generation`. While the pinned route passes checks `C1` through `C8`, every turn in that session must route to that `upstream_key_id` unless a recovery repin (`repin_on_personal_recovery`) fires after the pin has been idle for at least `recovery_repin_min_idle_secs` (default 300 s, `pin_outcome = 'repin_recovery'`). |
+| RTE-3 | P0 | Every request must first pass ordered request gates `G1` through `G7` (Section 10.0), and a candidate route `R = (K, M)` is eligible only when all eight candidate checks `C1` through `C8` (Section 10.1) hold. |
+| RTE-4 | P0 | When no usable pin exists, the router must select a route from the first non-empty tier group under `routing_scope` using per-group smooth weighted round-robin (`WrrState` keyed by `(user_id, canonical_id, protocol, pool_tier)` under a mutex, evicting members absent for `>= 300 s` and preserving the zero-sum weight invariant without clamping). |
+| RTE-5 | P0 | A route's effective priority `W(U, r)` is resolved in three steps: (1) for `Own` and `Shared` routes only, `user_route_preferences.priority_override` (`1` to `1000`) if set, (2) `model_routes.priority_override` if set, and (3) `upstream_keys.priority`. Standard users cannot override weights on `Global` routes. |
+| RTE-6 | P0 | Each canonical model must support two distribution modes: `weighted` (default smooth WRR across all eligible routes in the active tier group) and `strict` (filters candidates in the active tier group to the lowest numeric `strict_tier` value, where `1` is highest priority and `10` is lowest, before running smooth WRR within that tier). |
+| RTE-7 | P0 | Concurrent requests for the same `PinKey` must synchronize through the per-entry `parking_lot::Mutex<PinEntry>` in `PinStore` (Section 10.4): the first request runs the selector (`< 5 us`) and inserts `Provisional { K, gen = 1, expires = now + 50_000 }`, while followers share `(K, gen)`. On pre-first-byte failure, the first task to report failure advances `gen` and reselects excluding `tried_this_generation`, while tasks with stale `ticket.generation < gen` adopt the new `(K, gen)` instead of scattering across keys. |
+| RTE-8 | P0 | A provisional pin is promoted to `Confirmed` under the entry mutex only after the upstream returns HTTP 200 and its first non-comment SSE `data:` frame (or JSON body) is verified free of an embedded error object. Provisional pins exist only in memory; every row persisted to the SQLite `pins` table is confirmed. |
+| RTE-9 | P0 | If an upstream try fails with a failover-eligible outcome (Section 10.5.2) before the first valid response frame, LLMRoller must retry on up to two other eligible routes while the cumulative `failover_wall_clock_budget_ms` (`60 s`) is not exhausted. Wait-timeout outcomes (`first_activity_timeout_ms = 60 s`) are failover-eligible only for streaming requests on providers with `timeout_failover = true`. After the first valid frame is flushed to the client, or after any non-streaming request is accepted, LLMRoller must never retry. |
+| RTE-10 | P0 | Confirmed pins in `PinStore` (capped at `max_active_pins = 250,000`; overflow routes unpinned with `pin_outcome = 'unpinned_capacity'`) must expire after `pin_ttl_secs` (default 24 hours, checked via the `Clock` seam so `FakeClock` tests run deterministically) and persist to SQLite via the non-dropping `durable_state` queue. |
+| RTE-11 | P0 | When a confirmed pin fails any check `C1` through `C8` (or is expired), `PinStore::acquire` reselects under the entry mutex so concurrent turns of the same session coalesce onto one new key, increments `repin_count`, and records `pin_outcome = 'repin'`. |
+| RTE-12 | P0 | For OpenAI Responses requests, LLMRoller must create a durable `response_links` row (Section 9.1) for every upstream response ID at the moment the ID is first observed (streaming `response.created` or non-streaming JSON body) via the `durable_state` queue. Follow-up calls carrying `previous_response_id`, and `GET`, `DELETE`, `/input_items`, and `/cancel` calls on `/v1/responses/{id}`, must inherit the link's `session_hash`, route only to the link's `upstream_key_id` (`RoutingConstraint::HardKey`) under the decision table in Section 10.4, and must never fail over to another key. |
+| RTE-13 | P1 | Headroom mode should optionally scale each route's effective WRR weight by `bps = clamp(min_w floor(10_000 * max(0, w.limit - w.used - w.reserved_in_flight) / w.limit), 500, 10_000)` across all key and route windows (`W_eff = max(1, W(U, r) * bps / 10_000)`). |
 
 ### 6.8 Transparent proxying (API)
 
-The data plane forwards inference calls across all three supported protocols with minimal mutation and zero response buffering.
+The data plane forwards inference calls across all three supported protocols with minimal mutation and zero response buffering after the first valid frame.
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
 | API-1 | P0 | The data plane must serve `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel`, `POST /v1/responses/compact`, `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, `GET /v1/auth/key`, `GET /healthz`, and `GET /readyz`. |
 | API-2 | P0 | Client authentication (`Authorization: Bearer llr_...` or `x-api-key: llr_...`) and hop-by-hop headers must be stripped and replaced with the chosen upstream key's credential header. |
-| API-3 | P0 | All other client headers (`User-Agent`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `originator`, `x-claude-code-*`, `x-codex-*`, `x-opencode-*`, `x-session-*`, `x-stainless-*`, `x-cmd-zdr`) must pass through unchanged unless listed in the provider's header strip list. |
-| API-4 | P0 | Request JSON bodies must be forwarded with byte-identical message and tool ordering, changing only `model` (to `upstream_model_id`), the provider's configured session field (if absent), and `stream_options.include_usage: true` on streaming `chat` requests when needed. |
-| API-5 | P0 | When LLMRoller injects `stream_options.include_usage: true` into a streaming `chat` request where the client did not set it, LLMRoller must consume the extra usage-only SSE chunk in the usage tap and omit it from the client's outbound stream. |
-| API-6 | P0 | Responses must stream chunk-by-chunk without buffering, preserving upstream status codes, SSE framing, and headers while adding `x-llmroller-request-id`. |
-| API-7 | P0 | If the downstream client disconnects during a request or stream, LLMRoller must abort the upstream HTTP request within 1 s. |
-| API-8 | P0 | Client-caused 4xx upstream errors (400, 413, 422) must pass through unchanged without retry. Upstream 401 or 403 authentication errors on an upstream key must never return 401 to the client; they must mark the upstream key `invalid` (after two consecutive hits), trigger failover before the first byte, and return `502 upstream_unreachable` if all routes fail. |
+| API-3 | P0 | Non-credential headers (`User-Agent`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `originator`, `x-claude-code-*`, `x-codex-*`, `x-opencode-*`, `x-session-*`, `x-stainless-*`, `x-cmd-zdr`) must pass through with preserved values and per-name value order (lowercase header names) unless removed by `strip_headers`, `strip_header_tokens`, or Section 11.2 session-carrier stripping on `Shared` and `Global` keys. |
+| API-4 | P0 | Request JSON bodies must be validated as UTF-8 objects with no duplicate top-level keys (`400` on duplicate keys) and forwarded with byte-identical message and tool ordering, changing only `model` (JSON-escaped `upstream_model_id`), the provider's configured session field (preserving `Own` or overwriting with the salted token on `Shared`/`Global`), and `stream_options.include_usage: true` when `usage_reporting.chat_stream == 'inject'`. |
+| API-5 | P0 | When LLMRoller injects or flips `stream_options.include_usage: true` on a streaming `chat` request (`strip_injected_usage_chunk = true`), the forwarder's 64 KiB frame filter must feed any frame containing `"choices":[]` and an object `"usage"` to `SseUsageTap` and suppress that frame from the client stream. |
+| API-6 | P0 | Upstream status and headers are held (up to 64 KiB) until the first valid frame is verified, then filtered through the response-header pipeline (Section 12.1.1, stripping `content-length`, `content-encoding`, `set-cookie`, and on `Shared`/`Global` tiers stripping org and rate-limit headers while adding `x-llmroller-request-id` and `x-llmroller-upstream-scope`), after which chunks stream without buffering. |
+| API-7 | P0 | Every inference stream must be wrapped in an RAII `RequestLifecycle` guard: if the client disconnects, `hyper` drops the stream, aborting the upstream request within 1 s and finalizing usage (`termination = 'client_gone'`), reservations, preflight permits, probe slots, and traces in `Drop`. |
+| API-8 | P0 | Upstream errors must be classified by the five-class ordered classifier (Section 10.5): `QuotaExhausted`, `RequestRejected` (including content-moderation 403s, passed through verbatim with zero health effect), `PlanRestricted` (`upgrade_required`, blocking `(K, M, protocol)` until next `/models` refresh), `CredentialInvalid` (401 or credential 403, marking a key `invalid` only after strikes from `>= 2` distinct client keys within 10 minutes or a failing `GET /models` verification probe), and `Unclassified403` (passed through verbatim). When all failover tries fail, the terminal error selector (Section 10.5.3) returns 429, 504, or 502. |
 
 ### 6.9 Usage, budgets, and source provider `/usage` pass-through (USG & LIM)
 
-The usage and budget subsystem combines local token and cost accounting with live source provider `/usage` polling, reconciliation, and client or UI pass-through.
+The usage and budget subsystem combines local token and cost accounting with live source provider `/usage` polling, decaying observation reconciliation, and client or UI pass-through.
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| USG-1 | P0 | Every completed or failed request must emit a `usage_events` row recording timestamps, request ID, `client_key_id`, `owner_user_id`, `upstream_key_id`, `canonical_id`, `upstream_model_id`, protocol, `session_hash`, HTTP status, stream flag, `incomplete` flag, normalized token counts (`input_uncached`, `cache_read`, `cache_write`, `output`, `reasoning`), `cost_micro_usd`, `cost_source`, latency, TTFB, `pin_outcome`, and failover count. |
-| USG-2 | P0 | Token extractor logic must normalize cache accounting differences: subtracting `cached_tokens` from `prompt_tokens` or `input_tokens` on OpenAI `chat` and `responses` so `input_uncached`, `cache_read`, and `cache_write` are mutually exclusive across all three protocols. |
-| USG-3 | P0 | Request cost must use the provider-reported cost (`usage.cost` on OpenRouter) when present (`cost_source = 'provider'`), and otherwise compute integer micro-USD from the price book (`cost_source = 'price_book'`), applying context-length tiers and UTC peak or off-peak schedules. If no price book entry exists and the route is subject to any monetary cap, LLMRoller must charge a conservative fallback rate (`default $3/$15 per MTok`, `cost_source = 'unpriced'`). If a stream aborts before emitting token counts (`incomplete = 1`), LLMRoller must estimate tokens from UTF-8 byte lengths (`bytes / 4`) so aborted streams cannot bypass budgets. |
-| USG-4 | P0 | For every provider with a supported or custom `/usage` endpoint (`GET /zen/go/v1/usage` on OpenCode Go, `GET /alpha/billing/credits` and `/alpha/usage/summary` on Command Code, `GET /api/v1/key` on OpenRouter, or a custom URL), LLMRoller must poll the endpoint on key test, on manual refresh, on a periodic schedule (default every 5 minutes for active keys), and upon 80% local window spend or a 429 or quota response. |
-| USG-5 | P0 | Each upstream `/usage` poll must store an `upstream_usage_snapshots` record containing both the raw upstream JSON payload and normalized fields (`window_kind`, `used_percent`, `used_micro_usd`, `limit_micro_usd`, `remaining_micro_usd`, `resets_at`, `plan_name`, `fetched_at`). |
-| USG-6 | P0 | When an upstream `/usage` snapshot reports authoritative window usage (`used_percent` or `used_micro_usd`) or an exact `resets_at` timestamp, the budget engine must reconcile the key's in-memory window counter and reset boundary with the provider's values, automatically marking the key `exhausted` at 100% (or >=98% admission threshold) until `resets_at`. |
-| USG-7 | P0 | The data plane must serve `GET /v1/usage` and `GET /v1/key` authenticated by a client key. The response must include: (a) the client key's own usage and remaining limits, (b) normalized window status for the caller's eligible pool or pinned session key, and (c) a `source_provider_usage` pass-through object containing the raw and normalized upstream `/usage` payload when the request targets a pinned session (`?session_id=...` or session header) or a specific personal key owned by the caller (`?upstream_key_id=...`), with an optional `?fresh=1` live fetch parameter. |
-| USG-8 | P0 | To protect multi-tenant privacy on `GET /v1/usage`, a standard user's client key must receive raw `source_provider_usage` payloads only for the user's own personal upstream keys; for shared personal keys and global keys, `GET /v1/usage` must return sanitized window availability (`status`, `used_percent`, `resets_at`) without exposing account-identifying fields (`whoami`, email, workspace ID, or billing details). |
-| LIM-1 | P0 | Admins (for global keys) and users (for own personal keys) must be able to configure rolling (`5h`, `7d`, custom hours or days) and anchored (`1mo`, billing cycle anchor) budget windows in micro-USD on each upstream key and route, with a configurable admission reserve (default 2%) and manual calibration adjustments. |
+| USG-1 | P0 | Every request that passes authentication gates `G1` through `G3` and completes or fails on an inference or state-bound endpoint must emit a `usage_events` row (`client_key_id NOT NULL`, `cost_micro_usd NOT NULL`, `endpoint`, nullable `protocol`, and `termination`) plus a `usage_attempts` row for each upstream try (`attempt_no = 1..3`, charging `estimated_input` on post-write 5xx, wait timeouts, and initial error frames). Failed `G1`..`G3` checks are recorded in `auth_failure_counters`. |
+| USG-2 | P0 | Token extractor logic must normalize cache accounting across all three protocols using Section 12.5: subtracting both `cache_read` and `cache_write` from `prompt_tokens` or `input_tokens` on OpenAI `chat` and `responses` (or using `prompt_cache_miss_tokens` when present on `chat`), and taking the last observed `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `output_tokens` across `message_start` and `message_delta` on Anthropic `messages`. |
+| USG-3 | P0 | Request cost must use finite provider-reported `usage.cost` in `[0.0, 1000.0]` when present (`cost_source = 'provider'`), else compute integer micro-USD from `prices` (`cost_source = 'price_book'`) using non-overlapping context tiers and half-open `[start, end)` UTC schedules active at request start, else apply `unpriced_fallback_rates` (`$3/$15/$0.30/$3.75` per MTok, `cost_source = 'fallback_rate'`). Aborted streams (`incomplete = 1`) must estimate missing input tokens via the binary-aware JSON string scanner (`1,600` tokens per binary/base64 block `> 1 KiB` plus `ceil(text_bytes / 4)`) and missing output tokens from accumulated decoded text deltas (`ceil(decoded_text_bytes / 4)`, `cost_source = 'estimated_incomplete'`). |
+| USG-4 | P0 | For every provider with a supported or custom `/usage` endpoint, LLMRoller must poll the endpoint with per-key single-flight deduplication (`poll_in_flight: AtomicBool`), a 30 s per-key minimum automatic poll interval (10 s for owner/admin manual refresh), and a global 8-permit concurrency semaphore with `±20%` schedule jitter. |
+| USG-5 | P0 | Each upstream `/usage` poll must capture `local_at_observation` for each window at poll start `t0` and store an `upstream_usage_snapshots` row containing AEAD-sealed `raw_json_enc`, allow-list `sanitized_json`, and normalized window fields. |
+| USG-6 | P0 | Each normalized upstream window (`5h`, `7d`, `1mo`) updates the matching local key-scoped window (`upstream_window_kind`) with an `UpstreamObservation { used_micro_usd, observed_at_ms: t0, local_at_observation, resets_at_ms }`. Effective window usage is `max(local, o.used_micro_usd + max(0, local - o.local_at_observation))` while `now < min(resets_at_ms, observed_at_ms + 1_800_000)` (30 minutes), decaying automatically to the local ring if polling stalls. Exhausted snapshots set `health = exhausted` until `coalesce(resets_at_ms, now + 300_000)`. |
+| USG-7 | P0 | The data plane must serve `GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, and `GET /v1/auth/key` authenticated by a client key, resolving session context exclusively from request headers (`x-llmroller-session-id` or precedence rows 1 through 6; `?session_id=` query strings are rejected with HTTP 400). `?fresh=1` triggers a live poll only when the caller is the key owner (`Own` tier) or an admin; `/v1/usage/raw` always serves the latest stored snapshot. |
+| USG-8 | P0 | To protect multi-tenant privacy on `GET /v1/usage` and `/v1/usage/raw`, a standard user's client key receives decrypted `raw_json` only for the user's own `personal` upstream keys; for `Shared` and `Global` keys, responses return only allow-list `sanitized_json` (`SEC-18`). |
+| LIM-1 | P0 | Admins (for global keys) and users (for own personal keys) must be able to configure `rolling` (`1 h` to `31 d` in 360-bucket rings), `anchored_fixed`, `anchored_calendar_month` (with day-of-month clamping across short months), and `anchored_provider` budget windows in micro-USD on each upstream key and route, with a configurable admission reserve (`0..=50%`, default `2%`), cache-aware in-flight reservations (`try_reserve`), and window-instance-bound manual calibration adjustments (`budget_adjustments`). |
 
 ### 6.10 Content traceability mode and session chat preview (TRC)
 
-The content traceability subsystem lets an admin record full request and response contents. It also renders a read-only multi-turn chat preview per pinned session.
+The content traceability subsystem lets an admin record full request and response contents using content-addressed block deduplication. It also renders a read-only multi-turn chat preview per pinned session.
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| TRC-1 | P0 | Content traceability mode must be disabled (`off`) by default. Only an `admin` can enable, scope (`all`, `users`, `client_keys`, or `models`), or disable content traceability mode (`PUT /admin/api/settings/traceability`), and every change must write an `audit_log` entry. |
-| TRC-2 | P0 | When content traceability mode is active for a request, LLMRoller must asynchronously capture the inbound request and outbound response JSON bodies (strictly excluding HTTP headers such as `Authorization`, `x-api-key`, or `Cookie`), extracting: system instructions, input messages, tool definitions, model parameters, assistant reasoning or thinking blocks, assistant tool calls (`id`, `name`, `arguments`), tool results, final assistant output text, and error payloads. |
-| TRC-3 | P0 | For streaming SSE responses across `chat`, `responses`, and `messages`, the trace tap must reassemble chunked deltas (`delta.content`, `delta.reasoning_content`, `delta.tool_calls`, `response.output_text.delta`, `response.reasoning_summary_text.delta`, and `content_block_delta`) into a complete turn record without buffering or delaying the client stream (`PERF-2`). |
-| TRC-4 | P0 | Each `trace_records` row must link to `usage_events.id`, `request_id`, `session_hash`, `client_key_id`, `owner_user_id`, and `turn_index` (ordered by timestamp `ts` within `session_hash`) so all turns of a pinned session form a deterministic sequence. |
-| TRC-5 | P0 | The control plane must expose read-only session chat preview endpoints (`GET /admin/api/sessions/{session_hash}/chat` for admins and `GET /api/user/sessions/{session_hash}/chat` for a user's own sessions) that reconstruct the full multi-turn conversation by deduplicating repeated message prefixes across stateless turns and chaining `previous_response_id` turns. |
-| TRC-6 | P0 | The dashboard must render a read-only Session Chat Preview screen and drawer displaying chronological turns with collapsible sections for system prompts, tool schemas, user prompts, reasoning blocks, tool call arguments, tool outputs, assistant responses, raw JSON toggle, and per-turn metrics (model, upstream key, TTFB, latency, tokens, cache hit rate, and cost). |
-| TRC-7 | P0 | Admins must be able to set a dedicated retention window (`trace_retention_days`, default 14 days) and purge recorded trace contents globally or for a single `session_hash` (`DELETE /admin/api/traces`, `DELETE /admin/api/sessions/{session_hash}/trace`) without deleting the underlying token and cost rows in `usage_events`. |
-| TRC-8 | P0 | Multi-tenant trace isolation: A standard `user` may view recorded traces and chat previews only for sessions created by their own `client_keys`. When Grantee B routes through a personal key shared by Grantor A, Grantor A must never have access to Grantee B's recorded prompts, reasoning, tool calls, or responses. |
+| TRC-1 | P0 | Content traceability mode must be disabled (`traceability_config.enabled = false`) by default and evaluated once per request at request start (`match: { user_ids, client_key_ids, models }`, where a request is traced iff every non-empty list matches, and `auto_disable_at` is respected and persisted by the 60 s sweeper). Every change via `PUT /admin/api/settings/traceability` writes an `audit_log` entry. |
+| TRC-2 | P0 | When traceability is active for a request, `TraceTap` receives chunk clones via a bounded per-request channel (`256` slots, `try_send`) under a `64 MiB` global `trace_inflight_bytes` budget and a `256 MiB` global output accumulator budget (1 MiB per stream), replacing binary/base64 blocks (`> 1 KiB`) with SHA-256 placeholders and capping new request blocks at 4 MiB (keeping newest) and outputs at 1 MiB (keeping first 512 KiB and last 512 KiB). |
+| TRC-3 | P0 | For streaming SSE responses across `chat`, `responses`, and `messages`, `TraceTap` reassembles text, reasoning, and tool-call deltas into a `NormalizedTurnOutput` and submits a `SealJob` at turn end to the fixed 2-thread OS sealer pool (`crossbeam_channel::bounded(64)` with reusable `zstd::bulk::Compressor`), never allocating per-stream zstd encoders or delaying client chunk forwarding (`PERF-2`, `PERF-5`). |
+| TRC-4 | P0 | Each turn is stored as self-contained content-addressed blocks in `trace_blocks` (`PRIMARY KEY (owner_user_id, block_hash)`) linked via `trace_record_blocks` and a `trace_records` row (`StoredTurnTrace v2` containing `request_skeleton` with `{"$blk":"<hash>"}` references, `block_refs`, and `response`), ordered by immutable `(ts, request_id)` and tagged with `thread_id` (`subagent_id` or `'main'`). |
+| TRC-5 | P0 | The read-only chat preview endpoints (`GET /admin/api/sessions/{session_hash}/chat` and `GET /api/user/sessions/{session_hash}/chat`) must paginate by cursor (`?after=<ts>:<request_id>&limit=50`, loading one predecessor row per page and capping decrypted bytes at 8 MiB per page) and compute Longest Common Prefix (`LCP`) directly over `block_refs` hash arrays without decrypting unchanged prefix blocks. |
+| TRC-6 | P0 | The Session Chat Preview response and UI must carry `canonical_model` and `protocol` per turn and `system_instructions` and `tools` per thread (with `system_changed`), pass key labels through `project_key`, render assistant Markdown via `pulldown-cmark` (raw HTML disabled) + `ammonia`, and render reasoning, user text, tool arguments, tool results, and raw JSON as auto-escaped text inside `<pre>`. |
+| TRC-7 | P0 | Admins must be able to configure `traceability_config.retention_days` (`1..=90`, default 14 days; lowering `retention_days` returns HTTP 409 with the affected row count unless `"confirm_purge": true` is sent) and purge traces globally or per session (`DELETE /admin/api/traces`, `DELETE /admin/api/sessions/{session_hash}/trace`), deleting unreferenced `trace_blocks` while leaving `usage_events` intact. |
+| TRC-8 | P0 | LLMRoller never exposes a grantee's recorded traces or `trace_blocks` to a share grantor through any LLMRoller interface (`owner_user_id` isolation). Grantees must explicitly accept each share after viewing the destination endpoint disclosure (`SHR-3`), as LLMRoller cannot prevent the operator of the external endpoint or upstream account from observing traffic sent to it. |
 
 ### 6.11 Web UI and audit logging (UI & AUD)
 
@@ -628,27 +722,27 @@ The web UI and audit subsystem provide full self-service and administrative visi
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| UI-1 | P0 | The embedded web UI must provide role-aware navigation: admins see both the Admin Console (`/admin/*`) and Personal Workspace (`/app/*`), while standard users see the Personal Workspace (`/app/*`) covering Overview, Personal Providers & Keys, Shared With Me, Share Grants, Routing Overrides, Client Keys, Active Sessions, and Usage Explorer. |
-| UI-2 | P0 | The UI must display both local estimated window spend and source provider `/usage` gauges side-by-side on each upstream key card, with a "Refresh `/usage`" button and a modal to inspect the raw source provider `/usage` JSON (for authorized owners and admins). |
-| UI-3 | P0 | All HTML templates, CSS, HTMX, and chart scripts (`uPlot`) must be compiled into the Rust binary with zero external CDN requests. |
-| UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Active Sessions and Usage Explorer screens must display a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a global banner showing when content traceability mode is active. |
-| AUD-1 | P0 | Every state-changing action by an `admin` or `user` (login, account changes, provider or key creation, share grant or revocation, route override, calibration, pin move, client key creation or revocation, content traceability toggle, or admin inspection of another user's chat trace) must append a tamper-evident hash-chained row (`prev_hash`, `hash`) to `audit_log` without logging secrets. |
+| UI-1 | P0 | The embedded web UI must provide role-aware navigation: admins see both the Admin Console (`/admin/*`) and Personal Workspace (`/app/*`), while standard users see the Personal Workspace (`/app/*`) covering Overview, Personal Providers & Keys, Shared With Me (with share acceptance disclosure), Share Grants, Routing Overrides (with aggregated `"Global pool"` column), Client Keys, Active Sessions, and Usage Explorer. |
+| UI-2 | P0 | The UI must display both local window ring spend and reconciled `UpstreamObservation` gauges side-by-side on each upstream key card, projected disk usage (`A6`), live key health from `RuntimeState`, a "Refresh `/usage`" button, and a modal to inspect decrypted raw `/usage` JSON (for authorized personal owners and admins). |
+| UI-3 | P0 | All HTML templates, CSS, HTMX (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`), and chart scripts (`uPlot`) must be compiled into the Rust binary with zero external CDN requests and zero `hx-on:*` or `js:` attributes. |
+| UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Active Sessions and Usage Explorer screens must display a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a persistent global banner whenever traceability is enabled. |
+| AUD-1 | P0 | Every state-changing action by an `admin`, `user`, or `SystemTask` (plus admin chat-trace views, deduplicated to one `trace.viewed` row per `(admin, session_hash)` per 30 minutes) must append an HMAC-SHA256 hash-chained row (`seq`, `prev_hash`, `hash`) to `audit_log` inside the same transaction without logging secrets, and emit an `audit_anchor` structured log line to `stdout` every 100 rows and at least hourly. |
 
 ## 7. Non-functional requirements
 
-LLMRoller must add less than 5 ms of proxy overhead at p99 before the first upstream byte. It must forward every streamed chunk without buffering and preserve pins and committed usage rows across restarts.
+LLMRoller must add less than 5 ms of proxy overhead at p99 before the first upstream byte. It must forward every complete streamed frame within 1 ms and preserve pins, response links, and committed usage rollups across restarts.
 
 ### 7.1 Latency and capacity (PERF)
 
-Speed and capacity targets apply to a reference host with 2 vCPU and 2 GB RAM running Linux `x86_64` against a local stub upstream. The benchmark harness in Section 16 verifies each target before release.
+Speed and capacity targets apply to a reference host with 2 vCPU and 2 GB RAM running Linux `x86_64` against a local stub upstream. The benchmark harness in Section 16 verifies each target against both a zero-delay stub and a log-normal `ttff` stub (median `2 s`, p95 `8 s`). Benchmarks run across request body sizes of `64 KiB`, `512 KiB`, and `2 MiB`.
 
 | ID | Pri | Requirement specification | Verification method |
 | --- | --- | --- | --- |
-| PERF-1 | P0 | Added proxy latency before the first upstream byte must stay at or below 1 ms at p50 and 5 ms at p99 at 500 req/s across 100 concurrent streams. | Load test (`oha` or `k6`) against a zero-delay local stub upstream |
-| PERF-2 | P0 | Each SSE chunk received from an upstream stream must reach the client socket write buffer within 1 ms at p99, with zero full-response buffering. | Timestamped chunk-forwarding test in `crates/proxy` |
-| PERF-3 | P0 | The process must sustain 2,000 open SSE streams and 500 req/s within 300 MB of resident memory (`RSS`) for typical coding turns (`<= 64 KiB` active failover buffer per stream, bounded by a global `128 MiB` pre-first-byte body buffer semaphore that releases each buffer the instant the first upstream byte arrives). | Soak test with 2,000 slow-dripping stub streams |
-| PERF-4 | P0 | Idle resident memory must stay below 50 MB (for standard deployments up to 10,000 routes), and cold start time to readiness (`/readyz` HTTP 200) must stay below 2 s by reconstructing 7 d and 1 mo counters from `usage_rollups_hourly` and scanning raw `usage_events` only for the trailing 5 h window. | Startup benchmark in CI |
-| PERF-5 | P0 | Enabling content traceability mode must add at most 0.5 ms to p99 TTFB and zero delay to SSE chunk forwarding (`PERF-2`). Inbound prompts and SSE deltas stream into an incremental `zstd::stream::Encoder` (releasing raw request buffers immediately after upstream send) and seal with `XChaCha20-Poly1305` on a bounded worker pool with a 4 MiB suffix-preserving cap per turn. | Load benchmark with `content_traceability_mode` enabled vs. disabled |
+| PERF-1 | P0 | Added proxy latency before the first upstream byte must stay at or below 1 ms at p50 and 5 ms at p99 at 500 req/s (for bodies `<= 256 KiB` against a zero-delay stub, and sustaining `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB / (mean_body * ttff)` req/s with zero `503 gateway_busy` against the log-normal TTFF stub). | Load benchmark (`benches/proxy_latency.rs`) with both zero-delay and log-normal TTFF stubs |
+| PERF-2 | P0 | Each complete SSE frame received from an upstream stream must reach the client socket write buffer within 1 ms of its final byte arriving at p99, with zero full-response buffering and zero delay when `TraceTap` is active or artificially stalled. | Timestamped frame-forwarding test in `crates/proxy` |
+| PERF-3 | P0 | With 2,000 open SSE streams past their first valid frame, 250,000 active pins in `PinStore` (`~72 MB`), and 64 requests in the pre-first-byte phase with 1 MiB bodies, resident memory (`RSS`) must stay at or below 300 MB plus the pre-first-byte bodies in flight (`64 MiB`). Pre-first-byte request bodies are bounded by `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (`min(1024, floor(0.40 * memory_limit_mb))`, `819 MiB` on a 2 GB host) with a `2,000 ms` admission queue and released the instant the first valid frame commits. | Soak test with 2,000 active stub streams and 250,000 seeded pins |
+| PERF-4 | P0 | Idle resident memory must stay below 50 MB (for standard deployments up to 10,000 routes), and cold start time to readiness (`/readyz` HTTP 200) must stay below 2 s against a database containing 7 days of `usage_rollups_5min` for 500 upstream keys and 50,000,000 raw `usage_events` rows by rebuilding all window rings and monthly accumulators exclusively from `usage_rollups_5min`. | Startup benchmark in CI against a 50M-row seeded database |
+| PERF-5 | P0 | Enabling content traceability mode for all traffic at 2,000 open streams must add at most 0.5 ms to p99 TTFB, zero delay to SSE chunk forwarding (`PERF-2`), and keep RSS at or below `PERF-3` plus the global trace accumulator budget (`min(256 MiB, 0.10 * memory_limit)` and `64 MiB` `trace_inflight_bytes`). Compression and AEAD sealing run only at turn completion on a fixed pool of `trace_sealer_threads` (default 2) OS threads reusing `zstd::bulk::Compressor` contexts (`~7 MiB` total across both threads), never allocating per-stream `zstd::stream::Encoder` contexts. | Load and memory soak benchmark with `traceability_config.enabled = true` |
 
 ### 7.2 Reliability and availability (REL)
 
@@ -656,12 +750,12 @@ Reliability requirements govern crash recovery, graceful shutdown, fault isolati
 
 | ID | Pri | Requirement specification | Verification method |
 | --- | --- | --- | --- |
-| REL-1 | P0 | On `SIGTERM` or `SIGINT`, the server must stop accepting new connections and allow in-flight SSE streams up to 60 s (configurable) to finish before exiting. | Integration test sending `SIGTERM` mid-stream |
-| REL-2 | P0 | An unexpected process kill (`SIGKILL`) must lose zero confirmed pins or usage rows committed to SQLite WAL more than 2 s earlier, and a graceful `SIGTERM` drain must lose zero confirmed pins or usage rows across all completed streams. | Crash-recovery integration test against SQLite WAL |
-| REL-3 | P0 | A slow or locked SQLite writer must never block or fail an inference request. Durable state updates (`confirmed` pins, `response_links`, and pre-aggregated `usage_rollups_hourly` deltas) use a non-dropping coalescing queue, while raw `usage_events` and paired `trace_records` use a bounded 10,000-slot ring buffer (`Mutex<VecDeque>`) that folds token/cost totals into in-memory rollups before dropping the oldest raw event and incrementing `llmroller_usage_dropped_total`. | Fault-injection test stalling the SQLite writer task |
-| REL-4 | P0 | All control-plane changes (new keys, shares, priority overrides, disabled routes, budget rules) must apply to new requests within 1 s without restarting the process. | Integration test verifying `ArcSwap<ConfigSnapshot>` propagation |
-| REL-5 | P0 | One failing provider or upstream key must not slow down requests routed to healthy providers. Outbound HTTP connection pools and host circuit breakers are isolated per upstream origin `(scheme, host, port, allow_private_network)`. | Fault-injection test blackholing one upstream host |
-| REL-6 | P1 | The CLI command `llmroller backup --out <path>` should write a consistent online snapshot using the SQLite Online Backup API while the server runs. | CLI integration test during concurrent write load |
+| REL-1 | P0 | On `SIGTERM` or `SIGINT`, the server must run the eight-step shutdown sequence (Section 5.5.3): flip `/readyz` to 503 for `drain_grace_secs` (`5 s`), stop accepting new connections, allow open SSE streams up to `drain_timeout_secs` (`60 s`) to finish, cancel remaining streams with `Termination::ShutdownCut`, flush sealer and writer queues, run `PRAGMA wal_checkpoint(TRUNCATE)`, and exit `0` (or `11` on queue timeout). | Integration test sending `SIGTERM` mid-stream |
+| REL-2 | P0 | (a) Every confirmed pin, `response_links` row, persisted health transition (`exhausted`/`invalid`), and 5-minute or hourly rollup delta must be committed to SQLite within 1 s of the event under normal load. (b) An unexpected process kill (`SIGKILL`) loses zero committed transactions. (c) Under default `LLMROLLER_SQLITE_SYNCHRONOUS=NORMAL`, an OS crash or host power loss may lose transactions committed since the last WAL sync; operators needing power-loss durability set `LLMROLLER_SQLITE_SYNCHRONOUS=FULL`. | Crash-recovery integration test sending `SIGKILL` 1.2 s after pin confirmation, `response.created`, and request completion |
+| REL-3 | P0 | A slow or locked SQLite writer must never block or fail an inference request, and data-plane batches must never starve control-plane transactions (the writer drains `Control` commands between every `4 MiB` / 200-item data batch). Data-plane writes use three separate queues: (1) `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, capped at 500,000 keys; on full, stops confirming new pins to disk and flips `/readyz` to 503 without dropping queued ops), (2) `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>` for additive 5-minute and hourly rollup coalescing), and (3) `raw_events` (`Mutex<VecDeque<RawItem>>` capped at 10,000 items and `64 MiB`, evicting the oldest raw event, `usage_attempts`, or trace item after its cost is already folded into `rollups` and incrementing `llmroller_usage_dropped_total{kind}`). | Fault-injection test stalling the SQLite writer task while firing 10,500 requests and concurrent share revocations |
+| REL-4 | P0 | All control-plane changes (new keys, shares, priority overrides, disabled routes, budget rules) must be published by the single `Reloader` task in monotonic `instance_meta.config_version` order (applying `CacheInvalidationEvent` purges after the `ArcSwap` store) and take effect within 1 s without restarting the process. | Concurrent mutation and revocation ordering test |
+| REL-5 | P0 | One failing provider or upstream key must not slow down requests routed to healthy providers. Outbound HTTP connection pools and `OriginBreaker` state machines (Section 10.5.1) are isolated per upstream origin `OriginKey { scheme, host, port, allow_private_network }`. | Fault-injection test blackholing one upstream origin |
+| REL-6 | P1 | The CLI command `llmroller backup --out <path> [--overwrite]` must write a consistent online snapshot to `<path>.tmp`, `fsync` the file, verify `PRAGMA integrity_check`, atomically rename to `<path>`, `fsync` the parent directory, and output JSON including `master_key_id`. | CLI integration test during concurrent write load |
 
 ### 7.3 Transparency and compatibility (TRN & COM)
 
@@ -669,10 +763,10 @@ Transparency requirements verify that neither the coding agent nor the upstream 
 
 | ID | Pri | Requirement specification | Verification method |
 | --- | --- | --- | --- |
-| TRN-1 | P0 | For any request where `model` equals `upstream_model_id` and no session body field or `include_usage` flag needs injection, the outbound request body bytes must be byte-for-byte identical to the inbound body bytes. | Byte-identity property test in `crates/proxy` |
-| TRN-2 | P0 | When LLMRoller edits the top-level JSON body (`model`, `prompt_cache_key`, `session_id`, or `stream_options.include_usage`), all other JSON fields (`messages`, `input`, `tools`, `system`, `metadata`) must retain their exact byte sequence and key order. | Golden byte-diff test on real agent payloads |
-| TRN-3 | P0 | SSE event order, event names (`event:`), data lines (`data:`), and blank-line delimiters must reach the client unchanged (except for stripping an injected `include_usage` final chunk). | Streaming wire-fidelity test |
-| COM-1 | P0 | [Claude Code](https://code.claude.com/docs/en/llm-gateway), [Codex CLI](https://github.com/openai/codex/issues/24973), [opencode](https://github.com/anomalyco/opencode/issues/55243), the official OpenAI Python and TypeScript SDKs, and the official Anthropic Python and TypeScript SDKs must complete multi-turn streaming tool-call workflows through LLMRoller. | End-to-end compatibility test suite |
+| TRN-1 | P0 | For any request routed to an `Own`-tier personal key where `model` equals `upstream_model_id` and no session body field or `include_usage` flag needs injection, the outbound request body `Bytes` buffer must be byte-for-byte identical (same pointer) to the inbound body bytes. On `Shared` and `Global` tiers, recognized client session carriers are stripped and replaced with the tenant-salted affinity token per `SEC-16`. | Byte-identity property test in `crates/proto` and `crates/proxy` |
+| TRN-2 | P0 | When LLMRoller edits the top-level JSON body (`model`, `prompt_cache_key`, `session_id`, or `stream_options.include_usage`), all other JSON fields (`messages`, `input`, `tools`, `system`, `metadata`) must retain their exact byte sequence and key order, and inserted string values must be JSON-escaped via `serde_json`. | Golden byte-diff and property tests on real agent payloads |
+| TRN-3 | P0 | SSE event order, event names (`event:`), data lines (`data:`), and blank-line delimiters must reach the client unchanged (except for suppressing an injected empty-choices usage frame and decoding unexpected upstream compression when a provider ignores `accept-encoding: identity`). | Streaming wire-fidelity test |
+| COM-1 | P0 | [Claude Code](https://www.google.com/search?q=https%3A%2F%2Fcode.claude.com%2Fdocs%2Fen%2Fllm-gateway), [Codex CLI](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fopenai%2Fcodex%2Fissues%2F24973), [opencode](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fanomalyco%2Fopencode%2Fissues%2F55243), the official OpenAI Python and TypeScript SDKs, and the official Anthropic Python and TypeScript SDKs must complete multi-turn streaming tool-call workflows (including stateful `previous_response_id` chains) through LLMRoller. | End-to-end compatibility test suite |
 
 ### 7.4 Portability, maintainability, observability, and privacy (POR, MNT, OBS, PRIV)
 
@@ -680,17 +774,17 @@ Operational quality attributes keep the binary portable, auditable, observable, 
 
 | ID | Pri | Requirement specification | Verification method |
 | --- | --- | --- | --- |
-| POR-1 | P0 | LLMRoller must compile and pass all tests on Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`), and ship a container image under 50 MB. | CI build matrix and image size gate |
+| POR-1 | P0 | LLMRoller must compile and pass unit tests in CI from Sub-phase 1.1 onward on Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`), and ship a container image under 50 MB. | CI build matrix and image size gate |
 | MNT-1 | P0 | All workspace crates must declare `#![forbid(unsafe_code)]` and pass `cargo clippy --all-targets -- -D warnings`. | CI lint gate |
-| MNT-2 | P0 | Provider-specific endpoint paths, headers, error patterns, and `/usage` parsers must live inside `ProviderAdapter` implementations and preset TOML files; `crates/core` must contain zero provider-specific branches. | Architectural dependency check (`cargo-depgraph`) |
-| OBS-1 | P0 | Every request must receive a unique ULID in `x-llmroller-request-id`, emitted in structured JSON logs and recorded in `usage_events`. Prometheus metrics must be served at `/metrics`. | Integration test inspecting headers, logs, and metrics |
+| MNT-2 | P0 | Provider-specific endpoint paths, headers, error patterns, and `/usage` parsers must live inside `ProviderAdapter` implementations and preset TOML files; `crates/core` must contain zero provider-specific branches and zero I/O dependencies (`Clock` in `crates/core` is synchronous). | Architectural dependency check (`tests/workspace_boundaries.rs`) |
+| OBS-1 | P0 | Every request must receive a unique ULID in `x-llmroller-request-id`, emitted in structured JSON logs and recorded in `usage_events`. Prometheus metrics at `/metrics` must enforce a closed label allow-list (`provider_kind`, `provider_id`, `protocol`, `endpoint`, `status_class`, `outcome`, `job`, `reason`, and a bounded top-50 `model_bucket` with others grouped as `"other"`), strictly forbidding high-cardinality or tenant-identifying labels (`client_key_id`, `user_id`, `username`, key labels, `session_hash`, or unbounded model IDs). | Integration and metric-registry label allow-list tests |
 | PRIV-1 | P0 | LLMRoller must emit zero telemetry, analytics, or crash reports to third parties. Outbound network connections may go only to configured provider hosts and, when explicitly enabled by an admin, the configured price-book catalog URL. | Network sandbox egress test |
 
 ## 8. Security and privacy
 
-Warning: Do not expose the control-plane listener (`LLMROLLER_ADMIN_LISTEN`) to an untrusted network without TLS. Bind it to `127.0.0.1` or place it behind an authenticated VPN or reverse proxy.
+Warning: Do not expose the control-plane listener (`LLMROLLER_ADMIN_LISTEN`) to an untrusted network without TLS. Bind it to `127.0.0.1` or place it behind an authenticated reverse proxy that handles TLS and is listed in `LLMROLLER_TRUSTED_PROXIES`.
 
-LLMRoller holds high-value upstream credentials across global and personal accounts. The security design encrypts all upstream secrets and opt-in trace payloads at rest, hashes client keys and session IDs, and enforces strict tenant boundaries.
+LLMRoller holds high-value upstream credentials across global and personal accounts. The security design separates stable instance secrets (`audit_hmac_key` and `session_hmac_secret`) from the rotatable master key. It seals all six sensitive column families with canonical length-prefixed `AAD`, filters every outbound socket at connect time, and enforces tenant boundaries.
 
 ### 8.1 Threat model
 
@@ -698,70 +792,104 @@ Fifteen concrete threats drive the security controls in LLMRoller.
 
 | ID | Threat description | Primary mitigations |
 | --- | --- | --- |
-| T1 | An attacker reads `llmroller.db` or a backup file from disk to steal upstream API keys. | `SEC-1`, `SEC-2`, `SEC-14` |
-| T2 | An attacker races a fresh internet-facing installation to register the first admin account. | `AUTH-1`, `AUTH-2`, `AUTH-3`, `SEC-9` |
-| T3 | A malicious user or compromised admin configures a custom provider URL pointing to `127.0.0.1`, `169.254.169.254`, or RFC 1918 internal services (SSRF). | `PRV-7`, `SEC-7` |
+| T1 | An attacker reads `llmroller.db` or a backup file from disk to steal upstream API keys or account billing details from `/usage` snapshots. | `SEC-1`, `SEC-2`, `SEC-14`, `SEC-18` |
+| T2 | An attacker races a fresh installation or reads persisted stdout logs to steal the bootstrap setup token and register the first admin account. | `AUTH-1`, `AUTH-2`, `AUTH-3`, `SEC-9` |
+| T3 | A malicious user or compromised admin configures a custom provider URL (or IP-literal / IPv6-mapped / 6to4 URL) pointing to `127.0.0.1`, `169.254.169.254`, or RFC 1918 internal services (SSRF). | `PRV-7`, `SEC-7` |
 | T4 | An upstream API key, client key, session cookie, or user prompt leaks into application logs, panic traces, or error responses. | `SEC-6`, `SEC-14` |
-| T5 | HTTP request smuggling or hop-by-hop header injection tricks the proxy into misrouting traffic or poisoning connections. | `SEC-15` |
-| T6 | An attacker brute-forces web logins, TOTP codes, or client bearer keys. | `AUTH-8`, `SEC-3`, `SEC-4`, `SEC-12` |
-| T7 | Cross-Site Request Forgery (CSRF) or Cross-Site Scripting (XSS) hijacks an admin or standard user session in the browser. | `SEC-5` |
-| T8 | A compromised third-party crate in the dependency tree exfiltrates secrets (as occurred in the [March 2026 LiteLLM incident](https://docs.litellm.ai/blog/security-update-march-2026)). | `SEC-10`, `SEC-11`, `PRIV-1` |
-| T9 | A leaked client key drains all global or shared upstream budgets. | `CLK-4`, `CLK-5`, `USR-5`, `SHR-2`, `LIM-1` |
-| T10 | Two users sharing a global or shared upstream key infer prompt prefixes via cache-hit timing side channels. | `SEC-16` |
+| T5 | HTTP request smuggling, duplicate top-level JSON keys (`{"model":"cheap","model":"expensive"}`), or hop-by-hop header injection tricks the proxy into bypassing model restrictions or poisoning connections. | `API-4`, `SEC-15` |
+| T6 | An attacker brute-forces web logins, TOTP codes, or client bearer keys, or floods the admin username to lock out the legitimate admin. | `AUTH-8`, `SEC-3`, `SEC-4`, `SEC-12` |
+| T7 | Cross-Site Request Forgery (CSRF) or Cross-Site Scripting (XSS) hijacks an admin or standard user session in the browser. | `SEC-5`, `SEC-19` |
+| T8 | A compromised third-party crate in the dependency tree exfiltrates secrets (as occurred in the [March 2026 LiteLLM incident](https://www.google.com/search?q=https%3A%2F%2Fdocs.litellm.ai%2Fblog%2Fsecurity-update-march-2026)). | `SEC-10`, `SEC-11`, `PRIV-1` |
+| T9 | A leaked client key drains all global or shared upstream budgets, or a caller sends content-flagged prompts to trigger 403s and disable shared/global keys. | `CLK-4`, `CLK-5`, `USR-5`, `SHR-2`, `LIM-1`, `API-8` |
+| T10 | Two users sharing a global or shared upstream key collide on sticky replica routing or infer prompt prefixes via client-supplied session headers. | `SEC-16` |
 | T11 | A malicious upstream server returns a 301, 302, 307, or 308 redirect to exfiltrate the `Authorization` header to an attacker host. | `PRV-7`, `SEC-7` |
-| T12 | Standard User A crafts control-plane API calls (IDOR) to read, edit, share, or route through User B's unshared personal provider or inspect User B's usage. | `USR-3`, `USR-4`, `SEC-17` |
-| T13 | Grantee B abuses a shared personal key from Grantor A to extract A's raw API key or read A's personal account metadata via `GET /v1/usage`. | `SHR-4`, `USG-8`, `SEC-18` |
-| T14 | An attacker tampers with SQLite `audit_log` rows to hide unauthorized configuration or share changes. | `AUD-1`, `SEC-13` |
-| T15 | An attacker with disk access, a Grantor on a shared key, or a crafted model response reads sensitive prompts in `trace_records` or triggers XSS in the chat preview UI. | `TRC-8`, `SEC-19`, `SEC-5` |
+| T12 | Standard User A crafts control-plane API calls (IDOR) to read, edit, share, or probe existence of User B's personal resources. | `USR-3`, `USR-4`, `SEC-17` |
+| T13 | Grantee B abuses a shared personal key from Grantor A to extract A's raw API key, read A's account headers, or read A's raw `/usage` metadata; or Grantor A pushes an unconsented share pointing to an attacker-controlled relay to capture B's prompts. | `SHR-3`, `SHR-4`, `USG-8`, `SEC-16`, `SEC-18` |
+| T14 | An attacker tampers with or truncates the tail of SQLite `audit_log` rows to hide unauthorized configuration or share changes. | `AUD-1`, `SEC-13` |
+| T15 | An attacker with disk access, a Grantor on a shared key, or a crafted model response reads sensitive prompts in `trace_records`/`trace_blocks` or triggers XSS in the chat preview UI. | `TRC-8`, `SEC-19`, `SEC-5` |
 
 ### 8.2 Security requirements (SEC)
 
-Every security requirement is mandatory (`P0`) for version 1.0 unless marked `P1`.
+Every security requirement is mandatory (`P0`) for version 1.0.
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| SEC-1 | P0 | All upstream key secrets must be encrypted with `XChaCha20-Poly1305` (192-bit random nonce per encryption, authenticated associated data `AAD = master_key_id || "|" || upstream_key.id || "|" || provider_id`) using a 256-bit domain-separated subkey derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY` (using distinct HKDF `info` labels: `"llmroller.v1.upstream_key"`, `"llmroller.v1.totp_secret"`, `"llmroller.v1.trace_record"`, and `"llmroller.v1.audit_hmac"`). A persistent 256-bit `session_hmac_secret` is generated once at bootstrap and stored sealed in `settings` so rotating `LLMROLLER_MASTER_KEY` via `llmroller rotate-master-key` (which re-seals secrets in 500-row batched transactions while holding `llmroller.lock`) never invalidates existing `session_hash` pins or traces. |
-| SEC-2 | P0 | The master key must be supplied via `LLMROLLER_MASTER_KEY` or `LLMROLLER_MASTER_KEY_FILE` (32 raw bytes encoded in base64) and must never be written to SQLite or logs. The binary must refuse to start if the master key is missing or has fewer than 32 decoded bytes. |
-| SEC-3 | P0 | Client keys (`llr_...`) must contain 256 bits of cryptographic randomness (`OsRng`), be stored solely as a SHA-256 digest, and be verified in constant time (`subtle::ConstantTimeEq`). |
-| SEC-4 | P0 | User and admin passwords must be hashed with `Argon2id` (`m = 19456 KiB`, `t = 2`, `p = 1`, 128-bit random salt) following the [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html). |
-| SEC-5 | P0 | Web session cookies must use `__Host-llmroller_session` (or `llmroller_session` only when `--dev-insecure-cookies` is set on plain HTTP), `HttpOnly`, `Secure`, `SameSite=Strict`, 12-hour idle expiry, and 7-day absolute expiry. Every state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) on cookie-authenticated routes (and `/api/auth/login` via double-submit cookie) must validate a per-session `x-csrf-token` derived via `HMAC-SHA256(csrf_subkey, session_id_hash)`. All HTML responses must set `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`. |
-| SEC-6 | P0 | Application logs, error bodies, and panic hooks must redact `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, `secret`, and request or response payloads (truncating and scrubbing any echoed `sk-*`/`llr_*` tokens in upstream error strings), and CSV exports must prefix cells starting with `=`, `+`, `-`, `@`, `\t`, or `\r` with `'` to prevent formula injection. Automated canary tests must verify that a planted secret string never appears in stdout, stderr, or database error columns. |
-| SEC-7 | P0 | Outbound `reqwest` clients must disable environment proxies (`.no_proxy()`), enforce TLS 1.2+ with `rustls` (permitting `http://` only when an admin sets `allow_private_network = 1`), disable HTTP redirects (`redirect::Policy::none()`), send an upstream key only to the exact origin of its provider's `base_url` (or preset `allowed_usage_origins`), and resolve DNS on every connect through an SSRF filter blocking all IANA special-purpose IPv4 and IPv6 ranges (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `198.18.0.0/15`, `224.0.0.0/4`, `::1/128`, `::ffff:0:0/96` bogons, `64:ff9b::/96`, `fc00::/7`, `fe80::/10`) unless `allow_private_network = 1`. |
-| SEC-8 | P0 | The server must enforce configurable resource limits: max request body size (`32 MiB` default), global pre-first-byte body buffer cap (`128 MiB`), max `/models` or `/usage` response size (`2 MiB`, max `500` models per provider), per-user personal resource quotas (`20` providers, `50` upstream keys), max header block (`64 KiB`), upstream connect timeout (`5 s`), per-try TTFB timeout (`30 s` with failover / `300 s` final), and stream idle timeout (`300 s` to accommodate extended thinking). |
-| SEC-9 | P0 | The control plane (`LLMROLLER_ADMIN_LISTEN`) and metrics listener (`LLMROLLER_METRICS_LISTEN`) must bind to `127.0.0.1` by default, separate from the data-plane listener (`0.0.0.0:8080`). |
+| SEC-1 | P0 | All sealed blobs must use `XChaCha20-Poly1305` in the versioned envelope `0x01 \|\| nonce (24 bytes) \|\| ciphertext \|\| tag (16 bytes)` with canonical length-prefixed Associated Data `aad(domain, fields) = "llmroller.aad.v1 " \|\| u32_be(len(domain)) \|\| domain \|\| (for f in fields: u32_be(len(f)) \|\| f)` (Section 9.2.2) under 256-bit subkeys derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY` and salted with the 16-byte `instance_meta.instance_id` (info labels: `"llmroller.v1.upstream_key"`, `"llmroller.v1.totp_secret"`, `"llmroller.v1.trace_record"`, and `"llmroller.v1.instance_secret"`). Two random 256-bit secrets (`session_hmac_secret` and `audit_hmac_key`) are generated once at bootstrap and stored sealed in `instance_secrets` so offline resumable master-key rotation (`llmroller rotate-master-key`, Section 5.5) re-seals all six encrypted tables without ever invalidating `audit_log` hashes, `session_hash` pins, or traces. |
+| SEC-2 | P0 | The master key must be supplied via `LLMROLLER_MASTER_KEY_FILE` (preferred; rejected with exit `3` if group or other permission bits are set) or `LLMROLLER_MASTER_KEY`, must decode from base64 to **exactly** 32 raw bytes, and must never be written to SQLite or logs. Startup must exit `3` if the key is missing, not 32 bytes, or disagrees with `instance_meta.active_master_key_id`, or if `instance_meta.rotation_state == 'in_progress'`. |
+| SEC-3 | P0 | Client keys (`llr_...`) must contain 256 bits of cryptographic randomness (`OsRng`), be stored solely as SHA-256 digests (`key_hash` and optional grace `prev_key_hash`), and be verified in constant time (`subtle::ConstantTimeEq`). |
+| SEC-4 | P0 | User and admin passwords must be hashed with `Argon2id` with parameters `m >= 19456 KiB`, `t >= 2`, `p = 1`, and a 128-bit random salt stored in the PHC string so stronger parameters remain verifiable ([OWASP Password Storage Cheat Sheet](https://www.google.com/search?q=https%3A%2F%2Fcheatsheetseries.owasp.org%2Fcheatsheets%2FPassword_Storage_Cheat_Sheet.html)). |
+| SEC-5 | P0 | The control plane must refuse to start on a non-loopback plain-HTTP address unless `LLMROLLER_TRUSTED_PROXIES` is configured (exit `2`). Web session cookies must use `__Host-llmroller_session` (or `llmroller_session` only when `--dev-insecure-cookies` is set), `HttpOnly`, `Secure`, `SameSite=Strict`, 12-hour idle expiry, and 7-day absolute expiry. Each login generates a random 256-bit CSRF token stored as `web_sessions.csrf_hash = SHA-256(token)`, delivered in `<meta name="csrf-token">` and validated in constant time against `x-csrf-token` on every `POST`, `PUT`, `PATCH`, or `DELETE` request (`GET /login` sets a 10-minute `__Host-llmroller_login_csrf` cookie paired with `x-csrf-token` and an `Origin` header check on `POST /api/auth/login`). All HTML responses must set `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`, with `htmx.config.includeIndicatorStyles = false`, `allowEval = false`, and `allowScriptTags = false`. |
+| SEC-6 | P0 | Application logs, error bodies, and panic hooks must redact `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, `secret`, and request or response payloads (truncating and scrubbing any echoed `sk-*`/`llr_*` tokens in upstream error strings), and CSV exports must prefix cells starting with `=`, `+`, `-`, `@`, `	`, or `
+` with `'` to prevent formula injection. Automated canary tests must verify that a planted secret string never appears in stdout, stderr, or database error columns. |
+| SEC-7 | P0 | Outbound connections must use `GuardedConnector` (`crates/proxy::ssrf`), which disables environment proxies, enforces TLS 1.2+ with `rustls` (permitting `http://` only when an admin sets `allow_private_network = 1`), disables HTTP redirects (`redirect::Policy::none()`), sends an upstream key only to its provider's `base_url` origin (or preset `allowed_usage_origins`, or personal `usage_url_cross_origin_ack` which forbids sharing), and validates **every connected socket IP** (for both DNS hostnames and IP-literal URLs, unwrapping IPv4-mapped IPv6 `::ffff:0:0/96` and 6to4 `2002::/16`) against all special-purpose ranges (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`, `255.255.255.255/32`, `::/128`, `::1/128`, `64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23`, `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`) unless `allow_private_network = 1`. |
+| SEC-8 | P0 | The server must enforce configurable resource limits: max request body size (`LLMROLLER_MAX_BODY_MB`, default `32 MiB`, `<= budget / 4`), global pre-first-byte body budget (`LLMROLLER_PREFLIGHT_BODY_BUDGET_MB`, default `min(1024, floor(0.40 * memory_limit_mb))`, `2,000 ms` queue wait), max `/models` or `/usage` response size (`2 MiB`, max `1,000` models per provider refresh), per-user personal resource quotas (`20` providers, `50` upstream keys, `2,000` personal-origin canonical models), max header block (`64 KiB`), and the normative timeout table in Section 10.5.2. |
+| SEC-9 | P0 | The control plane (`LLMROLLER_ADMIN_LISTEN`) and metrics listener (`LLMROLLER_METRICS_LISTEN`) must bind to `127.0.0.1` by default, separate from the data-plane listener (`0.0.0.0:8080`). When `LLMROLLER_LISTEN` is non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES`, startup must log an error every 10 minutes and set `llmroller_plaintext_data_plane = 1` (or exit `2` when `LLMROLLER_REQUIRE_TLS=true`). |
 | SEC-10 | P0 | `Cargo.lock` must be committed. CI must run `cargo audit`, `cargo deny check advisories bans licenses sources`, and `cargo vet`. GitHub Actions workflows must pin third-party actions by full 40-character commit SHA. |
 | SEC-11 | P0 | Release artifacts must include SHA-256 checksums, a CycloneDX SBOM, and a `cosign` signature. Container images must use a distroless base, run as UID `65532` (non-root), drop all Linux capabilities, and mount the root filesystem read-only. |
-| SEC-12 | P0 | Failed client-key authentication requests must be rate-limited per client IP (default 20 failures per minute, extracting `X-Forwarded-For` only when the TCP peer matches `LLMROLLER_TRUSTED_PROXIES`), and failed login or setup requests must be rate-limited per IP and username (default five failures per 15 minutes). |
-| SEC-13 | P0 | Each `audit_log` row must be written in the same SQLite transaction as the state change it records and compute `hash = hex_lower(HMAC_SHA256(audit_hmac_subkey, canonical_frame(seq, prev_hash, id, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json)))` (Section 9.2.1) so any edit, deletion, or unkeyed recomputation of audit records breaks the chain (`llmroller verify-audit-log`). |
-| SEC-14 | P0 | All in-memory secret strings (master key, decrypted upstream API keys, raw client tokens, CSRF secrets) must be wrapped in `secrecy::SecretString` or `SecretBox<[u8]>` with `ZeroizeOnDrop`. |
-| SEC-15 | P0 | The HTTP edge must reject requests containing both `Content-Length` and `Transfer-Encoding`, multiple `Host` headers, or non-ASCII control characters in header values, and must strip all hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`) and `Set-Cookie` headers in both directions. |
-| SEC-16 | P1 | When routing through a shared or global upstream key on a provider that uses a body or header session key, LLMRoller must mix the caller's `owner_user_id` into the outbound synthetic affinity key (`HMAC(session_hmac_secret, owner_user_id || raw_session_id)`) and overwrite any client-supplied affinity field so two users cannot collide on sticky replica routing. To prevent a personal provider owner from redirecting a grantee's prompts (`TRC-8`), modifying `base_url` or `add_headers` on a personal provider automatically disables active `provider_shares` on that provider until re-approved. |
-| SEC-17 | P0 | Every repository method in `crates/store` and handler in `crates/admin` that accesses providers, upstream keys, shares, routes, client keys, pins, or usage must take an `&ActorScope` parameter and enforce SQL-level `WHERE` predicates scoping rows to `owner_user_id` or `grantee_user_id` whenever `actor.role != Role::Admin`. |
-| SEC-18 | P0 | Upstream `/usage` pass-through responses (`GET /v1/usage`, `GET /v1/key`, and `/api/user/upstream-keys/{id}/usage`) must strip raw provider account identifiers (email, organization ID, payment method, billing address, raw key prefix) whenever the caller is not the owner of a `personal` key or an `admin`. |
-| SEC-19 | P0 | All recorded prompt, reasoning, tool-call, and completion payloads in `trace_records` must be compressed with `zstd` and encrypted at rest using `XChaCha20-Poly1305` (with a subkey derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY` and `AAD` binding `request_id || owner_user_id || session_hash`). Rendering the read-only Session Chat Preview in the dashboard must sanitize all HTML and Markdown via `ammonia` (and strict DOM escaping under CSP) so prompt-injected script tags or event handlers never run in the browser. |
+| SEC-12 | P0 | Client IP extraction must read the right-most `X-Forwarded-For` entry not in `LLMROLLER_TRUSTED_PROXIES` only when the TCP peer matches `LLMROLLER_TRUSTED_PROXIES`. Failed client-key authentication requests (`G1`..`G3`) must be rate-limited per client IP (20 failures per minute -> HTTP 429) and aggregated into `auth_failure_counters` (never `usage_events`), while failed logins use the three-tier limiter in `AUTH-8`. |
+| SEC-13 | P0 | Each `audit_log` row must be written in the same SQLite transaction as the state change it records and compute `hash = hex_lower(HMAC_SHA256(audit_hmac_key, canonical_frame(seq, prev_hash, id, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json)))` using `audit_hmac_key` from `instance_secrets` (Section 9.2.1). Every 100 rows and at least hourly, the writer must emit `{"event":"audit_anchor","seq":N,"hash":"H","ts":T}` to `stdout` so `llmroller verify-audit-log --anchor-seq N --anchor-hash H` detects both internal tampering (exit `8`) and tail truncation (exit `9`). |
+| SEC-14 | P0 | All in-memory secret strings (master key, `instance_secrets`, decrypted upstream API keys, raw client tokens, CSRF tokens) must be wrapped in `secrecy::SecretString` or `SecretBox<[u8]>` with `ZeroizeOnDrop`. |
+| SEC-15 | P0 | The HTTP edge must reject requests containing both `Content-Length` and `Transfer-Encoding`, multiple `Host` headers, non-ASCII control characters in header values, or duplicate top-level JSON keys with HTTP 400, and must strip all hop-by-hop headers and `Set-Cookie` headers in both directions (Section 12.1 and Section 12.1.1). |
+| SEC-16 | P0 | When routing through a `Shared` or `Global` upstream key, LLMRoller must strip every recognized client session header and body field (except `x-claude-code-agent-id` and `x-claude-code-parent-agent-id`) and write only the provider's configured affinity fields with the tenant-salted token `llr_<base32(HMAC(session_hmac_secret, "affinity.v1 " \|\| owner_user_id \|\| " " \|\| raw_session_id))[0..26]>`. Shares need explicit grantee acceptance matching `providers.share_config_fingerprint` (and admin approval for `custom` providers) so any change to a personal provider's routing-relevant config suspends active shares until re-accepted. |
+| SEC-17 | P0 | Every repository method in `crates/store` and handler in `crates/admin` that accesses providers, upstream keys, shares, routes, client keys, pins, or usage must take an `&ActorScope` parameter and enforce SQL-level `WHERE` predicates scoping rows to `owner_user_id` or `grantee_user_id` whenever `actor` is `ActorScope::User { role: Role::User, .. }`. |
+| SEC-18 | P0 | `upstream_usage_snapshots.raw_json_enc` must be sealed at rest with `XChaCha20-Poly1305` (domain `usage_raw`). Upstream `/usage` pass-through responses (`GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, and `/api/user/upstream-keys/{id}/usage`) and inference response headers (Section 12.1.1) must strip all provider account identifiers whenever the caller is not the personal key owner or an `admin`. |
+| SEC-19 | P0 | All recorded `trace_blocks.payload_enc` (domain `trace_block`) and `trace_records.payload_enc` (domain `trace_record`) blobs must be compressed with `zstd` and encrypted at rest using `XChaCha20-Poly1305` with canonical length-prefixed `AAD` (Section 9.2.2). In the Session Chat Preview, assistant Markdown must be rendered with `pulldown-cmark` (raw HTML disabled) and sanitized with `ammonia` (`rel="noopener noreferrer nofollow"`, `https:`/`http:` links only), while reasoning, user text, tool arguments, tool results, and raw JSON must be rendered as Askama auto-escaped text inside `<pre>`. |
 
 ### 8.3 Privacy and operator compliance
 
-LLMRoller is built for data minimization. It never stores prompt text, system instructions, tool arguments, or model completions unless an admin explicitly enables content traceability mode (`TRC-1`). When enabled, all recorded payloads are encrypted at rest (`SEC-19`), isolated to the client key owner (`TRC-8`), and purged after `trace_retention_days` (`TRC-7`). It never stores raw client session IDs; it hashes every session ID with a server-side HMAC secret before persisting pins or usage rows.
+LLMRoller is built for data minimization. It never stores prompt text, system instructions, tool arguments, or model completions unless an admin explicitly enables content traceability mode (`TRC-1`). When enabled, recorded payloads are deduplicated per user in `trace_blocks`, encrypted at rest (`SEC-19`), and isolated to the client key owner (`TRC-8`). They are purged automatically after `traceability_config.retention_days` (`TRC-7`). It never stores raw client session IDs in SQLite or accepts them in URL query strings (`GET /v1/usage` accepts session IDs only via HTTP headers); it hashes every session ID with `session_hmac_secret` before persisting pins, usage rows, or traces.
 
-Because LLMRoller forwards non-credential headers unchanged, privacy headers sent by agents (such as Command Code's `x-cmd-zdr: 1` zero-data-retention header) reach the upstream provider intact. Operators and users who share keys must review each provider's terms of service on pooled access (tracked as Risk `R1` in Section 18).
+Aside from stripping session carriers on pooled keys, LLMRoller forwards non-credential headers unchanged. Privacy headers such as Command Code's `x-cmd-zdr: 1` zero-data-retention header therefore reach the upstream provider intact. Operators and users who share keys must review each provider's terms of service on pooled access (tracked as Risk `R1` in Section 18).
 
 ## 9. Data model
 
-LLMRoller stores all persistent state in a single SQLite database running in Write-Ahead Logging (`WAL`) mode with `NORMAL` synchronous commits and `FOREIGN_KEYS = ON`. All monetary amounts are stored as 64-bit signed integers representing micro-USD (`1 USD = 1,000,000 micro_usd`) to avoid floating-point rounding errors. All timestamps are stored as 64-bit integers representing Unix epoch milliseconds in UTC, and all primary keys use sortable 26-character ULIDs (or composite natural keys).
+LLMRoller stores all persistent state in a single SQLite database running in Write-Ahead Logging (`WAL`) mode with incremental auto-vacuum (`PRAGMA auto_vacuum = INCREMENTAL`) and foreign-key enforcement (`PRAGMA foreign_keys = ON`). All monetary amounts are stored as 64-bit signed integers representing micro-USD (`1 USD = 1,000,000 micro_usd`) to avoid floating-point rounding errors. All timestamps are 64-bit integers in UTC epoch milliseconds, and primary keys use 26-character ULIDs or composite keys.
 
-### 9.1 Complete SQLite DDL schema
+### 9.1 Per-connection pragma builder and complete 31-table SQLite DDL schema
 
-The SQLite schema has 21 tables across five logical domains. These domains cover accounts, providers and sharing, models and pricing, session pins, and usage, traces, and operations.
+SQLite pragmas such as `foreign_keys`, `busy_timeout`, `query_only`, `synchronous`, and `temp_store` apply per connection rather than in database DDL. Every connection across the writer, the 8 readers, and all CLI commands is therefore built through `crates/store::pool::connect_options(role: Role)`.
+
+| Pragma | Server writer (`Role::Writer`) | Server readers (`Role::Reader`, 8 connections) | CLI subcommands (`Role::Cli`) |
+| --- | --- | --- | --- |
+| `journal_mode` | `WAL` (asserted equal to `"wal"` on open) | `WAL` (asserted) | `WAL` (asserted) |
+| `synchronous` | `NORMAL` or `FULL` (`LLMROLLER_SQLITE_SYNCHRONOUS`) | Not modified | `FULL` |
+| `foreign_keys` | `ON` | `ON` | `ON` |
+| `busy_timeout` | `5000` (5 s) | `5000` (5 s) | `30000` (30 s) |
+| `query_only` | `OFF` | `ON` | `OFF` for `rotate-master-key` and `reset-admin`; `ON` for `verify-audit-log` and `backup` |
+| `temp_store` | `MEMORY` | `MEMORY` | `MEMORY` |
+| `journal_size_limit` | `67108864` (64 MiB) | Not modified | `67108864` |
+
+Migration `0001` runs `PRAGMA auto_vacuum = INCREMENTAL;` first on an empty database (plus `VACUUM;` if needed). At startup, `serve` asserts `PRAGMA auto_vacuum == 2` and exits with code `13` otherwise.
+
+The SQLite schema has 31 tables (plus triggers and partial unique indexes) across five logical domains. These domains cover instance metadata and accounts, providers and sharing, models and pricing, session pins and response links, and usage, traces, and operations.
 
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-PRAGMA journal_size_limit = 67108864;
-PRAGMA auto_vacuum = INCREMENTAL;
+-- 0. Schema Version, Instance Metadata, and Sealed Instance Secrets
+CREATE TABLE _llmroller_schema (
+  version INTEGER PRIMARY KEY
+);
 
--- 1. Accounts, Web Sessions, and Client Keys
+CREATE TABLE instance_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  instance_id BLOB NOT NULL CHECK (length(instance_id) = 16),
+  active_master_key_id TEXT NOT NULL,
+  config_version INTEGER NOT NULL DEFAULT 0,
+  rotation_state TEXT NOT NULL DEFAULT 'idle' CHECK (rotation_state IN ('idle', 'in_progress')),
+  rotation_from_key_id TEXT,
+  rotation_to_key_id TEXT,
+  rotation_cursor_table TEXT,
+  rotation_cursor_id TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE instance_secrets (
+  name TEXT PRIMARY KEY CHECK (name IN ('session_hmac_secret', 'audit_hmac_key')),
+  sealed BLOB NOT NULL, -- 0x01 || 24-byte nonce || ciphertext || 16-byte tag
+  master_key_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+-- 1. Accounts, Deleted-User History, Web Sessions, and Client Keys
 CREATE TABLE users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
@@ -776,16 +904,22 @@ CREATE TABLE users (
   can_use_global_providers INTEGER NOT NULL DEFAULT 1,
   global_budget_micro_usd_month INTEGER,
   default_routing_scope TEXT NOT NULL DEFAULT 'personal_first'
-    CHECK (default_routing_scope IN ('personal_first', 'blended', 'personal_only', 'global_only')),
+    CHECK (default_routing_scope IN ('personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
   disabled INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   last_login_at INTEGER
 );
 
+CREATE TABLE deleted_users (
+  user_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL
+);
+
 CREATE TABLE web_sessions (
   id_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  csrf_hash TEXT NOT NULL,
+  csrf_hash TEXT NOT NULL, -- SHA-256 of per-session random 256-bit CSRF token
   ip_addr TEXT,
   user_agent TEXT,
   created_at INTEGER NOT NULL,
@@ -801,12 +935,17 @@ CREATE TABLE client_keys (
   label TEXT NOT NULL,
   prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
+  prev_key_hash TEXT,
+  prev_key_expires_at INTEGER,
   routing_scope TEXT NOT NULL DEFAULT 'inherit'
-    CHECK (routing_scope IN ('inherit', 'personal_first', 'blended', 'personal_only', 'global_only')), -- 'inherit' resolves to users.default_routing_scope
+    CHECK (routing_scope IN ('inherit', 'personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
   allowed_models TEXT, -- JSON array of canonical_id strings, or NULL for all accessible models
   rate_limit_rpm INTEGER,
   budget_micro_usd_month INTEGER,
   allowed_cidrs TEXT, -- JSON array of CIDR strings, or NULL
+  constant_session_flagged_at INTEGER,
+  constant_session_mode TEXT NOT NULL DEFAULT 'flag'
+    CHECK (constant_session_mode IN ('flag', 'fingerprint_generic_ids')),
   disabled INTEGER NOT NULL DEFAULT 0,
   revoked_at INTEGER,
   expires_at INTEGER,
@@ -814,6 +953,22 @@ CREATE TABLE client_keys (
   last_used_at INTEGER
 );
 CREATE INDEX idx_client_keys_owner ON client_keys(owner_user_id);
+CREATE UNIQUE INDEX uq_client_keys_prev_hash ON client_keys(prev_key_hash)
+  WHERE prev_key_hash IS NOT NULL;
+
+CREATE TRIGGER trg_client_keys_hash_disjoint_ins BEFORE INSERT ON client_keys
+WHEN EXISTS (
+  SELECT 1 FROM client_keys c
+  WHERE c.key_hash = NEW.prev_key_hash OR c.prev_key_hash = NEW.key_hash
+)
+BEGIN SELECT RAISE(ABORT, 'client key hash collision'); END;
+
+CREATE TRIGGER trg_client_keys_hash_disjoint_upd BEFORE UPDATE OF key_hash, prev_key_hash ON client_keys
+WHEN EXISTS (
+  SELECT 1 FROM client_keys c
+  WHERE c.id <> NEW.id AND (c.key_hash = NEW.prev_key_hash OR c.prev_key_hash = NEW.key_hash)
+)
+BEGIN SELECT RAISE(ABORT, 'client key hash collision'); END;
 
 -- 2. Global and Personal Providers, Upstream Keys, Shares, Budgets, and Upstream /usage Snapshots
 CREATE TABLE providers (
@@ -823,22 +978,27 @@ CREATE TABLE providers (
   kind TEXT NOT NULL CHECK (kind IN ('opencode_go', 'command_code', 'open_design_amr', 'openrouter', 'custom')),
   name TEXT NOT NULL,
   base_url TEXT NOT NULL,
-  config_json TEXT NOT NULL, -- protocol paths, auth style, header strip/add, UA policy, session profile, usage profile, error classifiers
+  config_json TEXT NOT NULL,
+  share_config_fingerprint TEXT NOT NULL DEFAULT '',
+  usage_url_cross_origin_ack INTEGER NOT NULL DEFAULT 0 CHECK (usage_url_cross_origin_ack IN (0, 1)),
   allow_private_network INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   CHECK (
     (ownership_scope = 'global' AND owner_user_id IS NULL) OR
     (ownership_scope = 'personal' AND owner_user_id IS NOT NULL)
-  ),
-  UNIQUE (ownership_scope, owner_user_id, name)
+  )
 );
 CREATE INDEX idx_providers_owner ON providers(owner_user_id);
+CREATE UNIQUE INDEX uq_providers_global_name ON providers(name)
+  WHERE ownership_scope = 'global';
+CREATE UNIQUE INDEX uq_providers_personal_name ON providers(owner_user_id, name)
+  WHERE ownership_scope = 'personal';
 
 CREATE TABLE upstream_keys (
   id TEXT PRIMARY KEY,
   provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-  owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE, -- NULL for global provider keys, matches provider.owner_user_id for personal keys
+  owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
   label TEXT NOT NULL,
   secret_enc BLOB NOT NULL,
   master_key_id TEXT NOT NULL,
@@ -848,42 +1008,142 @@ CREATE TABLE upstream_keys (
   strict_tier INTEGER NOT NULL DEFAULT 1 CHECK (strict_tier BETWEEN 1 AND 10),
   health TEXT NOT NULL DEFAULT 'healthy' CHECK (health IN ('healthy', 'cooling_down', 'exhausted', 'invalid')),
   health_until INTEGER,
+  health_version INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX idx_upstream_keys_provider ON upstream_keys(provider_id);
 CREATE INDEX idx_upstream_keys_owner ON upstream_keys(owner_user_id);
 
+CREATE TRIGGER trg_upstream_keys_owner_ins BEFORE INSERT ON upstream_keys
+WHEN NEW.owner_user_id IS NOT (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'upstream_keys.owner_user_id must equal providers.owner_user_id'); END;
+
+CREATE TRIGGER trg_upstream_keys_owner_upd BEFORE UPDATE OF owner_user_id, provider_id ON upstream_keys
+WHEN NEW.owner_user_id IS NOT (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'upstream_keys.owner_user_id must equal providers.owner_user_id'); END;
+
 CREATE TABLE provider_shares (
   id TEXT PRIMARY KEY,
   provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-  upstream_key_id TEXT REFERENCES upstream_keys(id) ON DELETE CASCADE, -- NULL means all enabled keys in provider_id are shared
+  upstream_key_id TEXT REFERENCES upstream_keys(id) ON DELETE CASCADE,
   owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   grantee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   allowed_models TEXT, -- JSON array of canonical_id strings, or NULL for all models served
   max_monthly_micro_usd INTEGER,
+  accepted_at INTEGER,
+  accepted_config_fingerprint TEXT,
+  admin_approved_at INTEGER,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   revoked_at INTEGER,
-  CHECK (owner_user_id != grantee_user_id),
-  UNIQUE (grantee_user_id, provider_id, upstream_key_id)
+  CHECK (owner_user_id != grantee_user_id)
 );
 CREATE INDEX idx_provider_shares_grantee ON provider_shares(grantee_user_id, enabled);
 CREATE INDEX idx_provider_shares_owner ON provider_shares(owner_user_id);
+CREATE UNIQUE INDEX uq_share_key_active ON provider_shares(grantee_user_id, upstream_key_id)
+  WHERE upstream_key_id IS NOT NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX uq_share_provider_active ON provider_shares(grantee_user_id, provider_id)
+  WHERE upstream_key_id IS NULL AND revoked_at IS NULL;
+
+CREATE TRIGGER trg_shares_integrity_ins BEFORE INSERT ON provider_shares
+WHEN (SELECT ownership_scope FROM providers WHERE id = NEW.provider_id) <> 'personal'
+  OR (SELECT usage_url_cross_origin_ack FROM providers WHERE id = NEW.provider_id) <> 0
+  OR NEW.owner_user_id <> (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+  OR (NEW.upstream_key_id IS NOT NULL AND (SELECT provider_id FROM upstream_keys WHERE id = NEW.upstream_key_id) <> NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'invalid provider share'); END;
+
+CREATE TRIGGER trg_shares_integrity_upd BEFORE UPDATE OF provider_id, upstream_key_id, owner_user_id ON provider_shares
+WHEN (SELECT ownership_scope FROM providers WHERE id = NEW.provider_id) <> 'personal'
+  OR (SELECT usage_url_cross_origin_ack FROM providers WHERE id = NEW.provider_id) <> 0
+  OR NEW.owner_user_id <> (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+  OR (NEW.upstream_key_id IS NOT NULL AND (SELECT provider_id FROM upstream_keys WHERE id = NEW.upstream_key_id) <> NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'invalid provider share'); END;
+
+-- 3. Model Catalog (Surrogate model_pk), Redirects, Aliases, Routes, Preferences, Budgets, and Price Book
+CREATE TABLE models (
+  model_pk TEXT PRIMARY KEY, -- Immutable 26-char ULID surrogate key
+  canonical_id TEXT NOT NULL UNIQUE,
+  display_name TEXT,
+  exposed INTEGER CHECK (exposed IN (0, 1)), -- NULL = automatic global exposure rule, 0 = forced off, 1 = forced on
+  distribution TEXT NOT NULL DEFAULT 'weighted' CHECK (distribution IN ('weighted', 'strict')),
+  merge_state TEXT NOT NULL DEFAULT 'confirmed' CHECK (merge_state IN ('confirmed', 'pending_review')),
+  origin TEXT NOT NULL DEFAULT 'global' CHECK (origin IN ('global', 'preset', 'personal')),
+  created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE model_redirects (
+  old_canonical_id TEXT PRIMARY KEY,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE model_aliases (
+  alias TEXT PRIMARY KEY,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  confirmed INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TRIGGER trg_alias_not_canonical BEFORE INSERT ON model_aliases
+WHEN EXISTS (SELECT 1 FROM models WHERE canonical_id = NEW.alias)
+BEGIN SELECT RAISE(ABORT, 'alias collides with canonical_id'); END;
+
+CREATE TABLE model_routes (
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  upstream_model_id TEXT NOT NULL,
+  vendor_prefix TEXT, -- Substring before the last '/', NULL when absent
+  protocols TEXT NOT NULL, -- JSON array: ["chat","responses","messages"]
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'missing', 'retired')),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  priority_override INTEGER CHECK (priority_override BETWEEN 1 AND 1000),
+  route_health TEXT NOT NULL DEFAULT 'healthy'
+    CHECK (route_health IN ('healthy', 'cooling_down', 'exhausted', 'unavailable')),
+  route_health_until INTEGER,
+  health_version INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  missing_since INTEGER,
+  discovered_at INTEGER NOT NULL,
+  PRIMARY KEY (upstream_key_id, model_pk)
+);
+
+CREATE TABLE route_protocol_blocks (
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
+  reason TEXT NOT NULL,
+  until_ms INTEGER NOT NULL,
+  PRIMARY KEY (upstream_key_id, model_pk, protocol)
+);
+
+CREATE TABLE user_route_preferences (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  priority_override INTEGER NOT NULL CHECK (priority_override BETWEEN 1 AND 1000),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (user_id, upstream_key_id, model_pk)
+);
 
 CREATE TABLE budget_windows (
   id TEXT PRIMARY KEY,
   scope_kind TEXT NOT NULL CHECK (scope_kind IN ('upstream_key', 'route')),
   upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
-  canonical_id TEXT REFERENCES models(canonical_id) ON DELETE CASCADE,
-  window_kind TEXT NOT NULL CHECK (window_kind IN ('rolling', 'anchored')),
-  period TEXT NOT NULL, -- '5h', '7d', '1mo', or integer milliseconds as text
+  model_pk TEXT REFERENCES models(model_pk) ON DELETE RESTRICT,
+  window_kind TEXT NOT NULL
+    CHECK (window_kind IN ('rolling', 'anchored_fixed', 'anchored_calendar_month', 'anchored_provider')),
+  period_ms INTEGER CHECK (period_ms BETWEEN 3600000 AND 2678400000), -- 1 h .. 31 d; NULL for calendar month
   anchor_at INTEGER,
-  limit_micro_usd INTEGER NOT NULL,
+  upstream_window_kind TEXT CHECK (upstream_window_kind IN ('5h', '7d', '1mo')),
+  limit_micro_usd INTEGER NOT NULL CHECK (limit_micro_usd > 0),
   reserve_pct INTEGER NOT NULL DEFAULT 2 CHECK (reserve_pct BETWEEN 0 AND 50),
   CHECK (
-    (scope_kind = 'upstream_key' AND canonical_id IS NULL) OR
-    (scope_kind = 'route' AND canonical_id IS NOT NULL)
+    (scope_kind = 'upstream_key' AND model_pk IS NULL) OR
+    (scope_kind = 'route' AND model_pk IS NOT NULL)
+  ),
+  CHECK (
+    (window_kind = 'anchored_calendar_month' AND period_ms IS NULL) OR
+    (window_kind <> 'anchored_calendar_month' AND period_ms IS NOT NULL)
   )
 );
 CREATE INDEX idx_budget_windows_key ON budget_windows(upstream_key_id);
@@ -891,13 +1151,15 @@ CREATE INDEX idx_budget_windows_key ON budget_windows(upstream_key_id);
 CREATE TABLE budget_adjustments (
   id TEXT PRIMARY KEY,
   budget_window_id TEXT NOT NULL REFERENCES budget_windows(id) ON DELETE CASCADE,
-  actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL, -- NULL for automatic upstream_usage_sync adjustments
+  actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   delta_micro_usd INTEGER NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('manual_calibration', 'upstream_usage_sync')),
+  effective_at INTEGER NOT NULL,
+  window_instance_start INTEGER, -- Anchored windows: start of instance it applies to; NULL for rolling
+  source TEXT NOT NULL CHECK (source = 'manual_calibration'),
   note TEXT,
   created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_budget_adjustments_window ON budget_adjustments(budget_window_id, created_at);
+CREATE INDEX idx_budget_adjustments_window ON budget_adjustments(budget_window_id, effective_at);
 
 CREATE TABLE upstream_usage_snapshots (
   id TEXT PRIMARY KEY,
@@ -905,139 +1167,142 @@ CREATE TABLE upstream_usage_snapshots (
   fetched_at INTEGER NOT NULL,
   http_status INTEGER NOT NULL,
   plan_name TEXT,
-  windows_json TEXT NOT NULL, -- Normalized array: [{"kind":"5h","used_pct":12.5,"used_micro_usd":null,"limit_micro_usd":null,"resets_at":1792400000000}]
+  windows_json TEXT NOT NULL, -- [{"kind":"5h","status":"ok","used_pct":12.5,"used_micro_usd":null,"limit_micro_usd":null,"resets_at":1792400000000}]
   balance_micro_usd INTEGER,
-  raw_json TEXT NOT NULL, -- Exact JSON returned by source provider /usage endpoint
-  sanitized_json TEXT NOT NULL -- Sanitized JSON stripped of PII and account IDs for grantee or shared inspection
+  raw_json_enc BLOB NOT NULL, -- Sealed XChaCha20-Poly1305 blob (domain 'usage_raw')
+  master_key_id TEXT NOT NULL,
+  sanitized_json TEXT NOT NULL
 );
 CREATE INDEX idx_upstream_usage_key_ts ON upstream_usage_snapshots(upstream_key_id, fetched_at DESC);
 
--- 3. Model Catalog, Routes, User Route Overrides, and Price Book
-CREATE TABLE models (
-  canonical_id TEXT PRIMARY KEY,
-  display_name TEXT,
-  exposed INTEGER CHECK (exposed IN (0, 1)), -- NULL = auto intersection rule for global pool, 0 = forced off, 1 = forced on
-  distribution TEXT NOT NULL DEFAULT 'weighted' CHECK (distribution IN ('weighted', 'strict'))
-);
-
-CREATE TABLE model_aliases (
-  alias TEXT PRIMARY KEY,
-  canonical_id TEXT NOT NULL REFERENCES models(canonical_id) ON DELETE CASCADE,
-  confirmed INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE model_routes (
-  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
-  canonical_id TEXT NOT NULL REFERENCES models(canonical_id) ON DELETE CASCADE,
-  upstream_model_id TEXT NOT NULL,
-  protocols TEXT NOT NULL, -- JSON array: ["chat","responses","messages"]
-  enabled INTEGER NOT NULL DEFAULT 1,
-  priority_override INTEGER CHECK (priority_override BETWEEN 1 AND 1000),
-  route_health TEXT NOT NULL DEFAULT 'healthy'
-    CHECK (route_health IN ('healthy', 'cooling_down', 'exhausted', 'unavailable')),
-  route_health_until INTEGER,
-  last_error TEXT,
-  missing_since INTEGER, -- Non-null when temporarily absent from /models refresh; preserves priority_override
-  discovered_at INTEGER NOT NULL,
-  PRIMARY KEY (upstream_key_id, canonical_id)
-);
-
-CREATE TABLE user_route_preferences (
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
-  canonical_id TEXT NOT NULL REFERENCES models(canonical_id) ON DELETE CASCADE,
-  priority_override INTEGER NOT NULL CHECK (priority_override BETWEEN 1 AND 1000),
-  enabled INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY (user_id, upstream_key_id, canonical_id)
-);
-
 CREATE TABLE prices (
-  provider_id TEXT NOT NULL DEFAULT '', -- Empty string '' for preset/kind default; specific provider.id for custom/personal provider overrides
+  provider_id TEXT NOT NULL DEFAULT '',
   provider_kind TEXT NOT NULL,
   upstream_model_id TEXT NOT NULL,
   input_per_mtok_micro_usd INTEGER NOT NULL,
   output_per_mtok_micro_usd INTEGER NOT NULL,
   cache_read_per_mtok_micro_usd INTEGER NOT NULL DEFAULT 0,
   cache_write_per_mtok_micro_usd INTEGER NOT NULL DEFAULT 0,
-  tiers_json TEXT, -- Optional prompt token threshold overrides
-  schedule_json TEXT, -- Optional UTC peak and off-peak multipliers
+  tiers_json TEXT,
+  schedule_json TEXT,
   source TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (provider_id, provider_kind, upstream_model_id)
 );
 
--- 4. Session Pins and Stateful Response Links
+-- 4. Confirmed Session Pins and Durable Stateful Response Links
 CREATE TABLE pins (
   client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
   session_hash TEXT NOT NULL,
-  canonical_id TEXT NOT NULL REFERENCES models(canonical_id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
   upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
-  status TEXT NOT NULL CHECK (status IN ('provisional', 'confirmed')),
+  pool_tier INTEGER NOT NULL DEFAULT 0 CHECK (pool_tier BETWEEN 0 AND 3),
   created_at INTEGER NOT NULL,
   last_used_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
   repin_count INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (client_key_id, session_hash, canonical_id)
+  PRIMARY KEY (client_key_id, session_hash, model_pk)
 );
 CREATE INDEX idx_pins_expires ON pins(expires_at);
 CREATE INDEX idx_pins_upstream_key ON pins(upstream_key_id);
 
 CREATE TABLE response_links (
   response_id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL,
   client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
   upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
-  canonical_id TEXT NOT NULL REFERENCES models(canonical_id) ON DELETE CASCADE,
-  protocol TEXT NOT NULL DEFAULT 'responses',
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  session_hash TEXT NOT NULL,
+  protocol TEXT NOT NULL DEFAULT 'responses' CHECK (protocol = 'responses'),
+  status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed', 'incomplete', 'failed')),
+  store_flag INTEGER NOT NULL CHECK (store_flag IN (0, 1)),
   created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX idx_response_links_expires ON response_links(expires_at);
+CREATE INDEX idx_response_links_session ON response_links(owner_user_id, session_hash);
 
--- 5. Usage Events, Hourly Rollups, Audit Log, and Settings
+-- 5. Usage Events, Attempts, 5-Min & Hourly Rollups, Auth Counters, Content-Addressed Traces, Audit Log, and Settings
 CREATE TABLE usage_events (
   id TEXT PRIMARY KEY,
   ts INTEGER NOT NULL,
   request_id TEXT NOT NULL UNIQUE,
-  client_key_id TEXT, -- Nullable only for unauthenticated 401 rejections
-  owner_user_id TEXT,
-  upstream_key_id TEXT, -- Nullable for local 4xx/503 rejections prior to route selection
+  client_key_id TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  upstream_key_id TEXT,
   provider_id TEXT,
-  provider_scope TEXT CHECK (provider_scope IN ('global', 'personal', 'shared')),
+  provider_scope TEXT CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
   share_id TEXT,
   canonical_id TEXT,
   upstream_model_id TEXT,
-  protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
+  endpoint TEXT NOT NULL
+    CHECK (endpoint IN ('chat', 'responses', 'messages', 'count_tokens', 'responses_get', 'responses_delete', 'responses_input_items', 'responses_cancel', 'responses_compact')),
+  protocol TEXT CHECK (protocol IN ('chat', 'responses', 'messages')),
   session_hash TEXT,
   status INTEGER NOT NULL,
   stream INTEGER NOT NULL,
   incomplete INTEGER NOT NULL DEFAULT 0,
+  termination TEXT NOT NULL DEFAULT 'completed'
+    CHECK (termination IN ('completed', 'upstream_truncated', 'client_gone', 'idle_timeout', 'shutdown_cut')),
+  trace_dropped INTEGER NOT NULL DEFAULT 0,
   input_uncached_tokens INTEGER,
   cache_read_tokens INTEGER,
   cache_write_tokens INTEGER,
   output_tokens INTEGER,
   reasoning_tokens INTEGER,
-  cost_micro_usd INTEGER,
-  cost_source TEXT CHECK (cost_source IN ('provider', 'price_book', 'unpriced')),
+  cost_micro_usd INTEGER NOT NULL,
+  cost_source TEXT NOT NULL
+    CHECK (cost_source IN ('provider', 'price_book', 'fallback_rate', 'estimated_incomplete', 'estimated_attempt')),
   latency_ms INTEGER,
   ttfb_ms INTEGER,
-  pin_outcome TEXT CHECK (pin_outcome IN ('new_pin', 'followed', 'repin', 'unpinned_stateless', 'response_link')),
+  pin_outcome TEXT
+    CHECK (pin_outcome IN ('new_pin', 'followed', 'repin', 'repin_recovery', 'unpinned_stateless', 'unpinned_capacity', 'response_link')),
   failovers INTEGER NOT NULL DEFAULT 0,
   error_code TEXT
 );
 CREATE INDEX idx_usage_ts ON usage_events(ts);
 CREATE INDEX idx_usage_owner_ts ON usage_events(owner_user_id, ts);
 CREATE INDEX idx_usage_client_key_ts ON usage_events(client_key_id, ts);
-CREATE INDEX idx_usage_upstream_key_ts ON usage_events(upstream_key_id, ts);
-CREATE INDEX idx_usage_share_ts ON usage_events(share_id, ts);
+
+CREATE TABLE usage_attempts (
+  request_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 3),
+  ts INTEGER NOT NULL,
+  upstream_key_id TEXT NOT NULL,
+  share_id TEXT,
+  outcome TEXT NOT NULL
+    CHECK (outcome IN ('served', 'connect_error', 'write_stalled', 'http_429', 'http_402', 'http_401', 'http_403', 'http_5xx', 'wait_timeout', 'error_frame')),
+  http_status INTEGER,
+  bytes_sent INTEGER NOT NULL,
+  charged_micro_usd INTEGER NOT NULL DEFAULT 0,
+  charge_basis TEXT NOT NULL CHECK (charge_basis IN ('none', 'actual', 'estimated_input')),
+  PRIMARY KEY (request_id, attempt_no)
+);
+CREATE INDEX idx_usage_attempts_key_ts ON usage_attempts(upstream_key_id, ts);
+
+CREATE TABLE usage_rollups_5min (
+  bucket_ms INTEGER NOT NULL, -- floor(ts / 300000) * 300000
+  upstream_key_id TEXT NOT NULL, -- '' for pre-route rejections
+  canonical_id TEXT NOT NULL,
+  client_key_id TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
+  share_id TEXT NOT NULL DEFAULT '',
+  cost_micro_usd INTEGER NOT NULL,
+  requests INTEGER NOT NULL,
+  PRIMARY KEY (bucket_ms, upstream_key_id, canonical_id, client_key_id, share_id)
+);
+CREATE INDEX idx_rollups_5min_key ON usage_rollups_5min(upstream_key_id, bucket_ms);
 
 CREATE TABLE usage_rollups_hourly (
   hour_ms INTEGER NOT NULL,
   owner_user_id TEXT NOT NULL,
   client_key_id TEXT NOT NULL,
-  upstream_key_id TEXT NOT NULL,
-  provider_id TEXT NOT NULL,
-  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared')),
-  share_id TEXT NOT NULL DEFAULT '', -- Empty string '' when not routed via provider_shares
+  upstream_key_id TEXT NOT NULL, -- '' for pre-route rejections
+  provider_id TEXT NOT NULL, -- '' for pre-route rejections
+  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
+  share_id TEXT NOT NULL DEFAULT '',
   canonical_id TEXT NOT NULL,
   requests INTEGER NOT NULL,
   errors INTEGER NOT NULL,
@@ -1052,6 +1317,25 @@ CREATE TABLE usage_rollups_hourly (
 CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);
 CREATE INDEX idx_rollups_share_hour ON usage_rollups_hourly(share_id, hour_ms);
 
+CREATE TABLE auth_failure_counters (
+  minute_ms INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('unknown_key', 'disabled', 'expired', 'revoked', 'owner_disabled')),
+  ip_prefix TEXT NOT NULL, -- /24 for IPv4, /56 for IPv6
+  count INTEGER NOT NULL,
+  PRIMARY KEY (minute_ms, reason, ip_prefix)
+);
+
+CREATE TABLE trace_blocks (
+  block_hash TEXT NOT NULL, -- hex SHA-256 of canonical block bytes (cache_control and citations removed)
+  owner_user_id TEXT NOT NULL,
+  payload_enc BLOB NOT NULL, -- Sealed zstd(canonical block JSON), domain 'trace_block'
+  master_key_id TEXT NOT NULL,
+  byte_len INTEGER NOT NULL,
+  last_referenced_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_user_id, block_hash)
+);
+CREATE INDEX idx_trace_blocks_lastref ON trace_blocks(last_referenced_at);
+
 CREATE TABLE trace_records (
   usage_event_id TEXT PRIMARY KEY REFERENCES usage_events(id) ON DELETE CASCADE,
   request_id TEXT NOT NULL UNIQUE,
@@ -1059,18 +1343,25 @@ CREATE TABLE trace_records (
   owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
   session_hash TEXT NOT NULL,
-  subagent_id TEXT, -- Optional x-claude-code-agent-id subagent thread identifier
-  turn_index INTEGER NOT NULL,
+  thread_id TEXT NOT NULL DEFAULT 'main', -- subagent_id or 'main'
   canonical_id TEXT NOT NULL,
   protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
   truncated_content INTEGER NOT NULL DEFAULT 0,
-  payload_enc BLOB NOT NULL, -- XChaCha20-Poly1305(zstd(NormalizedTurnTrace + raw request and response JSON))
+  payload_enc BLOB NOT NULL, -- Sealed zstd(StoredTurnTrace v2), domain 'trace_record'
   master_key_id TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 );
-CREATE INDEX idx_trace_session_ts ON trace_records(session_hash, ts ASC);
+CREATE INDEX idx_trace_session_order ON trace_records(owner_user_id, session_hash, ts ASC, request_id ASC);
 CREATE INDEX idx_trace_owner_ts ON trace_records(owner_user_id, ts DESC);
 CREATE INDEX idx_trace_expires ON trace_records(expires_at);
+
+CREATE TABLE trace_record_blocks (
+  usage_event_id TEXT NOT NULL REFERENCES trace_records(usage_event_id) ON DELETE CASCADE,
+  owner_user_id TEXT NOT NULL,
+  block_hash TEXT NOT NULL,
+  PRIMARY KEY (usage_event_id, block_hash)
+);
+CREATE INDEX idx_trace_record_blocks_ref ON trace_record_blocks(owner_user_id, block_hash);
 
 CREATE TABLE audit_log (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1095,22 +1386,22 @@ CREATE TABLE settings (
 );
 ```
 
-### 9.2 Storage invariants and write batching
+### 9.2 Storage invariants, dual-queue write batching, and retention
 
-Six storage rules keep SQLite fast and crash-safe under concurrent streaming load.
+Six storage rules keep SQLite fast, bounded, and crash-safe under concurrent streaming load.
 
 | Rule | Implementation mechanism |
 | --- | --- |
-| Single batching writer | Read queries run across eight read-only SQLite connections (`PRAGMA query_only = ON`), while all writes (both control-plane mutations and data-plane batches) serialize through one dedicated writer actor holding the single read-write connection. Data-plane batches flush whenever 200 items accumulate or 250 ms elapse (whichever comes first) inside a `BEGIN IMMEDIATE` transaction ordered as: (1) `usage_events`, (2) `usage_rollups_hourly`, (3) `trace_records`, and (4) `confirmed` `pins` (coalescing sliding TTL updates to once per 60 s), `response_links`, and `client_keys.last_used_at`. Each item runs inside a nested `SAVEPOINT item_i` so a foreign-key violation on a concurrently deleted parent row rolls back only that item (`llmroller_writer_skipped_fk_total`) without aborting the batch. |
-| Envelope encryption | `upstream_keys.secret_enc` and `users.totp_secret_enc` store a 24-byte `XChaCha20` nonce plus `Poly1305` ciphertext and tag, with `upstream_key.id` (or `user.id`) bound in the AEAD Associated Data (`AAD`) so a ciphertext blob cannot be copied between rows. |
-| Provider scope recording | Each `usage_events` row records `provider_scope` (`global`, `personal`, or `shared`) and `share_id` (when routed via `provider_shares`) at request time. Historical share accounting and monthly share caps stay exact even if a share is later modified. |
-| Snapshot history cap | The `upstream_usage_snapshots` table keeps the most recent 100 snapshots per upstream key. Older snapshots are pruned by the retention task, allowing the dashboard and `/v1/usage` endpoint to read the latest upstream quota state in O(1) time. |
-| Compressed and encrypted traces | When content traceability mode is active, `trace_records.payload_enc` stores `24-byte nonce || XChaCha20-Poly1305(zstd(json_bytes))` with length-prefixed `master_key_id || "|" || request_id || "|" || owner_user_id || "|" || session_hash` bound in the AEAD `AAD`. To prevent quadratic `O(N^2)` growth across multi-turn stateless sessions, turn `k > 1` stores only new delta input messages plus a reference to turn `k - 1`'s prefix hash; if a turn exceeds `4 MiB`, truncation drops the oldest prefix blocks first so the newest user/tool suffix and assistant output remain intact (`truncated_content = 1`). |
-| Retention policies | Raw `usage_events` rows are kept for 90 days by default (configurable via `usage_events_retention_days`), `trace_records` for 14 days (configurable via `retention_days` in `traceability_config`, with updates retroactively purging rows where `ts < now - retention_days`), `response_links` for 30 days, expired `pins` and `web_sessions` are swept every 60 s, and `usage_rollups_hourly` and `audit_log` are kept indefinitely. All retention sweeps run in bounded chunks of `1,000` rows per transaction followed by `PRAGMA incremental_vacuum(500)` to prevent WAL checkpoint starvation. |
+| Dual-queue writer (`Control` + `Data`) | Read queries run across eight read-only SQLite connections (`PRAGMA query_only = ON`) in pages of at most 50 turns or 5,000 rows per read transaction so no reader pins the WAL snapshot. All writes serialize through one dedicated writer actor fed by a high-priority `Control` channel (control-plane mutations + `audit_log` + `instance_meta.config_version` increment, awaited with a `2,000 ms` handler timeout) and three `Data` queues (`durable_state`, `rollups`, and `raw_events`). The writer drains all pending `Control` transactions before and after every data batch. Each data batch commits when `200` items accumulate, `4 MiB` of serialized row bytes accumulate, or `250 ms` elapse inside `BEGIN IMMEDIATE` ordered as: (1) `durable_state` (`pins`, `response_links`, `health_version` updates), (2) `rollups` (`usage_rollups_5min`, `usage_rollups_hourly`, `auth_failure_counters`), and (3) `raw_events` (`usage_events`, `usage_attempts`, `trace_blocks`, `trace_records`, `trace_record_blocks`). Any trace record exceeding `1 MiB` commits in its own standalone transaction. Each item runs in a nested `SAVEPOINT item_i` so a foreign-key violation rolls back only that item (`llmroller_writer_skipped_fk_total`). |
+| Three-tier data queue backpressure | (1) `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, coalescing by key, capped at `500,000` keys): on full, stops confirming new pins to disk and flips `/readyz` to 503 without dropping queued ops. (2) `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>`): additive coalescing for 5-minute and hourly rollups, never drops. (3) `raw_events` (`Mutex<VecDeque<RawItem>>` capped at `10,000` items and `64 MiB`): on overflow, evicts the oldest raw item (whose cost is already in `rollups`) and increments `llmroller_usage_dropped_total{kind}`. |
+| Canonical AEAD encryption (`aad`) | Every encrypted blob uses the versioned format `0x01 \|\| nonce (24 bytes) \|\| ciphertext \|\| tag (16 bytes)` and the canonical length-prefixed AAD encoder in Section 9.2.2 so ciphertexts cannot be swapped across rows, tables, or master-key versions. |
+| Content-addressed trace deduplication and truncation | Request blocks are hashed without `cache_control` or `citations` and stored once per `(owner_user_id, block_hash)` in `trace_blocks` (guarded by a 100,000-entry in-memory LRU cache to avoid redundant upserts). Binary/base64 blocks (`> 1 KiB`) are replaced before hashing with `{"type":"<orig>","llmroller_omitted":"binary","sha256":"<hex>","bytes":<int>}`. New request blocks per turn are capped at `4 MiB` (keeping newest blocks) and response outputs at `1 MiB` (keeping the first `512 KiB` and last `512 KiB` with `[llmroller: N bytes omitted]`). |
+| WAL checkpointing and `SQLITE_FULL` handling | `PRAGMA wal_autocheckpoint = 1000` is paired with a 30 s background task running `PRAGMA wal_checkpoint(PASSIVE)`. If the `-wal` file exceeds `256 MiB`, the writer issues `PRAGMA wal_checkpoint(RESTART)` between batches; if it exceeds `1 GiB`, `/readyz` flips to 503 and `llmroller_wal_bytes` alerts. On `SQLITE_FULL`, the writer drops incoming `raw_events`, retries `durable_state` and `rollups` every `5 s`, flips `/readyz` to 503, and sets `llmroller_storage_full = 1`. |
+| Retention policies | Raw `usage_events` and `usage_attempts` are kept for `usage_events_retention_days` (default `30` days) and capped at `usage_events_max_rows` (default `50,000,000` rows); `usage_rollups_5min` and `auth_failure_counters` for `35` days; `trace_records` and unreferenced `trace_blocks` (`last_referenced_at < cutoff`) for `traceability_config.retention_days` (default `14` days); `response_links` for `30` days (`1 h` when `store_flag = 0`); `retired` `model_routes` for `90` days; expired `pins` and `web_sessions` every `60 s`; and `usage_rollups_hourly` and `audit_log` indefinitely. Sweeps delete in portable chunks (`DELETE FROM usage_events WHERE id IN (SELECT id FROM usage_events WHERE id < :cutoff_ulid ORDER BY id LIMIT 1000)`) and bound trace deletions to `64 MiB` of blob bytes per transaction followed by `PRAGMA incremental_vacuum(500)`. |
 
 #### 9.2.1 Canonical `audit_log` hash-chain serialization
 
-Nullable columns (`actor_user_id`, `ip_addr`, `target_id`, `detail_json`) can be `NULL` or contain delimiter characters. To prevent canonicalization collisions, `crates/store::audit` computes `audit_log.hash` (`SEC-13`) over a length-prefixed byte buffer. The genesis `prev_hash` for the first row is 64 ASCII zeros (`"0000000000000000000000000000000000000000000000000000000000000000"`).
+Nullable columns (`actor_user_id`, `ip_addr`, `target_id`, `detail_json`) can be `NULL` or contain delimiter characters. To prevent canonicalization collisions, `crates/store::audit` computes `audit_log.hash` (`SEC-13`) over a length-prefixed byte buffer using `audit_hmac_key` from `instance_secrets`. The genesis `prev_hash` for the first row (`seq = 1`) is 64 ASCII zeros (`"0000000000000000000000000000000000000000000000000000000000000000"`).
 
 ```text
 opt_field(NULL)    = 0x00
@@ -1118,7 +1409,7 @@ opt_field(Some(s)) = 0x01 || u32_be(len(s)) || utf8(s)
 req_field(s)       = u32_be(len(s)) || utf8(s)
 
 canonical_frame =
-    "llmroller.audit.v1\0"
+    "llmroller.audit.v1 "
  || i64_be(seq)
  || req_field(prev_hash)
  || req_field(id)
@@ -1130,16 +1421,36 @@ canonical_frame =
  || opt_field(target_id)
  || opt_field(detail_json)
 
-hash = hex_lower(HMAC_SHA256(audit_hmac_subkey, canonical_frame))
+hash = hex_lower(HMAC_SHA256(audit_hmac_key, canonical_frame))
 ```
 
-### 9.3 JSON column schemas and runtime `settings` structures
+#### 9.2.2 Canonical AEAD Associated Data (`aad`) specification
 
-Four SQLite columns (`providers.config_json`, `prices.tiers_json`, `prices.schedule_json`, and `settings.value_json`) store structured JSON documents. `crates/core` validates these documents with `serde` before persistence and compiles them into `ConfigSnapshot`.
+All six encrypted column families in SQLite use a single canonical Associated Data encoder in `crates/store::crypto`:
+
+```text
+aad(domain: &str, fields: &[&[u8]]) =
+    "llmroller.aad.v1 "
+ || u32_be(len(domain)) || utf8(domain)
+ || (for f in fields: u32_be(len(f)) || f)
+```
+
+| Table and column | HKDF subkey info label | `domain` | `fields` (in exact order) |
+| --- | --- | --- | --- |
+| `instance_secrets.sealed` | `"llmroller.v1.instance_secret"` | `"instance_secret"` | `[master_key_id, name]` |
+| `users.totp_secret_enc` | `"llmroller.v1.totp_secret"` | `"totp_secret"` | `[totp_master_key_id, users.id]` |
+| `upstream_keys.secret_enc` | `"llmroller.v1.upstream_key"` | `"upstream_key"` | `[master_key_id, upstream_keys.id, provider_id]` |
+| `upstream_usage_snapshots.raw_json_enc` | `"llmroller.v1.instance_secret"` | `"usage_raw"` | `[master_key_id, upstream_usage_snapshots.id]` |
+| `trace_blocks.payload_enc` | `"llmroller.v1.trace_record"` | `"trace_block"` | `[master_key_id, owner_user_id, block_hash]` |
+| `trace_records.payload_enc` | `"llmroller.v1.trace_record"` | `"trace_record"` | `[master_key_id, request_id, owner_user_id, session_hash]` |
+
+### 9.3 JSON column schemas and closed runtime `settings` registry
+
+Four SQLite columns (`providers.config_json`, `prices.tiers_json`, `prices.schedule_json`, and `settings.value_json`) store structured JSON documents validated with `serde` before persistence and compiled into `ConfigSnapshot`.
 
 #### 9.3.1 `providers.config_json` (`ProviderConfigJson`)
 
-Every provider row stores a serialized `ProviderConfigJson` object. This object parameterizes `ProviderAdapter` without hard-coding vendor branches in `crates/core`.
+Every provider row stores a serialized `ProviderConfigJson` object. Modifying any routing-relevant field recomputes `providers.share_config_fingerprint` in the same transaction.
 
 ```json
 {
@@ -1151,13 +1462,24 @@ Every provider row stores a serialized `ProviderConfigJson` object. This object 
     "messages": "/messages",
     "models": "/models"
   },
+  "aux_endpoints": {
+    "count_tokens": "probe",
+    "responses_compact": "probe"
+  },
   "auth": {
     "chat": "bearer",
     "responses": "bearer",
     "messages": "x_api_key_or_bearer"
   },
+  "usage_reporting": {
+    "chat_stream": "inject"
+  },
   "strip_headers": ["x-experimental-*"],
+  "strip_header_tokens": {
+    "anthropic-beta": []
+  },
   "add_headers": {},
+  "response_header_allow": [],
   "ua_policy": "label",
   "session_profile": {
     "headers_if_absent": ["x-opencode-session"],
@@ -1169,16 +1491,25 @@ Every provider row stores a serialized `ProviderConfigJson` object. This object 
     "endpoints": ["https://opencode.ai/zen/go/v1/usage"],
     "parser_kind": "opencode_go"
   },
+  "timeouts": {
+    "timeout_failover": false,
+    "first_activity_timeout_ms": 60000,
+    "first_valid_frame_timeout_ms": 180000,
+    "nonstream_response_timeout_ms": 600000
+  },
   "error_classifiers": {
     "quota_exhausted_substrings": ["quota_exceeded", "window_limit_reached", "insufficient_credits"],
-    "plan_invalid_substrings": ["upgrade_required", "invalid_api_key"]
+    "request_rejected_substrings": ["flagged", "moderation"],
+    "plan_restricted_substrings": ["upgrade_required", "not available on your plan"],
+    "credential_invalid_substrings": ["invalid_api_key", "invalid x-api-key", "unauthorized"],
+    "model_not_found_substrings": ["model_not_found", "does not exist", "unknown model"]
   }
 }
 ```
 
 #### 9.3.2 `prices.tiers_json` and `prices.schedule_json`
 
-Context-length pricing tiers (`tiers_json`) and UTC time-of-day multipliers (`schedule_json`) use the following deterministic schemas:
+Context-length pricing tiers (`tiers_json`) apply when `total_input_tokens >= min_total_input_tokens` and (`max_total_input_tokens` is `null` or `total_input_tokens <= max_total_input_tokens`); overlapping tiers are rejected on write with HTTP 422. Time-of-day schedules (`schedule_json`) use half-open `[start, end)` UTC minute ranges (`0..1440`) evaluated at request start (`ts` of first byte sent upstream); overlapping schedules on one price row are rejected with HTTP 422.
 
 ```json
 {
@@ -1204,72 +1535,161 @@ Context-length pricing tiers (`tiers_json`) and UTC time-of-day multipliers (`sc
 }
 ```
 
-#### 9.3.3 Runtime `settings` table keys
+#### 9.3.3 Closed runtime `settings` registry
 
-The `settings` table stores instance-wide runtime configuration keys. Admins can update these keys via `PATCH /admin/api/settings` or `PUT /admin/api/settings/traceability`.
+The `settings` table enforces a closed 13-key registry. Any unknown key or out-of-range value submitted to `PATCH /admin/api/settings` is rejected with HTTP 422.
 
-| `settings.key` | Default `value_json` | Purpose and hot-reload target in `ConfigSnapshot` |
-| --- | --- | --- |
-| `pin_ttl_secs` | `86400` | Sliding idle expiration window in seconds for confirmed session pins (`RTE-10`). |
-| `usage_poll_interval_secs` | `300` | Periodic polling interval in seconds for active upstream keys' `/usage` endpoints (`USG-4`). |
-| `headroom_scaling_enabled` | `false` | Enables scaling WRR route weights by `max(0.05, remaining_budget_ratio)` (`RTE-13`). |
-| `repin_on_personal_recovery` | `true` | When `true`, a `personal_first` session that fell back to a `global` key repins back to the owner's `personal` key once its cooldown or window resets. |
-| `price_sync_catalog_url` | `{"enabled":false,"url":"https://models.dev/api.json"}` | Opt-in external price-book synchronization configuration (`PRIV-1`, `MDL-4`). |
-| `drain_timeout_secs` | `60` | Maximum seconds to wait for open SSE streams to finish after `SIGTERM` (`REL-1`). |
-| `traceability_config` | `{"enabled":false,"scope":"all","user_ids":[],"client_key_ids":[],"models":[],"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
+| `settings.key` | Type & validation range | Default `value_json` | Purpose and hot-reload target in `ConfigSnapshot` |
+| --- | --- | --- | --- |
+| `pin_ttl_secs` | Integer `300..=2_592_000` | `86400` | Sliding idle expiration window in seconds for confirmed session pins (`RTE-10`). |
+| `max_active_pins` | Integer `1_000..=1_000_000` | `250000` | Maximum entries in `PinStore` (`~72 MB` at 250k); overflow routes unpinned (`unpinned_capacity`, `RTE-10`). |
+| `usage_poll_interval_secs` | Integer `60..=3600` | `300` | Periodic polling interval in seconds for active upstream keys' `/usage` endpoints (`USG-4`). |
+| `headroom_scaling_enabled` | Boolean | `false` | Scales WRR route weights by remaining budget basis points `bps in 500..=10_000` (`RTE-13`). |
+| `repin_on_personal_recovery` | Boolean | `true` | Enables recovery repin from a fallback tier back to a higher priority tier once idle (`RTE-2`). |
+| `recovery_repin_min_idle_secs` | Integer `0..=86400` | `300` | Minimum idle seconds since the pin's previous served turn before a recovery repin is permitted (`RTE-2`). |
+| `global_exposure_mode` | Enum `"union" \| "intersection"` | `"union"` | Controls automatic global exposure when `models.exposed IS NULL` (`MDL-3`). |
+| `usage_events_retention_days` | Integer `1..=365` | `30` | Retention window in days for raw `usage_events` and `usage_attempts` rows (`REL-3`). |
+| `usage_events_max_rows` | Integer `>= 1_000_000` | `50000000` | Maximum raw `usage_events` row count before the sweeper prunes oldest rows (`A6`). |
+| `drain_timeout_secs` | Integer `0..=3600` | `60` | Maximum seconds to wait for open SSE streams to finish after `SIGTERM` (`REL-1`). |
+| `price_sync_catalog_url` | Object `{enabled: bool, url: https}` | `{"enabled":false,"url":"https://models.dev/api.json"}` | Opt-in external price-book synchronization configuration (`PRIV-1`, `USG-3`). |
+| `unpriced_fallback_rates` | Object `{input, output, cache_read, cache_write}` | `{"input":3000000,"output":15000000,"cache_read":300000,"cache_write":3750000}` | Fallback micro-USD per MTok rates charged whenever no `prices` row matches (`USG-3`). |
+| `traceability_config` | Object `{enabled, match, retention_days 1..=90, auto_disable_at}` | `{"enabled":false,"match":{"user_ids":[],"client_key_ids":[],"models":[]},"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
 
 ## 10. Routing design
 
-The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It resolves the caller's session, checks pin eligibility, selects new routes by smooth weighted round-robin, and manages failovers before the first byte.
+The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It evaluates request gates (`G1` through `G7`), resolves the session and routing constraint, and checks candidate eligibility (`C1` through `C8`). It then selects routes via per-group smooth WRR and manages single-flight pinning and pre-first-valid-frame failover.
 
-### 10.1 Candidate eligibility rules
+### 10.0 Ordered request gates (`G1` through `G7`)
 
-Consider a request authenticated by `client_key` (owned by `user_id = U`) for canonical model `M` over protocol `P`. A route `R = (upstream_key K, canonical_model M)` is a valid candidate only when all eight conditions below hold.
+Before inspecting candidate routes, every request on `/v1/*` (except `/healthz` and `/readyz`) is evaluated against seven ordered request gates. The first failing gate returns its deterministic HTTP status and protocol error envelope immediately.
 
-| Check # | Condition | Source in `ConfigSnapshot` and runtime state |
+| Gate | Predicate (must hold) | Failure response |
 | --- | --- | --- |
-| 1 | Model `M` is permitted by `client_key.allowed_models` (or `allowed_models` is `NULL`). | `client_keys.allowed_models` |
-| 2 | User `U` has authorization to use key `K` under `client_key.routing_scope`: (a) `K` belongs to a `personal` provider with `owner_user_id == U`, (b) `K` is covered by an enabled `provider_shares` row with `grantee_user_id == U`, `M` in `share.allowed_models`, and current-month share spend below `share.max_monthly_micro_usd`, or (c) `K` belongs to a `global` provider, `U.can_use_global_providers == 1`, and `U`'s current-month global spend is below `U.global_budget_micro_usd_month`. | `providers`, `upstream_keys`, `provider_shares`, `users`, window counters |
-| 3 | Model `M` is exposed in the pool being checked (for global routes, `M` satisfies the global auto-intersection or `exposed == 1` rule; for personal or shared routes, `R.enabled == 1`). | `models.exposed`, `model_routes.enabled`, `user_route_preferences.enabled` |
-| 4 | Provider, upstream key `K`, and route `R` all have `enabled == 1`. | `providers`, `upstream_keys`, `model_routes` |
-| 5 | Route `R.protocols` includes the inbound request protocol `P` (`chat`, `responses`, or `messages`). | `model_routes.protocols` |
-| 6 | Both key health `K.health` and route health `R.route_health` are `healthy` (or `cooling_down` where `now >= health_until`). | In-memory key and route health tables |
-| 7 | The provider's circuit breaker is `Closed` (or `HalfOpen` with a free probe slot). | In-memory circuit breaker |
-| 8 | Every budget window attached to key `K` or route `(K, M)` has `used_micro_usd + reserve_micro_usd < limit_micro_usd` AND the latest reconciled `upstream_usage_snapshot` has `used_percent < (100 - reserve_pct)`. | In-memory window counters and `upstream_usage_snapshots` |
+| `G1` | Bearer or `x-api-key` token hashes (`SHA-256`) in constant time to a known `client_keys` row in `ConfigSnapshot` via either `key_hash` (`HashRole::Current`) or `prev_key_hash` with `now_ms < prev_key_expires_at` (`HashRole::Previous`) | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
+| `G2` | `client_key.disabled == 0 AND client_key.revoked_at IS NULL AND (client_key.expires_at IS NULL OR client_key.expires_at > now_ms)` | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
+| `G3` | Owner account `users[client_key.owner_user_id].disabled == 0` | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
+| `G4` | `client_key.allowed_cidrs IS NULL` or the resolved client IP (after `LLMROLLER_TRUSTED_PROXIES` extraction) falls inside at least one allowed CIDR | HTTP 403 `permission_error` |
+| `G5` | `client_key.rate_limit_rpm IS NULL` or the client key's token bucket admits one token at `now_ms` | HTTP 429 `rate_limit_error` with `Retry-After` set to seconds until next token |
+| `G6` | For endpoints carrying a `model`, the model resolves to a known `model_pk` (`canonical_id = M`, returning 409 on ambiguous raw ID) and `client_key.allowed_models IS NULL OR M in client_key.allowed_models` | HTTP 404 `model_not_found` if `M` is unknown, else HTTP 403 `permission_error` |
+| `G7` | For `EndpointKind::Inference`, `client_key.budget_micro_usd_month IS NULL` or the client key's UTC monthly accumulator admits the request reservation | HTTP 429 `rate_limit_error` with `code = "client_key_budget_exhausted"` and `Retry-After` set to seconds until next UTC month |
 
-### 10.2 Pool resolution by `routing_scope`
+### 10.1 Candidate eligibility rules (`C1` through `C8`)
 
-After filtering routes that pass Checks 1 through 8, the router splits candidates into `Pool_Personal_And_Shared` and `Pool_Global`. It then applies `client_key.routing_scope` according to the table below.
+Consider a request from `client_key` (owner `U`) for model `M` (`model_pk`) and protocol `P` that passed gates `G1` through `G7`. A route `R = (upstream_key K, model_pk)` is a valid candidate only when all eight checks below hold.
 
-| Routing scope mode | Pool selection rule |
+```text
+fn effective_share(U: UserId, K: UpstreamKeyId) -> Option<&ShareGrant>:
+    // Key-level active share takes strict precedence over provider-level active share.
+    if let Some(s) = key_level_shares.get(&(U, K))
+        where s.enabled && s.revoked_at.is_none() && s.accepted_at.is_some()
+          && s.accepted_config_fingerprint == providers[K.provider_id].share_config_fingerprint
+          && (providers[K.provider_id].kind != Custom || s.admin_approved_at.is_some()) {
+        return Some(s);
+    }
+    if let Some(s) = provider_level_shares.get(&(U, K.provider_id))
+        where s.enabled && s.revoked_at.is_none() && s.accepted_at.is_some()
+          && s.accepted_config_fingerprint == providers[K.provider_id].share_config_fingerprint
+          && (providers[K.provider_id].kind != Custom || s.admin_approved_at.is_some()) {
+        return Some(s);
+    }
+    None
+```
+
+| Check | Condition that must hold for route `R = (K, M)` |
 | --- | --- |
-| `personal_first` (default) | If `Pool_Personal_And_Shared` is non-empty, use `Pool_Personal_And_Shared`. Otherwise use `Pool_Global`. |
-| `blended` | Use the union of `Pool_Personal_And_Shared` and `Pool_Global`. |
-| `personal_only` | Use `Pool_Personal_And_Shared` only. |
-| `global_only` | Use `Pool_Global` only. |
+| `C1` | `provider.enabled == 1 AND K.enabled == 1 AND R.enabled == 1 AND R.status == 'active'` |
+| `C2` | Authorization tier membership under `client_key.routing_scope`: `K` belongs to tier `Own` (`provider.ownership_scope == 'personal' AND provider.owner_user_id == U`), tier `Shared` (`effective_share(U, K)` returns `Some(s)` with `s.allowed_models IS NULL OR M in s.allowed_models`), or tier `Global` (`provider.ownership_scope == 'global' AND U.can_use_global_providers == 1`). |
+| `C3` | For `personal` providers (tiers `Own` and `Shared`): the provider owner account has `users[provider.owner_user_id].disabled == 0`. |
+| `C4` | Model exposure and merge review: `models[M].exposed IS DISTINCT FROM 0` (admin `exposed = 0` is an instance-wide kill switch across all tiers), and if `models[M].merge_state == 'pending_review'`, `R.vendor_prefix` matches the majority vendor prefix of `M`. For tier `Global`, `models[M].exposed == 1` or `M` satisfies `global_exposure_mode` (`union` or `intersection` over enabled global providers with at least one enabled, non-`invalid` key). For tiers `Own` and `Shared`, `user_route_preferences(U, K, M).enabled` is `NULL` or `1`. |
+| `C5` | `R.protocols` contains the inbound protocol `P` and `(K, M, P)` is not blocked in `route_protocol_blocks` (`now_ms >= until_ms`). |
+| `C6` | Both key health `K.health` and route health `R.route_health` in `RuntimeState` are `healthy`, or are `cooling_down` / `exhausted` with `now_ms >= health_until`. |
+| `C7` | The `OriginBreaker` for `K`'s upstream origin `OriginKey { scheme, host, port, allow_private_network }` is `Closed`, or is `HalfOpen` with a free probe slot. |
+| `C8` | For `EndpointKind::Inference` (skipped for `Auxiliary` and `StateBound`), `try_reserve` succeeds across the ordered counter set for `(K, M, U, client_key)`: every key window on `K`, every route window on `(K, M)`, the share UTC monthly accumulator for `effective_share(U, K)` (when tier is `Shared`), and `U`'s global UTC monthly accumulator (when tier is `Global`). |
 
-If the resulting candidate set `C` is empty, the router returns HTTP `503 Service Unavailable` (`no_eligible_route`). The response includes `Retry-After` set to the earliest recovery timestamp among excluded routes.
+### 10.2 Three-tier pool resolution by `routing_scope`
 
-### 10.3 Effective priority and smooth weighted round-robin
+Routes passing `C1` through `C8` are partitioned into `Tier_Own`, `Tier_Shared`, and `Tier_Global`. The router evaluates the ordered tier groups for the effective `routing_scope` and selects the first non-empty tier group `C`.
 
-For each candidate route `r` in the active candidate set `C`, the integer effective weight `W(U, r)` is resolved in three steps:
-1. For `personal` or `shared` routes, use `user_route_preferences.priority_override` when user `U` configured one. Standard users cannot override weights on `global` routes.
-2. Else if route `r` has a `model_routes.priority_override`, use `model_routes.priority_override`.
+| Routing scope mode | Ordered tier groups evaluated | Pool tier recorded on pin (`PoolTier`) |
+| --- | --- | --- |
+| `personal_first` (default) | `1. [Tier_Own]`, `2. [Tier_Shared]`, `3. [Tier_Global]` | `Own (0)`, `Shared (1)`, or `Global (2)` |
+| `blended` | `1. [Tier_Own U Tier_Shared U Tier_Global]` | `Blended (3)` |
+| `personal_only` | `1. [Tier_Own]`, `2. [Tier_Shared]` | `Own (0)` or `Shared (1)` |
+| `own_only` | `1. [Tier_Own]` | `Own (0)` |
+| `global_only` | `1. [Tier_Global]` | `Global (2)` |
+
+When all allowed tier groups are empty because of share or user monthly caps, the router returns HTTP `429 rate_limit_error` (`code = "monthly_cap_exhausted"`). Otherwise it returns HTTP `503 no_eligible_route` with `Retry-After` set to the earliest positive recovery delay.
+
+### 10.3 Effective priority, headroom scaling, and per-group smooth WRR
+
+For each candidate route `r = (K, M)` in the active tier group `C`, the base integer weight `W(U, r)` in `1..=1000` is resolved in three steps:
+1. For `Own` or `Shared` routes, use `user_route_preferences(U, K, M).priority_override` when set.
+2. Else if `R.priority_override` is set on `model_routes`, use `R.priority_override`.
 3. Otherwise use `upstream_keys.priority`.
 
-When `headroom_scaling_enabled` is active (`RTE-13`), `W(U, r)` is scaled by remaining budget basis points `bps in 500..=10_000` via integer arithmetic: `W_eff(U, r) = max(1, (W(U, r) * bps) / 10_000)`. When `models.distribution == 'strict'` (`RTE-6`), the router keeps only candidates with the minimum `strict_tier` (`1` is highest, `10` is lowest). It then runs weighted selection within that top tier.
+When `headroom_scaling_enabled` is active (`RTE-13`), let `windows` be the union of key windows on `K` (`scope_kind = 'upstream_key'`) and route windows on `(K, M)` (`scope_kind = 'route'`). The remaining budget basis points `bps` and effective weight `W_eff(U, r)` are computed as:
 
-For a new session, the router runs nginx's subset-tolerant smooth weighted round-robin (`smooth_wrr`). Each route `r` keeps an atomic `current_weight` scoped to `(pool_owner_scope, r.upstream_key_id, canonical_model_id)` without resetting on transient cooldowns:
-1. For each eligible candidate `r` in `C`, add its effective weight: `current_weight[r] += W_eff(U, r)`.
-2. Select `r_win` in `C` with the maximum `current_weight[r]` (breaking ties deterministically by `upstream_key_id`).
-3. Subtract the total weight of the active subset `C` from the winner and clamp to `[-10 * total_W, 10 * total_W]`: `current_weight[r_win] -= sum(W_eff(U, r) for r in C)`.
-4. Return `r_win`.
+```text
+if windows.is_empty() {
+    bps = 10_000;
+} else {
+    bps = clamp(
+        min over w in windows of floor(
+            10_000 * max(0, w.limit - w.effective_used(now_ms) - w.reserved_in_flight) / w.limit
+        ),
+        500,
+        10_000
+    );
+}
+W_eff(U, r) = max(1, (W(U, r) * bps) / 10_000);
+```
+
+When `models.distribution == 'strict'` (`RTE-6`), `C` is filtered to candidates with the minimum `strict_tier` (`1` is highest, `10` is lowest) before running smooth WRR.
+
+To prevent cross-user weight interference and multi-atomic race conditions while keeping memory bounded, WRR state lives in `WrrState` keyed by `WrrGroupKey { user_id, canonical_id, protocol, pool_tier }`. Each group is protected by a short synchronous `parking_lot::Mutex<WrrGroup>` and maintains the exact invariant `sum(m.current for m in members) == 0` without clamping:
+
+```text
+const WRR_MEMBER_EVICT_MS: i64 = 300_000; // 5 minutes
+
+fn select(group_key: WrrGroupKey, candidates: &[(RouteId, i64)], now_ms: i64) -> RouteId {
+    let mut group = wrr_state.get_or_insert(group_key).lock();
+    for (route, _) in candidates {
+        if !group.members.iter().any(|m| m.route == *route) {
+            group.members.push(WrrMember { route: *route, current: 0, last_present_ms: now_ms });
+        }
+    }
+    for m in &mut group.members {
+        if candidates.iter().any(|(r, _)| *r == m.route) {
+            m.last_present_ms = now_ms;
+        }
+    }
+    // Evict members absent for >= 5 minutes and rebalance their residual weight so sum(current) stays 0.
+    group.members.retain(|m| {
+        candidates.iter().any(|(r, _)| *r == m.route) || now_ms - m.last_present_ms < WRR_MEMBER_EVICT_MS
+    });
+    let total_w: i64 = candidates.iter().map(|(_, w)| *w).sum();
+    for m in &mut group.members {
+        if let Some((_, w)) = candidates.iter().find(|(r, _)| *r == m.route) {
+            m.current += *w;
+        }
+    }
+    let winner = group.members.iter_mut()
+        .filter(|m| candidates.iter().any(|(r, _)| *r == m.route))
+        .max_by(|a, b| a.current.cmp(&b.current).then_with(|| b.route.cmp(&a.route)))
+        .expect("non-empty candidates");
+    winner.current -= total_w;
+    group.last_used_ms = now_ms;
+    winner.route
+}
+```
+
+The 60 s background sweeper deletes `WrrGroup` entries where `now_ms - last_used_ms >= 86_400_000` (24 h).
 
 #### 10.3.1 Worked routing example
 
-Consider three upstream keys with default priorities matching their general plan tiers: Open Design AMR (`100`), OpenCode Go (`60`), and Command Code GOAT (`30`). For `deepseek-v4.1-flash`, the monthly allowances follow the same order ($120, $80, $60), so no override is needed. For `mimo-v2.6-pro`, Command Code GOAT gives $20 while OpenCode Go gives $15, so the admin or user sets per-model overrides (`60`, `20`, `15`).
+Consider three upstream keys with default priorities matching their general plan tiers: Open Design AMR (`100`), OpenCode Go (`60`), and Command Code GOAT (`30`). The table below uses illustrative per-model monthly allowances to show how per-model `priority_override` values adjust session shares.
 
-| Canonical model | Upstream key | Monthly allowance | Key default priority | Route priority override | Effective weight `W` | Share of new sessions |
+| Canonical model | Upstream key | Illustrative per-model monthly allowance | Key default priority | Route priority override | Effective weight `W` | Share of new sessions |
 | --- | --- | --- | --- | --- | --- | --- |
 | `deepseek-v4.1-flash` | Open Design AMR | $120 | 100 | None | 100 | 52.6% (100 / 190) |
 | `deepseek-v4.1-flash` | OpenCode Go | $80 | 60 | None | 60 | 31.6% (60 / 190) |
@@ -1278,127 +1698,303 @@ Consider three upstream keys with default priorities matching their general plan
 | `mimo-v2.6-pro` | Command Code GOAT | $20 | 30 | 20 | 20 | 21.1% (20 / 95) |
 | `mimo-v2.6-pro` | OpenCode Go | $15 | 60 | 15 | 15 | 15.8% (15 / 95) |
 
-### 10.4 Session pin lifecycle and single-flight concurrency
+### 10.4 Session pin state machine (`PinStore`) and stateful response links
 
-Session pins live in an in-memory `moka::sync::Cache` keyed by `PinKey = (client_key_id, canonical_id, session_hash)` and backed by asynchronous write-behind to the SQLite `pins` table.
+Session pins live in `PinStore` (`DashMap<PinKey, Arc<parking_lot::Mutex<PinEntry>>>`, where `PinKey = (client_key_id, canonical_id, session_hash)`), using the `Clock` seam for all timestamps so `FakeClock` tests run deterministically without sleeping. `PinStore` is capped at `max_active_pins` (default `250,000`, `~72 MB`); when `len() >= max_active_pins` on a miss, the request routes via WRR without inserting a pin (`pin_outcome = 'unpinned_capacity'`, incrementing `llmroller_pin_capacity_overflow_total`).
 
-| Lifecycle stage | Behavior and concurrency rule |
-| --- | --- |
-| Single-flight provisional pin (`RTE-7`) | When parallel requests arrive for a new session, a non-blocking `DashMap` entry guard runs the synchronous route selector (`< 5 µs`) once and inserts an in-memory `provisional` pin with `pin_generation = 1` so all concurrent turn-1 requests share the same candidate without blocking Tokio worker threads. |
-| Confirmation on first valid frame (`RTE-8`) | When the upstream returns HTTP 200 and its first non-comment SSE `data:` frame (or JSON prefix) contains no upstream error object, the proxy promotes the pin to `confirmed` via CAS on `(upstream_key_id, pin_generation)`, updates `expires_at = now + pin_ttl_ms` (default 24 h), and enqueues the `confirmed` pin for SQLite persistence. If pre-first-byte failover switches to another key, it increments `pin_generation` via CAS so stale concurrent turns cannot overwrite the failover winner. |
-| Repin on ineligibility (`RTE-11`) | If a later turn finds that the pinned route `(upstream_key_id, canonical_id)` fails any eligibility check in Section 10.1 (including an exhausted window, a cooling key or route, a revoked share, or a changed `client_key.routing_scope` that now forbids the pinned key's `ownership_scope`), the router picks a new candidate via `smooth_wrr`, replaces the pin, increments `repin_count`, and records `pin_outcome = 'repin'`. |
-| Stateful Responses override (`RTE-12`) | On `response.created`, LLMRoller inserts `response_id -> (client_key_id, upstream_key_id)` into `moka` (and persists to SQLite `response_links` on stream completion). When a follow-up request carries `previous_response_id` (or calls `GET`/`DELETE /v1/responses/{id}`), the router looks up `response_links` (falling back to the SQLite read pool on a `moka` eviction miss), verifies caller `owner_user_id` and Eligibility Checks 1, 2, and 4, and routes directly to that `upstream_key_id` (`pin_outcome = 'response_link'`). If the linked key was disabled or its share revoked, the router returns HTTP `503` (or `403`) rather than bypassing authorization. |
+```rust
+pub enum PinState { Provisional, Confirmed }
 
-### 10.5 Key health state machine and pre-first-byte failover
+pub struct PinEntry {
+    pub state: PinState,
+    pub upstream_key_id: UpstreamKeyId,
+    pub generation: u64,
+    pub pool_tier: PoolTier,
+    pub created_ms: i64,
+    pub last_used_ms: i64,
+    pub expires_ms: i64, // Confirmed: last_used + pin_ttl; Provisional: created + 50_000
+    pub repin_count: u32,
+    pub tried_this_generation: SmallVec<[UpstreamKeyId; 3]>,
+}
+```
 
-Each upstream key maintains an atomic health state and transitions according to upstream responses.
+All transitions on a `PinEntry` run synchronously (`< 5 us`) under the entry mutex and follow the table below. The entry mutex is never held across an `.await`.
 
-| Upstream outcome (before first byte) | Router failover action | Key health transition and circuit breaker effect |
-| --- | --- | --- |
-| HTTP 200 with valid first frame | Confirm pin via generation CAS and stream to client. | Key and route stay `healthy`; origin circuit breaker resets failure counter to 0. |
-| HTTP 200 with initial SSE `error` frame, or TCP/TLS error, or per-try TTFB timeout (`30 s` when alternatives exist, within `45 s` global failover deadline) | Advance provisional `pin_generation` via CAS; retry on next eligible candidate (up to two retries). | Increment origin breaker failure count; set `route_health` (for SSE model error) or `key.health` to `cooling_down` for 30 s. |
-| HTTP 500, 502, 503, 504 (host error) or 529 (model overloaded) | Retry on next eligible candidate (up to two retries). | `500..=504` increments origin breaker and cools down `key.health` (`5 s` to `300 s`); `529` cools down `model_routes.route_health` only. |
-| HTTP 429 with `Retry-After <= 2 s` (on both confirmed and provisional pins) | Sleep `Retry-After` once (counted against the `45 s` failover deadline) and retry on the **same** key to preserve cache. | No health change if retry succeeds; otherwise cool down `route_health` (if model-scoped) or `key.health`. |
-| HTTP 429, 402, or 403 matching `quota_exhausted_substrings` (evaluated **before** auth rules on 403) | Retry on next eligible candidate; trigger async `/usage` poll. | Set `route_health` (if model-scoped) or `key.health` to `exhausted` with `health_until = coalesce(resets_at_ms, now + 300_000)`. Automatically recovers when `now >= health_until`. |
-| HTTP 429 (general rate limit, `Retry-After > 2 s` or absent) | Retry on next eligible candidate (up to two retries). | Set `route_health` (if body names model) or `key.health` to `cooling_down` for `Retry-After` (or backoff `15 s` to `300 s`). |
-| HTTP 401 or 403 authentication/plan failure (`plan_invalid_substrings`) | Retry on next eligible candidate; never forward upstream 401/403 to client. | After 3 consecutive auth failures spanning `>= 5 s`, set `key.health = invalid` and schedule a 15-minute `/models` auto-recovery probe. |
-| HTTP 404 on an inference route | Retry on next eligible candidate (up to two retries). | Set `model_routes.route_health = unavailable` until next `/models` refresh; key stays `healthy` for other models. |
-| HTTP 400, 408, 409, 413, 422, or 499 (client request error or client cancel) | Do not retry. Forward status and body directly to client. | Key and route stay `healthy`; no breaker failure counted. |
-| Mid-stream disconnect after first byte | Never retry. Close client stream cleanly and mark usage event `incomplete = 1`. | Count soft breaker failure if upstream reset the connection. |
+| Event | Current state | Guard condition | Action taken under entry mutex | Next state |
+| --- | --- | --- | --- | --- |
+| `Acquire(req)` | Absent | `PinStore.len() < max_active_pins` | Run selector `select(C)` -> `(K, tier)`; insert `Provisional { K, gen: 1, pool_tier: tier, expires_ms: now + 50_000 }`; return `PinTicket { K, gen: 1 }` (`pin_outcome = 'new_pin'`) | `Provisional` |
+| `Acquire(req)` | `Provisional` | `now < expires_ms` and `K` passes `C1..C8` | Return follower `PinTicket { K, gen }` | `Provisional` |
+| `Acquire(req)` | `Provisional` | `now >= expires_ms` or `K` fails `C1..C8` | Reselect excluding `K`; `gen += 1`; reset `expires_ms = now + 50_000` | `Provisional` |
+| `Acquire(req)` | `Confirmed` | `now < expires_ms`, `K` passes `C1..C8`, and recovery repin does not fire | `last_used_ms = now`; return `PinTicket { K, gen }` (`pin_outcome = 'followed'`) | `Confirmed` |
+| `Acquire(req)` | `Confirmed` | `now < expires_ms`, `K` passes `C1..C8`, `repin_on_personal_recovery == true`, `routing_scope in {personal_first, personal_only}`, `pin.pool_tier > best_tier(req)`, and `now - last_used_ms >= recovery_repin_min_idle_secs * 1000` | Select `(K_new, best_tier)` from `best_tier`; `K = K_new`; `pool_tier = best_tier`; `gen += 1`; `repin_count += 1`; return ticket (`pin_outcome = 'repin_recovery'`) | `Provisional` |
+| `Acquire(req)` | `Confirmed` | `now >= expires_ms` | Enqueue durable delete of expired row; reselect as new `Provisional` (`gen += 1`, `pin_outcome = 'new_pin'`) | `Provisional` |
+| `Acquire(req)` | `Confirmed` | `K` fails `C1..C8` | Reselect excluding `K`; `gen += 1`; `repin_count += 1`; return ticket (`pin_outcome = 'repin'`) | `Provisional` |
+| `FirstValidFrame(ticket)` | Any | `ticket.generation == gen && ticket.upstream_key_id == K` | `state = Confirmed`; `last_used_ms = now`; `expires_ms = now + pin_ttl_ms`; enqueue durable `pins` upsert on `durable_state` (coalesced to once per 60 s for sliding TTL updates) | `Confirmed` |
+| `FirstValidFrame(ticket)` | Any | `ticket.generation != gen` | No pin change (stream already committed upstream); increment `llmroller_pin_stale_confirm_total` | Unchanged |
+| `PreFirstByteFailure(ticket, K_failed)` | Any | `ticket.generation == gen` | Push `K_failed` to `tried_this_generation`; reselect excluding `tried_this_generation`; `gen += 1`; `expires_ms = now + 50_000`; return new ticket | `Provisional` |
+| `PreFirstByteFailure(ticket, K_failed)` | Any | `ticket.generation < gen` | **Adopt winner:** if current `K` is not in caller's tried set and passes `C1..C8`, return current `(K, gen)`; else reselect excluding union of tried sets and bump `gen += 1` | Unchanged or `Provisional` |
+| `AdminMove(K_new)` | `Confirmed` | `K_new` passes `C1..C8` | `K = K_new`; `gen += 1`; `last_used_ms = now`; enqueue durable `pins` upsert | `Confirmed` |
+| `Invalidate(target)` | Any | `K` or `client_key_id` matches `target` | Remove entry from `PinStore`; enqueue durable `pins` delete | Absent |
+| `Sweep` (every 60 s) | `Provisional` or `Confirmed` | `now >= expires_ms` | Remove entry from `PinStore` | Absent |
 
-#### 10.5.1 Provider circuit breaker state machine and failure thresholds
+#### 10.4.1 Stateful Responses hard-route decision table (`RTE-12`)
 
-Per-key health (`upstream_keys.health`) and per-route health (`model_routes.route_health`) isolate failures on a single credential or model. In addition, each `provider_id` maintains an atomic `ProviderCircuitBreaker` in `crates/core` to guard against host-wide outages (`REL-5`, `RTE-3`). Client errors (`400`, `413`, `422`), single-key rate limits (`429`), and single-key auth errors (`401`, `402`, `403`) never trip the provider breaker. Only transport errors and upstream `500`/`502`/`503`/`504` server errors count toward the provider breaker.
+When `resolve_session_and_constraint` (Section 11.1.2) resolves a `response_links` row for `upstream_key_id = K`, the request uses `RoutingConstraint::HardKey(K)`. The router then applies the decision table below.
+
+| Condition on linked key `K` | Router action | `pin_outcome` | Side effect on `PinStore` |
+| --- | --- | --- | --- |
+| Passes `C1`..`C5`, and (`EndpointKind::StateBound` or passes `C6`..`C8`) | Route to `K` with failover **disabled** (`HardKey(K)`) | `response_link` | Upsert pin `(client_key_id, canonical_id, inherited_session_hash) -> K` as `Confirmed` (bumping `gen` and `repin_count` only if prior pin target differed). |
+| Passes `C1`..`C5`, but fails `C6` (`cooling_down` / `exhausted`), `C7` (breaker `Open`), or `C8` (window/cap full) | Return HTTP 429 `rate_limit_error` with `Retry-After` set to seconds until `health_until`, breaker probe, or window reset; **never** route to another key because the response state exists only on `K` | `response_link` | None |
+| Fails `C2` (share revoked, config fingerprint changed, or global access revoked), `C3` (owner disabled), or `C1` (key/provider disabled) | Return HTTP 403 `permission_error` (`"the upstream key that holds previous_response_id is no longer available to this client key"`) | `response_link` | Remove pin if it points to `K`. |
+| Fails `C4` (model force-disabled) or `C5` (protocol blocked) | Return HTTP 403 `permission_error` | None | None |
+
+### 10.5 Error classification, endpoint kinds, key health, and pre-first-byte failover
+
+Every `/v1/*` routed request has a `RoutingConstraint` (`Free`, `PinnedPreferred(K)`, or `HardKey(K)`) and an `EndpointKind`:
+
+| Endpoint path | `EndpointKind` | Budget check (`C8`) | Failover allowed | 404 behavior |
+| --- | --- | --- | --- | --- |
+| `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages` | `Inference` | Yes | Per Section 10.5.2 (disabled if `HardKey`) | Model-missing 404 -> `route_health = unavailable` for `10 min` + trigger `/models` refresh for `K`; other 404 -> pass through unchanged |
+| `POST /v1/responses/compact` | `Inference` | Yes | `HardKey` if `previous_response_id` present, else `PinnedPreferred` / `Free` | As `Inference` |
+| `POST /v1/messages/count_tokens` | `Auxiliary` | No | Yes (any eligible key, pin preferred) | Pass through; set `aux_unsupported(K, count_tokens)` for `6 h` (when unsupported on all eligible keys, answer locally with HTTP 404 `not_found_error`) |
+| `GET`, `DELETE /v1/responses/{id}`, `/input_items`, `/cancel` | `StateBound` | No | Never (`HardKey`; unknown link returns local 404 `response_not_found`) | Pass through unchanged, zero health effect |
+
+Before commit, `crates/proto::adapters::classify` inspects any upstream HTTP error or initial SSE error frame. It matches the first `8 KiB` of the body case-insensitively against five ordered classes:
+
+| Order | Classifier class | Match rule | Health and `OriginBreaker` effect | Failover | Client sees |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `QuotaExhausted` | Status in `{402, 403, 429}` and body matches `quota_exhausted_substrings` | Set `route_health` (if body names model) or `key.health` to `exhausted` (`health_version += 1`, persisted to SQLite) with `health_until = coalesce(resets_at_ms, now + 300_000)`; trigger single-flight `/usage` poll | Yes (unless `HardKey`) | Terminal error selector if all tries fail |
+| 2 | `RequestRejected` | Status `403` matching `request_rejected_substrings` (`"flagged"`, `"moderation"`, or `"permission_error"` with `"content"`), or status in `{400, 404 (not model-missing), 408, 409, 413, 422, 499}` | None (key, route, and breaker stay healthy) | No | Upstream status and scrubbed body verbatim |
+| 3 | `PlanRestricted` | Status `403` matching `plan_restricted_substrings` (`"upgrade_required"`, `"not available on your plan"`) | Insert `route_protocol_blocks(K, model_pk, protocol, until_ms = next_discovery)` | Yes (unless `HardKey`) | Terminal error selector if all tries fail |
+| 4 | `CredentialInvalid` | Status `401`, or status `403` matching `credential_invalid_substrings` (`"invalid_api_key"`, `"invalid x-api-key"`, `"unauthorized"`) | Record strike in `strikes[K]` for `client_key_id` (10-minute sliding window): if `strikes[K].len() >= 2` (two distinct client keys), mark `key.health = invalid` (`health_version += 1`, persisted, 15-min auto-recovery probe); else spawn a single-flight `GET /models` verification probe (`5 s` timeout) that marks `K` `invalid` on 401/403 or clears `strikes[K]` on 2xx | Yes (unless `HardKey`) | `502 upstream_unreachable` if all tries fail (never forwards upstream 401/403) |
+| 5 | `Unclassified403` | Any other status `403` | None; increment `llmroller_upstream_unclassified_403_total{provider_id}` | No | Upstream status and scrubbed body verbatim |
+
+For status `429` not matching `QuotaExhausted`: if `Retry-After <= 2 s`, sleep `Retry-After` once (counted against `failover_wall_clock_budget_ms`) and retry the **same** key to preserve prompt cache; otherwise set `route_health` or `key.health` to `cooling_down` (in memory only) for `Retry-After` (or `15 s..300 s` backoff) and fail over. For status `529`, set `route_health = cooling_down` and fail over. For status `500`, set `route_health = cooling_down` (`5 s..60 s`) and fail over without counting a host failure on `OriginBreaker`. For status `502`, `503`, `504`, count a host failure on `OriginBreaker`, set `key.health = cooling_down`, and fail over.
+
+`RuntimeState` is authoritative for health while running. Transitions to `exhausted`, `invalid`, or `healthy` increment `health_version` and enqueue a durable `HealthWrite` guarded by `WHERE id = ? AND health_version < ?`. Stale data-plane writes therefore never overwrite a control-plane `reset-health`.
+
+#### 10.5.1 Per-origin circuit breaker state machine (`OriginBreaker`)
+
+Each upstream origin `OriginKey { scheme, host, port, allow_private_network }` maintains an `OriginBreaker` in `RuntimeState` with 6 rolling 10-second buckets (`attempts: u32, host_failures: u32`), `consecutive_host_failures: u32`, and `open_streak: u32`. Only `TransportError::{Dns, Connect, Tls, WriteStalled}` and pre-first-frame HTTP `502`, `503`, and `504` count as host failures.
 
 | Current state | Event or condition | Next state | Action taken |
 | --- | --- | --- | --- |
-| `Closed` | Upstream returns HTTP 200..=499 (any status other than transport timeout/error or 500/502/503/504) | `Closed` | Reset `consecutive_host_failures = 0`. |
-| `Closed` | `consecutive_host_failures` reaches `5` within a rolling `60 s` window across the provider's keys | `Open` | Record `opened_at = now_ms` and `open_duration_ms = min(120_000, 15_000 * 2^open_streak)`. Exclude all routes on this provider from Check 7 (`RTE-3`). |
-| `Open` | Request arrives while `now_ms < opened_at + open_duration_ms` | `Open` | Route immediately fails Check 7 with zero network I/O. |
-| `Open` | Request arrives when `now_ms >= opened_at + open_duration_ms` and `probe_in_flight == false` | `HalfOpen` | Atomically set `probe_in_flight = true` (`compare_exchange`) inside an RAII `ProbeSlotGuard` (which clears `probe_in_flight = false` on drop if the client disconnects before first byte) and allow one probe request through. |
-| `HalfOpen` | Probe request receives first valid response byte (HTTP 200) | `Closed` | Reset `consecutive_host_failures = 0`, `open_streak = 0`, and `probe_in_flight = false`. |
-| `HalfOpen` | Probe request fails with transport error or HTTP 5xx before first byte | `Open` | Increment `open_streak`, set `probe_in_flight = false`, and re-open breaker for `min(120_000, 15_000 * 2^open_streak)`. |
+| `Closed` | Host failure where `consecutive_host_failures + 1 >= 5` OR (`window_attempts >= 20` and `window_host_failures / window_attempts >= 0.5`) | `Open` | Set `until_ms = now_ms + min(120_000, 15_000 * 2^open_streak)` |
+| `Closed` | Host failure below both thresholds | `Closed` | Increment `consecutive_host_failures` and current 10 s bucket counters |
+| `Closed` | Any upstream HTTP response received (any HTTP status other than 502/503/504) | `Closed` | Set `consecutive_host_failures = 0`; increment bucket `attempts` |
+| `Open` | Request evaluates `C7` while `now_ms < until_ms` | `Open` | Route fails `C7` with zero network I/O |
+| `Open` | Request evaluates `C7` when `now_ms >= until_ms` and CAS acquires `probe_in_flight` (`ProbeSlotGuard`) | `HalfOpen` | Allow this single request through as the origin probe |
+| `HalfOpen` | Probe receives any HTTP response (any status except 502/503/504) | `Closed` | Set `open_streak = 0`, `consecutive_host_failures = 0`, clear 10 s buckets, release probe slot |
+| `HalfOpen` | Probe fails with a host failure (`Dns`, `Connect`, `Tls`, `WriteStalled`, or 502/503/504) | `Open` | Increment `open_streak`, set `until_ms = now_ms + min(120_000, 15_000 * 2^open_streak)`, release probe slot |
+| `HalfOpen` | Probe cancelled by client disconnect before outcome (`ProbeSlotGuard::drop`) | `HalfOpen` | Release `probe_in_flight = false` so the next request can probe |
 
-### 10.6 Deterministic canonical model ID normalization algorithm
+#### 10.5.2 Normative timeout and failover eligibility tables
 
-The pure function `crates/core::catalog::normalize_model_id(raw_id: &str) -> String` implements `MDL-2` and `ADR-7` in six stateless steps without depending on catalog insertion order:
-1. Trim leading and trailing ASCII whitespace and convert all ASCII uppercase bytes (`A..=Z`) to lowercase (`a..=z`).
-2. Strip any vendor prefix up to and including the last `/` character (for example, `deepseek/deepseek-v4.1-flash` becomes `deepseek-v4.1-flash`).
-3. Strip operational routing tags (`:nitro`, `:floor`, `:extended`). Convert `:free` and `:thinking` into `-free` and `-thinking` so free-tier and reasoning variants stay distinct.
-4. Replace all `_` characters and spaces with `-`, convert version dots in non-`v` model families (`claude-sonnet-4.6` -> `claude-sonnet-4-6`) while preserving `v<major>.<minor>` dots (`v4.1` vs. `v4`, `ADR-7`), and collapse consecutive hyphens (`--`) into one hyphen (`-`).
-5. Preserve explicit release-date suffixes (`-20250514`, `-20260514`) as distinct normalized slugs so dated snapshots never collide automatically.
-6. During request resolution, check `model_aliases` (`confirmed = 1`) first. Next check `models.canonical_id`, and finally check exact `model_routes.upstream_model_id`.
+To prevent duplicate billing on slow prefill or non-streaming calls while keeping connection failures fast to recover, LLMRoller enforces seven distinct timers:
+
+| Timer | Default | Scope | Behavior on expiry |
+| --- | --- | --- | --- |
+| `connect_timeout_ms` | `5,000` | TCP + TLS handshake per try | `TransportError::Connect` -> failover allowed (upstream never accepted the request). |
+| `request_write_timeout_ms` | `30,000` | Writing request headers and body to upstream | `TransportError::WriteStalled` -> failover allowed only if zero response bytes have been received. |
+| `first_activity_timeout_ms` (streaming) | `60,000` | From end of request write until the first response byte of any kind (status line, header, SSE comment, or `data:`) | Increment `llmroller_upstream_slow_total{provider_id}`; if provider `timeouts.timeout_failover == true`, fail over (charging `estimated_input` in `usage_attempts`); else return HTTP 504 `upstream_timeout`. |
+| `first_valid_frame_timeout_ms` (streaming) | `180,000` | From end of request write until the first valid non-comment frame (SSE comments `: ...` and `event: ping` keep `stream_idle_timeout_ms` alive) | Return HTTP 504 `upstream_timeout`; **never** fail over (upstream accepted and is computing). |
+| `stream_idle_timeout_ms` | `300,000` | After first valid frame, maximum gap between any two received bytes | Close stream with `Termination::IdleTimeout` (`incomplete = 1`). |
+| `nonstream_response_timeout_ms` | `600,000` | Non-streaming (`stream: false`): from end of request write until full JSON body received | Return HTTP 504 `upstream_timeout`; **never** fail over. |
+| `failover_wall_clock_budget_ms` | `60,000` | Cumulative wall-clock time spent across tries that ended with a failover-eligible outcome | Stop failing over and return the terminal error from Section 10.5.3. |
+
+#### 10.5.3 Pre-first-frame holding buffer and terminal error selection
+
+Until the first valid non-comment frame is verified, the forwarder holds the upstream status, headers, and initial bytes in a `64 KiB` buffer. If the buffer reaches `64 KiB` without encountering an error object, the response commits immediately (status and filtered headers sent, held bytes flushed).
+
+When no try commits, LLMRoller selects the client-facing terminal error from the ordered `outcomes` of the tries:
+1. If any try ended with `RequestRejected`, `Unclassified403`, or a non-retryable 4xx passthrough, return that upstream response verbatim.
+2. Else if all tries ended in `{http_429, QuotaExhausted, PlanRestricted, breaker_open}`, return HTTP 429 (`upstream_quota_exhausted` or `upstream_rate_limited`) with `Retry-After` floored at `1 s`.
+3. Else if any try ended in `wait_timeout`, return HTTP 504 (`code = "upstream_timeout"`).
+4. Otherwise return HTTP 502 (`code = "upstream_unreachable"`).
+
+### 10.6 Deterministic canonical model ID normalization, discovery lifecycle, and merges
+
+The pure function `crates/core::catalog::normalize_model_id(raw_id: &str) -> Result<String, NormalizeError>` normalizes raw upstream model IDs without ever merging distinct version numbers:
+
+```text
+fn normalize_model_id(raw: &str) -> Result<String, NormalizeError> {
+    let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    if s.is_empty() || s.len() > 256 || !s.bytes().all(|b| (0x21..=0x7E).contains(&b) || b == b' ') {
+        return Err(NormalizeError::InvalidCharacters);
+    }
+    let mut s = s.to_ascii_lowercase();
+    if let Some(idx) = s.rfind('/') {
+        s = s[idx + 1..].to_string();
+    }
+    if let Some(idx) = s.rfind(':') {
+        let (base, tag) = (&s[..idx], &s[idx + 1..]);
+        s = match tag {
+            "free" => format!("{base}-free"),
+            "thinking" => format!("{base}-thinking"),
+            "nitro" | "floor" => base.to_string(),
+            "extended" => format!("{base}-extended"),
+            "beta" => format!("{base}-beta"),
+            other => format!("{base}-{other}"),
+        };
+    }
+    let replaced: String = s.chars().map(|c| if c == '_' || c == ' ' { '-' } else { c }).collect();
+    // Preserve '.' iff immediately preceded and followed by an ASCII digit; otherwise replace '.' with '-'.
+    let bytes = replaced.as_bytes();
+    let mut dotted = String::with_capacity(bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'.' {
+            let prev_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            let next_digit = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+            dotted.push(if prev_digit && next_digit { '.' } else { '-' });
+        } else {
+            dotted.push(b as char);
+        }
+    }
+    // Collapse consecutive '-' and trim leading/trailing '-'.
+    let collapsed = collapse_hyphens(&dotted);
+    Ok(collapsed)
+}
+```
+
+When one key's `/models` list has multiple raw IDs with the same normalized slug, discovery runs `normalize_keep_vendor(raw)` (replacing `/` with `--`) and logs a warning. Discovery then applies confirmed `model_aliases` (`alias -> model_pk`) so aliased dated IDs attach their routes directly to the target `model_pk`.
 
 | Raw upstream `id` from provider `/models` | Provider kind | Normalized `canonical_id` (`MDL-2`) | Preserved `upstream_model_id` (`model_routes`) |
 | --- | --- | --- | --- |
 | `deepseek-v4.1-flash` | `open_design_amr` | `deepseek-v4.1-flash` | `deepseek-v4.1-flash` |
 | `deepseek/deepseek-v4.1-flash` | `command_code` | `deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
 | `deepseek-v4-flash` | `opencode_go` | `deepseek-v4-flash` (kept distinct per `ADR-7`) | `deepseek-v4-flash` |
-| `anthropic/claude-sonnet-4.6` | `openrouter` | `claude-sonnet-4-6` | `anthropic/claude-sonnet-4.6` |
-| `claude-sonnet-4-6-20260514` | `command_code` | `claude-sonnet-4-6-20260514` (aliased to `claude-sonnet-4-6` via preset alias) | `claude-sonnet-4-6-20260514` |
-| `openai/gpt-5.4-pro:free` | `openrouter` | `gpt-5.4-pro-free` (kept distinct from paid tier) | `openai/gpt-5.4-pro:free` |
+| `anthropic/claude-sonnet-4.6` | `openrouter` | `claude-sonnet-4.6` (preset alias `claude-sonnet-4-6` -> `claude-sonnet-4.6`) | `anthropic/claude-sonnet-4.6` |
+| `claude-sonnet-4-6-20260514` | `command_code` | Attaches to `claude-sonnet-4.6` via preset alias | `claude-sonnet-4-6-20260514` |
+| `openai/gpt-5.4-pro:free` | `openrouter` | `gpt-5.4-pro-free` | `openai/gpt-5.4-pro:free` |
 | `mimo/mimo_v2.6_pro` | `command_code` | `mimo-v2.6-pro` | `mimo/mimo_v2.6_pro` |
+| `qwen/qwen2.5-coder-32b-instruct` | `openrouter` | `qwen2.5-coder-32b-instruct` | `qwen/qwen2.5-coder-32b-instruct` |
+
+When an admin merges model `a` into `b` (`POST /admin/api/models/merge`), the writer runs one transaction over `model_pk`. It repoints `model_routes`, `user_route_preferences`, `budget_windows`, `pins`, `response_links`, and `model_aliases`, deletes `a` from `models`, and inserts `model_redirects(a.canonical_id -> b.model_pk)`.
 
 ## 11. Session identification and hints
 
-Because coding agents and upstream providers use different session headers and body fields, LLMRoller separates inbound session extraction from outbound affinity hint injection.
+Coding agents and upstream providers use different session headers and body fields. LLMRoller therefore separates inbound session extraction and response-link inheritance from outbound affinity hint injection.
 
-### 11.1 Inbound session ID resolution order
+### 11.1 Eight-step inbound session ID resolution order
 
-The session resolver checks each inbound request using the nine-step precedence order below. The resolver ignores any value that is empty, exceeds 256 bytes, or contains non-printable ASCII bytes. Resolution then falls through to the next step.
+The session resolver checks each inbound request using the eight-step precedence order below (after evaluating Response-link session inheritance in Section 11.1.2). Note that `previous_response_id` is **not** a session-ID precedence step because its value changes on every turn of a stateful Responses conversation; instead, `previous_response_id` inherits the parent turn's `session_hash` via `response_links` (Section 11.1.2). For steps 1 through 7, the resolver ignores empty values, values over 256 bytes, or non-printable ASCII bytes, falling through to the next step.
 
 | Precedence | Source location | Header or JSON field name | Target client or scenario |
 | --- | --- | --- | --- |
-| 1 | HTTP header | `x-llmroller-session-id` | Explicit override for custom scripts and tests |
-| 2 | HTTP header | `x-claude-code-session-id` | [Claude Code](https://code.claude.com/docs/en/llm-gateway). Note: `x-claude-code-agent-id` and `x-claude-code-parent-agent-id` are ignored for pin lookup so subagents share the parent conversation's pin and prompt cache. |
-| 3 | HTTP header | `x-parent-session-id` | [opencode](https://github.com/anomalyco/opencode/issues/55243) child or forked sessions, keeping child turns on the parent's warm cache |
+| 1 | HTTP header | `x-llmroller-session-id` | Explicit override for custom scripts, `/v1/usage` queries, and tests |
+| 2 | HTTP header | `x-claude-code-session-id` | [Claude Code](https://www.google.com/search?q=https%3A%2F%2Fcode.claude.com%2Fdocs%2Fen%2Fllm-gateway). Note: `x-claude-code-agent-id` and `x-claude-code-parent-agent-id` are ignored for pin lookup so subagents share the parent conversation's pin and prompt cache. |
+| 3 | HTTP header | `x-parent-session-id` | [opencode](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fanomalyco%2Fopencode%2Fissues%2F55243) child or forked sessions, keeping child turns on the parent's warm cache |
 | 4 | HTTP header | `x-opencode-session` | Clients already configured with OpenCode Go's session header |
-| 5 | HTTP header | `x-session-affinity` | [opencode](https://github.com/anomalyco/opencode/pull/35982), Fireworks, and Vercel AI Gateway clients |
-| 6 | HTTP header | `x-session-id`, `session-id`, `session_id`, `conversation-id`, `x-bf-session-id` | [Codex CLI](https://github.com/openai/codex/issues/24973), [OpenRouter](https://openrouter.ai/docs/guides/best-practices/prompt-caching), [Bifrost](https://docs.getbifrost.ai/providers/session-affinity.md), and generic gateways |
+| 5 | HTTP header | `x-session-affinity` | [opencode](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fanomalyco%2Fopencode%2Fpull%2F35982), Fireworks, and Vercel AI Gateway clients |
+| 6 | HTTP header | `x-session-id`, `session-id`, `session_id`, `conversation-id`, `x-bf-session-id` | [Codex CLI](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fopenai%2Fcodex%2Fissues%2F24973), [OpenRouter](https://www.google.com/search?q=https%3A%2F%2Fopenrouter.ai%2Fdocs%2Fguides%2Fbest-practices%2Fprompt-caching), [Bifrost](https://www.google.com/search?q=https%3A%2F%2Fdocs.getbifrost.ai%2Fproviders%2Fsession-affinity.md), and generic gateways |
 | 7 | JSON body | `session_id`, `prompt_cache_key`, `promptCacheKey`, or `metadata.session_id` | OpenAI, OpenRouter, and Claude Code metadata hints |
-| 8 | JSON body | `previous_response_id` | Stateful OpenAI Responses continuation calls (resolves to the upstream key in `response_links`) |
-| 9 | Derived fallback | `SHA-256(client_key_id || "\0" || canonical_id || "\0" || protocol || "\0" || system_prompt[..4096] || "\0" || first_role_user_message[..4096])` (extracting the first message item where `role == "user"`, independent of whether a `system` message precedes it) | Stateless SDK callers that send no session header or body field |
+| 8 | Derived fallback | `"fp:" \|\| hex(SHA-256(fp_input))[0..32]` computed over canonical byte-sliced `SYS[0..min(len, 4096)]` and `USER1[0..min(len, 4096)]` (Section 11.1.3) | Stateless SDK callers that send no session header or body field (or keys with `constant_session_mode = 'fingerprint_generic_ids'` on steps 4..7) |
 
-#### 11.1.1 Privacy hashing and anomaly detection
+#### 11.1.1 Privacy hashing and 21-slot exact constant-session detector
 
-LLMRoller never writes the raw inbound session ID to SQLite. It computes a tenant-scoped `session_hash = hex(HMAC-SHA256(session_hmac_secret, owner_user_id || "\0" || raw_session_id)[0..16])` (128 bits, 32 hex characters) so two different users can never collide on `session_hash` in `pins`, `usage_events`, or `trace_records`.
+LLMRoller never writes the raw inbound session ID to SQLite. It computes a tenant-scoped `session_hash = hex_lower(HMAC-SHA256(session_hmac_secret, owner_user_id || " " || raw_session_id)[0..16])` (128 bits, 32 hex characters) using the persistent `session_hmac_secret` from `instance_secrets` so two different users never collide on `session_hash`.
 
-A misconfigured client that sends a static constant session ID across all conversations defeats load balancing ([vscode#334186](https://github.com/microsoft/vscode/issues/334186)). To catch and mitigate this with bounded memory (`< 256 bytes` per active pin), LLMRoller stores an inline 21-slot fixed array of 64-bit opening-message hashes per pin. When a 21st distinct opening-message fingerprint arrives on one `session_hash` within an hour, LLMRoller sets `suspected_constant_session_id = true`. It also switches that client key to Step 9 fallback fingerprinting so new conversations spread across the WRR pool.
+A misconfigured client that sends a static constant session ID across all conversations defeats load balancing ([vscode#334186](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fmicrosoft%2Fvscode%2Fissues%2F334186)). Claude Code subagents (`x-claude-code-agent-id`) and opencode child sessions (Step 3) intentionally share a parent session ID across distinct opening prompts. `ConstantSessionDetector` therefore evaluates only generic session sources (Steps 4 through 7) when `x-claude-code-agent-id` is absent.
 
-### 11.2 Outbound provider session hint profiles
+The detector is keyed by `(ClientKeyId, SessionHash)` independent of model (`DashMap<(ClientKeyId, SessionHash), DetectorEntry>`, swept after 60 minutes of inactivity). Each `DetectorEntry` (`~262 bytes`) holds an exact 21-slot array of `OpeningSlot { fingerprint: u64, seen_minute: u32 }` where `fingerprint` is the first 8 bytes of `SHA-256(sys || 0x00 || usr)` (Section 11.1.3):
+1. On each qualifying request, drop slots with `now_minute - seen_minute >= 60`.
+2. If `fingerprint` is already present, update its `seen_minute` and return.
+3. Insert `(fingerprint, now_minute)` into `slots`. When `len == 21` and `flagged_at_ms` is `None`, set `flagged_at_ms = Some(now_ms)`, increment `llmroller_constant_session_suspected_total{client_key_id}`, enqueue a system audit row (`session.constant_id_suspected`), and enqueue a durable update setting `client_keys.constant_session_flagged_at = now_ms`.
+4. By default (`client_keys.constant_session_mode == 'flag'`), flagging surfaces a warning badge in the UI without altering routing. When `constant_session_mode = 'fingerprint_generic_ids'`, Steps 4 through 7 switch to the Step 8 fingerprint while Steps 1 through 3 still use their native header.
 
-Each provider has a configurable `session_profile` in `providers.config_json` that tells the adapter which headers or body fields to write into the outbound request.
+#### 11.1.2 Response-link session inheritance (`previous_response_id`)
 
-| Rule | Outbound affinity behavior |
-| --- | --- |
-| Personal key passthrough | When routing through a user's own `personal` key, if the client sent a raw session ID, LLMRoller uses that ID (or a deterministic `llr_<26-char-base32>` token when using the Step 9 fallback fingerprint). |
-| Tenant-salted shared and global IDs (`SEC-16`) | When routing through a `global` key or a `shared` personal key, LLMRoller derives the outbound affinity string as `llr_` plus 26 base32 characters of `HMAC-SHA256(server_session_secret, owner_user_id || raw_session_id)` so two different users on the same upstream key never share an affinity token while every turn from the same user and session sends an identical token. |
-| Preserve existing headers (`send_if_absent`) | If the inbound request already carries the target header (and tenant salting is not active), LLMRoller leaves it untouched. |
+Stateful OpenAI Responses conversations are chained via `previous_response_id`. To keep a stateful conversation on one `session_hash` and one key, `resolve_session_and_constraint` runs before pin lookup:
+
+```text
+fn resolve_session_and_constraint(req, caller) -> Result<SessionResolution, ProxyError> {
+    let raw_id_1_to_7 = extract_steps_1_to_7(req, caller.client_key.constant_session_mode);
+    if req.protocol == Protocol::Responses {
+        if let Some(prev_id) = req.body_previous_response_id_or_path_id() {
+            if let Some(link) = link_cache.get(prev_id).or_else(|| read_pool.select_response_link(prev_id)) {
+                if link.owner_user_id != caller.owner_user_id {
+                    return Err(ProxyError::NotFound("response_not_found"));
+                }
+                return Ok(SessionResolution {
+                    session_hash: link.session_hash, // Inherit parent session_hash, overriding raw_id_1_to_7
+                    constraint: RoutingConstraint::HardKey(link.upstream_key_id),
+                    source: SessionSource::ResponseLink,
+                });
+            } else if req.endpoint_kind == EndpointKind::StateBound {
+                return Err(ProxyError::NotFound("response_not_found"));
+            }
+        }
+    }
+    let raw_id = raw_id_1_to_7.unwrap_or_else(|| step8_fingerprint(req, caller.client_key_id));
+    Ok(SessionResolution {
+        session_hash: hmac_session_hash(caller.owner_user_id, &raw_id),
+        constraint: RoutingConstraint::Free,
+        source: SessionSource::Normal,
+    })
+}
+```
+
+#### 11.1.3 Canonical byte-sliced Step 8 fallback fingerprint extraction
+
+Step 8 extracts `SYS` and `USER1` into canonical `Vec<u8>` byte buffers so multi-byte UTF-8 characters, moving `cache_control` markers, and base64 images never break pinning:
+
+| Protocol | `SYS` (concatenated in document order with `0x1E` separator) | `USER1` |
+| --- | --- | --- |
+| `chat` | `content` of every `messages[i]` with `role in {"system", "developer"}` appearing before the first `role == "user"` message | `content` of the first `messages[i]` with `role == "user"` |
+| `messages` | Top-level `system` string or content-block array | `content` of the first `messages[i]` with `role == "user"` |
+| `responses` | Top-level `instructions` plus `content` of every `input` item with `role in {"system", "developer"}` appearing before the first `role == "user"` item | If `input` is a string, that string; else `content` of the first item with `role == "user"` |
+
+Content canonicalization `canon(content) -> Vec<u8>`:
+1. If `content` is a JSON string, return its decoded UTF-8 bytes.
+2. If `content` is an array of blocks, for each block in order (joined by `0x1E`): if `type in {"text", "input_text"}`, emit `b"T" || decoded_text_bytes`; otherwise emit `b"B" || type_bytes || 0x1F || SHA-256(canonical_json_without_cache_control_and_citations)`.
+3. Truncate as raw byte slices (never `&str` slicing): `sys = &canon(SYS)[0..min(len, 4096)]` and `usr = &canon(USER1)[0..min(len, 4096)]`.
+4. Compute `fp_input = "llmroller.fp.v1 " || u32_be(len(client_key_id)) || client_key_id || u32_be(len(canonical_id)) || canonical_id || u8(protocol_code) || u32_be(len(sys)) || sys || u32_be(len(usr)) || usr`, and return `raw_session_id = "fp:" || hex_lower(SHA-256(fp_input))[0..32]`.
+
+### 11.2 Outbound provider session hint profiles and tier isolation
+
+Each provider has a configurable `session_profile` in `providers.config_json` that tells the adapter which headers or body fields to write into the outbound request. Outbound session handling depends strictly on the authorization tier (`Own` vs. `Shared` / `Global`) of the chosen upstream key (`SEC-16`):
+
+| Tier of chosen upstream key | Recognized inbound session carriers (headers in Precedence Steps 1..6 and body fields in Step 7) | Provider's configured `session_profile` affinity fields |
+| --- | --- | --- |
+| `Own` (caller's own personal key) | Forwarded verbatim | Written only if absent (`send_if_absent`), using the client's raw session ID (truncated at the largest UTF-8 character boundary `<= 256` bytes) or `llr_<26-char-base32>` when resolved via Step 8 |
+| `Shared` or `Global` (pooled across users) | Every recognized client session header and body field is **removed** from the outbound request (headers stripped; body fields removed by span deletion), except `x-claude-code-agent-id` and `x-claude-code-parent-agent-id` | Always written (overwriting any existing value) with the tenant-salted token `llr_<base32(HMAC-SHA256(session_hmac_secret, "affinity.v1 " \|\| owner_user_id \|\| " " \|\| raw_session_id))[0..26]>` |
 
 The table below lists the default session hint profile for each built-in provider preset.
 
-| Provider preset | Outbound headers written (`if_absent`) | Outbound body field written (`if_absent`) | Special rules and verification source |
+| Provider preset | Outbound headers configured | Outbound body field configured | Special rules and verification source |
 | --- | --- | --- | --- |
-| `opencode_go` | `x-opencode-session: <affinity_id>` | None | Mandatory on [OpenCode Go](https://opencode.ai/docs/go); prevents `400 MissingSessionID`. Also passes through `x-claude-code-session-id` and `session_id`. |
-| `openrouter` | `x-session-id: <affinity_id>` | `session_id: "<affinity_id>"` (truncated to 256 chars) | Enables sticky provider routing from turn 1 ([OpenRouter prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching)). Never injects `provider.order`. |
-| `command_code` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | [Command Code](https://commandcode.ai/docs/provider) documents no custom header; forwarding standard headers and `prompt_cache_key` preserves upstream cache hints. |
-| `open_design_amr` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | Same safe default as Command Code. |
+| `opencode_go` | `x-opencode-session: <affinity_id>` | None | Mandatory on [OpenCode Go](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo); prevents `400 MissingSessionID`. On `Own` keys, native `x-claude-code-session-id` and `session_id` pass through; on `Shared`/`Global` keys, they are stripped and replaced by the salted `x-opencode-session`. |
+| `openrouter` | `x-session-id: <affinity_id>` | `session_id: "<affinity_id>"` (truncated to UTF-8 boundary `<= 256` bytes) | Enables sticky provider routing from turn 1 ([OpenRouter prompt caching](https://www.google.com/search?q=https%3A%2F%2Fopenrouter.ai%2Fdocs%2Fguides%2Fbest-practices%2Fprompt-caching)). Never injects `provider.order`. |
+| `command_code` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | [Command Code](https://www.google.com/search?q=https%3A%2F%2Fcommandcode.ai%2Fdocs%2Fprovider) documents no custom header; forwarding standard headers and `prompt_cache_key` preserves upstream cache hints. |
+| `open_design_amr` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | Same default as Command Code. |
 | `custom` | Configurable header list (default `x-session-id`, `x-session-affinity`) | Configurable (`off`, `prompt_cache_key`, or `session_id`) | Allows operators and users to match Fireworks, DeepInfra, vLLM Router, or LiteLLM upstream requirements. |
 
 ## 12. Protocol handling and transparent proxying
 
-LLMRoller acts as a transparent wire proxy for OpenAI Chat Completions (`POST /v1/chat/completions`), OpenAI Responses (`POST /v1/responses`), and Anthropic Messages (`POST /v1/messages`). It modifies only what routing and usage accounting need.
+LLMRoller acts as a transparent wire proxy for OpenAI Chat Completions (`POST /v1/chat/completions`), OpenAI Responses (`POST /v1/responses`), and Anthropic Messages (`POST /v1/messages`). It buffers the inbound request body once in a shared `Bytes` buffer to read `model` and support pre-first-byte failover. It edits only top-level routing and usage fields, and streams responses chunk-by-chunk after the first valid frame.
 
-### 12.1 Inbound and outbound header policy
+### 12.1 Request and response header policies
 
-The proxy applies a deterministic four-rule header pipeline to every request.
+The proxy applies a deterministic four-rule request header pipeline to every outbound upstream request.
 
 | Rule | Header names | Action taken |
 | --- | --- | --- |
-| 1. Strip hop-by-hop, org-scoping, and proxy internal | `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `host`, `content-length`, `cookie`, `openai-organization`, `openai-project`, `forwarded`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `x-real-ip`, `x-llmroller-*` | Removed unconditionally before provider `add_headers` (which cannot override `host`, `authorization`, or `content-length`). Outbound `accept-encoding` is forced to `identity` on tapped inference calls so SSE usage/trace taps and chunk suppression operate on uncompressed UTF-8 frames without recompression overhead. |
-| 2. Strip provider deny-list | Any header matching a pattern in `provider.config.strip_headers` (for example, experimental `anthropic-beta` flags rejected by a specific upstream) | Removed when configured on that provider. |
+| 1. Strip hop-by-hop, org-scoping, and proxy internal | `connection` (plus any header named in `connection`), `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `host`, `content-length`, `cookie`, `set-cookie`, `openai-organization`, `openai-project`, `forwarded`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `x-real-ip`, `x-llmroller-*`, plus (when routing to `Shared` or `Global` tiers) all recognized session headers in Precedence Steps 1..6 | Removed unconditionally before provider `add_headers` (which cannot override `host`, `authorization`, or `content-length`). Outbound `accept-encoding` is forced to `identity` on inference and `/usage` calls. |
+| 2. Strip provider deny-list and token filters | Any header matching a glob in `provider.config.strip_headers`, plus individual comma-separated tokens listed in `provider.config.strip_header_tokens` (for example stripping an unsupported beta token from `anthropic-beta` and dropping the header if empty) | Removed when configured on that provider. |
 | 3. Replace credentials | `authorization`, `x-api-key` | Stripped of the client's `llr_...` key and replaced with the decrypted upstream key in the provider's configured auth scheme (`Authorization: Bearer <secret>` or `x-api-key: <secret>`). |
-| 4. Forward all other headers verbatim | `user-agent`, `accept`, `content-type`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `originator`, `x-claude-code-*`, `x-codex-*`, `x-opencode-*`, `x-session-*`, `x-stainless-*`, `x-cmd-zdr`, and any future agent headers | Forwarded unchanged in their original order (preserving casing on HTTP/1.1 and lowercase header names per RFC 9113 on HTTP/2; [Claude Code Gateway Guide](https://code.claude.com/docs/en/llm-gateway)). |
+| 4. Forward remaining headers | `user-agent`, `accept`, `content-type`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `originator`, `x-claude-code-*` (or agent-only headers on `Shared`/`Global`), `x-stainless-*`, `x-cmd-zdr`, and any future agent headers | Forwarded unchanged in value; multiple values of the same header name preserve their relative order, and header names are sent in lowercase (RFC 9110 Section 5.1 / RFC 9113). The relative order of distinct header names is not preserved. |
+
+#### 12.1.1 Response header policy (`R1` through `R5`)
+
+When an upstream response commits at the first valid frame, LLMRoller filters response headers through five rules. These rules prevent `content-length` mismatches and strip upstream account identifiers on pooled keys (`SEC-18`):
+
+| Step | Response header rule |
+| --- | --- |
+| `R1` | Remove all hop-by-hop headers: `connection`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, plus every header name listed inside a `connection` header value. |
+| `R2` | Remove `content-length` and `content-encoding` unconditionally (LLMRoller re-frames responses; `hyper` sets chunked transfer encoding for streams and exact length for buffered non-streaming bodies). Remove `set-cookie` and `set-cookie2`. |
+| `R3` | Retain only allow-listed headers: `content-type`, `cache-control`, `x-request-id`, `request-id`, `retry-after`, `openai-processing-ms`, `anthropic-version`, any additional lowercase header names in `provider.config.response_header_allow`, and (only when the caller is the personal key owner on tier `Own` or an `admin`) `x-ratelimit-*` and `anthropic-ratelimit-*`. |
+| `R4` | When the chosen key is on tier `Shared` or `Global` (and the caller is not an `admin`), strip `openai-organization`, `openai-project`, `anthropic-organization-id`, every `x-ratelimit-*`, every `anthropic-ratelimit-*`, `cf-ray`, `server`, and `via` (`R4` overrides `response_header_allow`). `x-request-id` and `request-id` are kept for per-request supportability. |
+| `R5` | Add `x-llmroller-request-id: <ULID>`. When the chosen key is on tier `Shared` or `Global`, add `x-llmroller-upstream-scope: shared` or `global` (never exposing the key label). |
 
 ### 12.2 User-Agent policy
 
@@ -1407,98 +2003,146 @@ Each provider configures `ua_policy` to one of three modes shown below.
 | Mode | Policy behavior |
 | --- | --- |
 | `pass` (default for Command Code, Open Design AMR, OpenRouter) | Forwards the client's `User-Agent` header unchanged, or sends `llmroller/1.0` when the client sent no `User-Agent`. |
-| `label` (default for OpenCode Go) | Forwards coding-agent `User-Agent` values (`claude-cli/*`, `codex-cli/*`, `opencode/*`, `hermes/*`) unchanged, and replaces generic HTTP library strings (`curl/*`, `python-requests/*`, `node-fetch/*`) with `llmroller/1.0` to satisfy [OpenCode Go's client identification guidelines](https://opencode.ai/docs/go) without impersonating another vendor. |
+| `label` (default for OpenCode Go) | Forwards coding-agent `User-Agent` values (`claude-cli/*`, `codex-cli/*`, `opencode/*`, `hermes/*`) unchanged, and replaces generic HTTP library strings (`curl/*`, `python-requests/*`, `node-fetch/*`) with `llmroller/1.0` to satisfy [OpenCode Go's client identification guidelines](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo) without impersonating another vendor. |
 | `reject` | Returns HTTP 400 if the client sends an empty or generic library `User-Agent`. |
 
-### 12.3 Surgical JSON body edits and prefix cache preservation
+### 12.3 Surgical JSON body validation and edits
 
-LLM providers compute prompt cache hashes over the exact serialized sequence of `system`, `tools`, and `messages` (or `input`). Re-serializing the entire JSON payload through an unordered `HashMap` would permute object keys and destroy prompt cache hits.
+LLM providers compute prompt cache hashes over the exact serialized sequence of `system`, `tools`, and `messages` (or `input`). Re-serializing the entire JSON payload through a DOM map would permute object keys and destroy prompt cache hits.
 
-LLMRoller parses only top-level fields using a zero-copy span scanner (`serde_json::value::RawValue` over an ordered slice of `(Key, &RawValue)` pairs) and makes at most three surgical edits:
-1. If `upstream_model_id` differs from the client's `model` string, replace the `model` string slice with `upstream_model_id`.
-2. When `session_profile` configures a body field (`prompt_cache_key` or `session_id`), append it if absent (omitting a leading comma on `{}`). On `global` or `shared` keys, replace any existing span so tenant-salted affinity (`SEC-16`) always wins.
-3. On a streaming `chat` request without `stream_options.include_usage: true`, inject `"stream_options":{"include_usage":true}` (or splice `"include_usage":true` into an existing `stream_options` object span) when `provider.config.inject_include_usage == true`, and set `strip_injected_usage_chunk = true`.
+`crates/proto::body_edit::scan_top_level(bytes)` scans top-level fields in a single pass and enforces the normative validation and editing contract below before routing:
 
-When none of these three edits apply, LLMRoller forwards the original `bytes::Bytes` buffer untouched (`TRN-1`).
-
-### 12.4 Zero-buffering SSE streaming tee and disconnect cancellation
-
-When an upstream response starts, the forwarder wraps the `reqwest` byte stream in a custom `Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send>>`:
-1. Every `Bytes` chunk read from the upstream socket is yielded immediately to `axum::body::Body::from_stream` so hyper writes it to the client socket within 1 ms (`PERF-2`).
-2. Before yielding a chunk, the stream adapter sends a reference-counted clone (`Bytes::clone` is an O(1) atomic increment) to the per-request `SseUsageTap` state machine.
-3. If `strip_injected_usage_chunk` is `true` on a `chat` stream, the stream adapter inspects SSE `data:` frames that contain `"usage"` with `"choices":[]`; it feeds that frame to `SseUsageTap` and suppresses it from the client output so strict clients do not fail on an unexpected empty-choices chunk (`API-5`).
-4. If the client closes its TCP connection mid-stream, `hyper` drops the response stream. This drops the `reqwest` future and closes the upstream request within 1 s (`API-7`).
-
-#### 12.4.1 SSE chunk framing, partial-line holdback, and UTF-8 carryover state machine
-
-TCP packets and HTTP/2 `DATA` frames can split an SSE stream at any byte offset. They can split a `data: {...}\n\n` line or a multi-byte UTF-8 character (`0xC2..=0xF4`). LLMRoller handles chunk boundaries with two decoupled state machines so client forwarding delay stays under 1 ms (`PERF-2`).
-
-| Component | State machine behavior across arbitrary `Bytes` chunk splits |
+| Condition or operation | Normative behavior |
 | --- | --- |
-| Outbound client stream (`crates/proxy::forward`) | **Case A (`strip_injected_usage_chunk == false`):** Forwards every `Bytes` chunk to the client socket immediately with zero line buffering. **Case B (`strip_injected_usage_chunk == true`):** Streams all chunks immediately until all requested `n` choices (default `1`) have emitted a non-null `finish_reason`. Then enters `PostFinishReasonHoldback` (holding at most 16 KiB until `\n\n`) and parses the final `data:` JSON envelope: if `choices` is empty (`[]`) and `usage` is present, suppresses that frame from the client stream and forwards `data: [DONE]\n\n` (`API-5`). |
-| Asynchronous tap (`SseUsageTap` and `TraceTap` in `crates/proto`) | Processes `Bytes::clone` chunks synchronously on each poll step with zero channel backpressure. Maintains a 1-to-3 byte `utf8_carryover: [u8; 3]` buffer for incomplete UTF-8 codepoints and a 64 KiB line accumulator; if a single SSE line exceeds 64 KiB, switches to a streaming JSON token scanner for `usage` and replaces oversized base64 data URIs in `TraceTap` with `[base64_asset_truncated]`. |
+| Body is not valid UTF-8, begins with a UTF-8 BOM (`EF BB BF`), top-level value is not a JSON object (`{...}`), or non-whitespace bytes follow the closing `}` | Reject immediately with HTTP 400 `invalid_request_error`. |
+| Duplicate top-level JSON key (after JSON string unescaping of object member names) | Reject immediately with HTTP 400 `invalid_request_error` (`"duplicate top-level JSON key: <key>"`, key truncated to 64 bytes with control characters stripped) so parser differentials cannot bypass `allowed_models`, pricing, or `stream` detection. |
+| Type validation of top-level routing fields | `model` must be a JSON string; `stream` (when present) must be a JSON boolean; `previous_response_id` (when present) must be a JSON string; otherwise return HTTP 400 `invalid_request_error`. |
+| String escaping on insertion or replacement | Every inserted or replaced string value (`upstream_model_id` or session affinity token) is serialized via `serde_json::to_writer` as a JSON string so quotes or backslashes can never break JSON syntax or inject keys. |
+| Session string truncation | Truncated to the largest UTF-8 character boundary at or below `session_profile.max_len` (`256` bytes, computed via `s.char_indices()`), then JSON-encoded. |
+| Member insertion position | New top-level members are inserted immediately after the opening `{` as `"key":value,` (or `"key":value` if the object was `{}`), avoiding trailing-comma edge cases. |
+| Session body-field handling by tier | On `Own` tier, insert the configured session body field only if absent. On `Shared` and `Global` tiers, delete any client-supplied spans for `session_id`, `prompt_cache_key`, `promptCacheKey`, and `metadata.session_id`, and write the provider's configured session body field with the tenant-salted token. |
+
+For streaming `chat` requests (`stream: true`), `usage_reporting.chat_stream` (`inject`, `native`, or `none`) governs `stream_options.include_usage` editing:
+
+| Client request body state | Action when `chat_stream == "inject"` | `strip_injected_usage_chunk` |
+| --- | --- | --- |
+| `stream` is absent or `false`, or `chat_stream != "inject"` | None | `false` |
+| No `stream_options` field present | Insert `"stream_options":{"include_usage":true}` after `{` | `true` |
+| `stream_options` value is `null` | Replace the `null` span with `{"include_usage":true}` | `true` |
+| `stream_options` is an object without `include_usage` | Insert `"include_usage":true` as the first member of `stream_options` | `true` |
+| `stream_options.include_usage` is `false` | Replace the `false` span with `true` (never creating a duplicate key) | `true` |
+| `stream_options.include_usage` is already `true` | None | `false` |
+
+When the chosen key is in tier `Own` and no edit applies, LLMRoller forwards the original `bytes::Bytes` buffer with identical pointer identity (`TRN-1`).
+
+### 12.4 Pre-first-frame holding, SSE streaming tee, and `RequestLifecycle` guard
+
+Outbound `accept-encoding` is forced to `identity`. If an upstream still returns `gzip`, `deflate`, `br`, or `zstd`, the forwarder decodes the stream via `async-compression` and strips `content-encoding`. Any other encoding before the first byte triggers a failover-eligible `TransportError::UnsupportedEncoding`.
+
+#### 12.4.1 Frame filter, inline `SseUsageTap`, and bounded `TraceTap` execution model
+
+LLMRoller decouples the usage tap, the trace tap, and the client stream so chunk forwarding never blocks and usage frames are never lost:
+
+| Component | Runtime context | Input and memory bound | Backpressure / overflow behavior |
+| --- | --- | --- | --- |
+| Outbound client stream and usage-chunk filter (`crates/proxy::forward`) | Inline in the response body `Stream::poll_next` | When `strip_injected_usage_chunk == false`, forwards every `Bytes` chunk immediately after first-frame commit. When `strip_injected_usage_chunk == true`, buffers only the incomplete tail of the current SSE frame in `partial: BytesMut` (max `64 KiB`): each complete frame (`
+
+` or `
+
+`) whose single `data:` JSON has `"choices":[]` and an object `"usage"` is fed to `SseUsageTap` and suppressed from the client; all other complete frames (and any partial frame exceeding `64 KiB` or remaining at stream end) are flushed immediately. | Forwarding delay is bounded by single-frame completion (`<= 1 ms` per complete frame, `PERF-2`). |
+| `SseUsageTap` (`crates/proto::sse_tap`) | Inline synchronous call inside `poll_next` | Maintains a 3-byte `utf8_carryover` and a `64 KiB` line accumulator; JSON-parses **only** frames whose event or data can carry usage or response IDs: `chat` frames containing `"usage"`, `responses` events `response.created`, `response.completed`, `response.incomplete`, `response.failed`, and `messages` events `message_start`, `message_delta`, `message_stop` (plus accumulating decoded output text byte counts for abort estimation). | Zero channel queue; work per frame is `O(frame_len)` capped at `64 KiB`, so usage frames can never be dropped by channel backpressure. |
+| `TraceTap` collector (`crates/proto::trace_tap`) | Dedicated async task per traced request | Receives `Bytes::clone` chunks via `tokio::sync::mpsc::channel(256)` using non-blocking `try_send`, bounded by a global `trace_inflight_bytes` semaphore (`64 MiB`) and a per-stream `1 MiB` (`256 MiB` global) output accumulator. | On `try_send` failure or budget exhaustion, sets `trace_dropped = true`, stops sending chunks for that request, records `truncated_content = 1`, and increments `llmroller_trace_input_dropped_total`. Client streaming is never delayed. |
+| Trace sealer pool (`crates/store::traces`) | Fixed pool of `trace_sealer_threads` (default `2`) OS threads (`std::thread::Builder`) | Fed by `crossbeam_channel::bounded::<SealJob>(64)` using `try_send`. Each thread owns one reusable `zstd::bulk::Compressor` (level 3, `~3.5 MiB` context per thread = `~7 MiB` total). | On channel `Full`, drops the turn's trace, sets `usage_events.trace_dropped = 1`, and increments `llmroller_trace_dropped_total{reason="sealer_backlog"}`. |
+
+#### 12.4.2 Deterministic completion and abort guard (`RequestLifecycle`)
+
+Every routed request is owned by a `RequestLifecycle` struct wrapped inside the outbound response stream. `RequestLifecycle::drop` runs synchronously once (`finalized` flag) with zero I/O across all five `Termination` modes (`Completed`, `UpstreamTruncated`, `ClientGone`, `IdleTimeout`, `ShutdownCut`):
+1. Computes token counts and `cost_micro_usd` from `SseUsageTap` (using observed usage if received, or Section 13.1 abort estimation with `incomplete = 1` otherwise).
+2. Posts the actual or estimated cost to window rings and monthly accumulators before subtracting `est` from `reserved`.
+3. Releases the `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` permit (if not already released at first valid frame) and any `ProbeSlotGuard`.
+4. Enqueues the `UsageEvent` (with `termination` and `incomplete`), `usage_attempts` rows, and 5-minute/hourly rollup deltas, and finalizes any active `TraceTap` collector as truncated.
 
 ### 12.5 Token and cost extraction across protocols
 
-The `SseUsageTap` (for `text/event-stream`) and `JsonUsageExtractor` (for `application/json`) normalize token counts across the three wire protocols into five mutually exclusive integer fields.
+`SseUsageTap` and `JsonUsageExtractor` normalize token counts across all three wire protocols into five mutually exclusive non-negative integer fields using the normative formulas below.
 
 | Normalized field | OpenAI `chat` formula | OpenAI `responses` formula | Anthropic `messages` formula |
 | --- | --- | --- | --- |
-| `input_uncached_tokens` | `coalesce(usage.prompt_cache_miss_tokens, max(0, usage.prompt_tokens - coalesce(usage.prompt_tokens_details.cached_tokens, usage.prompt_cache_hit_tokens, 0) - coalesce(usage.prompt_tokens_details.cache_write_tokens, 0)))` | `max(0, usage.input_tokens - coalesce(usage.input_tokens_details.cached_tokens, 0))` | `usage.input_tokens` (already excludes cache reads and writes) |
-| `cache_read_tokens` | `coalesce(usage.prompt_tokens_details.cached_tokens, usage.prompt_cache_hit_tokens, 0)` | `coalesce(usage.input_tokens_details.cached_tokens, 0)` | `coalesce(usage.cache_read_input_tokens, 0)` |
-| `cache_write_tokens` | `coalesce(usage.prompt_tokens_details.cache_write_tokens, 0)` | `0` | `coalesce(usage.cache_creation_input_tokens, 0)` |
-| `output_tokens` | `usage.completion_tokens` (includes reasoning) | `usage.output_tokens` (includes reasoning) | `usage.output_tokens` (from final `message_delta`) |
-| `reasoning_tokens` | `coalesce(usage.completion_tokens_details.reasoning_tokens, 0)` | `coalesce(usage.output_tokens_details.reasoning_tokens, 0)` | Extracted when upstream includes extended thinking token metadata, else `0` |
-| `provider_cost_micro_usd` | `round(usage.cost * 1_000_000)` when `usage.cost` is present | `round(usage.cost * 1_000_000)` when `usage.cost` is present | `round(usage.cost * 1_000_000)` when present |
+| `cache_read_tokens` | `coalesce(usage.prompt_tokens_details.cached_tokens, usage.prompt_cache_hit_tokens, 0)` | `coalesce(usage.input_tokens_details.cached_tokens, 0)` | Last observed `cache_read_input_tokens` across `message_start` and `message_delta` (default `0`) |
+| `cache_write_tokens` | `coalesce(usage.prompt_tokens_details.cache_write_tokens, 0)` | `coalesce(usage.input_tokens_details.cache_write_tokens, 0)` | Last observed `cache_creation_input_tokens` across `message_start` and `message_delta` (default `0`) |
+| `input_uncached_tokens` | If `usage.prompt_cache_miss_tokens` is present: that value; else `max(0, usage.prompt_tokens - cache_read_tokens - cache_write_tokens)` | `max(0, usage.input_tokens - cache_read_tokens - cache_write_tokens)` | Last observed `input_tokens` across `message_start` and `message_delta` (already excludes cache reads and writes) |
+| `output_tokens` | `usage.completion_tokens` (includes reasoning) | `usage.output_tokens` (includes reasoning) | Last observed `output_tokens` across `message_start` and `message_delta` |
+| `reasoning_tokens` | `coalesce(usage.completion_tokens_details.reasoning_tokens, 0)` | `coalesce(usage.output_tokens_details.reasoning_tokens, 0)` | Upstream numeric reasoning token field when present, else `0` (included in `output_tokens`) |
+| `provider_cost_micro_usd` | `(usage.cost * 1_000_000.0).round() as i64` (half away from zero) when `usage.cost` is a finite `f64` in `[0.0, 1000.0]`; out-of-range values are ignored and logged | Same validation and rounding rule | Same validation and rounding rule |
 
-Warning: OpenAI `prompt_tokens` and `input_tokens` include `cached_tokens`, whereas Anthropic `input_tokens` excludes `cache_read_input_tokens` and `cache_creation_input_tokens`. Subtracting `cached_tokens` on `chat` and `responses` before multiplying by `input_per_mtok_micro_usd` prevents double-charging cached tokens.
+### 12.6 Content-addressed trace storage and Session Chat Preview reconstruction
 
-### 12.6 SSE delta reassembly and session chat reconstruction for content traceability
+When a request is traced, request blocks are extracted synchronously from the buffered request `Bytes` before the preflight permit is released. Each block is canonicalized (`cache_control` and `citations` removed; binary/base64 assets `> 1 KiB` replaced with SHA-256 placeholders) and hashed (`block_hash = hex_lower(SHA-256(canonical_block_bytes))`). New blocks not in the 100,000-entry in-memory block-hash LRU are sealed into `trace_blocks`, while `trace_records.payload_enc` seals `StoredTurnTrace` v2:
 
-When content traceability mode is active (`TRC-2`, `TRC-3`), `SseUsageTap` and `JsonUsageExtractor` build a `NormalizedTurnTrace`. They also keep the raw request and response JSON.
+```json
+{
+  "v": 2,
+  "request_skeleton": {
+    "model": "claude-sonnet-4.6",
+    "system": [{"$blk": "a1b2..."}],
+    "tools": [{"$blk": "c3d4..."}],
+    "messages": [{"$blk": "e5f6..."}]
+  },
+  "block_refs": ["a1b2...", "c3d4...", "e5f6..."],
+  "response": {
+    "assistant_reasoning": "Let us run cargo test -p llmroller-core first.",
+    "assistant_tool_calls": [
+      {"id": "toolu_01A", "name": "bash", "arguments_json": "{"cmd":"cargo test -p llmroller-core"}"}
+    ],
+    "assistant_text": ""
+  },
+  "response_raw": null,
+  "truncation": null
+}
+```
 
-| Protocol | Inbound fields parsed | Streamed SSE deltas reassembled into `NormalizedTurnTrace` |
-| --- | --- | --- |
-| OpenAI `chat` | `messages[]` (`system`, `developer`, `user`, `assistant`, `tool`), `tools[]`, `temperature`, `reasoning_effort` | Concatenates `choices[0].delta.content` into `assistant_text`, `choices[0].delta.reasoning_content` into `reasoning_text`, and merges `choices[0].delta.tool_calls[i]` by `index` into complete `ToolCall { id, name, arguments_json }` objects. |
-| OpenAI `responses` | `instructions`, `input` (string or item array), `tools[]`, `previous_response_id`, `reasoning` | Accumulates `response.output_text.delta` events into `assistant_text`, `response.reasoning_summary_text.delta` into `reasoning_text`, and `response.function_call_arguments.delta` (or completed `function_call` items in `response.completed`) into `ToolCall` records. |
-| Anthropic `messages` | `system` (string or block array), `messages[]` (`user` text/tool_result and `assistant` text/thinking/tool_use blocks), `tools[]`, `thinking` | Tracks active content blocks from `content_block_start` (`text`, `thinking`, `tool_use`) and appends `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta`) until `content_block_stop`. |
+Because each turn record is self-contained via `block_refs`, dropping, truncating, or purging an earlier turn never corrupts later turns. During read-time reconstruction (`crates/core::chat_preview`):
+1. The handler queries `trace_records` ordered by `(ts ASC, request_id ASC)` using cursor pagination (`?after=<ts>:<request_id>&limit=50`). Each page query fetches `limit + 1` rows starting one row **before** the cursor (the predecessor turn on that `thread_id`) in a short read transaction.
+2. For consecutive stateless turns on the same `thread_id`, Longest Common Prefix (`LCP`) is computed directly over the `block_refs` hash arrays **without decrypting** unchanged prefix blocks. Only the new suffix blocks `turn_k.message_block_refs[LCP..]` (capped at `8 MiB` of decrypted content per page; excess blocks render as `"load more"` placeholders fetched via `GET /api/user/traces/{request_id}`) are fetched from `trace_blocks` and decrypted.
+3. If a referenced block is absent from `trace_blocks` (expired), it renders as a `"content expired"` placeholder card without affecting any other block or turn.
 
-All turns in one conversation share a pinned `session_hash`. The reconstructor (`crates/core::chat_preview`) builds a clean read-only chat timeline from the ordered `trace_records` rows (`turn_index = 1..N`).
+#### 12.6.1 Session Chat Preview JSON contract (`SessionChatPreviewResponse`)
 
-| Turn pattern | Timeline reconstruction rule |
-| --- | --- |
-| Stateless turns (`chat` and `messages`) | Within each `(session_hash, coalesce(subagent_id, "main"))` thread, turn `k` resends prior messages `[m_1..m_p]` plus new user or `tool_result` blocks. The reconstructor strips transient `cache_control` breakpoint fields before hashing each block `(role, canonical_content_hash, tool_call_id)` and computes the positional Longest Common Prefix (`LCP`) against turn `k - 1`, emitting `turn_k.inputs[LCP..]` so repeated user prompts (like `"continue"`) at new positions are preserved and moving `cache_control` markers never cause false mismatches. |
-| Stateful turns (`responses` with `previous_response_id`) | Each turn already holds only new delta inputs and new assistant outputs, so the reconstructor links them directly in `turn_index` order. |
-| Context compaction or subagent branches | When `LCP < len(turn_{k-1}.all_messages)` on the same `subagent_id` thread, the reconstructor sets `context_compacted_or_branched = true` and emits a divider card; parallel subagent turns (`subagent_id != None`) render in collapsible subagent thread groups. |
-
-#### 12.6.1 `NormalizedTurnTrace` and Session Chat Preview JSON contract
-
-Each `trace_records.payload_enc` blob decrypts and decompresses (`zstd`) to a `StoredTurnTrace` JSON document. The endpoints `GET /api/user/sessions/{session_hash}/chat` and `GET /admin/api/sessions/{session_hash}/chat` return a `SessionChatPreviewResponse` matching the schema below (`TRC-4`, `TRC-5`, `TRC-6`).
+Because one session can span multiple models and subagent threads, `canonical_model` and `protocol` live on each turn. Similarly, `system_instructions` and `tools` live per thread. Upstream key metadata is projected through `project_key(viewer, key)` so standard users see `"global pool"` on global routes.
 
 ```json
 {
   "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
   "owner_user_id": "01J9X0USER...",
   "client_key_prefix": "llr_7f9a",
-  "canonical_model": "claude-sonnet-4-6",
-  "protocol": "messages",
   "total_turns": 2,
-  "pagination": { "from_turn": 1, "limit": 50, "next_turn": null },
-  "system_instructions": "You are an expert Rust systems engineer.",
-  "tools": [
-    { "name": "bash", "description": "Run a shell command", "parameters": { "type": "object" } }
-  ],
+  "pagination": {
+    "after": null,
+    "limit": 50,
+    "next_after": null
+  },
+  "threads": {
+    "main": {
+      "system_instructions": "You are an expert Rust systems engineer.",
+      "tools": [
+        { "name": "bash", "description": "Run a shell command", "parameters": { "type": "object" } }
+      ]
+    }
+  },
   "timeline": [
     {
-      "turn_index": 1,
+      "ordinal": 1,
       "request_id": "01J9X5REQ1...",
       "ts": 1792401000000,
+      "thread_id": "main",
       "pin_outcome": "new_pin",
-      "canonical_model": "claude-sonnet-4-6",
+      "canonical_model": "claude-sonnet-4.6",
       "protocol": "messages",
-      "subagent_id": null,
+      "upstream_key_id": "01J9X1B...",
       "upstream_key_label": "my-opencode-go-1",
       "provider_scope": "personal",
+      "system_changed": false,
+      "new_system_instructions": null,
       "context_compacted_or_branched": false,
       "truncated_content": false,
       "new_input_messages": [
@@ -1506,7 +2150,7 @@ Each `trace_records.payload_enc` blob decrypts and decompresses (`zstd`) to a `S
       ],
       "assistant_reasoning": "Let us run cargo test -p llmroller-core first.",
       "assistant_tool_calls": [
-        { "id": "toolu_01A", "name": "bash", "arguments_json": "{\"cmd\":\"cargo test -p llmroller-core\"}" }
+        { "id": "toolu_01A", "name": "bash", "arguments_json": "{"cmd":"cargo test -p llmroller-core"}" }
       ],
       "assistant_text": "",
       "metrics": {
@@ -1527,17 +2171,19 @@ Each `trace_records.payload_enc` blob decrypts and decompresses (`zstd`) to a `S
 
 ## 13. Pricing, limits, and source provider usage engine
 
-LLMRoller combines a deterministic local micro-USD pricing and window-budget engine with live polling, reconciliation, and pass-through of each source provider's `/usage` API.
+LLMRoller combines local micro-USD pricing and window budgets with single-flight `/usage` polling, time-bounded observation projections, and sanitized `/usage` pass-through.
 
-### 13.1 Local price book and integer micro-USD cost calculation
+### 13.1 Local price book, fallback rates, and token estimation
 
-Every `(provider_id, provider_kind, upstream_model_id)` row in `prices` (`provider_id = ""` for defaults, or `provider.id` for custom overrides) sets micro-USD rates per 1,000,000 tokens. It also supports two optional modifiers:
-1. Context tiers (`tiers_json`) define replacement rates when `total_input_tokens = input_uncached + cache_read + cache_write` exceeds a threshold (such as the 200,000-token tier on OpenCode Go and Command Code).
-2. Time-of-day schedules (`schedule_json`) define UTC weekday and hour ranges that apply a rate multiplier. For example, [OpenCode Go](https://opencode.ai/docs/go) and [Command Code](https://pi.dev/packages/pi-commandcode-provider) apply a 2x peak rate for DeepSeek models on weekdays from `01:00–04:00 UTC` and `06:00–10:00 UTC`.
+Every `(provider_id, provider_kind, upstream_model_id)` row in `prices` (`provider_id = ""` for preset/kind defaults, or a specific `provider.id` for custom/personal overrides; lookup checks `(provider.id, kind, model)` first, then `("", kind, model)`) sets micro-USD rates per 1,000,000 tokens. It supports two validated modifiers:
+1. Context tiers (`tiers_json`) apply when `total_input_tokens = input_uncached + cache_read + cache_write` satisfies `total_input_tokens >= min_total_input_tokens` and (`max_total_input_tokens` is `null` or `total_input_tokens <= max_total_input_tokens`). Tiers for a price row must not overlap (validated on write with HTTP 422).
+2. Time-of-day schedules (`schedule_json`) define half-open `[start, end)` UTC minute ranges (`0..1440`) and ISO weekdays evaluated at request start (`ts` of first byte sent upstream). Schedules for a price row must not overlap (HTTP 422).
 
-For each request at start timestamp `ts_utc`, if the upstream response includes an explicit dollar cost (`usage.cost` on [OpenRouter](https://openrouter.ai/docs/cookbook/administration/usage-accounting)), LLMRoller records `cost_micro_usd = round(usage.cost * 1_000_000)` and `cost_source = 'provider'`. Otherwise, LLMRoller selects the active tier and schedule rate for `ts_utc` and computes the cost in integer micro-USD:
+Every `usage_events` row has a non-null `cost_micro_usd`:
+1. If the upstream response includes a finite `usage.cost` in `[0.0, 1000.0]`, `cost_micro_usd = (usage.cost * 1_000_000.0).round() as i64` (half away from zero) and `cost_source = 'provider'`.
+2. Otherwise LLMRoller uses the matching `prices` row (or `settings.unpriced_fallback_rates` with `cost_source = 'fallback_rate'`) and computes `cost_micro_usd` with `i128` ceiling division:
 
-```
+```text
 cost_micro_usd = div_ceil(
     input_uncached_tokens * rate_in
   + cache_read_tokens     * rate_cache_read
@@ -1547,120 +2193,108 @@ cost_micro_usd = div_ceil(
 )
 ```
 
-Using 128-bit intermediate integer arithmetic (`i128`) and ceiling division prevents integer overflow and floating-point drift.
+#### 13.1.1 Binary-aware input token estimator and aborted output estimation
 
-### 13.2 Rolling and anchored budget window ring counters
+Pre-flight reservations and aborted-stream costing (`cost_source = 'estimated_incomplete'`) share `crates/core::pricing::estimate_input_tokens(body: &[u8]) -> i64` so base64 media are never miscounted as text:
 
-Each `budget_windows` rule attaches either to an entire `upstream_key_id` (base plan cap) or to a specific `(upstream_key_id, canonical_id)` route (per-model allowance).
-
-| Window kind | Supported periods | In-memory data structure | Reset semantics |
-| --- | --- | --- | --- |
-| `rolling` | `5h` (300 min), `6h` (360 min), `7d` (168 h) | Ring buffer of 360 one-minute buckets (for `<= 6h`, where `5h` sums the trailing 300 buckets) or 336 half-hour buckets (for `<= 7d`) | Sliding sum over active buckets at `now_ms` (or `reconciled_baseline_micro_usd + local_spend_since(reconciled_at_ms)` when synced from an upstream `/usage` snapshot). `5h` rings rebuild from `usage_events` at startup; `7d` rings rebuild from `usage_rollups_hourly` plus current-hour `usage_events`. |
-| `anchored` | `5h`, `7d`, `1mo` (UTC calendar month or provider billing anchor) | Single accumulator `used_micro_usd` plus `window_start_ms` and `resets_at_ms` | Resets to `0` when `now_ms >= resets_at_ms` and advances `resets_at_ms` forward past `now_ms` (`resets_at_ms += ceil((now_ms - resets_at_ms) / period_ms) * period_ms`). Rebuilt at startup from `usage_rollups_hourly`. |
-
-Built-in presets seed the documented plan windows automatically when a user or admin selects a plan template:
-1. The OpenCode Go preset seeds rolling 5 h ($12), rolling 7 d ($30), and anchored 1 mo ($60).
-2. The [Command Code GOAT](https://commandcode.ai/docs/plans/goat) preset seeds rolling 5 h ($14), rolling 7 d ($35), anchored 1 mo ($70), and per-model boosted route allowances.
-3. The Open Design Go preset seeds rolling 5 h ($10), rolling 7 d ($30), and anchored 1 mo ($120).
-
-#### 13.2.1 RAII in-flight budget reservation guard (`InFlightBudgetGuard`)
-
-Concurrent requests arriving at 97.9% window spend could otherwise pass Check 8 (`Section 10.1`) together and overshoot a cap. To prevent TOCTOU races and under-reservation on large prompts, `crates/core::windows` enforces a size-proportional atomic reservation using an RAII guard (`InFlightBudgetGuard`):
-1. Before route selection, LLMRoller computes `estimated_micro_usd = max(50_000, div_ceil((request_body_bytes / 3) * rate_in + coalesce(max_tokens, 4096) * rate_out, 1_000_000))`.
-2. Selecting a route runs an atomic compare-and-swap loop (`AtomicI64::fetch_update`) across all attached windows and monthly caps (`SHR-2`, `USR-5`, `CLK-5`). It succeeds only when `used + reserved + estimated + reserve <= limit` on every counter, rolling back on failure.
-3. When the stream ends or aborts, `InFlightBudgetGuard::drop` atomically adds `actual_cost_micro_usd - estimated_micro_usd`. This single atomic update prevents any dip between releasing the reservation and recording cost.
-
-#### 13.2.2 UTC calendar-month accumulators for shares, users, and client keys
-
-Monthly caps on `provider_shares.max_monthly_micro_usd`, `users.global_budget_micro_usd_month`, and `client_keys.budget_micro_usd_month` are tracked in lock-free `DashMap<(UtcYearMonth, Id), AtomicI64>` accumulators anchored to `00:00:00 UTC` on the first day of each calendar month. At startup, all three accumulator maps are reconstructed in `< 10 ms` by summing `usage_rollups_hourly` rows for the current UTC month.
-
-### 13.3 Source provider `/usage` polling, parsing, and auto-reconciliation
-
-Local token accounting can drift from a provider's ledger when keys are used outside LLMRoller, when promotions apply, or when window boundaries shift. To remove drift, LLMRoller runs an upstream `/usage` poller and reconciler in each `ProviderAdapter`.
-
-#### 13.3.1 Provider `/usage` adapter profiles
-
-Each provider preset configures its upstream usage endpoints and normalizer rules.
-
-| Provider kind | Polled endpoint(s) | Normalized fields extracted | Fallback when unavailable |
-| --- | --- | --- | --- |
-| `opencode_go` | `GET https://opencode.ai/zen/go/v1/usage` ([opencode#43983](https://github.com/anomalyco/opencode/issues/43983)) | Extracts `usage.rolling` (`5h`), `usage.weekly` (`7d`), and `usage.monthly` (`1mo`): `status`, `percent` (`0..=100`), and `resetsAt` (parsed to Unix ms). | If HTTP 404 or 5xx, keep local window counter and log warning. |
-| `command_code` | `GET https://api.commandcode.ai/alpha/billing/credits` and `GET https://api.commandcode.ai/alpha/usage/summary` (with `/internal/billing/credits` fallback, [commandcode-goat-usagebar](https://open-vsx.org/extension/berkeduruu/commandcode-goat-usagebar)) | Extracts `5h`, `7d`, and `1mo` window percentages and credit balances, `plan` name, and billing period `resets_at`. | If alpha endpoints return 401 or 404, rely on local window counters and stream usage. |
-| `openrouter` | `GET https://openrouter.ai/api/v1/key` ([OpenRouter Limits](https://openrouter.ai/docs/api_reference/limits)) | Extracts `data.usage` (total USD), `usage_daily`, `usage_weekly`, `usage_monthly`, `limit`, `limit_remaining`, and `limit_reset`. | Uses per-response `usage.cost` plus local window counters. |
-| `open_design_amr` | `GET https://amr-link.open-design.ai/v1/usage` (configurable, off until [open-design#8674](https://github.com/nexu-io/open-design/issues/8674) ships) | Ready to parse `plan`, `windows[]` (`label`, `used_percent`, `resets_at`), and `wallet_balance_usd`. | Uses local window counters and manual calibration while endpoint returns 404. |
-| `custom` | Optional `usage_url` and JSONPath mapping in `provider.config_json` | Extracts custom percentage, remaining USD, and reset timestamp fields. | Local window counters. |
-
-#### 13.3.2 Polling triggers and reconciliation math
-
-The `/usage` poller runs for an enabled upstream key under four triggers:
-1. Immediately when the key is created or when the user clicks **Test** or **Refresh `/usage`**.
-2. Every 5 minutes (configurable via `usage_poll_interval_secs`) for keys that served at least one request since the previous poll, and every 60 minutes for idle keys.
-3. Asynchronously (once per 30 s max) when window spend crosses 80%, 90%, or 95%, or on HTTP 429 or 402.
-4. On demand when a client calls `GET /v1/usage?fresh=1` (rate-limited to six live refreshes per minute per key).
-
-When a valid snapshot arrives from the source provider, the budget engine applies three reconciliation rules:
-
-| Reconciliation step | Action taken |
-| --- | --- |
-| Reset boundary sync | If the snapshot provides `resets_at` for a window (`5h`, `7d`, `1mo`), LLMRoller updates that window's `resets_at_ms` to match the provider's clock. |
-| Usage reconciliation | If the snapshot reports `used_micro_usd` (or `used_percent`, converted via `round(used_percent / 100.0 * limit_micro_usd)`), LLMRoller compares `upstream_used` with `local_used`. If `abs(upstream_used - local_used) > 0.5% of limit`, LLMRoller inserts an automatic `budget_adjustments` row (`source = 'upstream_usage_sync'`, `delta_micro_usd = upstream_used - local_used`) so the window gauge and admission check match the provider's ledger. |
-| Exhaustion state transition | If the snapshot reports `status != "ok"`, `used_percent >= (100 - reserve_pct)`, or `limit_remaining <= 0`, LLMRoller sets `health = exhausted` and `health_until = coalesce(resets_at_ms, now_ms + 300_000)`. As soon as `now_ms >= health_until`, Check 6 automatically treats the key as eligible again and triggers a background `/usage` refresh so keys never deadlock waiting for a 60-minute idle poll. |
-
-#### 13.3.3 Strict allow-list PII sanitizer for `sanitized_json` (`USG-8`, `SEC-18`)
-
-When saving an `upstream_usage_snapshots` row, `crates/proto::usage_poller` builds `sanitized_json` using a strict allow-list projection. This prevents newly added upstream fields from leaking account PII on shared or global keys:
-1. `sanitized_json` is produced by serializing a dedicated Rust struct (`SanitizedUsageSnapshot { provider_kind, fetched_at, plan_tier, is_free_tier, windows: Vec<SanitizedWindow> }`) containing only `kind`, `status`, `used_percent`, and `resets_at` per window.
-2. Deserialization discards all unmapped upstream JSON keys (such as `email`, `user_id`, `workspace_id`, or `billing`). None of those fields ever enter `sanitized_json`.
-
-### 13.4 Source provider `/usage` pass-through API (`GET /v1/usage` and `GET /v1/key`)
-
-Coding agents, IDE status bars ([CommandCode GOAT Usagebar](https://open-vsx.org/extension/berkeduruu/commandcode-goat-usagebar), [opencode#43983](https://github.com/anomalyco/opencode/issues/43983)), and CLI scripts can query LLMRoller for quota status using their `llr_...` client key.
-
-| Endpoint and query parameters | Returned payload and pass-through behavior |
-| --- | --- |
-| `GET /v1/usage` (optional `?session_id=<id>`, `?model=<id>`, `?upstream_key_id=<id>`, `?fresh=0\|1`, or inbound session headers) | Validates that any requested `?upstream_key_id` is accessible to the caller (returning 404 otherwise), applies a 3 s timeout when `?fresh=1` triggers a live poll, and returns: (1) `client_key` usage (computed from `usage_rollups_hourly`), (2) `pinned_route` (redacting `upstream_key_id` to `null` and `key_label` to `"global-pool"` for non-admin callers on `global` keys per `USR-4`), (3) `usage`: window objects (`rolling`, `weekly`, `monthly`) for the pinned key or the weight-averaged pool (`sum(W_eff * used_pct) / sum(W_eff)`), and (4) `source_provider_usage` (`raw_json` for own personal keys; `sanitized_json` for shared or global keys). |
-| `GET /v1/key` (and `GET /v1/auth/key`) | Returns an [OpenRouter-compatible](https://openrouter.ai/docs/api_reference/limits) `{ "data": { "label", "usage", "usage_daily", "usage_weekly", "usage_monthly", "limit", "limit_remaining", "limit_reset", "is_free_tier", "llmroller": { ... } } }` payload so tools built for OpenRouter's key endpoint work unmodified against LLMRoller. |
-| `GET /v1/usage/raw` (needs `?session_id=<id>` or `?upstream_key_id=<id>`) | Passes through the exact HTTP status and raw JSON body (`raw_json` for personal keys owned by the caller or admins; `sanitized_json` for shared or global keys) from the upstream provider's `/usage` endpoint. |
-
-Example `GET /v1/usage?session_id=ses_99a` response when pinned to an OpenCode Go personal key:
-
-```json
-{
-  "object": "llmroller.usage",
-  "client_key": {
-    "id": "01J9X2A...",
-    "prefix": "llr_7f9a",
-    "routing_scope": "personal_first",
-    "usage_24h_micro_usd": 4120000,
-    "usage_30d_micro_usd": 28450000,
-    "budget_month_micro_usd": null
-  },
-  "pinned_route": {
-    "upstream_key_id": "01J9X1B...",
-    "key_label": "my-opencode-go-1",
-    "provider_kind": "opencode_go",
-    "ownership_scope": "personal",
-    "canonical_model": "deepseek-v4.1-flash"
-  },
-  "usage": {
-    "rolling": { "status": "ok", "percent": 18, "resetsAt": "2026-10-19T18:15:45.084Z" },
-    "weekly": { "status": "ok", "percent": 42, "resetsAt": "2026-10-25T00:00:00.000Z" },
-    "monthly": { "status": "ok", "percent": 31, "resetsAt": "2026-11-12T07:45:46.000Z" }
-  },
-  "source_provider_usage": {
-    "provider_kind": "opencode_go",
-    "fetched_at": 1792401200000,
-    "sanitized": false,
-    "raw": {
-      "usage": {
-        "rolling": { "status": "ok", "percent": 18, "resetsAt": "2026-10-19T18:15:45.084Z" },
-        "weekly": { "status": "ok", "percent": 42, "resetsAt": "2026-10-25T00:00:00.000Z" },
-        "monthly": { "status": "ok", "percent": 31, "resetsAt": "2026-11-12T07:45:46.000Z" }
-      }
-    }
-  }
+```text
+fn estimate_input_tokens(body: &[u8]) -> i64 {
+    // Walk JSON string values without building a DOM:
+    // If a string is the value of a key in {"data", "image_url", "file_data", "b64_json"}
+    // (or "url" whose value starts with "data:") and its byte length > 1_024:
+    //     binary_blocks += 1;
+    // else:
+    //     text_bytes += decoded_utf8_byte_len;
+    div_ceil(text_bytes, 4) + binary_blocks * 1_600
 }
 ```
+
+For an aborted stream (`incomplete = 1`), observed token fields from `SseUsageTap` are kept. Missing input tokens use `estimate_input_tokens(body)` and missing output tokens use `div_ceil(decoded_text_bytes, 4)` over decoded text deltas. In `usage_attempts`, failed tries with outcome in `{'http_5xx', 'wait_timeout', 'error_frame'}` charge `estimated_input = div_ceil(estimate_input_tokens(body) * rate_in, 1_000_000)` against that key's windows and caps.
+
+### 13.2 Generalized budget windows, decaying observations, and startup rebuild
+
+Each `budget_windows` rule attaches either to an `upstream_key_id` (`scope_kind = 'upstream_key'`) or to a specific `(upstream_key_id, model_pk)` route (`scope_kind = 'route'`), and specifies one of four `window_kind` values:
+
+| `window_kind` | `period_ms` / `anchor_at` | In-memory structure and reset semantics |
+| --- | --- | --- |
+| `rolling` | `period_ms` in `3_600_000..=2_678_400_000` (`1 h` to `31 d`) | Generalized ring buffer of at most 360 buckets: bucket width `b = max(60_000, div_ceil(period_ms, 360 * 60_000) * 60_000)` and bucket count `n = div_ceil(period_ms, b)` (`5 h` -> `300 * 1 min`, `7 d` -> `360 * 28 min`, `30 d` -> `360 * 120 min`). Local spend is the sliding sum of the trailing `n` buckets plus `manual_offset.value_at(now_ms)` (manual calibration deltas inserted into the ring bucket for `effective_at` so they age out naturally after `period_ms`). |
+| `anchored_fixed` | `period_ms` (`1 h..31 d`) and `anchor_at` | Accumulator `used` plus `window_start_ms` and `resets_at_ms`; when `now_ms >= resets_at_ms`, advances `resets_at_ms += div_ceil(now_ms - resets_at_ms + 1, period_ms) * period_ms` and resets `used = 0`. Manual calibration deltas apply iff `window_instance_start == window_start_ms`. |
+| `anchored_calendar_month` | `period_ms IS NULL`; `anchor_at` stores the billing anchor timestamp (UTC day-of-month `1..=31` and time-of-day) | Advances across calendar months with day-of-month clamping (`day = min(anchor_day, days_in_month(candidate_month))`, so a 31 January anchor resets on 28/29 February and 31 March). |
+| `anchored_provider` | `period_ms` (`5 h`, `7 d`, or `30 d`) with `upstream_window_kind in {'5h','7d','1mo'}` | Used for provider windows that report an explicit `resets_at` timestamp (OpenCode Go and Command Code `5h`, `7d`, and `1mo` windows). Before the first upstream observation arrives, behaves as a sliding ring; when an observation provides a new `resets_at_ms`, sets `window_start_ms = resets_at_ms - period_ms` and sums local ring events with `ts >= window_start_ms`. |
+
+#### 13.2.1 Time-bounded `UpstreamObservation` projection (`MAX_OBSERVATION_AGE_MS`)
+
+Upstream `/usage` snapshots never overwrite the local ring and never insert rows into `budget_adjustments`. A key therefore never stays stuck at a stale upstream percentage when `/usage` polling fails. Instead, each window stores an optional `UpstreamObservation`:
+
+```rust
+pub struct UpstreamObservation {
+    pub used_micro_usd: i64,       // From snapshot used_micro_usd, or round(used_pct / 100.0 * limit)
+    pub observed_at_ms: i64,       // Poll start timestamp t0
+    pub local_at_observation: i64, // Local ring + manual_offset captured at t0 when the poll was issued
+    pub resets_at_ms: Option<i64>,
+}
+```
+
+The effective usage of window `w` at `now_ms` is:
+
+```text
+const MAX_OBSERVATION_AGE_MS: i64 = 1_800_000; // 30 minutes
+
+fn effective_used(w: &WindowState, now_ms: i64) -> i64 {
+    let local = w.ring.sum_at(now_ms) + w.manual_offset.value_at(now_ms);
+    match &w.observation {
+        None => local,
+        Some(o) => {
+            let expiry = o.resets_at_ms.unwrap_or(i64::MAX).min(o.observed_at_ms + MAX_OBSERVATION_AGE_MS);
+            if now_ms >= expiry {
+                return local; // Observation aged out or window reset; local ring governs alone
+            }
+            let projected = o.used_micro_usd + (local - o.local_at_observation).max(0);
+            local.max(projected)
+        }
+    }
+}
+```
+
+#### 13.2.2 Per-candidate cache-aware reservation (`try_reserve`) and UTC month accumulators
+
+During check `C8` (for both new selections and pinned turns), LLMRoller computes a per-candidate estimate `est` using `observed_cache_read_ratio_ewma` (`alpha = 0.1`, initial `0.0`):
+
+```text
+input_tokens_est   = estimate_input_tokens(body)
+cache_ratio        = route.observed_cache_read_ratio_ewma
+in_cost            = input_tokens_est * ((1.0 - cache_ratio) * rate_in + cache_ratio * rate_cache_read)
+out_tokens_est     = min(coalesce(req.max_tokens, model.max_output_tokens, 8_192), 8_192)
+out_cost           = out_tokens_est * rate_out
+estimate_micro_usd = clamp(div_ceil(in_cost + out_cost, 1_000_000), 1_000, 2_000_000) // $0.001 .. $2.00
+```
+
+`try_reserve(counters, est)` visits the candidate's counters in fixed global order and runs `reserved.compare_exchange` checking `effective_used(now_ms) + reserved + est + reserve_amount <= limit`. Any failure rolls back the reservation on earlier counters. On failover to a new candidate, the previous reservation is dropped and a new reservation is acquired for the new candidate.
+
+UTC monthly accumulators are keyed by `(UtcYearMonth_of_reservation, Id)`. A request straddling midnight at month end therefore releases its reservation and posts its cost to the month it started in. On the first 60 s sweep at least 1 hour after month `M + 1` begins, entries for months `< M + 1` with `reserved == 0` are pruned.
+
+#### 13.2.3 Fast startup reconstruction from `usage_rollups_5min` (`< 2 s`)
+
+Startup reconstruction never scans `usage_events`. Instead, `serve` scans `usage_rollups_5min` (`WHERE bucket_ms >= now_ms - max_window_period - 300_000`), places each bucket at `bucket_ms + 150_000`, and applies `budget_adjustments` and the latest `upstream_usage_snapshots` row.
+
+### 13.3 Source provider `/usage` polling, single-flight concurrency, and reconciliation
+
+The `/usage` poller enforces strict concurrency and rate bounds so client traffic or 429 bursts cannot flood upstream endpoints:
+1. Per-key single-flight: each key has `poll_in_flight: AtomicBool`; concurrent triggers attach to the in-flight poll result.
+2. Per-key minimum start interval: `30 s` between automatic poll starts and `10 s` between owner or admin manual refreshes.
+3. Global concurrency cap: an 8-permit semaphore (`usage_poll_concurrency = 8`) with scheduled polls (`300 s` active, `3600 s` idle) jittered by `±20%`.
+4. At poll start `t0`, the poller records `local_at_observation = w.ring.sum_at(t0) + w.manual_offset.value_at(t0)` for each window on the key. It then fetches `/usage` (`10 s` timeout), seals `raw_json_enc`, builds `sanitized_json`, and updates each matching `upstream_window_kind` window.
+5. If a snapshot window reports `status != "ok"`, `used_percent >= (100 - w.reserve_pct)`, or `limit_remaining <= 0`, key health transitions to `exhausted` (`health_version += 1`) with `health_until = resets_at_ms` (if present and `> now_ms`) else `now_ms + 300_000`. When `now_ms >= health_until`, Check `C6` admits the key immediately and the observation has also expired (`now_ms >= resets_at_ms`), so a failing `/usage` poll never extends exclusion.
+
+### 13.4 Source provider `/usage` pass-through API (`GET /v1/usage`, `/v1/key`, `/v1/usage/raw`)
+
+Coding agents and IDE status bars query LLMRoller for quota status using their `llr_...` client key. To keep raw session IDs out of access logs (`SEC-9`), `/v1/usage` and `/v1/usage/raw` reject `?session_id=` query parameters with HTTP 400. They read the session ID only from request headers (`x-llmroller-session-id` or precedence rows 1 through 6).
+
+| Endpoint and parameters | Returned payload and pass-through behavior |
+| --- | --- |
+| `GET /v1/usage` (optional `?model=<id>`, `?upstream_key_id=<id>`, `?fresh=0\|1`, plus session headers) | Validates that any requested `?upstream_key_id` is accessible to the caller (returning 404 otherwise). Honors `?fresh=1` (10 s min interval, 3 s wait timeout) **only** when the caller is the personal key owner (`Own` tier) or an `admin`; for `Shared` or `Global` callers, `?fresh=1` is ignored and the cached snapshot is returned with header `x-llmroller-usage-stale-ms`. Returns `client_key` usage, `pinned_route` (projected via `project_key`), `usage` window gauges, and `source_provider_usage` (decrypted `raw_json` for `Own` personal keys and admins; `sanitized_json` for `Shared` and `Global` keys). |
+| `GET /v1/key`, `GET /v1/auth/key` | Returns an [OpenRouter-compatible](https://www.google.com/search?q=https%3A%2F%2Fopenrouter.ai%2Fdocs%2Fapi_reference%2Flimits) `{ "data": { "label", "usage", "usage_daily", "usage_weekly", "usage_monthly", "limit", "limit_remaining", "limit_reset", "is_free_tier", "llmroller": { ... } } }` payload. |
+| `GET /v1/usage/raw` (optional `?upstream_key_id=<id>` plus session headers) | Always serves the latest **stored** snapshot from `upstream_usage_snapshots` (never triggering a live upstream fetch), returning its stored `http_status` and decrypted `raw_json` (for `Own` personal keys and admins) or `sanitized_json` (for `Shared` and `Global` keys). |
 
 ## 14. API and web UI specification
 
@@ -1670,22 +2304,23 @@ LLMRoller exposes three HTTP surfaces. The data plane (`/v1/*`) serves coding ag
 
 All `/v1/*` routes except `/healthz` and `/readyz` authenticate using a client key (`llr_...`) passed in `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-| Method and path | Protocol or purpose | Behavior summary |
-| --- | --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat Completions (`chat`) | Routes to an eligible upstream key supporting `chat`. Supports JSON and SSE (`stream: true`). |
-| `POST /v1/responses` | OpenAI Responses (`responses`) | Routes to an eligible upstream key supporting `responses`. Honors `previous_response_id` affinity (`RTE-12`). |
-| `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel`, `POST /v1/responses/compact` | OpenAI Responses stateful operations | Looks up `response_links(id)` (or `previous_response_id` / session pin on `/v1/responses/compact`), verifies caller ownership and key eligibility, and forwards to that upstream key. |
-| `POST /v1/messages` | Anthropic Messages (`messages`) | Routes to an eligible upstream key supporting `messages`. Supports JSON and SSE (`stream: true`). |
-| `POST /v1/messages/count_tokens` | Anthropic token counting | Routes to the pinned or eligible `messages` upstream key. |
-| `GET /v1/models` | Model discovery | Returns models accessible to the client key in OpenAI list shape, or in Anthropic list shape when `anthropic-version` is sent. |
-| `GET /v1/usage` | Unified and pass-through usage | Returns client key usage, normalized window percentages (`rolling`, `weekly`, `monthly`), and `source_provider_usage` pass-through (`USG-7`). |
-| `GET /v1/key`, `GET /v1/auth/key` | OpenRouter-compatible key usage | Returns OpenRouter key usage format plus LLMRoller pool metadata (`USG-7`). |
-| `GET /v1/usage/raw` | Raw upstream `/usage` pass-through | Returns the upstream provider's raw `/usage` JSON (or sanitized JSON on shared and global keys, `USG-8`). |
-| `GET /healthz`, `GET /readyz` | Process liveness and readiness | Returns HTTP 200 when the process is alive (`/healthz`) and when SQLite WAL and `ConfigSnapshot` are ready (`/readyz`). |
+| Method and path | `EndpointKind` | Protocol or purpose | Behavior summary |
+| --- | --- | --- | --- |
+| `POST /v1/chat/completions` | `Inference` | OpenAI Chat Completions (`chat`) | Routes to an eligible upstream key supporting `chat`. Supports JSON and SSE (`stream: true`). |
+| `POST /v1/responses` | `Inference` | OpenAI Responses (`responses`) | Routes to an eligible upstream key supporting `responses`. Inherits `session_hash` and sets `HardKey` when `previous_response_id` matches `response_links` (`RTE-12`). |
+| `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` | `StateBound` | OpenAI Responses stateful operations | Looks up `response_links(id)` (returning local 404 `response_not_found` if absent or owned by another user), verifies `C1`..`C5`, and forwards to `link.upstream_key_id` with no failover (`HardKey`). |
+| `POST /v1/responses/compact` | `Inference` | OpenAI Responses compaction | Routes via `HardKey` when `previous_response_id` is present, else via `PinnedPreferred` or `Free`. |
+| `POST /v1/messages` | `Inference` | Anthropic Messages (`messages`) | Routes to an eligible upstream key supporting `messages`. Supports JSON and SSE (`stream: true`). |
+| `POST /v1/messages/count_tokens` | `Auxiliary` | Anthropic token counting | Skips budget check `C8`; routes to the pinned or eligible `messages` key (or returns local 404 `not_found_error` if unsupported on all eligible keys). |
+| `GET /v1/models` | Metadata | Model discovery | Returns canonical models passing `C1`..`C5` (plus confirmed aliases) in OpenAI list shape, or in Anthropic list shape when `anthropic-version` is sent.Produces metrics only (no `usage_events` row). |
+| `GET /v1/usage` | Metadata | Unified and pass-through usage | Extracts session from headers only (rejects `?session_id=` with 400); returns client key usage, window gauges, and role-scoped `source_provider_usage` (`USG-7`). |
+| `GET /v1/key`, `GET /v1/auth/key` | Metadata | OpenRouter-compatible key usage | Returns OpenRouter key usage format plus LLMRoller pool metadata (`USG-7`). |
+| `GET /v1/usage/raw` | Metadata | Stored upstream `/usage` snapshot | Serves the latest stored `upstream_usage_snapshots` payload (`raw_json` for `Own`/admin; `sanitized_json` for `Shared`/`Global`). |
+| `GET /healthz`, `GET /readyz` | Probe | Process liveness and readiness | `/healthz` returns 200 when alive; `/readyz` returns 200 when startup preload is complete, not draining, WAL `< 1 GiB`, `durable_state` not full, and not `SQLITE_FULL` (503 otherwise). |
 
 #### 14.1.1 Client configuration examples
 
-Standard coding agents connect to LLMRoller by setting their base URL and API key environment variables, following the patterns documented by [Claude Code](https://code.claude.com/docs/en/llm-gateway-connect) and [OpenCode](https://opencode.ai/docs/go):
+Standard coding agents connect to LLMRoller by setting their base URL and API key environment variables, following the patterns documented by [Claude Code](https://www.google.com/search?q=https%3A%2F%2Fcode.claude.com%2Fdocs%2Fen%2Fllm-gateway-connect) and [OpenCode](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo):
 
 ```bash
 # 1. Claude Code (Anthropic Messages wire, base URL without /v1)
@@ -1702,42 +2337,44 @@ export OPENAI_API_KEY="llr_7f9a..."
 # apiKey:  "llr_7f9a..."
 ```
 
-#### 14.1.2 Proxy error envelopes
+#### 14.1.2 Proxy error envelopes and status codes
 
-Errors generated by LLMRoller itself use the caller's protocol envelope: `{"error":{"message": "...", "type": "...", "code": "..."}}` on OpenAI paths and `{"type":"error","error":{"type": "...", "message": "..."}}` on `/v1/messages`.
+Errors generated by LLMRoller itself use the caller's protocol envelope: `{"error":{"message": "...", "type": "...", "code": "..."}}` on OpenAI paths and `{"type":"error","error":{"type": "...", "message": "..."}}` on `/v1/messages`. Quota and monthly-cap exhaustions with a known reset time always return HTTP `429` with `Retry-After` so coding agents back off cleanly.
 
-| HTTP status | Error code | Trigger condition |
-| --- | --- | --- |
-| 400 | `invalid_request_error` | Malformed JSON body, missing `model` field, invalid header bytes (`SEC-15`), or rejected `User-Agent` (`ua_policy = reject`). |
-| 401 | `authentication_error` | Missing, malformed, disabled, expired, or revoked client key (`llr_...`), or disabled owner account. |
-| 403 | `permission_error` | Requested model is excluded by `client_key.allowed_models` or by an active share's `allowed_models` when no other pool serves the model (`SHR-3`), CIDR mismatch, or exhausted `client_key.budget_micro_usd_month`. |
-| 404 | `model_not_found` | Requested model or alias does not exist in any pool accessible to the caller, or unknown `response_id`. |
-| 405 / 415 | `invalid_request_error` | Unsupported HTTP method (`405`) or missing/non-JSON `Content-Type` on POST routes (`415`). |
-| 413 | `request_too_large` | Request body exceeds `LLMROLLER_MAX_BODY_MB` (default 32 MiB). |
-| 429 | `rate_limit_error` | Client key exceeded its configured `rate_limit_rpm` or IP auth failure limit (`SEC-12`). |
-| 502 | `upstream_unreachable` | All allowed failover retries failed before the first valid frame due to network, TLS, or upstream 5xx/auth errors. |
-| 503 | `no_eligible_route` | Every route for the model is cooling down, exhausted (including share or user global monthly caps), or circuit-open, or global in-flight body memory semaphore is full. Includes `Retry-After` set to the earliest positive recovery timestamp (or omits `Retry-After` if no timed recovery exists). |
+| HTTP status | Envelope `type` / `code` | Trigger condition | `Retry-After` header |
+| --- | --- | --- | --- |
+| 400 | `invalid_request_error` / `invalid_request` | Malformed JSON, non-UTF-8 or BOM prefix, non-object top level, trailing bytes, duplicate top-level JSON key, type-confused `model`/`stream`, `?session_id=` query parameter on `/v1/usage*`, invalid header bytes (`SEC-15`), or rejected `User-Agent` (`ua_policy = reject`). | Omitted |
+| 401 | `authentication_error` / `invalid_client_key` | Missing, malformed, disabled, expired, or revoked client key (`G1`, `G2`), or disabled owner account (`G3`). | Omitted |
+| 403 | `permission_error` / `permission_denied` | Client IP outside `client_key.allowed_cidrs` (`G4`), requested model excluded by `client_key.allowed_models` (`G6`), or `HardKey` (`previous_response_id`) references a key whose share was revoked or disabled. | Omitted |
+| 404 | `not_found_error` / `model_not_found` or `response_not_found` | Unknown model (`model_not_found`), or unknown / cross-tenant `response_id` (`response_not_found`). | Omitted |
+| 405 / 415 | `invalid_request_error` / `method_not_allowed` or `unsupported_media_type` | Unsupported HTTP method (`405`) or missing/non-JSON `Content-Type` on POST routes (`415`). | Omitted |
+| 409 | `invalid_request_error` / `ambiguous_model_id` | Client requested a raw `upstream_model_id` that maps to more than one accessible canonical model. | Omitted |
+| 413 | `invalid_request_error` / `request_too_large` | Request body exceeds `LLMROLLER_MAX_BODY_MB` (default 32 MiB). | Omitted |
+| 429 | `rate_limit_error` / `rate_limit_exceeded`, `client_key_budget_exhausted`, `monthly_cap_exhausted`, `upstream_quota_exhausted`, or `upstream_rate_limited` | Client key RPM exceeded (`G5`), IP auth failure limit exceeded (`SEC-12`), client-key monthly budget exhausted (`G7`), all candidates excluded solely by share or user global monthly caps, `HardKey` target is cooling/exhausted/breaker-open, or all failover tries failed with 429 / `QuotaExhausted` / `PlanRestricted` / breaker open. | Seconds to next token, next UTC month, or earliest `health_until` / `Retry-After` (min `1 s`) |
+| 502 | `server_error` (`api_error` on Anthropic) / `upstream_unreachable` | All allowed failover tries failed before the first valid frame with connect/TLS errors, 5xx, or `CredentialInvalid`. | Omitted |
+| 503 | `server_error` (`overloaded_error` on Anthropic) / `no_eligible_route` or `gateway_busy` | Every candidate route for the model is cooling down, window-exhausted, or circuit-open (`no_eligible_route`), or the global `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` semaphore queue timed out after `2,000 ms` (`gateway_busy`). | Earliest positive recovery seconds (`1 s` for `gateway_busy`) |
+| 504 | `server_error` (`api_error` on Anthropic) / `upstream_timeout` | `first_activity_timeout_ms` expired with `timeout_failover == false`, `first_valid_frame_timeout_ms` expired, or `nonstream_response_timeout_ms` expired. | Omitted |
 
 ### 14.2 Control plane JSON API (`/api/user` and `/admin/api`)
 
-All control plane endpoints authenticate via the `__Host-llmroller_session` cookie and validate `x-csrf-token` on mutating methods. Each handler supports content negotiation (`Accept: application/json` returns JSON; `HX-Request: true` returns an Askama HTML fragment). OpenAPI 3.1 specifications are served at `/api/openapi.json`.
+All control-plane endpoints authenticate via the `__Host-llmroller_session` cookie and validate the per-session random `x-csrf-token` on mutating methods (`POST /api/auth/login` validates `__Host-llmroller_login_csrf` against `x-csrf-token` plus `Origin`). Identifiers that may contain `/` (`upstream_model_id` and `alias`) travel in JSON bodies or query parameters so `%2F`-decoding proxies never break routing.
 
 #### 14.2.1 Self-service user API (`/api/user/*` for `user` and `admin` roles)
 
-Every `/api/user/*` endpoint scopes queries and mutations to `actor.user_id`.
+Every `/api/user/*` endpoint scopes queries to `actor.user_id`, returns HTTP 404 on other users' resources (`USR-3`), and applies `project_key`.
 
 | Resource group | Endpoints and methods |
 | --- | --- |
-| Authentication and profile | `POST /api/auth/login` (accepts `username`, `password`, and optional `totp_code` or `recovery_code`), `POST /api/auth/logout`, `GET /api/auth/me`, `POST /api/user/password`, `POST /api/user/totp/enroll`, `POST /api/user/totp/verify` (returns 10 one-time recovery codes), `POST /api/user/totp/disable`, `DELETE /api/user/web-sessions/{id_hash}` |
-| Personal providers & pricing | `GET /api/user/providers`, `POST /api/user/providers` (`ownership_scope = 'personal'`), `PATCH /api/user/providers/{id}`, `DELETE /api/user/providers/{id}`, `PUT /api/user/providers/{id}/prices/{upstream_model_id}` |
-| Personal upstream keys | `GET /api/user/providers/{id}/keys`, `POST /api/user/providers/{id}/keys`, `PATCH /api/user/upstream-keys/{id}`, `DELETE /api/user/upstream-keys/{id}`, `POST /api/user/upstream-keys/{id}/test`, `POST /api/user/upstream-keys/{id}/reset-health`, `PUT /api/user/upstream-keys/{id}/windows`, `POST /api/user/upstream-keys/{id}/calibrate` |
-| Source `/usage` inspection | `GET /api/user/upstream-keys/{id}/usage` (returns latest snapshot + history), `POST /api/user/upstream-keys/{id}/usage/refresh` (triggers live upstream `/usage` poll) |
-| Personal provider sharing | `GET /api/user/shares/outgoing`, `POST /api/user/shares` (share personal provider or key with `grantee_username`), `PATCH /api/user/shares/{id}`, `DELETE /api/user/shares/{id}`, `GET /api/user/shares/incoming` (keys shared with the caller) |
-| Personal route overrides | `GET /api/user/routes?model=`, `PUT /api/user/routes/{upstream_key_id}/{canonical_id}` (sets `user_route_preferences.priority_override` and `enabled`) |
-| Client keys | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}`, `POST /api/user/client-keys/{id}/rotate`, `DELETE /api/user/client-keys/{id}` |
-| Active session pins | `GET /api/user/pins` (caller's client keys only; redacts global key labels per `USR-4`), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` (validates full 8-check route eligibility on target key before moving) |
-| Session chat preview (read-only) | `GET /api/user/sessions/{session_hash}/chat` (reconstructed multi-turn chat timeline for caller's own session), `GET /api/user/traces/{request_id}` (single turn trace and raw JSON) |
-| Scoped usage analytics | `GET /api/user/usage/summary`, `GET /api/user/usage/timeseries`, `GET /api/user/usage/breakdown`, `GET /api/user/usage/events`, `GET /api/user/usage/export.csv` |
+| Authentication and profile | `POST /api/auth/login` (validates `__Host-llmroller_login_csrf` + `Origin`), `POST /api/auth/logout`, `GET /api/auth/me`, `POST /api/user/password`, `POST /api/user/totp/enroll`, `POST /api/user/totp/verify`, `POST /api/user/totp/disable`, `DELETE /api/user/web-sessions/{id_hash}` |
+| Personal providers & pricing | `GET /api/user/providers`, `POST /api/user/providers` (`ownership_scope = 'personal'`), `PATCH /api/user/providers/{id}` (recomputes `share_config_fingerprint`), `DELETE /api/user/providers/{id}`, `PUT /api/user/providers/{id}/prices` (body carries `upstream_model_id`, rates, `tiers_json`, `schedule_json`) |
+| Personal upstream keys | `GET /api/user/providers/{id}/keys`, `POST /api/user/providers/{id}/keys`, `PATCH /api/user/upstream-keys/{id}`, `DELETE /api/user/upstream-keys/{id}`, `POST /api/user/upstream-keys/{id}/test`, `POST /api/user/upstream-keys/{id}/reset-health` (bumps `health_version` in `RuntimeState` first), `PUT /api/user/upstream-keys/{id}/windows`, `POST /api/user/upstream-keys/{id}/calibrate` |
+| Source `/usage` inspection | `GET /api/user/upstream-keys/{id}/usage` (returns latest snapshot + history, decrypted `raw_json` for own keys, `sanitized_json` for shared keys), `POST /api/user/upstream-keys/{id}/usage/refresh` (owner only, 10 s min interval) |
+| Personal provider sharing | `GET /api/user/shares/outgoing`, `POST /api/user/shares` (returns 409 `share_overlap` on provider/key overlap or if `usage_url_cross_origin_ack = 1`), `PATCH /api/user/shares/{id}`, `DELETE /api/user/shares/{id}` (also deletes grantee `user_route_preferences`), `GET /api/user/shares/incoming`, `POST /api/user/shares/{id}/accept` (grantee only; body must echo `config_fingerprint`) |
+| Personal route overrides | `GET /api/user/routes?model=`, `PUT /api/user/routes/{upstream_key_id}/{canonical_id}` (sets `user_route_preferences.priority_override` and `enabled` on own or accepted shared routes) |
+| Client keys | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}` (including `routing_scope` and `constant_session_mode`), `POST /api/user/client-keys/{id}/rotate` (accepts `grace_period_secs` `0..=86400`, default `300`), `DELETE /api/user/client-keys/{id}` |
+| Active session pins | `GET /api/user/pins` (applies `project_key`), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` (validates `C1`..`C8` on target key before calling `PinStore::admin_move`) |
+| Session chat preview (read-only) | `GET /api/user/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (reconstructed timeline for caller's own session), `GET /api/user/traces/{request_id}` (single turn trace and reconstructed raw JSON) |
+| Scoped usage analytics | `GET /api/user/usage/summary`, `GET /api/user/usage/timeseries`, `GET /api/user/usage/breakdown`, `GET /api/user/usage/events` (paged `<= 5,000` rows per read tx), `GET /api/user/usage/export.csv` |
 | Scoped audit log | `GET /api/user/audit` (events where `actor_user_id == me` or target belongs to `me`) |
 
 #### 14.2.2 Instance administration API (`/admin/api/*` for `admin` role only)
@@ -1746,31 +2383,32 @@ Every `/admin/api/*` endpoint rejects non-admin callers with HTTP 403.
 
 | Resource group | Endpoints and methods |
 | --- | --- |
-| First-run setup (unauthenticated when `users == 0`) | `GET /setup`, `GET /admin/api/setup/status`, `POST /admin/api/setup` (exempt from session cookie check while `users` table is empty; all three return HTTP 404 permanently once any user exists per `AUTH-3`) |
-| User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}`, `DELETE /admin/api/users/{id}`, `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}` |
-| Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/reset-health`, `GET /admin/api/upstream-keys/{id}/usage`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
-| Model catalog and price book | `GET /admin/api/models`, `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`), `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases/{alias}`, `DELETE /admin/api/model-aliases/{alias}`, `GET /admin/api/prices`, `PUT /admin/api/prices/{provider_kind}/{upstream_model_id}`, `POST /admin/api/prices/sync` |
-| Global routing and pins | `GET /admin/api/routes`, `PATCH /admin/api/routes/{upstream_key_id}/{canonical_id}`, `GET /admin/api/pins` (all users), `DELETE /admin/api/pins` (needs filter or `confirm_all=true`), `POST /admin/api/pins/move` |
-| Content traceability & chat preview | `GET /admin/api/settings/traceability`, `PUT /admin/api/settings/traceability` (enable, scope, set retention TTL), `GET /admin/api/sessions/{session_hash}/chat`, `GET /admin/api/traces/{request_id}`, `DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces` |
-| Instance usage, settings, and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown` (group by `user`, `client_key`, `upstream_key`, `provider`, `provider_scope`, `model`), `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` |
+| First-run setup (`users == 0`) | `GET /setup`, `GET /admin/api/setup/status`, `POST /admin/api/setup` (all three return HTTP 404 permanently once any user exists per `AUTH-3`) |
+| User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}` |
+| Admin override on user resources | `GET /admin/api/users/{id}/providers`, `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `GET /admin/api/users/{id}/shares`, `DELETE /admin/api/shares/{id}`, `POST /admin/api/shares/{id}/approve` (approves `custom` provider share), `GET /admin/api/users/{id}/pins` (every action logs `target_type` and owner `user_id` in `audit_log`) |
+| Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/reset-health`, `GET /admin/api/upstream-keys/{id}/usage`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
+| Model catalog and price book | `GET /admin/api/models` (includes `merge_state` and `origin` filters), `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`), `POST /admin/api/models/{canonical_id}/confirm-merge`, `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases` (body `{alias, canonical_id}`), `DELETE /admin/api/model-aliases?alias=<urlencoded>`, `GET /admin/api/prices`, `PUT /admin/api/prices` (body carries `{provider_id, provider_kind, upstream_model_id, ...}`), `POST /admin/api/prices/sync` |
+| Global routing and pins | `GET /admin/api/routes`, `PATCH /admin/api/routes/{upstream_key_id}/{canonical_id}`, `GET /admin/api/pins`, `DELETE /admin/api/pins` (takes a filter or `confirm_all=true`), `POST /admin/api/pins/move` |
+| Content traceability & chat preview | `GET /admin/api/settings/traceability`, `PUT /admin/api/settings/traceability` (lowering `retention_days` returns 409 with row count unless `"confirm_purge": true`), `GET /admin/api/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (logs deduplicated `trace.viewed` audit row once per 30 m), `GET /admin/api/traces/{request_id}`, `DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces` |
+| Instance usage, settings, and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown`, `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` (validates against closed 13-key registry) |
 
-### 14.3 Web UI screens and metric definitions
+### 14.3 Web UI screens, CSP configuration, and metric definitions
 
-The web interface is server-rendered with Askama templates and HTMX partial updates, using zero external CDN assets. Standard users see the **Personal Workspace** (`/app/*`); admins also see the **Admin Console** (`/admin/*`).
+The web interface is server-rendered with Askama templates and HTMX partial updates, using zero external CDN assets. `/static/app.js` sets `htmx.config.includeIndicatorStyles = false`, `htmx.config.allowEval = false`, and `htmx.config.allowScriptTags = false` before HTMX initializes; loading-spinner CSS ships inside `/static/app.css`, and templates never use `hx-on:*` or `js:` attributes so `script-src 'self'; style-src 'self'` holds without exceptions.
 
 | Screen | Audience | Primary elements and actions |
 | --- | --- | --- |
-| Setup & Login | Public (unauthenticated) | First-admin setup form (with setup token) when zero users exist; username, password, and TOTP login form thereafter. |
-| Overview Dashboard | `user` (scoped) & `admin` (global + personal) | Range selector (24 h, 7 d, 30 d, custom); cards for total requests, tokens, micro-USD cost, cache hit rate, pin follow rate, and repin rate; stacked daily cost chart (`uPlot`); upstream key cards showing both local estimated budget gauges and source provider `/usage` window gauges (`5h`, `7d`, `1mo`) with reset countdowns; health alerts. |
-| Personal Providers & Keys | `user` & `admin` | Add personal provider from preset or custom URL; add personal upstream keys; Test button; Refresh `/usage` button; modal showing raw source provider `/usage` JSON; configure budget windows and manual calibration. |
-| Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key to another username, set allowed models and monthly USD cap, view per-grantee token and dollar consumption, revoke share. **Shared With Me tab:** inspect keys shared by teammates, health badge, allowed models, and remaining monthly share cap. |
-| Routing Matrix | `user` (personal + shared + global weights) & `admin` (global catalog) | Matrix of canonical models (rows) by upstream keys (columns). Displays protocol chips (`chat`, `responses`, `messages`), key default priority, inline editable per-model `priority_override`, effective weight, and projected percentage share of new sessions. |
-| Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once with copy button), select `routing_scope` (`personal_first`, `blended`, `personal_only`, `global_only`), restrict models, set RPM or monthly USD cap, rotate, or revoke. |
-| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins: session hash prefix, client key, model, pinned upstream key and scope badge (`personal`, `shared`, `global`), age, turn count, `repin_count`, constant-session warning badge, and **Preview Chat** button (when trace rows exist). Supports Unpin and Move Pin. |
-| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay for a `session_hash`: renders system instructions, tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs, assistant Markdown/code blocks (sanitized via `ammonia`), context-compaction markers, per-turn telemetry badges (TTFB, latency, tokens, cache hit ratio, cost, upstream key), and a raw request/response JSON inspector drawer. |
-| Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, or model. Paged event table with status, TTFB, total latency, token breakdown, `cost_source` badge (`provider` vs. `price_book`), and CSV or JSON export. |
-| Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, force-expose or hide models, edit canonical aliases, edit price book rates, and trigger catalog discovery. |
-| Admin: Users, Settings & Audit | `admin` only | Create or disable `admin` and `user` accounts, set per-user global pool access and monthly global budget caps, configure instance settings (pin TTL, `/usage` poll interval, retention), and inspect the hash-chained audit log. |
+| Setup & Login | Public (unauthenticated) | First-admin setup form (with setup token) when zero users exist; username, password, and TOTP login form protected by `__Host-llmroller_login_csrf` thereafter. |
+| Overview Dashboard | `user` (scoped) & `admin` (global + personal) | Range selector (24 h, 7 d, 30 d, custom); cards for total requests, tokens, micro-USD cost, cache hit rate, pin follow rate, and repin rate; projected disk usage meter (`A6`) and `"Unpriced models"` badge; stacked daily cost chart (`uPlot`); upstream key cards showing live health from `RuntimeState`, local window ring spend, and `UpstreamObservation` gauges (`5h`, `7d`, `1mo`) with reset countdowns. |
+| Personal Providers & Keys | `user` & `admin` | Add personal provider from preset or custom URL; add personal upstream keys; Test button; Refresh `/usage` button; modal showing decrypted raw source provider `/usage` JSON; configure budget windows and manual calibration. |
+| Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key (preventing overlapping provider/key shares), set allowed models and monthly USD cap, view per-grantee token and dollar consumption (including charged failed tries), revoke share. **Shared With Me tab:** inspect pending and accepted shares, view provider kind, `base_url` host, key label, and the explicit disclosure `"Requests you send through this share travel to the endpoint above and are visible to its operator"`, and click **Accept Share** (`POST /api/user/shares/{id}/accept`). |
+| Routing Matrix | `user` (`Own` + `Shared` + aggregated `"Global pool"` via `project_key`) & `admin` (full catalog) | Matrix of canonical models (rows) by upstream keys (columns). For standard users, all global keys are aggregated into a single `"Global pool"` column showing the combined projected share without leaking global key labels or priorities. Displays protocol chips (`chat`, `responses`, `messages`), inline editable per-model `priority_override` on `Own` and `Shared` routes, effective weight, and projected percentage share. |
+| Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once in a confirmation modal), select `routing_scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), configure `constant_session_mode` (`flag` or `fingerprint_generic_ids`), restrict models, set RPM or monthly USD cap, rotate with configurable `grace_period_secs`, or revoke. |
+| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins in `PinStore`: session hash prefix, client key, model, pinned upstream key (projected via `project_key`) and tier badge (`Own`, `Shared`, `Global`, `Blended`), age, turn count, `repin_count`, constant-session warning badge, and **Preview Chat** button. Supports Unpin and Move Pin. |
+| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay paginated by `(ts, request_id)` cursor: renders per-thread system instructions and tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs (auto-escaped in `<pre>`), assistant Markdown sanitized via `pulldown-cmark` (raw HTML off) + `ammonia`, context-compaction dividers, per-turn telemetry chips (with `project_key` redaction), and a raw JSON inspector drawer. |
+| Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, model, or `cost_source` (`provider`, `price_book`, `fallback_rate`, `estimated_incomplete`, `estimated_attempt`). Paged event table (`<= 5,000` rows per read tx) with `usage_attempts` breakdown and formula-sanitized CSV or JSON export. |
+| Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, review `pending_review` cross-vendor model merges, force-expose or disable models, merge or split models over `model_pk`, edit aliases and prices, and approve `custom` provider shares. |
+| Admin: Users, Settings & Audit | `admin` only | Create, disable, or delete user accounts (`?confirm=<username>`), inspect `deleted_users`, set per-user global pool access and monthly global caps, edit the 13 validated runtime settings, and inspect the hash-chained `audit_log`. |
 
 ## 15. Technology choices and workspace layout
 
@@ -1784,18 +2422,18 @@ Every dependency is chosen for predictable speed, memory safety, zero external r
 | --- | --- | --- | --- |
 | Language & toolchain | Rust (2024 edition, stable toolchain, `#![forbid(unsafe_code)]`) | Predictable tail latency on 2,000 concurrent SSE streams with no garbage-collector pauses and a single static binary. | Go (GC pauses under high stream counts) or Python (packaging and supply-chain exposure). |
 | HTTP server | `axum 0.8`, `hyper 1.x`, `hyper-util`, `tower` on `tokio 1.x` | Standard async Rust HTTP stack with native streaming body support and composable middleware. | `actix-web` (separate actor runtime model). |
-| HTTP client | `reqwest 0.13` (`rustls-tls`, `stream`, `http2`, `default-features = false`) | Connection pooling per provider, custom DNS resolver hook for SSRF filtering, and raw unbuffered chunk streaming. | `ureq` (blocking I/O unsuitable for 2,000 streams). |
-| Database | SQLite in WAL mode via `sqlx 0.9` | Zero-configuration single-file persistence with compile-time and migration-tested SQL queries. | PostgreSQL (needs an external database server for single-node installs). |
-| Cryptography | `chacha20poly1305`, `hkdf`, `sha2`, `hmac`, `argon2`, `totp-rs`, `subtle`, `secrecy`, `zeroize` | Pure-Rust audited RustCrypto implementations for XChaCha20-Poly1305 AEAD, Argon2id, HMAC-SHA256, and memory zeroization. | OpenSSL (`openssl-sys` C bindings complicate static musl builds). |
-| In-memory state & caches | `arc-swap` (`ConfigSnapshot`), `moka` (`sync::Cache` for pins and response links), `dashmap` (WRR and window ring counters) | Lock-free atomic snapshot reads on the hot path and single-flight cache loaders for concurrent turn-1 pinning (`RTE-7`). | Global `RwLock<Config>` (writer starvation under 500 req/s). |
-| Web UI & safe chat rendering | `askama`, `rust-embed`, `pulldown-cmark`, `ammonia`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates and strict HTML/Markdown sanitization (`ammonia`) for the read-only Session Chat Preview with zero CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
-| Compression | `zstd` (`async-compression`) | High-ratio fast compression for recorded `trace_records` payloads before AEAD encryption, plus gzip/br stream decoding in the usage tap. | Uncompressed JSON blobs in SQLite. |
-| Observability | `tracing`, `tracing-subscriber` (JSON formatter), `metrics`, `metrics-exporter-prometheus` | Structured JSON request logs with `request_id` correlation and low-overhead Prometheus counters and histograms. | Heavy OpenTelemetry gRPC exporters in v1.0 core. |
-| Testing & verification | `cargo-nextest`, `proptest`, `wiremock`, `insta`, `cargo-llvm-cov`, `cargo-mutants`, `cargo-fuzz`, `cargo-deny`, `cargo-audit`, `cargo-vet` | Enforces fast parallel tests, property testing, wire stubbing, line coverage, and automated mutation testing ([cargo-mutants](https://mutants.rs/)). | Standard `cargo test` alone without mutation verification. |
+| HTTP client & SSRF guard | `reqwest 0.13` (`rustls-tls`, `stream`, `http2`, `default-features = false`) + `hickory-resolver` inside `GuardedConnector` | Connection pooling per upstream origin (`OriginKey`), custom `tower::Service<Uri>` socket connector validating both DNS-resolved and IP-literal socket addresses against special-purpose ranges (`SEC-7`), and unbuffered chunk streaming. | `ureq` (blocking I/O) or `reqwest::dns::Resolve` alone (which `hyper` skips when the URL host is an IP literal). |
+| Database | SQLite in WAL mode via `sqlx 0.9` (`connect_options(role)`) | Zero-configuration single-file persistence with per-role pragma enforcement and migration-tested SQL queries. | PostgreSQL (needs an external database server for single-node installs). |
+| Cryptography | `chacha20poly1305`, `hkdf`, `sha2`, `hmac`, `argon2`, `totp-rs`, `subtle`, `secrecy`, `zeroize` | Pure-Rust audited RustCrypto implementations for XChaCha20-Poly1305 AEAD with canonical length-prefixed AAD, Argon2id, HMAC-SHA256, and memory zeroization. | OpenSSL (`openssl-sys` C bindings complicate static musl builds). |
+| In-memory state & caches | `arc-swap` (`ConfigSnapshot`), `dashmap` + `parking_lot` + `smallvec` (`PinStore`, `WrrState`, `OriginBreaker`, window rings, UTC month accumulators), `moka` (`response_links` cache), `indexmap` (`durable_state` queue) | Lock-free atomic snapshot reads on the hot path, `Clock`-driven deterministic pin expiry in `PinStore` (`max_active_pins = 250,000`), and `moka` read-through caching for `response_links`. | `moka` for session pins (whose internal `quanta` timer cannot be driven by `FakeClock` and whose TinyLFU eviction would silently drop confirmed pins). |
+| Web UI & safe chat rendering | `askama`, `rust-embed`, `pulldown-cmark`, `ammonia`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates and strict HTML/Markdown sanitization (`ammonia` with raw HTML disabled in `pulldown-cmark`) for the read-only Session Chat Preview with zero CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
+| Compression & sealer pool | `zstd` (`zstd::bulk::Compressor` on 2 OS threads via `crossbeam-channel`) + `async-compression` | Reusable bulk zstd contexts on a fixed 2-thread sealer pool (`~7 MiB` total RAM) for `trace_blocks` and `trace_records`, plus fallback `async-compression` decoders (`gzip`, `deflate`, `br`, `zstd`) only for upstreams that ignore `accept-encoding: identity`. | Per-stream `zstd::stream::Encoder` (which allocates `~3.5 MiB` per stream = `~7 GB` at 2,000 streams). |
+| Observability | `tracing`, `tracing-subscriber` (JSON formatter), `metrics`, `metrics-exporter-prometheus` | Structured JSON request logs with `request_id` correlation, `audit_anchor` emission, and bounded-cardinality Prometheus metrics. | Heavy OpenTelemetry gRPC exporters in v1.0 core. |
+| Workspace automation & testing | `xtask` (Rust workspace binary), `cargo-nextest`, `proptest`, `wiremock`, `insta`, `cargo-llvm-cov`, `cargo-mutants`, `cargo-fuzz`, `cargo-deny`, `cargo-audit`, `cargo-vet` | Pure-Rust `cargo xtask` commands (`traceability`, `doc-consistency`, `docs-bundle`) with zero Python supply-chain dependencies, plus property testing and automated mutation testing ([cargo-mutants](https://mutants.rs/)). | External Python or Node CI scripts. |
 
 ### 15.2 Cargo workspace layout and architectural boundaries
 
-The repository is structured as a six-crate Cargo workspace so the compiler enforces strict dependency direction and keeps the routing core free of I/O.
+The repository is a seven-member Cargo workspace (`crates/{core,proto,store,proxy,admin,server}` plus `xtask`) that enforces dependency direction and keeps `crates/core` free of I/O.
 
 ```
 llmroller/
@@ -1803,43 +2441,62 @@ llmroller/
   Cargo.lock                  # Committed lockfile for reproducible builds
   deny.toml                   # cargo-deny license, ban, and advisory rules
   .cargo/mutants.toml         # cargo-mutants configuration and timeout tuning
+  docs/
+    srdd/
+      0. SRDD - Introduction.md .. 21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md
+      requirements.toml       # Authoritative requirement -> milestone & sub-phase registry
+    bigbang/
+      big-bang-phases-0.md .. big-bang-phases-7.md (including big-bang-phases-4b.md)
   presets/
-    opencode_go.toml          # Built-in OpenCode Go preset (endpoints, session hint, /usage, prices)
+    opencode_go.toml          # Built-in OpenCode Go preset (endpoints, aliases, protocol_defaults, /usage, prices)
     command_code.toml         # Built-in Command Code preset
     open_design_amr.toml      # Built-in Open Design AMR preset
     openrouter.toml           # Built-in OpenRouter preset
-  fuzz/                       # cargo-fuzz targets for JSON span, SSE tap, trace tap, and headers
-  benches/                    # Criterion and load benchmarks (PERF-1..PERF-5)
+  fuzz/                       # cargo-fuzz targets for body_edit, sse_frame, sse_tap, trace_tap, headers, step8_fingerprint
+  benches/                    # Criterion and load benchmarks (PERF-1..PERF-5 with log-normal TTFF stub)
   fixtures/
+    crypto/
+      aad_vectors.json        # Committed XChaCha20-Poly1305 canonical AAD test vectors
     sse/                      # Recorded SSE streams (chat, responses, messages, truncated)
     usage/                    # Recorded source provider /usage JSON responses
     harnesses/                # Recorded Claude Code, Codex CLI, and opencode request traces
+  xtask/                      # Pure-Rust workspace automation binary:
+                              #   cargo xtask traceability --milestone M<N>
+                              #   cargo xtask doc-consistency
+                              #   cargo xtask docs-bundle
   crates/
     core/                     # Pure domain logic (ZERO network or database dependencies):
-                              #   models, ActorScope, RBAC rules, routing eligibility,
-                              #   smooth WRR, pin state machine, price math, window rings
+                              #   models (model_pk), ActorScope, RBAC rules, G1..G7 & C1..C8,
+                              #   per-group WrrState, PinStore state machine, OriginBreaker,
+                              #   pricing & binary-aware estimator, WindowState & UpstreamObservation,
+                              #   UTC month accumulators, synchronous Clock seam
     proto/                    # Wire protocols and provider adapters:
-                              #   surgical JSON span editor, header policy, SSE usage tap,
-                              #   ProviderAdapter trait, /models & /usage response parsers
-    store/                    # SQLite persistence and cryptography:
-                              #   migrations, Repository traits, batching writer task,
-                              #   XChaCha20-Poly1305 sealer, Argon2id, audit hash chain
+                              #   duplicate-rejecting surgical JSON span editor, request & response
+                              #   header pipelines, inline SseUsageTap, bounded TraceTap,
+                              #   ProviderAdapter trait, 5-class error classifier, /models & /usage parsers
+    store/                    # SQLite persistence, sealer pool, and cryptography:
+                              #   connect_options(role), 31-table migrations & triggers, dual-queue
+                              #   batching writer (Control + durable_state, rollups, raw_events),
+                              #   2-thread zstd::bulk::Compressor sealer pool, canonical AAD sealer,
+                              #   resumable rotate-master-key, Argon2id, HMAC audit_log chain
     proxy/                    # Data plane HTTP service (:8080):
-                              #   client key auth, SSRF DNS connector, stream forwarder,
-                              #   pre-first-byte failover loop, /v1/usage pass-through
+                              #   preflight body budget semaphore, GuardedConnector (socket SSRF filter),
+                              #   64 KiB pre-first-frame hold buffer, RequestLifecycle RAII drop guard,
+                              #   pre-first-byte failover loop, AsyncClock, /v1/usage pass-through
     admin/                    # Control plane HTTP service (127.0.0.1:8081):
-                              #   /api/user/* and /admin/api/* handlers, CSRF & session
-                              #   middleware, Askama templates, embedded static assets
+                              #   /api/user/* and /admin/api/* handlers, project_key redaction,
+                              #   CSRF & session middleware, Askama templates, embedded static assets
     server/                   # Binary entrypoint and background supervisor:
-                              #   CLI args, config loader, listener lifecycle, SIGTERM drain,
-                              #   discovery job, upstream /usage poller, retention sweeper
+                              #   CLI subcommands (exit codes 0..14), ordered startup & 8-step SIGTERM drain,
+                              #   Reloader task, supervised discovery, single-flight /usage poller,
+                              #   30s WAL checkpointer and retention sweeper
 ```
 
-`crates/core` depends only on pure-Rust in-memory crates (`serde`, `serde_json`, `time`, `ulid`, `sha2`, `hmac`, `subtle`, `secrecy`, `zeroize`, `ipnet`, `arc-swap`, `moka`, `dashmap`). Its `Clock` seam (`now_ms`, `monotonic_ms`) is synchronous. It cannot import `tokio`, `reqwest`, `hyper`, `axum`, or `sqlx`. This boundary guarantees that every routing, sharing, eligibility, pinning, and budget rule can be unit-tested and mutation-tested in milliseconds without sockets or disk files.
+`crates/core` depends only on pure-Rust in-memory crates (`serde`, `serde_json`, `time`, `ulid`, `sha2`, `hmac`, `subtle`, `secrecy`, `zeroize`, `ipnet`, `arc-swap`, `dashmap`, `parking_lot`, `smallvec`). Its `Clock` seam (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) is strictly synchronous; `crates/proxy::AsyncClock: Clock` extends it with `async fn sleep(&self, d: Duration)` outside `crates/core`. It cannot import `tokio`, `reqwest`, `hyper`, `axum`, or `sqlx`. This boundary guarantees that every routing, sharing, eligibility, pinning, breaker, and budget rule can be unit-tested and mutation-tested in milliseconds without sockets or disk files.
 
 ## 16. Testing plan and TDD governance
 
-Testing in LLMRoller is a primary architectural constraint, never an afterthought written after code lands. Every subsystem is built under strict Test-Driven Development (TDD) with bidirectional traceability between requirements, automated tests, and source modules. The test suite combines component mocking, integration tests, regression tests, end-to-end tests, and mutation testing with [cargo-mutants](https://mutants.rs/).
+Testing in LLMRoller is a primary architectural constraint, never an afterthought written after code lands. Every subsystem is built under strict Test-Driven Development (TDD) with bidirectional traceability between requirements (`docs/srdd/requirements.toml`), automated tests, and source modules verified by `cargo xtask traceability`. The test suite combines component mocking, property-based testing, integration tests, regression tests, end-to-end tests, and mutation testing with [cargo-mutants](https://mutants.rs/).
 
 ### 16.1 Testing boundary discipline: what we test vs. what we do not test
 
@@ -1847,13 +2504,13 @@ A disciplined test suite tests the logic that the engineering team controls and 
 
 | Inside our testing boundary (MUST test thoroughly) | Outside our testing boundary (DO NOT over-test) |
 | --- | --- |
-| Route eligibility rules across `global`, `personal`, and `shared` providers (`RTE-3`, `SHR-3`, `USR-3`) | Whether `tokio::spawn` schedules tasks onto OS threads or whether `moka` implements concurrent hash buckets internally |
-| Smooth weighted round-robin counter math, per-model priority overrides, and strict tier fallback (`RTE-4`, `RTE-5`, `RTE-6`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
-| Inbound session precedence, HMAC privacy hashing, and tenant-salted outbound affinity hints (`RTE-1`, `SEC-16`) | Whether `sha2`, `chacha20poly1305`, or `argon2` implements its underlying mathematical primitives correctly |
-| Surgical top-level JSON span editing (`model`, `prompt_cache_key`, `include_usage`) without altering message byte order (`TRN-1`, `TRN-2`, `API-4`, `API-5`) | Whether `serde_json` parses valid RFC 8259 JSON strings in general |
-| SSE usage and trace tap state machines, OpenAI vs. Anthropic cached token subtraction, SSE delta reassembly (`text`, `reasoning`, `tool_calls`), session chat deduplication, and integer micro-USD cost math (`USG-1`..`USG-3`, `TRC-2`..`TRC-5`) | Whether SQLite's `PRAGMA journal_mode = WAL` writes frames to the `-wal` file on the OS filesystem |
-| Source provider `/usage` response parsing, window reconciliation math, and PII sanitization on shared and global pass-through (`USG-4`..`USG-8`, `SEC-18`) | Live third-party provider uptime during automated CI runs (live upstream checks run only in an opt-in manual harness) |
-| Our SQL query predicates (`WHERE owner_user_id = ?`), migration invariants, AEAD associated-data binding, and audit hash chaining in `crates/store` (`SEC-1`, `SEC-13`, `SEC-17`) | Static constant values in preset files unless validating that every preset parses into a valid `ProviderConfig` |
+| Request gates (`G1`..`G7`), candidate checks (`C1`..`C8`), `effective_share` precedence, and three-tier pool resolution (`Own`, `Shared`, `Global`, `Blended`) (`RTE-3`, `SHR-3`, `USR-3`) | Whether `tokio::spawn` schedules tasks onto OS threads or whether `dashmap` implements concurrent hash shards internally |
+| Per-group `WrrState` counter math, zero-sum weight invariant across subset churn, per-model priority overrides, strict tier fallback, and headroom `bps` scaling (`RTE-4`, `RTE-5`, `RTE-6`, `RTE-13`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
+| Eight-step inbound session precedence, `response_links` session inheritance (`Section 11.1.2`), canonical byte-sliced Step 8 fingerprinting, 21-slot `ConstantSessionDetector`, and `Shared`/`Global` carrier stripping (`RTE-1`, `RTE-12`, `SEC-16`) | Whether `sha2`, `chacha20poly1305`, or `argon2` implements its underlying mathematical primitives correctly |
+| Duplicate-key rejection and surgical top-level JSON span editing (`model`, `prompt_cache_key`, `stream_options.include_usage`) without altering message byte order (`TRN-1`, `TRN-2`, `API-4`, `API-5`) | Whether `serde_json` parses valid RFC 8259 JSON strings in general |
+| Inline `SseUsageTap`, bounded `TraceTap`, `RequestLifecycle` drop finalization, unified cache-read and cache-write subtraction, content-addressed `trace_blocks` LCP reconstruction, and binary-aware token estimation (`USG-1`..`USG-3`, `TRC-2`..`TRC-5`) | Whether SQLite's `PRAGMA journal_mode = WAL` writes frames to the `-wal` file on the OS filesystem |
+| Source provider `/usage` response parsing, time-bounded `UpstreamObservation` projection and expiry, single-flight polling, and allow-list `sanitized_json` (`USG-4`..`USG-8`, `SEC-18`) | Live third-party provider uptime during automated CI runs (live upstream checks run only in an opt-in manual harness) |
+| Our SQL query predicates (`ActorScope`), triggers, `model_pk` merges, canonical length-prefixed AAD binding (`fixtures/crypto/aad_vectors.json`), resumable 500-row rotation, and `audit_log` HMAC verification (`SEC-1`, `SEC-13`, `SEC-17`) | Static constant values in preset files unless validating that every preset parses into a valid `ProviderConfigJson` |
 
 ### 16.2 Failing tests taxonomy: expected failures vs. unexpected failures
 
@@ -1865,7 +2522,7 @@ Expected failures happen when building something new or intentionally replacing 
 
 | Rule | Engineering protocol for expected failures |
 | --- | --- |
-| 1. Red-Green-Refactor for new specs | When building a new requirement (`AUTH-*`, `PRV-*`, `SHR-*`, `RTE-*`, `USG-*`, `SEC-*`), write the failing test guard first and cite the requirement ID. That test stays red until the implementation lands in the same branch. |
+| 1. Red-Green-Refactor for new specs | When building a new requirement, write the failing test guard first and cite `#[doc = "Spec: <ID>"]` (or `#[doc = "Partial: <ID>"]` when testing a foundational building block before the final integration sub-phase). Feature branches may hold a red test commit while developing locally, but every commit merged to `main` must be green (test and implementation committed together). |
 | 2. Replace retired behavior in the same change | When a product brief or architectural decision deliberately replaces an existing behavior, any test that pinned the old behavior will turn red. Update or retire that test in the exact same commit or pull request, naming the requirement ID or decision ID (`ADR-*`) that sanctioned the change. |
 | 3. Test observable contracts, not internals | A test that pins private struct fields, internal helper counts, or exact SQL whitespace is a test waiting to fail during routine refactoring. Write tests against observable inputs, outputs, state transitions, and wire effects so redesigning internal code underneath does not break them. |
 
@@ -1875,7 +2532,7 @@ Unexpected failures happen when changing one component breaks a test in another 
 
 | Rule | Engineering protocol for unexpected failures |
 | --- | --- |
-| 1. Leaking boundary or unintended side effect | If changing `/usage` reconciliation in `crates/core` breaks a session-pinning test or a personal-share authorization test, an architectural boundary is leaking. |
+| 1. Leaking boundary or unintended side effect | If changing `/usage` observation projection in `crates/core` breaks a session-pinning test or a personal-share authorization test, an architectural boundary is leaking. |
 | 2. Zero tolerance for loosening assertions | When an unexpected failure occurs, never loosen the assertion, add `#[ignore]`, delete the test, or tweak mock data just to make CI green. |
 | 3. The red-test rule of thumb | A red test is acceptable only when the change was meant to make that test red. Every other red test must be root-caused before work continues. |
 
@@ -1885,24 +2542,24 @@ Every feature, bug fix, or schema change follows a five-step loop enforced by pu
 
 | Step | Phase | Mandatory action |
 | --- | --- | --- |
-| 1 | Link requirement | Identify the exact requirement ID(s) in Section 6, 7, or 8, or add a new requirement ID to the SRDD first. |
-| 2 | Write failing test (Red) | Write the unit, property, or integration test asserting the observable contract and linking `#[doc = "Spec: <ID>"]`. Confirm it fails as expected. |
+| 1 | Link requirement | Identify the exact requirement ID(s) in Section 6, 7, or 8 and `docs/srdd/requirements.toml`, or add a new requirement ID to the SRDD and `requirements.toml` first. |
+| 2 | Write failing test (Red) | Write the unit, property, or integration test asserting the observable contract and linking `#[doc = "Spec: <ID>"]` (or `#[doc = "Partial: <ID>"]`). Confirm it fails as expected with `cargo nextest run`. |
 | 3 | Write minimal code (Green) | Implement the minimal production logic in `core`, `proto`, `store`, `proxy`, `admin`, or `server` to pass the new test and all existing tests. |
-| 4 | Refactor cleanly | Remove duplication and tighten types while keeping the entire test suite green. |
-| 5 | Kill surviving mutants | Run `cargo mutants --in-diff` on the changed files and add boundary or negative assertions until zero mutants survive. |
+| 4 | Refactor cleanly | Remove duplication and tighten types while keeping `cargo clippy --all-targets -- -D warnings` and `cargo nextest run` green. |
+| 5 | Kill surviving mutants | Stage the changes (`git add -A`), generate the staged diff (`git diff --cached > target/commit.diff`), and run `cargo mutants --in-diff target/commit.diff` locally (enforced as a blocking gate on every PR against `origin/main...HEAD` and nightly across the full workspace). |
 
 ### 16.4 Component mocking and dependency injection architecture
 
-To test our controlled logic thoroughly without flakiness from wall-clock time, OS entropy, network sockets, or slow disk I/O, LLMRoller defines six core seam traits. Production code wires the real implementations; unit and component tests inject deterministic fakes or mocks.
+To test our controlled logic thoroughly without flakiness from wall-clock time, OS entropy, network sockets, or slow disk I/O, LLMRoller defines six core seam traits. Note that `crates/core::Clock` is strictly synchronous (`now_ms`, `monotonic_ms`) so `crates/core` stays 100% free of async runtime dependencies, while `crates/proxy::AsyncClock: Clock` adds `async fn sleep(&self, d: Duration)` for proxy retry delays.
 
 | Seam trait | Production implementation | Test fake or mock implementation | Controlled logic verified by mocking this seam |
 | --- | --- | --- | --- |
-| `Clock` (`fn now_ms(&self) -> i64`, `async fn sleep(&self, d: Duration)`) | `SystemClock` (`time::OffsetDateTime::now_utc`, `tokio::time::sleep`) | `FakeClock` (atomic millisecond counter advanced manually by tests) | Pin sliding TTL expiration (`RTE-10`), 5 h and 7 d rolling ring bucket rotation (`LIM-1`), cooldown timer expiry, `Retry-After <= 2 s` same-key retry (`RTE-9`), and DeepSeek UTC peak-hour pricing schedules (`USG-3`). |
-| `EntropySource` (`fn fill_bytes(&self, dest: &mut [u8])`) | `OsEntropy` (`rand::rngs::OsRng`) | `DeterministicRng` (seeded ChaCha20 RNG for reproducible test vectors) | Client key generation (`llr_...`, `SEC-3`), XChaCha20 nonce generation (`SEC-1`), and web session token creation (`AUTH-7`). |
-| `UpstreamTransport` (`async fn send_inference(&self, req: OutboundRequest) -> Result<UpstreamResponseStream, TransportError>`) | `ReqwestUpstreamTransport` (with SSRF DNS filter and `rustls`) | `MockUpstreamTransport` (programmable per-route response queue: SSE chunk streams, delays, mid-stream drops, 429, 401, or 503 responses, and recorded outbound request capture) | Pre-first-byte failover (`RTE-9`), non-retry after first byte, header strip and passthrough policy (`API-2`, `API-3`), surgical body rewrites (`API-4`), and disconnect cancellation (`API-7`). |
-| `UsageEndpointClient` (`async fn fetch_usage(&self, key: &UpstreamKey) -> Result<RawUsageResponse, UsagePollError>`) | `HttpUsageEndpointClient` | `StubUsageEndpointClient` (returns canned or sequence-scripted OpenCode Go, Command Code, OpenRouter, or 404 responses) | Polling triggers, reset-time synchronization, automatic `budget_adjustments` reconciliation, key exhaustion transitions (`USG-4`..`USG-6`), and `/v1/usage` pass-through sanitization (`USG-7`, `USG-8`, `SEC-18`). |
-| `StorageRepository` (`UserRepo`, `ProviderRepo`, `ShareRepo`, `CatalogRepo`, `PinRepo`, `UsageRepo`, `AuditRepo`) | `SqliteRepository` (`sqlx::SqlitePool`) | `InMemoryRepository` (for fast `admin` and `proxy` handler unit tests) plus ephemeral temp-file SQLite WAL instances (for `crates/store` SQL integration tests) | Handler RBAC enforcement (`USR-1`..`USR-5`), share revocation effects (`SHR-5`), atomic first-admin setup (`AUTH-1`), and non-blocking usage queue overflow (`REL-3`). |
-| `SecretSealer` (`fn seal(&self, aad: &[u8], plain: &[u8]) -> Vec<u8>`, `fn open(...)`) | `XChaCha20Poly1305Sealer` | `TestSealer` (real XChaCha20-Poly1305 initialized with a fixed 32-byte test master key) | Cross-row AAD tampering rejection and master-key rotation (`SEC-1`, `SEC-2`). |
+| `Clock` (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) and `AsyncClock: Clock` (`async fn sleep(&self, d: Duration)`) | `SystemClock` (`time::OffsetDateTime::now_utc`, `std::time::Instant`, `tokio::time::sleep`) | `FakeClock` (atomic millisecond counter advanced manually by tests) | `PinStore` provisional (50 s) and confirmed (`pin_ttl_secs`) expiry (`RTE-10`), `recovery_repin_min_idle_secs` (`300 s`), 360-bucket rolling rings and day-clamped calendar months (`LIM-1`), 30-minute `UpstreamObservation` decay, `prev_key_expires_at` rotation grace, and `Retry-After <= 2 s` same-key retry (`RTE-9`). |
+| `EntropySource` (`fn fill_bytes(&self, dest: &mut [u8])`) | `OsEntropy` (`rand::rngs::OsRng`) | `DeterministicRng` (seeded ChaCha20 RNG for reproducible test vectors) | Client key generation (`llr_...`, `SEC-3`), XChaCha20 24-byte nonces (`SEC-1`, `fixtures/crypto/aad_vectors.json`), and web session and CSRF token creation (`AUTH-7`, `SEC-5`). |
+| `UpstreamTransport` (`async fn send_inference(&self, req: OutboundRequest) -> Result<UpstreamResponseStream, TransportError>`) | `ReqwestUpstreamTransport` (with `GuardedConnector` socket SSRF filter and `rustls`) | `MockUpstreamTransport` (programmable per-route response queue: SSE chunk streams, comment keep-alives, delays, mid-stream drops, 429/401/403/503 responses, and outbound request capture) | Pre-first-valid-frame failover and 64 KiB holding (`RTE-9`), `HardKey` no-failover (`RTE-12`), five-class error classification (`API-8`), request/response header policies (`API-2`, `API-3`, `API-6`), surgical body edits (`API-4`), and `RequestLifecycle` disconnect finalization (`API-7`). |
+| `UsageEndpointClient` (`async fn fetch_usage(&self, key: &UpstreamKey) -> Result<RawUsageResponse, UsagePollError>`) | `HttpUsageEndpointClient` | `StubUsageEndpointClient` (returns canned or sequence-scripted OpenCode Go, Command Code, OpenRouter, or 404/500 responses) | Single-flight polling, `local_at_observation` capture at `t0`, `UpstreamObservation` projection and 30-minute decay, key exhaustion transitions (`USG-4`..`USG-6`), and `/v1/usage` pass-through sanitization (`USG-7`, `USG-8`, `SEC-18`). |
+| `StorageRepository` (`UserRepo`, `ProviderRepo`, `ShareRepo`, `CatalogRepo`, `PinRepo`, `UsageRepo`, `AuditRepo`) | `SqliteRepository` (`sqlx::SqlitePool` via `connect_options(role)`) | `InMemoryRepository` (for fast handler unit tests) plus ephemeral temp-file SQLite WAL instances (for `crates/store` SQL integration tests) | Handler RBAC enforcement (`ActorScope`, `USR-1`..`USR-5`), share acceptance and `share_config_fingerprint` suspension (`SHR-3`, `SHR-5`), atomic `/setup` (`AUTH-1`), in-transaction `last_admin` guard (`AUTH-5`), and three-queue writer backpressure (`REL-3`). |
+| `SecretSealer` (`fn seal(&self, domain: &str, fields: &[&[u8]], plain: &[u8]) -> Vec<u8>`, `fn open(...)`) | `XChaCha20Poly1305Sealer` | `TestSealer` (real XChaCha20-Poly1305 initialized with a fixed 32-byte test master key and `instance_id`) | Canonical length-prefixed AAD tampering rejection across all 6 sealed tables and resumable 500-row master-key rotation (`SEC-1`, `SEC-2`). |
 
 ### 16.5 Test levels and suites
 
@@ -1914,19 +2571,20 @@ Unit and property tests verify pure domain and protocol rules in milliseconds wi
 
 | Test category | Invariants and behaviors verified |
 | --- | --- |
-| Table-driven unit tests | All nine session-resolution steps, canonical model normalization (`deepseek/deepseek-v4.1-flash` to `deepseek-v4.1-flash` while keeping `deepseek-v4-flash` distinct), RBAC checks for `admin` vs. `user`, personal, shared, and global candidate filtering across all four `routing_scope` modes, and error classification per provider. |
-| Smooth WRR `proptest` suite | For any generated vector of 1 to 50 routes with weights in `1..=1000`, over 100,000 picks, each route's selection share stays within `0.5%` of `W_i / sum(W)`, and the longest consecutive run of one route stays at or below `ceil(max(W) / min(W))`. |
-| Surgical JSON span `proptest` suite | For any generated JSON payload with nested `messages`, `tools`, and `system` arrays and arbitrary key order, editing `model` or injecting `prompt_cache_key` keeps exact byte equality on every untouched field span (`TRN-2`). |
-| Micro-USD cost and window ring `proptest` suite | For any sequence of token counts in `0..=10_000_000` and rates in `1..=100_000_000`, integer micro-USD cost math never overflows, never produces negative numbers, and rolling ring counters equal the exact sum of events inside `[now - window_ms, now]`. |
+| Table-driven unit tests | Eight-step session resolution plus `response_links` inheritance, canonical byte-sliced Step 8 fingerprinting (including multi-byte UTF-8 characters straddling offset 4096 and moving `cache_control` markers), 21-slot `ConstantSessionDetector` (skipping Steps 1..3 and `x-claude-code-agent-id`), digit-preserving model normalization and within-key `--` collision resolution, `ActorScope` RBAC checks, `G1`..`G7` and `C1`..`C8` across all five `routing_scope` modes, and five-class error classification. |
+| Smooth WRR `proptest` suite | (1) Fixed candidate set: for 1 to 50 routes with weights in `1..=1000`, over 100,000 picks, each route's share stays within `0.5%` of `W_eff_i / sum(W_eff)`, consecutive runs never exceed `ceil(max(W) / min(W))`, and `sum(current) == 0` holds after every pick. (2) Varying subsets: at each step drop a random subset of up to 50% of routes and assert the `G2` `1%` subset-relative bound and `sum(current) == 0`. (3) Two-user isolation: user B's `priority_override = 1000` on a shared key does not alter user C's selection shares. |
+| Surgical JSON span `proptest` suite | For any generated JSON payload, duplicate top-level keys always return 400; random `upstream_model_id` strings containing quotes and backslashes produce valid JSON whose parsed `model` equals the input; when `Own` tier and no edit applies, output `Bytes` pointer is identical to input (`TRN-1`); when edited, untouched spans keep exact byte equality (`TRN-2`). |
+| Micro-USD cost, estimator, and window `proptest` suite | Integer micro-USD cost math never overflows up to `10^9` tokens; `estimate_input_tokens` counts a 4 MB base64 image as `1,600` tokens plus text; generalized 360-bucket rolling rings, day-clamped calendar months (31 Jan -> 28/29 Feb -> 31 Mar), and 30-minute decaying `UpstreamObservation` projections match exact reference sums. |
 
 #### 16.5.2 Level 2: Golden fixture and wire-contract tests (`fixtures/`)
 
-Recorded real-world payloads in `fixtures/` are replayed through `crates/proto` to lock wire compatibility.
+Recorded real-world payloads in `fixtures/` are replayed through `crates/proto` and `crates/store` to lock wire and cryptographic compatibility.
 
 | Fixture set | Recorded scenarios verified |
 | --- | --- |
-| `fixtures/sse/` | Multi-chunk SSE streams for OpenAI `chat` (with and without `include_usage`), OpenAI `responses` (`response.completed` and `reasoning_tokens`), Anthropic `messages` (`message_start`, `content_block_delta`, `message_delta`, `message_stop`), OpenRouter `usage.cost`, and truncated streams ([command-code#785](https://github.com/CommandCodeAI/command-code/issues/785)). |
-| `fixtures/usage/` | Recorded JSON payloads from OpenCode Go (`/zen/go/v1/usage`), Command Code (`/alpha/billing/credits` and `/alpha/usage/summary`), OpenRouter (`/api/v1/key`), and Open Design AMR (404 and proposed [#8674](https://github.com/nexu-io/open-design/issues/8674) schema), verifying normalization and PII stripping (`sanitized_json`). |
+| `fixtures/crypto/aad_vectors.json` | Fixed-key, fixed-nonce test vectors for all 6 `aad(domain, fields)` domains (`instance_secret`, `totp_secret`, `upstream_key`, `usage_raw`, `trace_block`, `trace_record`). |
+| `fixtures/sse/` | Multi-chunk SSE streams for OpenAI `chat` (with and without `include_usage`), OpenAI `responses` (`response.created`, `response.completed`, `reasoning_tokens`), Anthropic `messages` (`message_start`, `content_block_delta`, `message_delta`, `message_stop`), OpenRouter `: OPENROUTER PROCESSING` keep-alives and `usage.cost`, and truncated streams ([command-code#785](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2FCommandCodeAI%2Fcommand-code%2Fissues%2F785)). |
+| `fixtures/usage/` | Recorded JSON payloads from OpenCode Go (`/zen/go/v1/usage`), Command Code (`/alpha/billing/credits` and `/alpha/usage/summary`), OpenRouter (`/api/v1/key`), and Open Design AMR (404 and proposed [#8674](https://github.com/nexu-io/open-design/issues/8674) schema), verifying normalization and allow-list `sanitized_json`. |
 
 #### 16.5.3 Level 3: Component and SQLite integration tests (`crates/store`, `crates/proxy`, `crates/admin`)
 
@@ -1934,10 +2592,10 @@ Integration tests run against temporary SQLite WAL databases and local `wiremock
 
 | Integration test suite | Scenario and assertions |
 | --- | --- |
-| Concurrency and single-flight pinning (`RTE-7`) | Spawn 100 concurrent Tokio tasks sending turn 1 of the same session ID simultaneously; assert that `MockUpstreamTransport` receives all 100 calls on one `upstream_key_id` and creates one pin row. |
-| Failover before first byte vs. post-first-byte no-retry (`RTE-9`) | Verify that a connect timeout, 503, 429, or 401 before the first byte fails over to the next candidate and re-pins, while a stream drop after yielding 1 byte never retries and marks `incomplete = 1`. |
-| Personal provider sharing and revocation isolation (`SHR-1`..`SHR-6`, `SEC-17`, `SEC-18`) | User A creates a personal provider, adds a key, and shares it with User B with a $5 monthly cap and `allowed_models = ["deepseek-v4.1-flash"]`. Verify that User B routes `deepseek-v4.1-flash`, gets HTTP 403 on other models, never sees User A's secret or raw `/usage` email, re-pins to global when the $5 cap hits or User A revokes the share, and cannot re-share with User C. |
-| Security and canary redaction (`SEC-1`..`SEC-19`) | Plant canary secret `sk-canary-9988776655443322` as an upstream key, trigger upstream 401 and 500 errors, invalid JSON, and panics, and assert the canary never appears in logs, HTTP responses, SQLite error columns, or `/metrics`. Verify SSRF rejection on `127.0.0.1`, `169.254.169.254`, and HTTP 302 redirects. |
+| Concurrency and single-flight pinning (`RTE-7`) | (1) Spawn 100 concurrent turn-1 tasks when stub returns 200 -> all 100 calls hit one `upstream_key_id` and write one `pins` row. (2) Spawn 10 concurrent turn-1 tasks when `K1` returns 429 (no `Retry-After`) and others return 200 -> all 10 tasks adopt the same failover winner `K2` (`MockUpstreamTransport` records zero calls to any third key). |
+| Failover before first valid frame vs. post-commit no-retry (`RTE-9`, `RTE-12`) | Verify that a connect error, 503, 429, or HTTP 200 whose first `data:` frame is an error object fails over to `K2` while holding status/headers until `K2`'s first valid frame commits (client sees one 200 status line), whereas a stream drop after the first valid frame is committed never retries and marks `incomplete = 1`, and a `HardKey` (`previous_response_id`) request on a cooling/503 key returns 429/502 with zero calls to other keys. |
+| Consented personal sharing and tier isolation (`SHR-1`..`SHR-6`, `SEC-16`..`SEC-18`) | User A creates a personal provider, adds a key, and shares it with User B ($5 monthly cap, `allowed_models = ["deepseek-v4.1-flash"]`). Verify the share is inert until B accepts `share_config_fingerprint`; once accepted, with B's client key set to `personal_only`, B routes `deepseek-v4.1-flash` (spending B's own key first under `personal_first` if B has one), gets HTTP 404 `model_not_found` on unserved models, has client session headers stripped and replaced with the salted token, never receives `openai-organization` or `x-ratelimit-*` headers, and is suspended within 1 s if A edits `paths.chat` or revokes the share. |
+| Security, SSRF connector, and canary redaction (`SEC-1`..`SEC-19`) | Plant canary secret `sk-canary-9988776655443322`, trigger upstream 401/500 errors, invalid JSON, and panics, and assert zero canary occurrences across logs, HTTP responses, SQLite tables, and `/metrics`. Verify `GuardedConnector` blocks IP-literal `https://127.0.0.1`, `https://[::ffff:127.0.0.1]`, 6to4 `https://[2002:a9fe:a9fe::1]`, decimal `https://2130706433` (at save), DNS rebinding to `10.0.0.5`, and HTTP 302 redirects. |
 
 #### 16.5.4 Level 4: Regression test suite
 
@@ -1953,59 +2611,60 @@ The E2E suite compiles the release `llmroller` binary and launches it as a child
 
 | E2E suite | End-to-end verification flow |
 | --- | --- |
-| Full multi-role lifecycle (`tests/e2e_lifecycle.rs`) | Complete `/setup` with the one-time token, confirm `/setup` locks to 404, add global providers as `admin`, create standard users Alice and Bob, log in as Alice, add a personal OpenCode Go key, share it with Bob, issue `llr_...` keys, stream multi-turn chats, verify `/v1/usage` and `/v1/key` pass-through, verify Alice's and Bob's HTMX pages and CSV exports, send `SIGTERM` mid-stream to verify graceful drain (`REL-1`), and restart to verify pin persistence (`REL-2`). |
-| Real CLI harness compatibility (`tests/e2e_cli_harnesses.rs`, `COM-1`) | Run headless invocations of `claude` (Claude Code), `codex`, `opencode`, and Python and TypeScript scripts using the official `openai` and `anthropic` SDKs against LLMRoller, completing a multi-turn tool-call loop and asserting pin stickiness and exact usage rows. |
+| Full multi-role lifecycle (`tests/e2e_lifecycle.rs`) | Complete `/setup` with the `setup-token` file, confirm `/setup` locks to 404, add global providers as `admin`, create standard users Alice and Bob, log in as Alice, add a personal OpenCode Go key, share it with Bob, accept the share as Bob, issue `llr_...` keys, stream multi-turn chats and chained `previous_response_id` turns, verify `/v1/usage` and `/v1/key`, verify `project_key` redaction across `/api/user/*` and HTMX pages, send `SIGTERM` mid-stream to verify the 8-step drain (`REL-1`), and restart to verify `< 2 s` rebuild from `usage_rollups_5min` (`PERF-4`, `REL-2`). |
+| Real CLI harness compatibility (`tests/e2e_cli_harnesses.rs`, `COM-1`) | Run headless invocations of `claude` (Claude Code), `codex`, `opencode`, and Python and TypeScript scripts using the official `openai` and `anthropic` SDKs against LLMRoller, completing multi-turn tool-call loops and stateful `previous_response_id` chains and asserting pin stickiness, single `session_hash` inheritance, and exact usage rows. |
 
 #### 16.5.6 Level 6: Mutation testing (`cargo-mutants`)
 
-Line and branch coverage (`cargo llvm-cov`, minimum gate `90%` workspace-wide and `95%` in `crates/core` and `crates/proto`) only proves that a test ran a line of code. It does not prove that any assertion checked the result ([cargo-mutants vs. coverage](https://mutants.rs/vs-coverage.html)).
+Line and branch coverage (`cargo llvm-cov`, minimum gate `90%` workspace-wide and `95%` in `crates/core` and `crates/proto`) only proves that a test ran a line of code. It does not prove that any assertion checked the result ([cargo-mutants vs. coverage](https://www.google.com/search?q=https%3A%2F%2Fmutants.rs%2Fvs-coverage.html)).
 
 LLMRoller enforces automated mutation testing using [`cargo-mutants`](https://mutants.rs/).
 
 | Mutation aspect | Specification and CI gate |
 | --- | --- |
-| Injected fault types | `cargo-mutants` parses the Rust AST and injects behavioral faults one by one: replacing functions with `Ok(())` or `Default::default()`, flipping `<` to `<=` or `>` in budget reserve and cooldown checks, inverting `&&` and `||` in route eligibility and RBAC guards (`SEC-17`), deleting match arms in error classifiers, and changing `+`, `-`, or `*` in WRR and micro-USD cost math. |
-| Pull-request gate (`--in-diff`) | Every pull request generates a unified diff (`git diff origin/main...HEAD > target/pr.diff`) and runs `cargo mutants --in-diff target/pr.diff -j 4` across modified Rust files ([diff testing](https://mutants.rs/in-diff.html)). Any surviving mutant fails the PR build unless annotated with `#[mutants::skip]` (permitted only on non-behavioral log lines or documented mathematically equivalent mutants with reviewer sign-off). |
+| Injected fault types | `cargo-mutants` parses the Rust AST and injects behavioral faults one by one: replacing functions with `Ok(())` or `Default::default()`, flipping `<` to `<=` or `>` in budget reserve and cooldown checks, inverting `&&` and `||` in route eligibility (`C1`..`C8`) and RBAC guards (`SEC-17`), deleting match arms in the five-class error classifier, and changing `+`, `-`, or `*` in WRR and micro-USD cost math. |
+| Pull-request gate (`--in-diff`) | Every pull request generates a unified diff (`git diff origin/main...HEAD > target/pr.diff`) and runs `cargo mutants --in-diff target/pr.diff -j 4` across modified Rust files ([diff testing](https://www.google.com/search?q=https%3A%2F%2Fmutants.rs%2Fin-diff.html)). Any surviving mutant fails the PR build unless annotated with `#[mutants::skip] // equivalent: <reason>` (CI fails if any `#[mutants::skip]` lacks an `equivalent:` reason comment or CODEOWNERS review). |
 | Nightly full-workspace gate | Nightly CI runs `cargo mutants --workspace` across `crates/core`, `crates/proto`, `crates/store`, `crates/proxy`, and `crates/admin`. |
 | Target mutation score | `100%` killed mutants (zero unannotated survivors) in `crates/core`, `crates/proto`, and all RBAC, share, and cryptographic guards in `crates/store`, `crates/proxy`, and `crates/admin`. |
 
-### 16.6 Code-test-spec traceability matrix
+### 16.6 Code-test-spec traceability matrix (`cargo xtask traceability`)
 
-Every requirement ID in this SRDD maps to concrete source modules and automated test targets. A CI script (`scripts/verify_traceability.py --milestone M<N>`) scans the SRDD tables and Rust test attributes (`#[doc = "Spec: ..."]`) on every commit. From `M0` through `M5`, the script verifies that all requirements in completed milestones have linked tests and rejects unknown IDs. At `M6` (`--milestone M6`), it enforces 100% coverage across every requirement in the SRDD.
+Every requirement ID in this SRDD is registered in `docs/srdd/requirements.toml` with its `priority`, `milestone`, `delivering_subphase`, and `partial_subphases`. On every commit and PR, `cargo xtask traceability --milestone M<N>` and `cargo xtask doc-consistency` scan `requirements.toml`, the SRDD and Big-Bang tables, and Rust test attributes (`#[doc = "Spec: <ID>"]` and `#[doc = "Partial: <ID>"]`). A milestone gate fails if any requirement assigned to that milestone in `requirements.toml` has only `Partial` links or zero full `Spec` links.
 
-| Requirement ID(s) | Source crate & module | Unit / property test target | Integration / E2E / mutation target |
-| --- | --- | --- | --- |
-| `AUTH-1`..`AUTH-9` | `crates/admin::auth`, `crates/store::users` | `admin::auth::tests::*`, `store::users::tests::*` | `tests/e2e_setup_and_auth.rs` (concurrent setup race, lockout, TOTP, cookie flags) |
-| `USR-1`..`USR-5` | `crates/core::rbac`, `crates/admin::middleware`, `crates/store::*` | `core::rbac::tests::actor_scope_matrix` | `tests/integration_rbac_isolation.rs` (IDOR checks across all `/api/user/*` and `/admin/api/*` routes) + `cargo-mutants` on `core::rbac` |
-| `PRV-1`..`PRV-8` | `crates/core::provider`, `crates/proto::adapters`, `crates/store::providers` | `core::provider::tests::*`, `proto::adapters::tests::*` | `tests/integration_providers_and_keys.rs` (global vs. personal CRUD, key test, SSRF check) |
-| `SHR-1`..`SHR-6` | `crates/core::shares`, `crates/store::shares`, `crates/admin::shares` | `core::shares::tests::eligibility_and_caps` | `tests/integration_personal_sharing.rs` (grant, model filter, monthly cap, revocation repin, no transitive share) |
-| `CLK-1`..`CLK-5` | `crates/core::client_key`, `crates/proxy::auth` | `core::client_key::tests::*` | `tests/integration_client_keys.rs` (creation, `routing_scope`, rotation, 1 s revocation, RPM & CIDR caps) |
-| `MDL-1`..`MDL-7` | `crates/core::catalog`, `crates/proto::discovery`, `crates/server::jobs` | `core::catalog::tests::normalization_and_intersection` | `tests/integration_model_catalog.rs` (auto intersection vs. forced on or off, personal model exposure, `/v1/models` shapes) |
-| `RTE-1`..`RTE-13` | `crates/core::router`, `crates/core::wrr`, `crates/core::pins` | `core::wrr::proptests::*`, `core::router::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (100-way single-flight race, pre-first-byte failover, post-first-byte no-retry, `previous_response_id`) + `cargo-mutants` |
-| `API-1`..`API-8`, `TRN-1`..`TRN-3` | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (byte-identical pass-through, injected `include_usage` chunk stripping, 1 s disconnect abort) |
-| `USG-1`..`USG-8`, `LIM-1` | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (OpenCode Go, Command Code, OpenRouter `/usage` sync, auto-adjustment, `/v1/usage` & `/v1/key` sanitization) |
-| `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (default-off check, streaming delta reassembly, Grantor A blocked from Grantee B trace, XSS sanitization in chat preview, purge & TTL) + `cargo-mutants` |
-| `UI-1`..`UI-4`, `AUD-1` | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (admin and standard user UI flows, read-only session chat preview drawer, zero external asset check, audit tamper detection) |
-| `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `crates/server`, workspace-wide | `crates/core` zero-I/O dependency test | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
-| `SEC-1`..`SEC-19` | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf`, `crates/admin::traces` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
+| Requirement ID(s) | Milestone & delivering sub-phase | Source crate & module | Unit / property test target | Integration / E2E / mutation target |
+| --- | --- | --- | --- | --- |
+| `AUTH-1`..`AUTH-9` | `M0` (`1.4`) | `crates/admin::auth`, `crates/store::users` | `admin::auth::tests::*`, `store::users::tests::*` | `tests/e2e_setup_and_auth.rs` (20-way setup race `COUNT(*) == 1`, `last_admin` tx guard, `reset-admin` CLI, 3-tier login limiter, TOTP, CSRF) |
+| `USR-1`..`USR-5` | `M0` (`1.2`), `M1` (`2.0`), `M2` (`3.0c`), `M5` (`6.2`, `6.3`) | `crates/core::rbac`, `crates/admin::projection`, `crates/store::*` | `core::rbac::tests::actor_scope_matrix` | `tests/integration_rbac_isolation.rs` (`ActorScope::System` boundary, 404 IDOR checks, `project_key` global label redaction) + `cargo-mutants` |
+| `PRV-1`..`PRV-8` | `M1` (`2.0`, `2.1`, `2.6`), `M2` (`3.6b`), `M4` (`4b.2`) | `crates/core::provider`, `crates/proto::adapters`, `crates/proxy::ssrf`, `crates/store::providers` | `core::provider::tests::*`, `proto::adapters::tests::*`, `proxy::ssrf::tests::ip_ranges` | `tests/integration_providers_and_keys.rs` (`GuardedConnector` IP-literal / 6to4 / DNS-rebinding SSRF tests, key disable invalidation) |
+| `SHR-1`..`SHR-6` | `M2` (`3.2`), `M3` (`4.3`) | `crates/core::shares`, `crates/store::shares`, `crates/admin::shares` | `core::shares::tests::eligibility_and_caps` | `tests/integration_personal_sharing.rs` (409 `share_overlap`, `share_config_fingerprint` acceptance & suspension, `custom` admin approval, monthly cap reservation) |
+| `CLK-1`..`CLK-5` | `M1` (`2.2`), `M2` (`3.0c`, `3.4`, `3.6b`) | `crates/core::client_key`, `crates/proxy::auth` | `core::client_key::tests::*` | `tests/integration_client_keys.rs` (`prev_key_hash` rotation grace, 5 `routing_scope` modes, <1 s revocation, G1..G7 gates) |
+| `MDL-1`..`MDL-7` | `M2` (`3.1`) | `crates/core::catalog`, `crates/proto::discovery`, `crates/store::models` | `core::catalog::tests::normalization_and_exposure` | `tests/integration_model_catalog.rs` (digit-dot preservation, `--` collision, `merge_state`, surrogate `model_pk` merge/split, `union`/`intersection`, 2,000 personal cap) |
+| `RTE-1`..`RTE-13` | `M2` (`3.3`, `3.4`, `3.5`, `3.6a`, `3.6b`, `3.7`) | `crates/core::router`, `crates/core::wrr`, `crates/core::pins`, `crates/core::session` | `core::wrr::proptests::*`, `core::session::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (`PinStore` 10-way 429 loser adoption, durable `response_links` session inheritance, `HardKey` no-failover, `OriginBreaker`) + `cargo-mutants` |
+| `API-1`..`API-8`, `TRN-1`..`TRN-3` | `M1` (`2.3`..`2.7`), `M2` (`3.6a`, `3.6b`), `M3` (`4.1`), `M4` (`4b.2`) | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (duplicate-key 400, response header `R1`..`R5`, 64 KiB frame filter, `RequestLifecycle` disconnect guard, 5-class error classifier) |
+| `USG-1`..`USG-8`, `LIM-1` | `M2` (`3.0a`, `3.0b`), `M3` (`4.1`, `4.2`, `4.3`, `4.6`), `M4` (`4b.1`, `4b.2`) | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (`usage_attempts`, `usage_rollups_5min` `< 2 s` rebuild, 30-min `UpstreamObservation` decay, single-flight polling, `raw_json_enc`) |
+| `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` | `M3b` (`5.1`..`5.4`), `M5` (`6.5`) | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (`trace_blocks` dedup, 2-thread `zstd::bulk::Compressor` pool, block-hash LCP, `(ts, request_id)` cursor pagination, `ammonia` + `<pre>` XSS tests) |
+| `UI-1`..`UI-4`, `AUD-1` | `M0` (`1.5`), `M5` (`6.1`..`6.5`) | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (`audit_anchor` truncation detection, HTMX CSP lint, share acceptance UI, `"Global pool"` matrix column, preview drawer) |
+| `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `M0` (`1.1`, `1.6`), `M1` (`2.2`, `2.5`, `2.7`), `M3` (`4.3`, `4.7`), `M4` (`4b.1`), `M6` (`7.1`..`7.5`) | `crates/server`, workspace-wide | `tests/workspace_boundaries.rs`, metric label allow-list test | `benches/proxy_latency.rs` (log-normal TTFF stub), `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
+| `SEC-1`..`SEC-19` | `M0` (`1.1`..`1.5`), `M1` (`2.1`..`2.4`), `M2` (`3.2`, `3.3`), `M3b` (`5.3`, `5.4`), `M4` (`4b.2`), `M5` (`6.1`), `M6` (`7.1`, `7.5`) | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf`, `crates/admin::traces` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
 
 ## 17. Roadmap and milestones
 
-Implementation follows seven dependency-ordered milestones (`M0` through `M6`). Under the TDD rules in Section 16, a milestone is complete only when all linked requirement tests pass and `cargo-mutants` reports zero surviving mutants.
+Implementation follows eight dependency-ordered milestones (`M0`, `M1`, `M2`, `M3`, `M4`, `M3b`, `M5`, `M6`) that map one-to-one to the Big-Bang epics. A milestone is complete when `cargo xtask traceability --milestone <M>` verifies 100% `Spec:` coverage and `cargo-mutants` reports zero unannotated survivors.
 
 ### 17.1 Milestone delivery plan
 
-The table below defines the scope, deliverables, and exit criteria for each milestone.
+The table below defines the scope, deliverables, and exit criteria for each milestone (generated from `docs/srdd/requirements.toml`).
 
-| Milestone | Scope and deliverables | Exit criteria (must pass before starting next milestone) |
+| Milestone (Big-Bang Epic) | Scope and deliverables | Exit criteria (must pass in `cargo xtask traceability --milestone <M>` before starting next milestone) |
 | --- | --- | --- |
-| `M0`: Foundation, Storage Writer, RBAC, and Auth | Cargo workspace setup, `flock` single-instance guard, SQLite WAL migrations (21 tables), serialized batch writer actor, XChaCha20-Poly1305 secret sealer, Argon2id + TOTP auth, CSRF middleware, atomic first-admin `/setup`, `admin` and `user` account management, `ActorScope` RBAC, HMAC-chained `audit_log`, `/healthz`, `/readyz`, `/metrics`, and CI gates. | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-5`, `SEC-9`, `SEC-10`, `SEC-12`..`SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
-| `M1`: Transparent Pass-Through Proxy | Global and personal provider repositories and JSON CRUD APIs, upstream key encryption and Stage-1 `/models` test endpoint, client key issuance (`llr_...`), SSRF-safe `reqwest` transport, header policy, surgical JSON span editor, canary log redaction (`SEC-6`), and unbuffered SSE streaming for `chat`, `responses`, and `messages`. | `PRV-1`..`PRV-5`, `PRV-7`, `PRV-8`, `CLK-1`, `CLK-2`, `CLK-4`, `API-2`..`API-7`, `TRN-1`..`TRN-3`, `SEC-3`, `SEC-6`..`SEC-8`, `SEC-15` tests pass; single-provider pass-through verified. |
-| `M2`: Routing, Pinning, and Sharing | Model catalog discovery and 6-step normalization, global union/intersection exposure and force exposure, personal provider and key sharing (`provider_shares`), `routing_scope` pool resolution, smooth WRR with per-model overrides, single-flight session pinning, `previous_response_id` links, and pre-first-byte failover. | `SHR-1`, `SHR-3`..`SHR-5`, `CLK-3`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `USR-2`..`USR-4`, `SEC-16` tests pass; 100-way concurrency race test and `proptest` WRR suite pass with zero surviving mutants in `crates/core`. |
-| `M3`: Usage Pipeline, Price Book, and Trace Storage | `SseUsageTap`, `JsonUsageExtractor`, and opt-in `TraceTap` delta reassembler for all three protocols; cache token normalization; integer micro-USD price book; `zstd` + `XChaCha20-Poly1305` `trace_records` storage; session chat timeline reconstructor; non-blocking telemetry ring buffer and hourly rollups. | `USG-1`..`USG-3`, `TRC-1`..`TRC-5`, `TRC-7`, `TRC-8`, `PERF-5`, `SEC-19`, `REL-2`, `REL-3` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
-| `M4`: Budget Windows and Source Provider `/usage` Engine | Rolling (`5h`, `7d`) and anchored (`1mo`) budget window ring counters, UTC monthly accumulators (`SHR-2`, `USR-5`, `CLK-5`), `InFlightBudgetGuard`, source provider `/usage` poller and parsers (`PRV-6` Stage 2), automatic window reconciliation, and `/v1/usage` + `/v1/key` pass-through (`API-1`) with PII sanitization. | `PRV-6`, `SHR-2`, `SHR-6`, `CLK-5`, `USR-5`, `API-1`, `USG-4`..`USG-8`, `LIM-1`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
-| `M5`: Embedded Web UI and Read-Only Session Chat Preview | Server-rendered Askama + HTMX screens for both the Personal Workspace (`/app/*`) and Admin Console (`/admin/*`), vendored `uPlot` charts, inline routing matrix editor, share management UI, raw `/usage` inspection modal, active session pin controls, XSS-safe read-only Session Chat Preview screen, and CSV or JSON exports. | `UI-1`..`UI-4`, `TRC-5`, `TRC-6` E2E browser and HTMX tests pass; CSP and zero-external-asset checks pass. |
-| `M6`: Hardening, Load Verification, and Release Packaging | `cargo-fuzz` targets on JSON span scanner, SSE parser, and header normalizer; 500 req/s and 2,000-stream benchmark verification (`PERF-1`..`PERF-4`); `SIGTERM` drain and `SIGKILL` recovery verification; live CLI harness verification (`Claude Code`, `Codex CLI`, `opencode`); signed static binaries, SBOM, and distroless container image under 50 MB. | All `PERF-*`, `REL-*`, `POR-1`, `COM-1`, `SEC-11` checks pass; `scripts/verify_traceability.py` reports 100% requirement test coverage. |
+| `M0`: Foundation, Dual-Queue Writer, Reloader, RBAC, and Auth (`Epic 1`: `1.1`..`1.6`) | Six-crate + `xtask` workspace, `POR-1` multi-arch CI matrix, `connect_options(role)` + 31-table SQLite WAL migrations (`auto_vacuum = INCREMENTAL`), `instance_meta` & `instance_secrets`, canonical AAD `XChaCha20-Poly1305` sealer, offline resumable 500-row `rotate-master-key`, `ActorScope::{User, System}`, `Argon2id` + TOTP + `setup-token` file (`0600`) + `reset-admin` CLI + 3-tier login limiter, HMAC `audit_log` with `audit_anchor`, dual-queue writer (`Control` + `Data` `4 MiB` cap), closed 13-key settings registry, and single `Reloader` task (`config_version` + `RuntimeState`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `POR-1` (build matrix), `REL-4`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
+| `M1`: Transparent Pass-Through Proxy & Orchestrator v1 (`Epic 2`: `2.0`..`2.7`) | Minimal control-plane JSON CRUD (`2.0`), `GuardedConnector` socket-level SSRF filter (`2.1`), client key issuance and `prev_key_hash` grace rotation + gates `G1`..`G6` + `auth_failure_counters` + `/healthz`, `/readyz`, `/metrics` with closed label allow-list (`2.2`), request & response header pipelines (`R1`..`R5`) (`2.3`), duplicate-rejecting surgical JSON span editor (`2.4`), 64 KiB pre-first-frame holding buffer + 64 KiB usage-chunk filter + `RequestLifecycle` drop guard (`2.5`), `ProviderAdapter` presets (`2.6`), and `/v1/*` orchestrator v1 + `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` admission queue + 8-step `SIGTERM` drain + parser fuzz targets + initial TTFF load benchmark (`2.7`). | `PRV-1`..`PRV-5`, `PRV-7`, `CLK-1`, `CLK-4`, `API-2`..`API-4`, `API-6`, `API-7`, `TRN-1`..`TRN-3`, `PERF-1`, `PERF-2`, `REL-1`, `OBS-1`, `SEC-3`, `SEC-6`..`SEC-9`, `SEC-12`, `SEC-15` tests pass. |
+| `M2`: Pure Pricing/Windows Core, Catalog, Consented Sharing, Smooth WRR, and Pinning (`Epic 3`: `3.0a`..`3.7`) | Pure `crates/core::pricing` + binary-aware estimator (`3.0a`), pure `WindowState` (360-bucket rings, day-clamped calendar months, decaying `UpstreamObservation`, cache-aware `try_reserve`) (`3.0b`), pure UTC monthly accumulators + gate `G7` (`3.0c`), `/models` discovery + digit-preserving normalization + surrogate `model_pk` merge/split (`3.1`), consented `provider_shares` (`effective_share`, `share_config_fingerprint`, `custom` approval) (`3.2`), 8-step session resolver + 21-slot detector + `Shared`/`Global` carrier stripping (`3.3`), `C1`..`C8` + 3-tier pool selector (`3.4`), per-group `WrrState` (`3.5`), pure health/5-class classifier/`OriginBreaker` (`3.6a`), `PinStore` mutex state machine + durable `response_links` inheritance + failover (`3.6b`), and orchestrator v2 (`3.7`). | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` tests pass; zero surviving mutants in `crates/core`. |
+| `M3`: Usage Pipeline, 5-Min & Hourly Rollups, Orchestrator v3, and Retention (`Epic 4`: `4.1`..`4.3`, `4.6`, `4.7`) | Inline `SseUsageTap` and `JsonUsageExtractor` with unified `cache_read` and `cache_write` subtraction (`4.1`), `models.dev` price sync and body-based price APIs (`4.2`), three-queue writer (`durable_state`, `rollups`, `raw_events` `VecDeque` dropping oldest) + `usage_events` + `usage_attempts` + `usage_rollups_5min` + `usage_rollups_hourly` + `SIGKILL` recovery (`4.3`), orchestrator v3 wiring live usage and reservations (`4.6`), and general retention sweeper + 30 s/256 MiB WAL checkpointer + `SQLITE_FULL` handling (`4.7`). | `SHR-6`, `API-5`, `USG-1`..`USG-3`, `REL-2`, `REL-3`, `PRIV-1` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
+| `M4`: Window Persistence, `< 2 s` Startup Reconstruction, and Source Provider `/usage` Engine (`Epic 4b`: `4b.1`, `4b.2`) | Startup reconstruction (`< 2 s`) of all window rings and UTC monthly accumulators from `usage_rollups_5min`, window-instance-bound `budget_adjustments`, and `upstream_usage_snapshots` (`4b.1`), plus single-flight `/usage` poller (8-permit concurrency semaphore, `local_at_observation` at `t0`, `raw_json_enc` sealing, allow-list `sanitized_json`, decaying `UpstreamObservation` sync, and header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw`) (`4b.2`). | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `PERF-4`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
+| `M3b`: Opt-In Content Traceability and Session Chat Preview API (`Epic 5`: `5.1`..`5.4`) | Request-start `traceability_config` matcher + `"confirm_purge": true` guard (`5.1`), bounded `TraceTap` (`mpsc(256)` + `64 MiB` in-flight + `1 MiB` per-stream output cap + 2,000-stream memory soak) (`5.2`), content-addressed `trace_blocks` + 2-thread OS sealer pool (`crossbeam::bounded(64)` + `zstd::bulk::Compressor`) (`5.3`), and block-hash LCP reconstructor + `(ts, request_id)` cursor pagination + 30-min deduplicated `trace.viewed` audit logging (`5.4`). | `TRC-1`..`TRC-5`, `TRC-7`, `TRC-8`, `PERF-5`, `SEC-19` tests pass. |
+| `M5`: Dual-Workspace HTMX Web UI and Session Chat Preview UI (`Epic 6`: `6.1`..`6.5`) | Embedded Askama + HTMX shell (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`) + CSRF middleware (`6.1`), Personal Workspace `/app/*` and `/api/user/*` with share-acceptance modal and `project_key` verification (`6.2`), Admin Console `/admin/*` and `/admin/api/*` with user-resource override routes and `model_pk` merge/split (`6.3`), Overview dashboard (`uPlot`, dual gauges, disk budget `A6`) + Active Sessions + paged Usage Explorer (`6.4`), and read-only Session Chat Preview UI (`6.5`). | `UI-1`..`UI-4`, `TRC-6`, `SEC-5` E2E browser and HTMX tests pass. |
+| `M6`: Extended Fuzzing, Full Soak Verification, Live Harnesses, and v1.0.0 Release (`Epic 7`: `7.1`..`7.5`) | Extended 24-hour fuzzing across all 6 fuzz targets + full-stack canary redaction test (`7.1`), full-workspace `cargo mutants --workspace` + `cargo xtask traceability --milestone M6` + `cargo xtask doc-consistency` (`7.2`), 500 req/s and 2,000-stream soak benchmark against 50M-row DB + `llmroller backup` `fsync` + exit codes `0..14` (`7.3`), headless CLI harness compatibility (`COM-1`) (`7.4`), and multi-arch static release + `< 50 MB` distroless container + SBOM + `cosign` + `llmroller --version` (`7.5`). | All `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `POR-1`, `COM-1`, `SEC-11` checks pass; `cargo xtask traceability --milestone M6` reports 100% coverage. |
 
 ### 17.2 Post-1.0 roadmap (`P2` items)
 
@@ -2025,21 +2684,21 @@ Each risk lists its likelihood, impact, and the specific design mechanisms and r
 
 | ID | Risk description | Likelihood | Impact | Mitigation in LLMRoller design |
 | --- | --- | --- | --- | --- |
-| R1 | An upstream provider suspends an account for pooling keys across multiple users or violating subscription terms. | Medium | High | Support personal providers (`PRV-1`) with `personal_first` or `personal_only` routing so each user routes primarily through their own subscription, and scope shares to trusted teammates (`SHR-1`). Forward authentic client headers (`API-3`) and pin each session to a single key (`RTE-2`) so traffic matches normal single-agent patterns. Document operator responsibility (`A1`). |
-| R2 | Source provider `/usage` endpoints change schema or are undocumented (such as Command Code `/alpha/billing/credits` or Open Design AMR [#8674](https://github.com/nexu-io/open-design/issues/8674)). | High | Medium | Isolate `/usage` parsing inside `ProviderAdapter` (`MNT-2`), store raw JSON alongside normalized fields (`USG-5`), and fall back automatically to local micro-USD window ring counters and manual calibration (`LIM-1`) whenever an upstream `/usage` endpoint returns 404 or an unparseable shape. |
-| R3 | Local micro-USD cost estimates drift from a provider's internal billing due to external key usage, promotional multipliers, or rounding. | High | Medium | Poll upstream `/usage` endpoints every 5 minutes and at 80% spend to auto-reconcile window counters and reset timestamps (`USG-4`, `USG-6`), enforce a 2% admission reserve (`LIM-1`), and provide one-click manual calibration. |
-| R4 | Command Code or Open Design AMR changes which session affinity header or body field its backend honors. | Medium | Medium | Make `session_profile` editable per provider in JSON configuration (`PRV-3`) and surface the per-route cache hit ratio on the dashboard so operators can verify cache locality empirically. |
+| R1 | An upstream provider suspends an account for pooling keys across multiple users or violating subscription terms. | Medium | High | Support personal providers (`PRV-1`) with three-tier `personal_first` or `own_only` routing so each user routes through their own `Own` key before any `Shared` or `Global` key, enforce grantee consent (`SHR-3`), forward authentic client headers on `Own` keys (`API-3`), and pin each session to a single key (`RTE-2`). |
+| R2 | Source provider `/usage` endpoints change schema, return 5xx, or are undocumented (such as Command Code `/alpha/billing/credits` or Open Design AMR [#8674](https://github.com/nexu-io/open-design/issues/8674)). | High | Medium | Isolate `/usage` parsing inside `ProviderAdapter` (`MNT-2`), seal raw JSON in `raw_json_enc` (`USG-5`), and model upstream figures as time-bounded `UpstreamObservation` projections that expire after 30 minutes (`MAX_OBSERVATION_AGE_MS`) or at `resets_at_ms` (`USG-6`) so a failing `/usage` endpoint never leaves a key permanently excluded. |
+| R3 | Local micro-USD cost estimates drift from a provider's internal billing due to external key usage, promotional multipliers, or failed tries. | High | Medium | Poll upstream `/usage` endpoints with single-flight deduplication and capture `local_at_observation` at poll start `t0` (`USG-4`, `USG-6`), record and charge failed tries that consumed compute in `usage_attempts` (`USG-1`), enforce cache-aware in-flight reservations (`LIM-1`), and support window-instance-bound manual calibration. |
+| R4 | Command Code or Open Design AMR changes which session affinity header or body field its backend honors. | Medium | Medium | Make `session_profile` editable per provider in `ProviderConfigJson` (`PRV-3`) and surface the per-route cache hit ratio (`observed_cache_read_ratio_ewma`) on the dashboard so operators can verify cache locality empirically. |
 | R5 | A provider enables automatic pay-as-you-go wallet fallback when subscription windows run out (such as OpenCode Go "Use balance" or Command Code extra credits). | Medium | High | Warn operators in the UI setup guide to disable automatic wallet fallback in provider consoles, or set LLMRoller window limits and reserve percentages (`reserve_pct = 5%`) below the plan cap so LLMRoller stops routing before spillover starts. |
-| R6 | A grantee on a shared personal key consumes the owner's entire monthly quota or tries to inspect the owner's private account details. | Medium | High | Enforce per-share `max_monthly_micro_usd` and `allowed_models` (`SHR-2`), allow instant share revocation (`SHR-5`), and strip all PII and account identifiers from `/v1/usage` responses on shared keys (`USG-8`, `SEC-18`). |
-| R7 | An upstream provider drops SSE streams mid-generation without sending `[DONE]`, `response.completed`, or `message_stop` ([command-code#785](https://github.com/CommandCodeAI/command-code/issues/785)). | Medium | Medium | Never retry after the first byte (`RTE-9`), detect missing terminal events in `SseUsageTap`, set `incomplete = 1` on the usage row (`USG-1`), and count soft circuit-breaker failures. |
-| R8 | A misconfigured client sends a static constant session ID for every conversation, funneling all traffic onto one key ([vscode#334186](https://github.com/microsoft/vscode/issues/334186)). | Medium | Medium | Track opening-message fingerprint cardinality per `session_hash` (`Section 11.1.1`) and flag any session hash exceeding 20 distinct conversations per hour in the Sessions UI. |
-| R9 | Long-running agent sessions skew actual token spend away from the session-count weights configured in smooth WRR. | Medium | Low | Provide `headroom` weight scaling (`RTE-13`) that scales WRR weights by remaining budget fraction, plus automatic repinning when a key's window reaches its limit (`RTE-11`). |
-| R10 | Upstream providers change model availability, endpoint support (`chat` vs. `messages`), or pricing without notice. | High | Low | Run scheduled `/models` discovery every 6 hours (`MDL-1`), read `supported_endpoints` dynamically, and keep prices and window rules in SQLite tables rather than compiled constants. |
-| R11 | A compromised crate in the Rust dependency ecosystem tries to exfiltrate decrypted upstream keys ([March 2026 LiteLLM incident](https://docs.litellm.ai/blog/security-update-march-2026)). | Low | High | Keep the dependency list small, commit `Cargo.lock`, enforce `cargo audit`, `cargo deny`, and `cargo vet` in CI (`SEC-10`), run inside a read-only distroless container (`SEC-11`), and restrict outbound connections to configured provider origins (`PRIV-1`, `SEC-7`). |
-| R12 | Losing `LLMROLLER_MASTER_KEY` renders all encrypted `upstream_keys.secret_enc` blobs unrecoverable. | Low | High | Validate the master key at startup (`SEC-2`), document master-key backup procedures in the operator guide, and provide `llmroller rotate-master-key` (`SEC-1`). |
-| R13 | Tests become brittle or allow subtle logic regressions in routing, budget math, or RBAC checks to slip into production. | Medium | High | Enforce strict TDD contract testing, boundary discipline, the Expected vs. Unexpected failure protocol (`Section 16.2`), and automated mutation testing with `cargo-mutants` (`Section 16.5.6`). |
-| R14 | A single-node SQLite instance experiences hardware failure. | Low | Medium | Persist pins and usage in WAL mode (`REL-2`), keep startup recovery under 2 s (`PERF-4`), and provide `llmroller backup --out <path>` for online cron backups (`REL-6`). |
-| R15 | Enabling content traceability mode increases SQLite disk usage or exposes sensitive prompts across shared personal keys. | Medium | High | Keep content traceability strictly off by default (`TRC-1`), compress with `zstd` and encrypt with `XChaCha20-Poly1305` (`SEC-19`), cap captured turns at 4 MiB (`PERF-5`), enforce a 14-day default TTL (`TRC-7`), and block shared-key grantors from reading grantee traces (`TRC-8`). |
+| R6 | A grantee on a shared personal key drains the owner's quota, inspects the owner's account details, or has their prompts redirected to a grantor-controlled relay. | Medium | High | Separate `Own` and `Shared` tiers so grantees use their own keys first (`CLK-3`), enforce per-share `max_monthly_micro_usd` and `allowed_models` (`SHR-2`), enforce explicit grantee acceptance of `share_config_fingerprint` (`SHR-3`, `SEC-16`) plus admin approval for `custom` providers, and strip account headers and raw `/usage` PII on shared keys (`SEC-18`). |
+| R7 | An upstream provider drops SSE streams mid-generation without sending `[DONE]`, `response.completed`, or `message_stop` ([command-code#785](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2FCommandCodeAI%2Fcommand-code%2Fissues%2F785)), or a slow generation times out. | Medium | High | Disable wait-timeout failover by default (`timeout_failover = false`) to prevent duplicate billing (`RTE-9`), never retry after the first valid frame commits, finalize every stream through `RequestLifecycle::drop` (`API-7`), and charge binary-aware token estimates on aborted streams (`USG-3`). |
+| R8 | A misconfigured client sends a static constant session ID for every conversation, funneling all traffic onto one key ([vscode#334186](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fmicrosoft%2Fvscode%2Fissues%2F334186)). | Medium | Medium | Track opening-message fingerprint cardinality in the 21-slot exact `ConstantSessionDetector` per `(ClientKeyId, SessionHash)` for generic session sources (Steps 4..7, excluding Claude Code subagents and opencode child sessions, Section 11.1.1), flag any session exceeding 20 distinct conversations per hour in the Sessions UI, and let the owner or admin enable `constant_session_mode = 'fingerprint_generic_ids'`. |
+| R9 | Long-running agent sessions skew actual token spend away from the session-count weights configured in smooth WRR. | Medium | Low | Provide `headroom` weight scaling (`RTE-13`) that scales WRR weights by minimum remaining window basis points `bps`, plus automatic repinning when a key's window reaches its limit (`RTE-11`). |
+| R10 | Upstream providers change model availability, endpoint support (`chat` vs. `messages`), or pricing without notice. | High | Low | Run scheduled `/models` discovery every 6 hours (`MDL-1`) with a `missing` -> `retired` lifecycle that preserves overrides during transient provider glitches, use surrogate `model_pk` keys (`MDL-4`), and charge `unpriced_fallback_rates` when a newly discovered model lacks a price entry (`USG-3`). |
+| R11 | A compromised crate in the Rust dependency ecosystem tries to exfiltrate decrypted upstream keys ([March 2026 LiteLLM incident](https://www.google.com/search?q=https%3A%2F%2Fdocs.litellm.ai%2Fblog%2Fsecurity-update-march-2026)). | Low | High | Keep the dependency list small, use pure-Rust `xtask` instead of external scripting runtimes, commit `Cargo.lock`, enforce `cargo audit`, `cargo deny`, and `cargo vet` in CI (`SEC-10`), run inside a read-only distroless container (`SEC-11`), and filter every socket connect through `GuardedConnector` (`PRIV-1`, `SEC-7`). |
+| R12 | Losing `LLMROLLER_MASTER_KEY` or crashing mid-rotation leaves encrypted rows unreadable or invalidates the audit log. | Low | High | Keep `audit_hmac_key` and `session_hmac_secret` in `instance_secrets` so rotation never alters their values, track rotation progress in `instance_meta` across 500-row resumable batches (`SEC-1`), refuse `serve` startup while `rotation_state == 'in_progress'` (`SEC-2`), and include `master_key_id` in `llmroller backup` JSON output (`REL-6`). |
+| R13 | Tests become brittle or allow subtle logic regressions in routing, budget math, or RBAC checks to slip into production. | Medium | High | Enforce strict TDD contract testing, boundary discipline, the Expected vs. Unexpected failure protocol (`Section 16.2`), `cargo xtask traceability`, and automated mutation testing with `cargo-mutants` (`Section 16.5.6`). |
+| R14 | A single-node SQLite instance experiences disk growth, WAL starvation, or hardware failure. | Medium | Medium | Cap raw `usage_events` at 30 days and 50,000,000 rows (`A6`), rebuild startup state from narrow `usage_rollups_5min` rows in `< 2 s` (`PERF-4`), page all read queries so readers never pin the WAL, run 30 s `PASSIVE` and 256 MiB `RESTART` WAL checkpoints, handle `SQLITE_FULL` gracefully, and provide `fsync`-verified `llmroller backup` (`REL-6`). |
+| R15 | Enabling content traceability mode exhausts RAM with per-stream compressors or exposes sensitive prompts across shared personal keys. | Medium | High | Keep traceability off by default (`TRC-1`), accumulate turn outputs in memory (`1 MiB` per stream, `256 MiB` global) and compress at turn end on a fixed 2-thread `zstd::bulk::Compressor` pool (`~7 MiB` total RAM, `PERF-5`), deduplicate request blocks per user in `trace_blocks` (`TRC-4`), and isolate traces strictly by `owner_user_id` (`TRC-8`, `SEC-19`). |
 
 ## 19. Architectural decisions and open questions
 
@@ -2047,19 +2706,21 @@ This section records the architectural decisions resolved during specification r
 
 ### 19.1 Resolved architectural decisions (ADRs)
 
-Nine core design questions from the initial draft and product brief are formally resolved below for version 1.0.
+Eleven core design decisions govern version 1.0 of LLMRoller.
 
 | ADR ID | Topic | Decision for version 1.0 | Rationale |
 | --- | --- | --- | --- |
-| `ADR-1` | Provider ownership scopes | Support two first-class provider scopes: `global` (created by `admin`, usable by any authorized user) and `personal` (created by any `user` or `admin`, usable by the owner and explicitly shared grantees). | Lets teams pool shared corporate keys while individuals safely bring their own coding-plan subscriptions and share spare capacity with specific teammates. |
-| `ADR-2` | Standard non-admin user class (`user`) | Ship the standard `user` role in version 1.0 (`P0`) with full self-service UI and API (`/app/*`, `/api/user/*`) for personal providers, key sharing, client keys, personal route overrides, pins, and scoped usage. | Eliminates admin bottlenecks and enforces strict SQL-level tenant isolation (`ActorScope`) from day one. |
-| `ADR-3` | Combining personal, shared, and global keys | Provide four selectable `routing_scope` modes on each client key: `personal_first` (default), `blended`, `personal_only`, and `global_only`. | Gives users predictable control over whether personal and shared keys are spent before global keys or blended together. |
-| `ADR-4` | Source provider `/usage` tracking and pass-through | Poll source provider `/usage` endpoints (`OpenCode Go`, `Command Code`, `OpenRouter`, and custom URLs) to auto-reconcile local window counters, and expose `/v1/usage`, `/v1/key`, and `/v1/usage/raw` with role-aware sanitization. | Combines the immediate responsiveness of local micro-USD accounting with the authoritative accuracy of upstream quota ledgers, while powering IDE status bars directly. |
-| `ADR-5` | Weighted round-robin vs. strict priority tiers | Ship both modes in version 1.0: `weighted` (smooth WRR using key priority or per-model `priority_override`) as the default, plus `strict` tier fallback per model or key. | Satisfies both proportional dollar-allowance balancing ($120, $80, $60) and primary-backup failover setups. |
-| `ADR-6` | Cross-protocol translation | Route requests in version 1.0 only to candidates that natively support the inbound protocol (`chat`, `responses`, or `messages`); defer opt-in cross-protocol translation to post-1.0 (`P2`). | Prevents silent loss of reasoning blocks ([open-design#8687](https://github.com/nexu-io/open-design/issues/8687)) and tool-call schema mismatches. |
-| `ADR-7` | Canonical model normalization | Normalize vendor prefixes and casing (`deepseek/deepseek-v4.1-flash` to `deepseek-v4.1-flash`) but never merge distinct version numbers (`deepseek-v4-flash` != `deepseek-v4.1-flash`). | Prevents routing a client request to a different model generation while still matching identical models across providers. |
-| `ADR-8` | Test governance and mutation testing | Mandate Red-Green-Refactor TDD, contract-level testing within our controlled boundary, strict Expected vs. Unexpected failure handling, and zero surviving mutants in `cargo-mutants`. | Guarantees that tests verify actual behavioral invariants rather than superficial line coverage. |
-| `ADR-9` | Opt-in content traceability and read-only session chat preview | Provide an admin opt-in `content_traceability_mode` that records compressed, AEAD-encrypted turn payloads (`trace_records`) and reconstructs a deduplicated read-only chat preview per pinned `session_hash` in the dashboard. | Enables deep debugging and session replay when needed while preserving zero-prompt-storage privacy by default and strict multi-tenant isolation (`TRC-1`..`TRC-8`, `SEC-19`). |
+| `ADR-1` | Provider ownership scopes and consented sharing | Support `global` (admin-owned) and `personal` (user-owned) provider scopes. Personal shares need explicit grantee acceptance of `share_config_fingerprint` (and admin approval when `kind == 'custom'`), and forbid overlapping provider-level and key-level grants. | Lets individuals safely share spare capacity while preventing unconsented prompt redirection or double-cap accounting bugs. |
+| `ADR-2` | Standard non-admin user class (`user`) and `ActorScope` | Ship the standard `user` role in version 1.0 (`P0`) with full self-service UI and API (`/app/*`, `/api/user/*`), enforced by a closed `ActorScope::{User, System}` enum on every repository method and `project_key` redaction on every user response. | Eliminates admin bottlenecks, keeps background jobs from masquerading as admins, and guarantees SQL-level and wire-level tenant isolation. |
+| `ADR-3` | Three-tier pool ordering (`Own`, `Shared`, `Global`) | Partition routes into three ordered tiers (`Own`, `Shared`, `Global`) across five selectable `routing_scope` modes: `personal_first` (`[Own] -> [Shared] -> [Global]`), `blended`, `personal_only` (`[Own] -> [Shared]`), `own_only` (`[Own]`), and `global_only` (`[Global]`). | Guarantees that grantees spend their own personal subscription quota before consuming a teammate's shared quota under `personal_first`, and gates recovery repins on `recovery_repin_min_idle_secs` (`300 s`). |
+| `ADR-4` | Source provider `/usage` observations and pass-through | Poll source provider `/usage` endpoints with per-key single-flight deduplication and capture `local_at_observation` at poll start `t0` to update a time-bounded `UpstreamObservation` (expiring after 30 minutes or at `resets_at_ms`), and expose header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw` with allow-list PII sanitization. | Prevents permanent key lockouts when `/usage` polling fails and eliminates timing jitter between poll start and completion. |
+| `ADR-5` | Per-group smooth WRR vs. strict priority tiers | Maintain smooth WRR counters inside per-`(user_id, canonical_id, protocol, pool_tier)` `WrrGroup` mutexes without clamping (evicting members absent `>= 5 min` to preserve `sum(current) == 0`), plus `strict` tier filtering per model. | Prevents cross-tenant weight interference and multi-atomic selection races while converging within `0.5%` on fixed sets and `1%` across subset churn (`G2`). |
+| `ADR-6` | Cross-protocol translation | Route requests in version 1.0 only to candidates that natively support the inbound protocol (`chat`, `responses`, or `messages`); defer opt-in cross-protocol translation to post-1.0 (`P2`). | Prevents silent loss of reasoning blocks ([open-design#8687](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fnexu-io%2Fopen-design%2Fissues%2F8687)) and tool-call schema mismatches. |
+| `ADR-7` | Digit-preserving model normalization and surrogate `model_pk` | Preserve every dot between two ASCII digits during normalization (`normalize_model_id`), resolve within-key collisions by keeping the vendor prefix with `--`, and identify canonical models by an immutable ULID `model_pk` (`ON DELETE RESTRICT` with `model_redirects`). | Prevents merging distinct model versions (`deepseek-v4-flash` != `deepseek-v4.1-flash`) and guarantees that admin merges and splits never cascade-delete pins, windows, preferences, or response links. |
+| `ADR-8` | Test governance, `xtask`, and mutation testing | Mandate Red-Green-Refactor TDD, pure-Rust `cargo xtask` (`traceability`, `doc-consistency`, `docs-bundle`) driven by `docs/srdd/requirements.toml`, and zero unannotated surviving mutants in `cargo-mutants` (`git diff --cached` locally, `origin/main...HEAD` per PR). | Guarantees that tests verify actual behavioral invariants and eliminates specification-to-phase drift. |
+| `ADR-9` | Content-addressed traceability and 2-thread sealer pool | Store opt-in traced prompts as per-user content-addressed blocks (`trace_blocks`) referenced by `StoredTurnTrace v2` (`trace_records`), ordered by `(ts, request_id)`, and compressed at turn end on a fixed 2-thread `zstd::bulk::Compressor` pool (`~7 MiB` total RAM). | Eliminates quadratic multi-turn storage growth, prevents broken delta chains when turns drop or expire, and avoids the `~7 GB` RAM cost of 2,000 per-stream zstd encoders. |
+| `ADR-10` | Pre-flight body budgeting and opt-in wait-timeout failover | Buffer request bodies once in shared `Bytes` under `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (`819 MiB` on a 2 GB host, `2,000 ms` queue wait), and fail over automatically on connection/write errors and explicit HTTP rejections while keeping wait-timeout failover opt-in (`timeout_failover = false`). | Sustains high concurrency for realistic megabyte-scale coding prompts and prevents duplicate billing on slow prefills or non-streaming calls. |
+| `ADR-11` | Separation of instance secrets from the rotatable master key | Store `session_hmac_secret` and `audit_hmac_key` as random 256-bit secrets sealed in `instance_secrets`, and run `llmroller rotate-master-key` as an offline resumable 500-row state machine tracked in `instance_meta`. | Guarantees that rotating `LLMROLLER_MASTER_KEY` never invalidates the `audit_log` HMAC chain or existing `session_hash` pins and recovers cleanly from mid-rotation crashes. |
 
 ### 19.2 Operational verification items for Milestone 1 (`M1`)
 
@@ -2070,7 +2731,7 @@ Four empirical checks are scheduled during Milestone 1 implementation against li
 | 1. Cache-affinity field benchmark | Command Code and Open Design AMR | Run `scripts/verify_cache_affinity.sh` sending identical 8,192-token prefixes twice under candidate headers (`x-session-affinity`, `x-session-id`) and body `prompt_cache_key`, and inspect `cached_tokens` on turn 2. |
 | 2. Upstream `/v1/usage` readiness | Open Design AMR | Monitor [nexu-io/open-design#8674](https://github.com/nexu-io/open-design/issues/8674) and enable the `open_design_amr` `/usage` poller URL in `presets/open_design_amr.toml` once the upstream service endpoint ships. |
 | 3. Alpha billing schema lock | Command Code (`GOAT` and `Pro`) | Capture live JSON responses from `/alpha/billing/credits` and `/alpha/usage/summary` across `GOAT` and `Pro` keys and lock them into `fixtures/usage/command_code_*.json`. |
-| 4. Responses transport check | Codex CLI | Verify that current Codex CLI builds use HTTP SSE when configured with a custom `base_url` on `/v1/responses`. |
+| 4. Responses transport check | Codex CLI | Verify that current Codex CLI builds use HTTP SSE when configured with a custom `base_url` on `/v1/responses` and inherit `session_hash` across `previous_response_id` turns. |
 
 ## 20. Sources
 
@@ -2142,3 +2803,187 @@ The links below cover Rust mutation testing, supply-chain security advisories, c
 | `prodex` Rust Codex profile pooling agent documentation | https://docs.rs/crate/prodex/0.2.133/source/AGENTS.md |
 | `shift-proxy` Rust streaming body forwarding pattern | https://docs.rs/crate/shift-proxy/latest/source/src/forward.rs |
 | `models.dev` public model and pricing catalog JSON | https://models.dev/api.json |
+| IANA IPv4 Special-Purpose Address Registry (`SEC-7` SSRF filter ranges) | https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml |
+| IANA IPv6 Special-Purpose Address Registry (`SEC-7` SSRF filter ranges) | https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml |
+| Facebook `zstd` C manual (`ZSTD_estimateCStreamSize` memory sizing) | https://facebook.github.io/zstd/zstd_manual.html |
+
+## 21. Concurrency, Lifecycle, and Failure-Recovery Model
+
+LLMRoller coordinates high-concurrency streaming inference (`2,000` open SSE streams and `500 req/s`) and lock-free configuration reads. It also coordinates in-memory state machines and asynchronous SQLite WAL persistence in one process. This section specifies the cross-cutting concurrency invariants, lock hierarchies, RAII lifecycle guards, state-machine synchronization rules, and failure-recovery protocols that govern every crate in the workspace.
+
+### 21.1 Per-request RAII completion guard (`RequestLifecycle`)
+
+When a downstream client disconnects mid-stream or a Tokio task is cancelled before end-of-stream, hyper drops the response body stream immediately without polling `poll_next` again. No in-flight reservation, pre-flight body permit, probe slot, provisional pin ticket, or usage/trace record may leak or bypass accounting. To guarantee this, `crates/proxy` wraps every routed request in a `RequestLifecycle` RAII struct owned by the response stream wrapper (`API-7`, `USG-1`, `USG-3`).
+
+```rust
+pub struct RequestLifecycle {
+    pub request_id: Ulid,
+    pub started_ms: i64,
+    pub first_frame_ms: Option<i64>,
+    pub usage: UsageAccumulator,                 // observed token counts + decoded_text_bytes
+    pub reservation: Option<Reservation>,        // per-candidate budget reservation guard
+    pub preflight_permit: Option<OwnedSemaphorePermit>,
+    pub probe_slot: Option<ProbeSlotGuard>,
+    pub pin_ticket: Option<PinTicket>,
+    pub trace: Option<TraceCollectorHandle>,
+    pub termination: Termination,                // defaults to Termination::ClientGone
+    pub emitter: UsageEmitter,                   // non-blocking queue sender
+    pub finalized: bool,
+}
+
+pub enum Termination {
+    Completed,
+    UpstreamTruncated,
+    ClientGone,
+    IdleTimeout,
+    ShutdownCut,
+}
+```
+
+| Lifecycle event | Deterministic action taken by `RequestLifecycle` |
+| --- | --- |
+| First valid response frame committed (or non-streaming response accepted) | Sets `first_frame_ms = Some(now_ms)`, drops `preflight_permit` immediately to free global pre-first-byte body memory (`PERF-3`), promotes `pin_ticket` via `FirstValidFrame(ticket)` (`RTE-8`), and closes any `HalfOpen` `OriginBreaker` via `probe_slot`. |
+| Normal stream completion (`[DONE]`, `response.completed`, or `message_stop`) | Sets `termination = Termination::Completed` and calls `finalize()` once before yielding the final stream poll. |
+| Upstream stream closes without terminal event | Sets `termination = Termination::UpstreamTruncated` (`incomplete = 1`) and calls `finalize()`. |
+| `stream_idle_timeout_ms` (`300,000 ms`) expires | Sets `termination = Termination::IdleTimeout` (`incomplete = 1`) and drops the stream, invoking `Drop::drop`. |
+| Graceful shutdown drain timer (`drain_timeout_secs`) expires | Cancels the stream with `termination = Termination::ShutdownCut` (`incomplete = 1`). |
+| Client TCP disconnect or future cancellation at any point | `Drop::drop` runs with `termination = Termination::ClientGone` (`incomplete = 1`). |
+
+The `finalize()` method (invoked either explicitly or from `Drop::drop` when `!self.finalized`) runs with zero blocking I/O:
+1. Sets `self.finalized = true`.
+2. Computes request cost from `self.usage` using observed token counts if a usage frame arrived. Otherwise, it estimates input via `estimate_input_tokens(body)` and output via `ceil(decoded_text_bytes / 4)` (`cost_source = 'estimated_incomplete'`).
+3. Posts the actual or estimated cost into the window rings and monthly accumulators **before** subtracting the estimate from `reserved_in_flight`. Thus `effective_used + reserved_in_flight` never dips below truth.
+4. Enqueues the `UsageEvent` (with `termination` and `incomplete = (termination != Completed) as i32`) and any `usage_attempts` rows to the batching writer's non-blocking queues.
+5. Marks any active `TraceCollectorHandle` as finished (setting `truncated_content = 1` if `termination != Completed`) and releases any remaining `preflight_permit` or `probe_slot`.
+
+### 21.2 Single-flight `PinStore` synchronization and loser adoption
+
+Session pins live in `crates/core::pins::PinStore` (`DashMap<PinKey, Arc<parking_lot::Mutex<PinEntry>>>`) driven by the synchronous `Clock` seam (`RTE-7`, `RTE-8`, `RTE-10`, `RTE-11`). Each `PinEntry` mutex is held only across synchronous in-memory operations (`< 5 us`, never across `.await`).
+
+| Concurrency hazard | Synchronization invariant in `PinStore` |
+| --- | --- |
+| Parallel turn-1 requests for the same new session (`RTE-7`) | The first caller acquires the `PinEntry` mutex on the absent slot, runs `WrrState::select` inside the mutex, and inserts `PinState::Provisional { generation: 1, expires_ms: now + 50_000 }`. Concurrent turn-1 callers acquiring the mutex observe the non-expired `Provisional` entry and receive follower tickets `(K, generation: 1)` without re-running selection. |
+| Concurrent pre-first-byte failover scatter (`PreFirstByteFailure`) | When `N` parallel turn-1 holders fail before the first valid frame on key `K1`, the first caller to acquire the `PinEntry` mutex observes `ticket.generation == entry.generation`, pushes `K1` to `tried_this_generation`, selects `K2` excluding all tried keys, and increments `entry.generation = 2`. The remaining `N - 1` callers acquire the mutex with `ticket.generation < entry.generation` and **adopt** the winner's `(K2, generation: 2)` (provided `K2` is not in their own tried set) rather than running independent WRR selections. |
+| Stale confirmation after failover or admin move (`FirstValidFrame`) | `FirstValidFrame(ticket)` promotes the pin to `Confirmed` and refreshes `expires_ms = now + pin_ttl_ms` only when `ticket.generation == entry.generation` and `ticket.upstream_key_id == entry.upstream_key_id`. On generation mismatch, the pin is left untouched (`llmroller_pin_stale_confirm_total`), preventing a slow loser or pre-move request from reverting a failover winner or admin pin move. |
+| Leaked provisional pins on client abort | If all holders of a provisional pin disconnect before any upstream responds, `expires_ms = created_ms + 50_000` expires after 50 s. Both `Acquire(req)` and the 60 s sweeper treat expired provisional entries as absent and increment `generation`. |
+| Capacity bound (`max_active_pins = 250,000`) | Confirmed pins are never evicted by TinyLFU capacity pressure. When `PinStore.len() >= max_active_pins`, new sessions bypass insertion, route via WRR with `pin_outcome = 'unpinned_capacity'`, and increment `llmroller_pin_capacity_overflow_total`. |
+
+### 21.3 Per-group smooth WRR atomicity and zero-sum invariant
+
+Smooth weighted round-robin state in `crates/core::wrr::WrrState` is partitioned into independent selection groups keyed by `WrrGroupKey = (user_id, model_pk, protocol, pool_tier)` (`RTE-4`, `RTE-5`, `G2`).
+
+| Invariant | Enforcement rule |
+| --- | --- |
+| Tenant weight isolation | Keying by `user_id` and `pool_tier` guarantees that User B's `user_route_preferences.priority_override` on a shared route never inflates or deflates the `current` weight counters seen by User C. |
+| Single critical section per pick | Each `WrrGroup` is protected by one `parking_lot::Mutex<WrrGroup>` (never held across `.await`). Adding `W_eff(r)` to active candidates, picking `argmax(m.current, r.id_bytes)`, and subtracting `total = sum(W_eff)` run as one atomic critical section, preventing concurrent threads from reading the same maximum before subtraction. |
+| Unclamped zero-sum convergence | For every `WrrGroup`, `sum(m.current for m in group.members)` before selection equals `sum(m.current)` after selection (`0`). No artificial clamp is applied when the candidate subset shrinks during transient cooldowns. Members absent from the eligible candidate set for `>= WRR_MEMBER_EVICT_MS` (`300,000 ms`) are evicted from `group.members` (rebalancing the remaining members by subtracting their offset lazily) and re-enter at `current = 0` when healthy again. |
+| Bounded memory | The 60 s background sweeper removes any `WrrGroup` with `now_ms - last_used_ms >= 86_400_000` (24 h). |
+
+### 21.4 Ordered budget reservation (`Reservation`) and decaying observations
+
+Admission check `C8` and gate `G7` reserve estimated spend across up to seven counters (`LIM-1`, `SHR-2`, `USR-5`, `CLK-5`). These counters cover key windows, route windows, and the share, user-global, and client-key monthly accumulators.
+
+1. Every candidate's counter list is sorted in a fixed canonical order. That order places key windows (`budget_windows.id`), route windows (`budget_windows.id`), the share accumulator, the user-global accumulator, and the client-key accumulator.
+2. `try_reserve(counters, est, reservation_month)` iterates the sorted counters and runs `AtomicI64::compare_exchange` on each counter's `reserved_in_flight`, checking `effective_used(now) + reserved + est + reserve_amount <= limit`. If any counter fails, `rollback(taken)` subtracts `est` from all previously acquired counters in reverse order and returns `None`.
+3. Every `Reservation` stores the `UtcYearMonth` of the reservation timestamp (`reservation_month`). A stream starting at `23:59:59.900 UTC` in month `M` and finishing in `M + 1` posts its cost and releases `reserved_in_flight` in month `M`.
+4. Upstream `/usage` polls record `UpstreamObservation { used_micro_usd, observed_at_ms: t0, local_at_observation, resets_at_ms }` where `t0` and `local_at_observation` are captured **before** sending the HTTP request. `effective_used(w, now)` returns `max(local, o.used_micro_usd + max(0, local - o.local_at_observation))` while `now < min(o.resets_at_ms.unwrap_or(i64::MAX), o.observed_at_ms + 1_800_000)`, and falls back automatically to `local` once the observation expires (30 minutes or `resets_at_ms`).
+
+### 21.5 Versioned health synchronization and origin circuit breakers
+
+Runtime health (`upstream_keys.health` and `model_routes.route_health`) is authoritative in `RuntimeState` (`DashMap`) while the server runs and persisted write-behind to SQLite for startup preload (`REL-5`, `Section 10.5`).
+
+| Component | State synchronization contract |
+| --- | --- |
+| Monotonic `health_version` | Every key and route in `RuntimeState` carries a monotonic `health_version: u64`. Transitions to `exhausted`, `invalid`, or back to `healthy` increment `health_version` in memory and enqueue `HealthWrite { id, state, until_ms, version }` on the `durable_state` queue. The SQLite writer runs `UPDATE ... WHERE id = ? AND health_version < ?`, guaranteeing that a control-plane `reset-health` (which bumps `health_version` in memory immediately) can never be overwritten by an older queued data-plane write. Transient `cooling_down` transitions remain in memory only. |
+| Two-key / probe credential invalidation | `CredentialInvalid` responses (`401` or `403` matching `credential_invalid_substrings`) record `(client_key_id, now_ms)` in a 10-minute sliding strike map per upstream key. A key transitions to `invalid` only when `strikes[K].len() >= 2` (two distinct client keys within 10 minutes) or when a single-flight verification probe (`GET {base_url}{models_path}`, 5 s timeout) returns `401`/`403` matching `CredentialInvalid`. Any `2xx` response clears `strikes[K]`. |
+| Per-origin `OriginBreaker` | Circuit breakers are keyed by `OriginKey = (scheme, host, port, allow_private_network)` (`REL-5`). Only `TransportError::{Dns, Connect, Tls, WriteStalled}` and HTTP `502`/`503`/`504` before the first valid frame count as host failures. `Closed -> Open` triggers when `consecutive_host_failures >= 5` or when 60 s sliding window requests `>= 20` and `host_failures / requests >= 0.5`. In `HalfOpen`, a `ProbeSlotGuard` (RAII) releases `probe_in_flight = false` if the probe request disconnects before receiving an outcome; any HTTP response from the origin closes the breaker. |
+
+### 21.6 Dual-priority SQLite writer, three-queue overflow, and single `Reloader`
+
+All SQLite mutations flow through a single writer task (`crates/store::writer`) paired with a single snapshot reloader task (`crates/server::reloader`) (`REL-2`, `REL-3`, `REL-4`).
+
+#### 21.6.1 Writer queue priority and byte bounds
+
+The writer polls two command channels and three data-plane queues:
+1. `control_rx` (`WriterCommand::Control { tx, reply }`): high-priority channel for control-plane transactions. The writer drains **all** pending `control_rx` commands before every data-plane batch so user/admin actions (`CLK-4`, `SHR-5`) never block behind data-plane load. Control handlers await `reply` with a `2,000 ms` timeout (`503 writer_busy`).
+2. `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, max `500,000` keys): non-dropping coalescing queue for confirmed pins, `response_links`, and `HealthWrite` items. If `len() >= 500,000`, new pin confirmations remain in memory only (`llmroller_durable_queue_full_total`) and `/readyz` returns HTTP `503`.
+3. `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>`): non-dropping additive coalescing map for `usage_rollups_5min` and `usage_rollups_hourly`.
+4. `raw_events` (`Mutex<VecDeque<RawItem>>`, max `10,000` items and `64 MiB`): bounded ring for `usage_events`, `usage_attempts`, `trace_blocks`, and `trace_records`. When full, the oldest item is popped and dropped (its token/cost totals are already folded into `rollups`) and `llmroller_usage_dropped_total{kind}` increments.
+5. Each data-plane batch flushes at `200` items, `4 MiB` of serialized row bytes (`writer_batch_max_bytes`), or `250 ms` (`writer_batch_max_age_ms`). Any `trace_records` item `> 1 MiB` commits in its own dedicated transaction.
+
+#### 21.6.2 Versioned `ConfigSnapshot` publication (`Reloader`)
+
+To prevent concurrent snapshot reloads from publishing an older snapshot over a newer one or purging pins before the new configuration is visible:
+1. Every `Control` transaction that modifies configuration tables increments `instance_meta.config_version = config_version + 1` inside the same `BEGIN IMMEDIATE` transaction.
+2. After `COMMIT`, the writer sends `ReloadRequest { min_version, changed_domains, invalidations }` to the single `Reloader` task.
+3. The `Reloader` drains and coalesces all pending `ReloadRequest` messages (`max(min_version)` and union of `changed_domains` and `invalidations`). It then opens one read transaction, reads `v = SELECT config_version FROM instance_meta`, and rebuilds only the `changed_domains` slices.
+4. If `v > published.version`, the `Reloader` calls `arc_swap.store(Arc::new(snapshot))` and **then** applies all `CacheInvalidationEvent`s (`PinStore` purges, `WrrState` resets, `RuntimeState` updates) before notifying waiting control handlers (`timeout 1 s`).
+
+#### 21.6.3 WAL checkpointing, paged reads, and `SQLITE_FULL` recovery
+
+1. Migration `0001` sets `PRAGMA auto_vacuum = INCREMENTAL` before creating any table (verified at startup: `PRAGMA auto_vacuum == 2`).
+2. A background checkpoint task runs `PRAGMA wal_autocheckpoint = 1000` and issues `PRAGMA wal_checkpoint(PASSIVE)` every `30 s`. If the `-wal` file exceeds `256 MiB`, the writer issues `PRAGMA wal_checkpoint(RESTART)` between batches; if it exceeds `1 GiB`, `/readyz` transitions to HTTP `503` and `llmroller_wal_bytes` alerts fire.
+3. Every read connection sets `PRAGMA query_only = ON`. Chat preview (`<= 50` turns) and usage export (`<= 5,000` rows) read each page in a short transaction and decrypt after closing it.
+4. On `SQLITE_FULL`, the writer stops accepting `raw_events` (dropping with metric), retries `durable_state` and `rollups` commits every `5 s`, sets `/readyz` to HTTP `503`, and sets `llmroller_storage_full = 1`.
+
+### 21.7 `ActorScope` isolation for human and system actors
+
+Every repository method in `crates/store` takes `&ActorScope` (`SEC-17`). To represent background tasks and CLI commands without fabricating a synthetic admin user ID, `ActorScope` is a two-variant enum:
+
+```rust
+pub enum ActorScope {
+    User { user_id: UserId, role: Role },
+    System { task: SystemTask },
+}
+
+pub enum SystemTask {
+    Writer,
+    Reloader,
+    Discovery,
+    UsagePoller,
+    RetentionSweeper,
+    DataPlaneUsage,
+    Cli(CliCommand),
+}
+```
+
+`ActorScope::System` can only be constructed inside `crates/server` and `crates/store` (`pub(crate)` builder in `crates/core`, verified by `tests/workspace_boundaries.rs` so `crates/admin` handlers can never construct a `System` scope). Audit rows written under `ActorScope::System` record `actor_user_id = NULL` and `detail_json.system_task`.
+
+### 21.8 Ordered startup, graceful shutdown, and background supervision
+
+Process startup, shutdown draining, and background job supervision follow strict deterministic sequences.
+
+#### 21.8.1 Ordered startup sequence (`llmroller serve`)
+
+`llmroller serve` runs ten ordered steps before setting `/readyz` to HTTP `200`:
+1. Acquire `flock(LOCK_EX | LOCK_NB)` on `${LLMROLLER_DATA_DIR}/llmroller.lock` (exit `4` on contention).
+2. Load and validate the 32-byte master key from `LLMROLLER_MASTER_KEY_FILE` (rejecting group/other permissions with exit `3`) or `LLMROLLER_MASTER_KEY` (logging a one-time `/proc/<pid>/environ` warning).
+3. Validate listener TLS rules: exit `2` if the control-plane listener is non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES`; exit `2` (when `LLMROLLER_REQUIRE_TLS=true`) or log a recurring 10-minute `error` (`llmroller_plaintext_data_plane = 1`) if the data-plane listener is non-loopback plaintext.
+4. Open SQLite via `connect_options`, verify `_llmroller_schema(version)` (exit `14` if newer than binary), run forward-only migrations (exit `13` on failure), and assert `PRAGMA auto_vacuum == 2`.
+5. Verify `instance_meta.rotation_state == 'idle'`, `LLMROLLER_MASTER_KEY_ID == active_master_key_id`, and unseal `instance_secrets` (`session_hmac_secret` and `audit_hmac_key`) (exit `3` on any mismatch or AEAD failure).
+6. Load the initial `ConfigSnapshot` into `ArcSwap`.
+7. Rebuild all rolling and anchored budget windows and UTC calendar-month accumulators from `usage_rollups_5min`, `budget_adjustments`, and `upstream_usage_snapshots` (`< 2 s`, `PERF-4`).
+8. Preload up to `max_active_pins` (`250,000`) non-expired confirmed `pins` (`ORDER BY last_used_at DESC`), `response_links`, and `upstream_keys.health` (`cooling_down` normalized to `healthy`) into memory.
+9. Spawn the writer actor, `Reloader` task, and the 2-thread OS trace sealer pool, then bind the three TCP listeners with `/readyz` returning HTTP `503`.
+10. Spawn supervised background jobs (`Discovery`, `UsagePoller`, `RetentionSweeper`, `WalCheckpointer`) and switch `/readyz` to HTTP `200`.
+
+#### 21.8.2 Eight-step graceful shutdown sequence (`SIGTERM` / `SIGINT`)
+
+Upon receiving `SIGTERM` or `SIGINT`, the server drains in eight time-bounded steps.
+
+| Step | Action taken | Time bound |
+| --- | --- | --- |
+| 1 | Switch `/readyz` to HTTP `503` while continuing to accept connections for `drain_grace_secs` (default `5 s`) so load balancers observe readiness withdrawal. | `5 s` |
+| 2 | Stop accepting new TCP connections on all listeners. | Immediate |
+| 3 | Wait for in-flight HTTP requests and SSE streams to complete naturally. | `drain_timeout_secs` (`60 s`) |
+| 4 | Cancel any remaining SSE streams with `Termination::ShutdownCut` so `RequestLifecycle::drop` finalizes their usage and releases reservations. | Immediate |
+| 5 | Stop background jobs (`UsagePoller`, `Discovery`, `RetentionSweeper`, `WalCheckpointer`). | `5 s` |
+| 6 | Close the `crossbeam_channel` sealer input queue and wait for the 2 sealer OS threads to finish in-flight jobs (dropping any remaining backlog with metrics on timeout). | `min(10 s, remaining_drain)` |
+| 7 | Drain `Control`, `durable_state`, `rollups`, and `raw_events` queues in the SQLite writer in strict priority order. | `15 s` |
+| 8 | Run `PRAGMA wal_checkpoint(TRUNCATE)`, close SQLite connections, and release `llmroller.lock`. | Exit `0` (or `11` if any queue timed out in Step 7) |
+
+#### 21.8.3 Background job supervision and writer panic isolation
+
+Stateless background jobs (`Discovery`, `UsagePoller`, `RetentionSweeper`, `WalCheckpointer`) run inside tasks wrapped with `FutureExt::catch_unwind`. On panic, the supervisor logs the panic payload (redacted per `SEC-6`) and restarts the job with exponential backoff (`1 s, 2 s, 4 s, ...` capped at `300 s`). Three panics within 10 minutes mark the job `failed`, set `llmroller_job_failed{job} = 1`, and leave the job stopped until operator intervention.
+
+The **SQLite writer actor is never restarted** after a panic because an interrupted batch could desynchronize in-memory queues. Instead, a writer panic sets `/readyz` to HTTP `503` and triggers controlled shutdown with exit code `12`.

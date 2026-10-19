@@ -1,63 +1,63 @@
-# Epic 4: Usage pipeline, price book, budget windows, and source `/usage` engine
+# Epic 4: Usage taps, three-queue batching writer, 5-minute & hourly rollups, orchestrator v3, and retention
 
-Epic 4 builds the SSE and JSON token extractors, the integer micro-USD price book, and the batching SQLite writer. It also implements budget window ring counters and the source provider `/usage` poller, reconciler, and pass-through endpoints. It corresponds to Milestones `M3` and `M4` (`SRDD Sections 2.4, 2.5, 6.9, 7.2, 9, 12.5, 13`).
+Epic 4 builds the inline SSE and JSON token extractors (`4.1`), the price-book APIs (`4.2`), and the three-queue batching SQLite writer (`4.3`). It also builds `/v1/*` orchestrator v3 (`4.6`) and the retention sweeper and WAL checkpoint supervisor (`4.7`). Pure-core pricing, window rings, and monthly accumulators were built in Sub-phases `3.0a`–`3.0c`, and startup window reconstruction plus source `/usage` polling live in `big-bang-phases-4b.md`. Epic 4 corresponds to Milestone `M3` (`SRDD Sections 2.5, 6.8, 6.9, 7.2, 9, 12.5, 13.1, 21`).
 
-## 4.1 Sub-phase 4.1: `SseUsageTap`, `JsonUsageExtractor`, and cache token normalization
+## 4.1 Sub-phase 4.1: Inline `SseUsageTap`, `JsonUsageExtractor`, unified cache subtraction, and `sse_tap` fuzzer
 
-This sub-phase extracts token counts across `chat`, `responses`, and `messages` (`SRDD Section 12.5`), normalizes OpenAI vs. Anthropic cache token accounting (`USG-2`), and detects truncated streams (`USG-1`, `R7`).
-
-| Attribute | Details |
-| --- | --- |
-| SRDD references | `Section 2.5`, `Section 6.9`, `Section 12.5`; Requirements `USG-1`, `USG-2` |
-| Crates touched | `crates/proto::sse_tap`, `crates/proto::json_usage`, `fixtures/sse/*` |
-| TDD step (`Red -> Green`) | Write golden fixture tests (`proto::sse_tap::golden_tests`, `#[doc = "Spec: USG-1, USG-2"]`) replaying recorded streams for OpenAI `chat`, OpenAI `responses`, Anthropic `messages`, OpenRouter `usage.cost`, and mid-stream drops missing `[DONE]`, `response.completed`, or `message_stop`. Assert that `input_uncached = prompt_tokens - cached_tokens` on `chat` and `responses`, while `input_uncached = input_tokens` on `messages`, and that truncated streams set `incomplete = 1`. |
-| Atomic commits | 1. `feat(proto/4.1): implement SseUsageTap and JsonUsageExtractor with cache normalization and truncation detection [Spec: USG-1, USG-2]` |
-| Risks and resolutions | **Risk:** A provider emits usage across two separate SSE events (`message_start` and `message_delta` in Anthropic `messages`) and aborts before `message_stop`. **Resolution:** Accumulate `message_start` input/cache counts immediately and update `output_tokens` on each `message_delta`; if `message_stop` never arrives, emit the partial usage with `incomplete = 1`. |
-
-## 4.2 Sub-phase 4.2: Integer micro-USD price book, context tiers, and UTC peak schedules
-
-This sub-phase implements 128-bit integer micro-USD cost calculation (`SRDD Section 13.1`), 200K+ context-length tier rates, and weekday UTC peak-hour multipliers (`USG-3`).
+This sub-phase extracts token counts across `chat`, `responses`, and `messages` inline in `poll_next` (`SRDD Section 12.4.1, Section 12.5`) and subtracts `cache_read` and `cache_write` (`USG-2`). It also verifies injected usage chunk capture (`API-5`), accumulates decoded output text for aborted streams (`USG-3`), and adds the `sse_tap` fuzzer (`USG-1`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 2.3`, `Section 6.9`, `Section 13.1`; Requirements `USG-3` |
-| Crates touched | `crates/core::pricing`, `presets/*.toml` |
-| TDD step (`Red -> Green`) | Write property-based and table-driven tests (`core::pricing::proptests`, `#[doc = "Spec: USG-3"]`) verifying: (1) provider-reported `usage.cost` wins (`cost_source = 'provider'`), (2) price-book math uses `i128` ceiling division with zero overflow up to `10^9` tokens, (3) prompts `> 200,000` tokens select the high-context tier rate, and (4) DeepSeek calls at `02:30 UTC` on Tuesday apply the 2x peak multiplier while `02:30 UTC` on Saturday uses the off-peak rate. |
-| Atomic commits | 1. `feat(core/4.2): implement i128 micro-USD pricing engine with context tiers and UTC schedules [Spec: USG-3]` 2. `feat(admin/4.2): implement opt-in models.dev price catalog importer and POST /admin/api/prices/sync [Spec: USG-3, PRIV-1]` |
-| Risks and resolutions | **Risk:** A newly discovered model has no entry in `prices`. **Resolution:** Record `cost_micro_usd = NULL` and `cost_source = 'unpriced'` (never `$0`), surface an "Unpriced models" badge on the dashboard, and support one-click baseline import from `models.dev`. |
+| SRDD references | `Section 2.5`, `Section 6.8`, `Section 6.9`, `Section 12.4.1`, `Section 12.5`; Requirements `API-5`, `USG-1`, `USG-2` |
+| Crates touched | `crates/proto::sse_tap`, `crates/proto::json_usage`, `fixtures/sse/*`, `fuzz/fuzz_targets/sse_tap.rs` |
+| TDD step (`Red -> Green`) | Write golden fixture and fuzz tests (`proto::sse_tap::golden_tests`, `#[doc = "Spec: API-5, USG-1, USG-2"]`) replaying recorded streams for OpenAI `chat`, OpenAI `responses` (`response.created`, `response.completed`, `response.incomplete`, `response.failed`), Anthropic `messages` (`message_start`, `message_delta`, `message_stop`), OpenRouter `usage.cost`, and truncated streams: (1) assert `input_uncached = prompt_cache_miss_tokens` when present, else `max(0, prompt_tokens - cache_read - cache_write)` on `chat` and `max(0, input_tokens - cache_read - cache_write)` on `responses`, while `messages` uses the last observed `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `output_tokens` across `message_start` and `message_delta`, (2) assert that an injected `include_usage` chunk (`"choices":[]`) is captured by `SseUsageTap` and omitted from the client stream (`API-5`), and (3) assert that an aborted stream with `10 KiB` of decoded delta text estimates `2,500` output tokens (`ceil(decoded_text_bytes / 4)`). Run `fuzz/fuzz_targets/sse_tap.rs` in CI. |
+| Atomic commits | 1. `feat(proto/4.1): implement inline SseUsageTap and JsonUsageExtractor with unified cache_read/cache_write subtraction and sse_tap fuzzer [Spec: API-5, USG-1, USG-2]` |
+| Risks and resolutions | **Risk:** Subtracting only `cached_tokens` on OpenRouter-routed Anthropic `chat` calls double-charges `cache_write_tokens`, and estimating aborted output from raw SSE framing inflates token counts by 3–5x. **Resolution:** Subtract both `cache_read` and `cache_write` on `chat` and `responses`, and estimate aborted output strictly from `decoded_text_bytes` accumulated from content, reasoning, and tool-argument deltas (`SRDD Section 12.5, Section 13.1`). |
 
-## 4.3 Sub-phase 4.3: Batching SQLite usage writer, bounded overflow queue, and hourly rollups
+## 4.2 Sub-phase 4.2: Body-based price book APIs and opt-in `models.dev` price catalog sync
 
-This sub-phase implements the non-blocking `mpsc` usage queue (10,000 slots) and the batching SQLite writer (`SRDD Section 7.2, Section 9.2`). Each transaction commits up to 200 rows every 250 ms and updates `usage_rollups_hourly`.
+This sub-phase connects the `crates/core::pricing` engine (`3.0a`) to the `prices` table and builds the opt-in `models.dev` catalog importer (`USG-3`). It also implements the body-based price upsert endpoints (`PUT /admin/api/prices` and `PUT /api/user/providers/{id}/prices`) supporting `/` in `upstream_model_id` (`SRDD Section 14.2`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 7.2`, `Section 9.1`, `Section 9.2`; Requirements `USG-1`, `REL-2`, `REL-3` |
+| SRDD references | `Section 6.9`, `Section 9.1`, `Section 13.1`, `Section 14.2.1`, `Section 14.2.2`; Requirements `USG-3`, `Partial: PRIV-1` |
+| Crates touched | `crates/store::prices`, `crates/admin::prices` |
+| TDD step (`Red -> Green`) | Write integration tests (`tests/integration_price_book.rs`, `#[doc = "Spec: USG-3, Partial: PRIV-1"]`) verifying: (1) `PUT /admin/api/prices` and `PUT /api/user/providers/{id}/prices` accept vendor-prefixed IDs containing `/` (such as `deepseek/deepseek-v4.1-flash`) in the JSON body and work behind a reverse proxy that decodes `%2F`, (2) `ConfigSnapshot` keys prices by `(provider_id_or_empty, provider_kind, upstream_model_id)` and resolves provider-specific overrides before preset defaults `''`, (3) overlapping tiers or overlapping UTC schedule minute ranges are rejected with HTTP 422 on write, and (4) `POST /admin/api/prices/sync` fetches `price_sync_catalog_url` only when enabled and inserts suggested aliases with `confirmed = 0`. |
+| Atomic commits | 1. `feat(admin/4.2): implement body-based price book endpoints, provider-specific price lookup, and opt-in models.dev importer [Spec: USG-3, Partial: PRIV-1]` |
+| Risks and resolutions | **Risk:** Placing `upstream_model_id` (`deepseek/deepseek-v4.1-flash`) in a URL path segment fails routing in `axum` or when reverse proxies decode `%2F`. **Resolution:** Pass `upstream_model_id` in the JSON request body on both admin and user price endpoints (`SRDD Section 14.2`). |
+
+## 4.3 Sub-phase 4.3: Three-queue batching SQLite writer (`durable_state`, `rollups`, `raw_events`), `usage_attempts`, and `usage_rollups_5min`
+
+This sub-phase implements the three-queue data-plane writer (`durable_state`, `rollups`, and `raw_events` `Mutex<VecDeque<RawItem>>` dropping oldest). It commits `usage_events`, `usage_attempts`, `usage_rollups_5min`, and `usage_rollups_hourly` (with `''`/`'none'` sentinels for pre-route rejections) and verifies `REL-2` and `REL-3` (`USG-1`, `SHR-6`).
+
+| Attribute | Details |
+| --- | --- |
+| SRDD references | `Section 7.2`, `Section 9.1`, `Section 9.2`, `Section 21.6`; Requirements `USG-1`, `SHR-6`, `REL-2`, `REL-3` |
 | Crates touched | `crates/store::usage_writer`, `crates/store::rollups` |
-| TDD step (`Red -> Green`) | Write fault-injection and crash tests (`tests/integration_usage_writer.rs`, `#[doc = "Spec: USG-1, REL-2, REL-3"]`): (1) pause the SQLite writer task and send 10,500 usage events; assert that inference requests complete in `< 1 ms`, the oldest 500 events drop cleanly, and `llmroller_usage_dropped_total == 500` (`REL-3`), and (2) verify that every committed batch updates `usage_rollups_hourly` in the same SQLite transaction. |
-| Atomic commits | 1. `feat(store/4.3): implement ordered batching SQLite usage writer, share-aware hourly rollups, and non-blocking overflow ring [Spec: USG-1, SHR-6, REL-2, REL-3]` |
-| Risks and resolutions | **Risk:** On `SIGTERM`, buffered events in the `mpsc` channel could be lost if the process exits immediately. **Resolution:** During the `SIGTERM` drain phase (`REL-1`), close the inbound listener first, wait for active streams to finish, and flush all remaining items in the usage channel before closing the SQLite pool. |
+| TDD step (`Red -> Green`) | Write fault-injection and crash-recovery tests (`tests/integration_usage_writer.rs`, `#[doc = "Spec: USG-1, SHR-6, REL-2, REL-3"]`): (1) pause the SQLite writer task and push 10,500 `UsageEvent` items; assert that inference completes in `< 1 ms`, the `Mutex<VecDeque<RawItem>>` evicts the **oldest** 500 raw events (`llmroller_usage_dropped_total{kind="usage_event"} == 500`), and 100% of all 10,500 token and cost totals are preserved in `usage_rollups_5min` and `usage_rollups_hourly` once the writer resumes (`REL-3`), (2) pre-route rejections (`503 no_eligible_route`) fold into rollups using `upstream_key_id = ''`, `provider_id = ''`, and `provider_scope = 'none'`, while `/v1/models`, `/v1/usage`, and `/v1/key` emit metrics only and zero `usage_events` rows, (3) failed upstream tries record `usage_attempts` rows (`attempt_no 1..3`) in the same batch, and (4) confirm a pin, response link, health write, and rollup delta, wait `1.2 s`, send `SIGKILL` (`kill -9`), restart, and assert zero lost rows (`REL-2`). |
+| Atomic commits | 1. `feat(store/4.3): implement three-queue batching writer, usage_attempts, 5-minute and hourly rollups, and SIGKILL recovery [Spec: USG-1, SHR-6, REL-2, REL-3]` |
+| Risks and resolutions | **Risk:** A standard `tokio::sync::mpsc` channel cannot drop its oldest item on overflow and would either block inference or drop the newest item. **Resolution:** Use a `Mutex<VecDeque<RawItem>>` (capped at `10,000` items and `64 MiB`) that pops the oldest item after its cost has already been folded into the non-dropping `rollups` map (`SRDD Section 21.6.1`). |
 
-## 4.4 Sub-phase 4.4: Rolling (`5h`, `7d`) and anchored (`1mo`) budget window ring counters
+## 4.6 Sub-phase 4.6: `/v1/*` orchestrator v3 (live usage accounting, attempt charging, and reservation finalization)
 
-This sub-phase implements the in-memory rolling ring counters and anchored monthly accumulators (`SRDD Section 13.2`). It rebuilds window state from `usage_events` and `budget_adjustments` at startup and enforces the 2% admission reserve.
-
-| Attribute | Details |
-| --- | --- |
-| SRDD references | `Section 6.9`, `Section 13.2`; Requirements `LIM-1`, `RTE-3` |
-| Crates touched | `crates/core::windows`, `crates/store::budgets` |
-| TDD step (`Red -> Green`) | Write deterministic clock-driven tests (`core::windows::tests`, `#[doc = "Spec: LIM-1, RTE-3"]`) using `FakeClock`: advance time minute-by-minute across a 5-hour rolling window and a 30-day anchored window, asserting that buckets expire at the exact millisecond boundary, that routes are excluded at `98%` spend (`reserve_pct = 2`), and that restarting the store reconstructs identical bucket sums from SQLite. |
-| Atomic commits | 1. `feat(core/4.4): implement rolling bucket ring counters, anchored windows, RAII InFlightBudgetGuard, and admission reserve checks [Spec: LIM-1, RTE-3]` |
-| Risks and resolutions | **Risk:** High concurrency allows several new requests to pass admission simultaneously when a window is at `97.9%`. **Resolution:** Increment an optimistic in-flight reservation counter (`reserved_in_flight_micro_usd`, default `$0.05` per active stream) while the stream is open and replace it with actual cost when the stream finishes. |
-
-## 4.5 Sub-phase 4.5: Source provider `/usage` poller, auto-reconciliation, and `/v1/usage` pass-through
-
-This sub-phase implements upstream `/usage` polling and automatic `budget_adjustments` reconciliation (`USG-4`..`USG-6`). It also serves `/v1/usage`, `/v1/key`, and `/v1/usage/raw` with PII sanitization (`USG-7`, `USG-8`, `SEC-18`).
+This sub-phase wires live `UsageEvent` and `usage_attempts` emission plus conservative `estimated_input` charging into `/v1/*` orchestrator v3. It also wires `Reservation` finalization in `RequestLifecycle::drop` and threshold `/usage` poll triggers (`SRDD Section 5.3, Section 13.2.1, Section 21.1`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 2.4`, `Section 6.9`, `Section 8.2`, `Section 13.3`, `Section 13.4`; Requirements `USG-4`..`USG-8`, `SEC-18` |
-| Crates touched | `crates/proto::usage_poller`, `crates/store::usage_snapshots`, `crates/proxy::usage_passthrough`, `fixtures/usage/*` |
-| TDD step (`Red -> Green`) | Write golden parser and integration tests (`tests/integration_usage_and_passthrough.rs`, `#[doc = "Spec: USG-4, USG-5, USG-6, USG-7, USG-8, SEC-18"]`): (1) replay `fixtures/usage/opencode_go.json`, `command_code_credits.json`, and `openrouter_key.json`, (2) assert that when OpenCode Go reports `percent: 25` and `resetsAt` while local spend is `10%`, LLMRoller inserts an automatic `upstream_usage_sync` adjustment so the window gauge reads `25%` (`USG-6`), (3) assert `GET /v1/usage` returns raw `source_provider_usage` for a user's own personal key, and (4) assert `GET /v1/usage` on a shared or global key strips `email`, `whoami`, `user_id`, and `workspace_id` (`USG-8`, `SEC-18`). |
-| Atomic commits | 1. `feat(proto/4.5): implement source provider /usage parsers and strict allow-list PII sanitizer [Spec: PRV-6, USG-4, USG-5, SEC-18]` 2. `feat(core/4.5): implement automatic window reset and spend reconciliation from /usage snapshots [Spec: USG-6]` 3. `feat(proxy/4.5): implement GET /v1/usage, GET /v1/key, and GET /v1/usage/raw pass-through endpoints [Spec: USG-7, USG-8]` |
-| Risks and resolutions | **Risk:** Command Code's `/alpha/billing/credits` endpoint changes a field name or Open Design AMR's `/v1/usage` returns 404 ([open-design#8674](https://github.com/nexu-io/open-design/issues/8674)). **Resolution:** Keep `raw_json` intact in `upstream_usage_snapshots`, treat missing normalized fields as `None` (falling back cleanly to local window counters without failing key health), and surface a non-fatal schema notice in the admin UI (`R2`). |
+| SRDD references | `Section 5.3`, `Section 6.9`, `Section 10.5.2`, `Section 13.2.1`, `Section 21.1`; Requirements `USG-1`..`USG-3`, `LIM-1` |
+| Crates touched | `crates/proxy::orchestrator`, `crates/proxy::lifecycle`, `tests/integration_usage_writer.rs` |
+| TDD step (`Red -> Green`) | Write end-to-end accounting tests (`tests/integration_usage_writer.rs`, `#[doc = "Spec: USG-1, USG-2, USG-3, LIM-1"]`) verifying: (1) an upstream try that fails with HTTP 502 after the request body is written records a `usage_attempts` row with `charge_basis = 'estimated_input'` and posts `charged_micro_usd = ceil(estimate_input_tokens(body) * rate_in / 1_000_000)` to that key's windows, share accumulator, and user global accumulator before failing over to key 2, (2) a client disconnecting mid-stream on each protocol (`chat`, `responses`, `messages`) emits exactly one `usage_events` row with `termination = 'client_gone'`, `incomplete = 1`, and non-zero cost (`cost_source = 'estimated_incomplete'`), and (3) `Reservation::drop` posts actual cost to rings/accumulators before decrementing `reserved_in_flight`. Re-run the `2.7` load benchmark. |
+| Atomic commits | 1. `feat(proxy/4.6): wire live usage emission, usage_attempts charging, and Reservation finalization into orchestrator v3 [Spec: USG-1, USG-2, USG-3, LIM-1]` |
+| Risks and resolutions | **Risk:** Failed upstream tries that consumed prefill tokens (502/504 after body write or opt-in wait timeouts) leave local window and share counters under-counted. **Resolution:** Record every upstream try in `usage_attempts` and charge `estimated_input` for tries in the possibly-consumed class (`SRDD Section 9.1, Section 10.5.2`). |
+
+## 4.7 Sub-phase 4.7: General retention sweeper, WAL checkpoint supervisor, and `SQLITE_FULL` degraded mode
+
+This sub-phase implements the portable ULID-range retention sweeper for `usage_events` (30 days or `50,000,000` rows), `usage_attempts`, `usage_rollups_5min`, `response_links`, `pins`, and `web_sessions`. It also adds the 30 s WAL checkpoint supervisor and `SQLITE_FULL` degraded-mode handling (`SRDD Section 3.3 A6, Section 9.2, Section 21.6.3`).
+
+| Attribute | Details |
+| --- | --- |
+| SRDD references | `Section 3.3 (A6)`, `Section 9.2`, `Section 21.6.3`; Requirements `REL-3`, `Partial: PERF-4` |
+| Crates touched | `crates/store::retention`, `crates/store::checkpoint`, `crates/server::jobs` |
+| TDD step (`Red -> Green`) | Write retention and WAL tests (`tests/integration_usage_writer.rs`, `#[doc = "Spec: REL-3, Partial: PERF-4"]`) verifying: (1) the sweeper deletes expired `usage_events` in 1,000-row chunks using portable `WHERE id IN (SELECT id FROM usage_events WHERE id < :cutoff_ulid ORDER BY id LIMIT 1000)` and enforces `usage_events_max_rows = 50_000_000` followed by `PRAGMA incremental_vacuum(500)`, (2) the checkpoint supervisor runs `wal_checkpoint(PASSIVE)` every 30 s, triggers `wal_checkpoint(RESTART)` between writer batches when the WAL exceeds `256 MiB`, and sets `/readyz` to HTTP 503 when the WAL exceeds `1 GiB`, and (3) simulated `SQLITE_FULL` drops incoming raw events (`llmroller_storage_full = 1`, `/readyz` -> 503) while continuing to retry `durable_state` and `rollups` commits every 5 s. |
+| Atomic commits | 1. `feat(store/4.7): implement portable ULID-range retention sweeper, WAL checkpoint supervisor, and SQLITE_FULL handler [Spec: REL-3, Partial: PERF-4]` |
+| Risks and resolutions | **Risk:** Long read transactions pin the WAL tail and prevent `PASSIVE` checkpoints from reclaiming space. **Resolution:** Bound all read-pool queries by paging (`<= 5,000` rows or `<= 50` turns per read transaction) and trigger `wal_checkpoint(RESTART)` from the writer between batches when WAL size exceeds `256 MiB` (`SRDD Section 21.6.3`). |

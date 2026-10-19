@@ -1,0 +1,802 @@
+# Authoritative LLMRoller Requirement Registry (`Section 16.6`)
+# Single source of truth mapping every SRDD requirement ID to its priority, milestone,
+# delivering Big-Bang sub-phase, and verification test targets.
+# Validated in CI by `cargo xtask traceability` and `cargo xtask doc-consistency`.
+
+schema_version = 1
+
+# --- 6.1 Setup, accounts, and authentication (AUTH) ---
+[requirements.AUTH-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-2]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-3]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-4]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/store/src/users/tests.rs", "tests/e2e_dashboard_htmx.rs"]
+
+[requirements.AUTH-5]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/store/src/users/tests.rs", "tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-6]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/store/src/users/tests.rs"]
+
+[requirements.AUTH-7]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/admin/src/auth/tests.rs", "tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-8]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/admin/src/auth/tests.rs", "tests/e2e_setup_and_auth.rs"]
+
+[requirements.AUTH-9]
+priority = "P1"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/store/src/users/tests.rs", "tests/e2e_setup_and_auth.rs"]
+
+# --- 6.2 User roles and access control (USR) ---
+[requirements.USR-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.2"
+tests = ["crates/core/src/rbac/tests.rs"]
+
+[requirements.USR-2]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+partial_subphases = ["1.2", "6.2"]
+tests = ["crates/core/src/rbac/tests.rs", "tests/integration_rbac_isolation.rs"]
+
+[requirements.USR-3]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+partial_subphases = ["1.2", "6.2"]
+tests = ["crates/core/src/rbac/tests.rs", "tests/integration_rbac_isolation.rs"]
+
+[requirements.USR-4]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+partial_subphases = ["1.2", "6.2"]
+tests = ["crates/core/src/rbac/tests.rs", "tests/integration_rbac_isolation.rs"]
+
+[requirements.USR-5]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.0c"
+partial_subphases = ["1.4", "6.3"]
+tests = ["crates/core/src/accumulators/tests.rs", "tests/e2e_dashboard_htmx.rs"]
+
+# --- 6.3 Global and personal providers and upstream keys (PRV) ---
+[requirements.PRV-1]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.0"
+tests = ["tests/integration_providers_and_keys.rs"]
+
+[requirements.PRV-2]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.6"
+tests = ["crates/proto/src/adapters/tests.rs"]
+
+[requirements.PRV-3]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.6"
+tests = ["crates/proto/src/adapters/tests.rs"]
+
+[requirements.PRV-4]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.0"
+tests = ["tests/integration_providers_and_keys.rs"]
+
+[requirements.PRV-5]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.0"
+partial_subphases = ["1.3"]
+tests = ["crates/store/src/crypto/tests.rs", "tests/integration_providers_and_keys.rs"]
+
+[requirements.PRV-6]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+partial_subphases = ["2.6"]
+tests = ["crates/proto/src/adapters/tests.rs", "tests/integration_usage_and_passthrough.rs"]
+
+[requirements.PRV-7]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.1"
+tests = ["crates/proxy/src/ssrf/tests.rs", "tests/security_canary_and_ssrf.rs"]
+
+[requirements.PRV-8]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+partial_subphases = ["2.0"]
+tests = ["tests/integration_routing_and_failover.rs"]
+
+# --- 6.4 Personal provider and key sharing (SHR) ---
+[requirements.SHR-1]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+tests = ["tests/integration_personal_sharing.rs"]
+
+[requirements.SHR-2]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+partial_subphases = ["3.0c"]
+tests = ["crates/core/src/shares/tests.rs", "tests/integration_personal_sharing.rs"]
+
+[requirements.SHR-3]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+tests = ["crates/core/src/shares/tests.rs", "tests/integration_personal_sharing.rs"]
+
+[requirements.SHR-4]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+tests = ["crates/core/src/shares/tests.rs", "tests/integration_personal_sharing.rs"]
+
+[requirements.SHR-5]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.2"
+tests = ["tests/integration_personal_sharing.rs"]
+
+[requirements.SHR-6]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.3"
+tests = ["tests/integration_usage_writer.rs"]
+
+# --- 6.5 Client keys (CLK) ---
+[requirements.CLK-1]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+partial_subphases = ["2.0"]
+tests = ["crates/core/src/client_key/tests.rs", "tests/integration_client_keys.rs"]
+
+[requirements.CLK-2]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+partial_subphases = ["2.2"]
+tests = ["tests/integration_client_keys.rs", "tests/integration_routing_and_failover.rs"]
+
+[requirements.CLK-3]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.4"
+tests = ["crates/core/src/eligibility/tests.rs"]
+
+[requirements.CLK-4]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+tests = ["tests/integration_client_keys.rs"]
+
+[requirements.CLK-5]
+priority = "P1"
+milestone = "M2"
+delivering_subphase = "3.0c"
+partial_subphases = ["2.2"]
+tests = ["crates/core/src/accumulators/tests.rs", "tests/integration_client_keys.rs"]
+
+# --- 6.6 Model catalog and discovery (MDL) ---
+[requirements.MDL-1]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["tests/integration_model_catalog.rs"]
+
+[requirements.MDL-2]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["crates/core/src/catalog/tests.rs"]
+
+[requirements.MDL-3]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["crates/core/src/catalog/tests.rs", "tests/integration_model_catalog.rs"]
+
+[requirements.MDL-4]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["crates/core/src/catalog/tests.rs", "tests/integration_model_catalog.rs"]
+
+[requirements.MDL-5]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["crates/core/src/catalog/tests.rs", "tests/integration_model_catalog.rs"]
+
+[requirements.MDL-6]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["crates/core/src/catalog/tests.rs", "tests/integration_model_catalog.rs"]
+
+[requirements.MDL-7]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.1"
+tests = ["tests/integration_model_catalog.rs"]
+
+# --- 6.7 Routing and session pinning (RTE) ---
+[requirements.RTE-1]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.3"
+tests = ["crates/core/src/session/tests.rs"]
+
+[requirements.RTE-2]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-3]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.4"
+partial_subphases = ["3.0b"]
+tests = ["crates/core/src/eligibility/tests.rs"]
+
+[requirements.RTE-4]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.5"
+tests = ["crates/core/src/wrr/proptests.rs"]
+
+[requirements.RTE-5]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.5"
+tests = ["crates/core/src/wrr/proptests.rs"]
+
+[requirements.RTE-6]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.5"
+tests = ["crates/core/src/wrr/proptests.rs"]
+
+[requirements.RTE-7]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["crates/core/src/pins/tests.rs", "tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-8]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["crates/core/src/pins/tests.rs", "tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-9]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-10]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["crates/core/src/pins/tests.rs", "tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-11]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["crates/core/src/pins/tests.rs", "tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-12]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6b"
+tests = ["tests/integration_routing_and_failover.rs"]
+
+[requirements.RTE-13]
+priority = "P1"
+milestone = "M2"
+delivering_subphase = "3.5"
+tests = ["crates/core/src/wrr/proptests.rs"]
+
+# --- 6.8 Transparent proxying (API) ---
+[requirements.API-1]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+partial_subphases = ["2.7", "3.7"]
+tests = ["tests/integration_routing_and_failover.rs", "tests/integration_usage_and_passthrough.rs"]
+
+[requirements.API-2]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.3"
+partial_subphases = ["2.2"]
+tests = ["crates/proto/src/headers/tests.rs", "tests/integration_client_keys.rs"]
+
+[requirements.API-3]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.3"
+tests = ["crates/proto/src/headers/tests.rs"]
+
+[requirements.API-4]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.4"
+tests = ["crates/proto/src/body_edit/proptests.rs"]
+
+[requirements.API-5]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.1"
+partial_subphases = ["2.5"]
+tests = ["crates/proto/src/sse_tap/golden_tests.rs", "tests/integration_wire_transparency.rs"]
+
+[requirements.API-6]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.5"
+tests = ["tests/integration_wire_transparency.rs"]
+
+[requirements.API-7]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.5"
+tests = ["tests/integration_wire_transparency.rs"]
+
+[requirements.API-8]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6a"
+partial_subphases = ["2.6"]
+tests = ["crates/core/src/health/tests.rs", "tests/integration_routing_and_failover.rs"]
+
+# --- 6.9 Usage, budgets, and source provider /usage pass-through (USG & LIM) ---
+[requirements.USG-1]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.3"
+partial_subphases = ["4.1", "4.6"]
+tests = ["crates/proto/src/sse_tap/golden_tests.rs", "tests/integration_usage_writer.rs"]
+
+[requirements.USG-2]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.1"
+tests = ["crates/proto/src/sse_tap/golden_tests.rs"]
+
+[requirements.USG-3]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.2"
+partial_subphases = ["3.0a", "4.6"]
+tests = ["crates/core/src/pricing/proptests.rs", "tests/integration_price_book.rs"]
+
+[requirements.USG-4]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+tests = ["tests/integration_usage_and_passthrough.rs"]
+
+[requirements.USG-5]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+tests = ["tests/integration_usage_and_passthrough.rs"]
+
+[requirements.USG-6]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+partial_subphases = ["3.0b"]
+tests = ["crates/core/src/windows/tests.rs", "tests/integration_usage_and_passthrough.rs"]
+
+[requirements.USG-7]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+tests = ["tests/integration_usage_and_passthrough.rs"]
+
+[requirements.USG-8]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+tests = ["tests/integration_usage_and_passthrough.rs"]
+
+[requirements.LIM-1]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.0b"
+partial_subphases = ["4.6", "4b.1"]
+tests = ["crates/core/src/windows/tests.rs"]
+
+# --- 6.10 Content traceability mode and session chat preview (TRC) ---
+[requirements.TRC-1]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.1"
+tests = ["crates/core/src/trace_config/tests.rs"]
+
+[requirements.TRC-2]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.2"
+tests = ["crates/proto/src/trace_tap/tests.rs"]
+
+[requirements.TRC-3]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.2"
+tests = ["crates/proto/src/trace_tap/tests.rs"]
+
+[requirements.TRC-4]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.3"
+tests = ["crates/store/src/traces/tests.rs"]
+
+[requirements.TRC-5]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.4"
+tests = ["crates/core/src/chat_preview/tests.rs", "tests/integration_content_traceability.rs"]
+
+[requirements.TRC-6]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.5"
+partial_subphases = ["5.4"]
+tests = ["tests/e2e_dashboard_htmx.rs"]
+
+[requirements.TRC-7]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.3"
+partial_subphases = ["5.1"]
+tests = ["crates/store/src/traces/tests.rs"]
+
+[requirements.TRC-8]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.4"
+tests = ["tests/integration_content_traceability.rs"]
+
+# --- 6.11 Web UI and audit logging (UI & AUD) ---
+[requirements.UI-1]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.4"
+partial_subphases = ["6.1", "6.2", "6.3"]
+tests = ["tests/e2e_dashboard_htmx.rs"]
+
+[requirements.UI-2]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.4"
+partial_subphases = ["6.2"]
+tests = ["tests/e2e_dashboard_htmx.rs"]
+
+[requirements.UI-3]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.1"
+tests = ["tests/security_csrf_and_headers.rs"]
+
+[requirements.UI-4]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.5"
+partial_subphases = ["6.1"]
+tests = ["tests/security_csrf_and_headers.rs", "tests/e2e_dashboard_htmx.rs"]
+
+[requirements.AUD-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.5"
+partial_subphases = ["5.1", "6.3"]
+tests = ["crates/store/src/audit/tests.rs"]
+
+# --- 7. Non-functional requirements (PERF, REL, TRN, COM, POR, MNT, OBS, PRIV) ---
+[requirements.PERF-1]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.3"
+partial_subphases = ["2.7", "3.7"]
+tests = ["benches/proxy_latency.rs"]
+
+[requirements.PERF-2]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.3"
+partial_subphases = ["2.5", "2.7", "5.2"]
+tests = ["tests/integration_wire_transparency.rs", "benches/proxy_latency.rs"]
+
+[requirements.PERF-3]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.3"
+partial_subphases = ["2.7"]
+tests = ["benches/proxy_latency.rs"]
+
+[requirements.PERF-4]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.1"
+partial_subphases = ["4.7", "7.3"]
+tests = ["crates/store/src/budgets/tests.rs", "benches/proxy_latency.rs"]
+
+[requirements.PERF-5]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.3"
+partial_subphases = ["5.2", "7.3"]
+tests = ["crates/proto/src/trace_tap/tests.rs", "benches/proxy_latency.rs"]
+
+[requirements.REL-1]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.7"
+partial_subphases = ["7.3"]
+tests = ["tests/e2e_sigterm_drain.rs"]
+
+[requirements.REL-2]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.3"
+partial_subphases = ["7.3"]
+tests = ["tests/integration_usage_writer.rs", "tests/e2e_kill9_recovery.rs"]
+
+[requirements.REL-3]
+priority = "P0"
+milestone = "M3"
+delivering_subphase = "4.3"
+partial_subphases = ["4.7", "7.3"]
+tests = ["tests/integration_usage_writer.rs"]
+
+[requirements.REL-4]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.6"
+partial_subphases = ["7.3"]
+tests = ["tests/integration_snapshot_reloader.rs"]
+
+[requirements.REL-5]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.6a"
+partial_subphases = ["7.3"]
+tests = ["crates/core/src/health/tests.rs"]
+
+[requirements.REL-6]
+priority = "P1"
+milestone = "M6"
+delivering_subphase = "7.3"
+tests = ["tests/e2e_kill9_recovery.rs"]
+
+[requirements.TRN-1]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.4"
+tests = ["crates/proto/src/body_edit/proptests.rs"]
+
+[requirements.TRN-2]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.4"
+partial_subphases = ["7.1"]
+tests = ["crates/proto/src/body_edit/proptests.rs"]
+
+[requirements.TRN-3]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.5"
+tests = ["tests/integration_wire_transparency.rs"]
+
+[requirements.COM-1]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.4"
+tests = ["tests/e2e_cli_harnesses.rs"]
+
+[requirements.POR-1]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.5"
+partial_subphases = ["1.1"]
+tests = ["scripts/verify_release_package.sh"]
+
+[requirements.MNT-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.1"
+tests = ["tests/workspace_boundaries.rs"]
+
+[requirements.MNT-2]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.1"
+partial_subphases = ["2.6"]
+tests = ["tests/workspace_boundaries.rs"]
+
+[requirements.OBS-1]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+partial_subphases = ["7.4"]
+tests = ["tests/integration_client_keys.rs"]
+
+[requirements.PRIV-1]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.4"
+partial_subphases = ["4.2"]
+tests = ["tests/e2e_cli_harnesses.rs"]
+
+# --- 8.2 Security requirements (SEC) ---
+[requirements.SEC-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.3"
+tests = ["crates/store/src/crypto/tests.rs"]
+
+[requirements.SEC-2]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.3"
+tests = ["crates/store/src/crypto/tests.rs"]
+
+[requirements.SEC-3]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+tests = ["crates/core/src/client_key/tests.rs"]
+
+[requirements.SEC-4]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/store/src/users/tests.rs"]
+
+[requirements.SEC-5]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+partial_subphases = ["6.1"]
+tests = ["tests/e2e_setup_and_auth.rs", "tests/security_csrf_and_headers.rs"]
+
+[requirements.SEC-6]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.3"
+partial_subphases = ["6.4", "7.1"]
+tests = ["tests/security_canary_and_ssrf.rs"]
+
+[requirements.SEC-7]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.1"
+tests = ["crates/proxy/src/ssrf/tests.rs", "tests/security_canary_and_ssrf.rs"]
+
+[requirements.SEC-8]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.7"
+partial_subphases = ["2.3", "7.1"]
+tests = ["tests/e2e_sigterm_drain.rs", "tests/security_canary_and_ssrf.rs"]
+
+[requirements.SEC-9]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+partial_subphases = ["1.4"]
+tests = ["tests/integration_client_keys.rs"]
+
+[requirements.SEC-10]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.1"
+partial_subphases = ["7.5"]
+tests = ["tests/workspace_boundaries.rs"]
+
+[requirements.SEC-11]
+priority = "P0"
+milestone = "M6"
+delivering_subphase = "7.5"
+tests = ["scripts/verify_release_package.sh"]
+
+[requirements.SEC-12]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.2"
+partial_subphases = ["1.4"]
+tests = ["tests/e2e_setup_and_auth.rs", "tests/integration_client_keys.rs"]
+
+[requirements.SEC-13]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.5"
+tests = ["crates/store/src/audit/tests.rs"]
+
+[requirements.SEC-14]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.2"
+partial_subphases = ["7.1"]
+tests = ["crates/core/src/ids/tests.rs", "tests/security_canary_and_ssrf.rs"]
+
+[requirements.SEC-15]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.3"
+partial_subphases = ["7.1"]
+tests = ["crates/proto/src/headers/tests.rs"]
+
+[requirements.SEC-16]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.3"
+tests = ["crates/core/src/session/tests.rs"]
+
+[requirements.SEC-17]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.2"
+partial_subphases = ["1.3", "3.2", "5.4"]
+tests = ["crates/core/src/rbac/tests.rs", "tests/integration_rbac_isolation.rs"]
+
+[requirements.SEC-18]
+priority = "P0"
+milestone = "M4"
+delivering_subphase = "4b.2"
+tests = ["tests/integration_usage_and_passthrough.rs"]
+
+[requirements.SEC-19]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.4"
+partial_subphases = ["1.3", "5.3", "6.5"]
+tests = ["crates/store/src/traces/tests.rs", "tests/integration_content_traceability.rs"]

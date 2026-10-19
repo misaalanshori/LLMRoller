@@ -1,63 +1,64 @@
 # Epic 7: System hardening, fuzzing, load verification, live harness E2E, and v1.0.0 release
 
-Epic 7 hardens the gateway through fuzzing, full-workspace mutation testing, and 500 req/s load benchmarks. It also verifies crash recovery, headless CLI agent compatibility (`Claude Code`, `Codex CLI`, `opencode`), and signed release packaging. It corresponds to Milestone `M6` (`SRDD Sections 7, 8, 16, 17, 18, 19`).
+Epic 7 runs extended fuzzing and canary verification (`7.1`), full-workspace mutation testing and traceability checks (`7.2`), and 500 req/s and 2,000-stream soak benchmarks (`7.3`). It also verifies `llmroller backup`, CLI exit codes `0..14`, headless CLI agent E2E workflows (`7.4`), and signed release packaging (`7.5`). It corresponds to Milestone `M6` (`SRDD Sections 5.5, 7, 8, 16, 17, 18, 19, 21`).
 
-## 7.1 Sub-phase 7.1: Structure-aware fuzzing (`cargo-fuzz`) and canary secret verification
+## 7.1 Sub-phase 7.1: Extended fuzzing campaigns (`cargo-fuzz`) and full-stack canary secret verification
 
-This sub-phase runs fuzzing campaigns against all untrusted wire parsers (`body_edit`, `sse_tap`, `trace_tap`, `headers`). It also runs the full-system canary secret redaction test (`SEC-6`).
+This sub-phase runs extended fuzzing campaigns across all six fuzz targets (`headers`, `body_edit`, `sse_frame`, `sse_tap`, `trace_tap`, `step8_fingerprint`). It also runs the full-system canary secret redaction suite (`SEC-6`, `SEC-14`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 8.2`, `Section 16.5.3`; Requirements `SEC-6`, `SEC-8`, `SEC-15`, `TRN-2` |
+| SRDD references | `Section 8.2`, `Section 16.5.3`; Requirements `SEC-6`, `SEC-8`, `SEC-14`, `SEC-15`, `TRN-2` |
 | Crates touched | `fuzz/fuzz_targets/*`, `tests/security_canary_and_ssrf.rs` |
-| TDD step (`Red -> Green`) | 1. Write four `cargo-fuzz` targets asserting zero panics, zero out-of-bounds slices, and bounded memory allocation on arbitrary byte streams. 2. Run `tests/security_canary_and_ssrf.rs` (`#[doc = "Spec: SEC-6, SEC-14"]`) planting canary secrets in upstream keys, client keys, cookies, and master keys, forcing upstream 401/500 errors, malformed SSE streams, and simulated handler panics, and asserting zero occurrences of any canary substring across stdout/stderr JSON logs, HTTP responses, `audit_log`, and `usage_events`. |
-| Atomic commits | 1. `test(fuzz/7.1): add cargo-fuzz targets for JSON span editor, SSE tap, trace reassembler, and header parser [Spec: SEC-8, SEC-15, TRN-2]` 2. `sec(tests/7.1): add full-stack canary secret redaction test across logs, errors, and SQLite tables [Spec: SEC-6, SEC-14]` |
-| Risks and resolutions | **Risk:** A fuzzer discovers a multi-byte UTF-8 boundary split across two `Bytes` chunks in `SseUsageTap` or `TraceTap` that causes a slice panic. **Resolution:** Convert any discovered crash input into a permanent regression test under `crates/proto/tests/regressions.rs` (`SRDD Section 16.5.4`) and use `std::str::from_utf8` with incomplete trailing UTF-8 byte carryover across chunk boundaries. |
+| TDD step (`Red -> Green`) | 1. Run all six `cargo-fuzz` targets (`headers`, `body_edit`, `sse_frame`, `sse_tap`, `trace_tap`, `step8_fingerprint`) asserting zero panics, zero out-of-bounds slices, zero duplicate-key bypasses, and bounded memory allocation on arbitrary byte streams. 2. Run `tests/security_canary_and_ssrf.rs` (`#[doc = "Spec: SEC-6, SEC-14"]`) planting canary secrets in upstream keys, client keys, cookies, setup tokens, and master keys, forcing upstream 401/403/500 errors, echoed `sk-*`/`llr_*` strings in upstream error bodies, malformed SSE streams, CSV exports with formula prefixes (`=`, `+`, `-`, `@`, `	`, `
+`), and simulated handler panics, and asserting zero occurrences of any canary substring across stdout/stderr JSON logs, HTTP responses, `/metrics`, `audit_log`, and SQLite tables. |
+| Atomic commits | 1. `sec(tests/7.1): complete six-target cargo-fuzz suite and full-stack canary redaction and CSV formula-injection verification [Spec: SEC-6, SEC-8, SEC-14, SEC-15, TRN-2]` |
+| Risks and resolutions | **Risk:** Upstream error bodies occasionally echo the `Authorization` bearer token back in an error message, leaking the key into `last_error` or logs. **Resolution:** Scrub all `sk-*`, `llr_*`, `user_*`, and configured secret substrings from upstream error bodies before persisting `last_error` or logging (`SRDD Section 8.2 SEC-6`). |
 
-## 7.2 Sub-phase 7.2: Full-workspace mutation sweep (`cargo-mutants`) and 100% traceability gate
+## 7.2 Sub-phase 7.2: Full-workspace mutation sweep (`cargo-mutants`) and 100% `xtask traceability` gate
 
-This sub-phase runs a full workspace `cargo mutants --workspace` sweep (`SRDD Section 16.5.6`). It also runs `scripts/verify_traceability.py` (`SRDD Section 16.6`) to verify bidirectional links across all SRDD requirements.
-
-| Attribute | Details |
-| --- | --- |
-| SRDD references | `Section 16.5.6`, `Section 16.6`; Requirements `G8`, `ADR-8`, all requirement IDs in `Sections 6, 7, 8` |
-| Crates touched | All test modules across `crates/{core,proto,store,proxy,admin,server}`, `scripts/verify_traceability.py` |
-| TDD step (`Red -> Green`) | Run `cargo mutants --workspace` and inspect every surviving mutant. For each survivor, write the missing boundary or negative contract test that kills the mutant. Run `python3 scripts/verify_traceability.py` and confirm 100% of requirement IDs in `6. SRDD - Functional Requirements.md`, `7. SRDD - Non-Functional Requirements.md`, and `8. SRDD - Security and Privacy.md` map to at least one passing test. |
-| Atomic commits | 1. `test(workspace/7.2): eliminate remaining surviving mutants across core, proto, store, proxy, and admin [Spec: G8, ADR-8]` 2. `ci(workspace/7.2): enforce 100% SRDD-to-test traceability check in CI [Spec: G8]` |
-| Risks and resolutions | **Risk:** Full-workspace mutation testing takes too long on every pull request. **Resolution:** Keep `cargo mutants --in-diff` (typically `< 90 s`) as the blocking PR gate and run full `cargo mutants --workspace` in the nightly and pre-release CI workflow (`SRDD Section 16.5.6`). |
-
-## 7.3 Sub-phase 7.3: Load and soak benchmarks (`PERF-1`..`PERF-5`) and crash/drain resilience (`REL-1`..`REL-6`)
-
-This sub-phase validates the latency and memory targets (`PERF-1`..`PERF-5`) on a 2 vCPU, 2 GB RAM host against a stub upstream cluster. It also verifies graceful `SIGTERM` draining, `SIGKILL` WAL durability, and online SQLite backups (`REL-1`..`REL-6`).
+This sub-phase runs the full workspace `cargo mutants --workspace` sweep (`SRDD Section 16.5.6`). It also runs `cargo xtask traceability --milestone M6`, `cargo xtask doc-consistency`, and `cargo xtask docs-bundle --check` (`SRDD Section 16.6`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 7.1`, `Section 7.2`; Requirements `PERF-1`..`PERF-5`, `REL-1`..`REL-6` |
-| Crates touched | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `crates/server::shutdown`, `crates/server::backup` |
-| TDD step (`Red -> Green`) | 1. Run the load harness (`500 req/s` and `2,000` concurrent SSE streams, both with `content_traceability_mode` off and on) and assert: p50 overhead `<= 1 ms`, p99 overhead `<= 5 ms` (`PERF-1`), chunk forwarding delay `<= 1 ms` (`PERF-2`), RSS `<= 300 MB` at 2,000 streams (`PERF-3`), idle RSS `<= 50 MB` and startup `<= 2 s` (`PERF-4`), and traceability TTFB delta `<= 0.5 ms` (`PERF-5`). 2. Send `SIGTERM` with 50 active streams and assert all 50 complete cleanly (`REL-1`). 3. Send `SIGKILL` (`kill -9`) 2 s after confirming pins and usage rows and assert zero lost pins or usage rows on restart (`REL-2`). |
-| Atomic commits | 1. `feat(server/7.3): implement graceful SIGTERM stream drain and llmroller backup CLI command [Spec: REL-1, REL-6]` 2. `perf(workspace/7.3): add load benchmark harness and verify PERF-1 through PERF-5 and REL-2 [Spec: PERF-1, PERF-2, PERF-3, PERF-4, PERF-5, REL-2]` |
-| Risks and resolutions | **Risk:** Under 2,000 open streams with `content_traceability_mode` enabled, per-stream trace buffers could push RSS above `300 MB`. **Resolution:** Stream trace deltas in 16 KiB chunks into a per-stream incremental `zstd::stream::Encoder` (which compresses ~5x in flight) so a 100 KiB transcript occupies `< 20 KiB` of RAM while streaming. |
+| SRDD references | `Section 16.5.6`, `Section 16.6`; Requirements `G8`, `ADR-8`, all requirement IDs in `docs/srdd/requirements.toml` |
+| Crates touched | All test modules across `crates/{core,proto,store,proxy,admin,server}`, `xtask` |
+| TDD step (`Red -> Green`) | Run `cargo mutants --workspace` across all crates, verify that every `#[mutants::skip]` annotation carries an `// equivalent: <reason>` comment, and add boundary or negative tests for any unannotated surviving mutant until zero survive. Run `cargo xtask traceability --milestone M6` and `cargo xtask doc-consistency` to confirm that 100% of requirement IDs in `docs/srdd/requirements.toml` and `SRDD Sections 6, 7, 8` map to passing `#[doc = "Spec: ..."]` tests (with zero `Partial:`-only requirements remaining). |
+| Atomic commits | 1. `test(workspace/7.2): eliminate remaining surviving mutants and verify equivalent-mutant annotations across workspace [Spec: G8, ADR-8]` 2. `ci(workspace/7.2): enforce cargo xtask traceability --milestone M6 and doc-consistency gates in CI [Spec: G8]` |
+| Risks and resolutions | **Risk:** Unreviewed `#[mutants::skip]` attributes mask real behavioral regressions. **Resolution:** Fail CI in `xtask` if any `#[mutants::skip]` lacks `// equivalent: <reason>` and enforce CODEOWNERS approval on skip changes (`SRDD Section 16.5.6`). |
 
-## 7.4 Sub-phase 7.4: Headless CLI harness compatibility (`COM-1`) and Milestone 1 live checks
+## 7.3 Sub-phase 7.3: Full-scale load and soak benchmarks (`PERF-1`..`PERF-5`), 50M-row DB verification, and CLI exit-code/backup resilience (`REL-1`..`REL-6`)
 
-This sub-phase runs headless E2E workflows with `Claude Code`, `Codex CLI`, `opencode`, and the OpenAI and Anthropic SDKs (`COM-1`). It also runs the opt-in live provider verification scripts (`SRDD Section 19.2`).
-
-| Attribute | Details |
-| --- | --- |
-| SRDD references | `Section 7.3`, `Section 16.5.5`, `Section 19.2`; Requirements `COM-1`, `OBS-1`, `PRIV-1` |
-| Crates touched | `tests/e2e_cli_harnesses.rs`, `scripts/verify_cache_affinity.sh` |
-| TDD step (`Red -> Green`) | Run `tests/e2e_cli_harnesses.rs` (`#[doc = "Spec: COM-1, OBS-1, PRIV-1"]`) pointing each CLI tool and SDK at LLMRoller backed by multi-turn tool-calling stub upstreams. Assert that: (1) every multi-turn tool-call loop completes, (2) all turns in one CLI invocation hit the same pinned `upstream_key_id`, (3) when content traceability mode is enabled, the entire multi-turn tool-call conversation renders accurately in `GET /api/user/sessions/{session_hash}/chat`, and (4) network egress monitoring confirms zero outbound packets to any host outside the configured upstream origins (`PRIV-1`). |
-| Atomic commits | 1. `test(e2e/7.4): add headless CLI harness compatibility suite for Claude Code, Codex CLI, opencode, and SDKs [Spec: COM-1, OBS-1, PRIV-1]` 2. `feat(scripts/7.4): add opt-in live cache-affinity and /usage verification script [Spec: RTE-2, USG-4]` |
-| Risks and resolutions | **Risk:** A new release of `Claude Code` or `Codex CLI` changes a path or header formatting expectation. **Resolution:** Lock the recorded inbound HTTP requests from each CLI version into `fixtures/harnesses/` so CI runs them deterministically on every PR even when the external CLI binary is not installed in a minimal container. |
-
-## 7.5 Sub-phase 7.5: Multi-arch static builds, distroless container, SBOM, `cosign` signing, and v1.0.0 release
-
-This sub-phase builds static binaries for Linux (`x86_64`, `aarch64`) and macOS (`aarch64-apple-darwin`) and packages the `< 50 MB` distroless container (`POR-1`, `SEC-11`). It then generates the CycloneDX SBOM, signs all release files with `cosign`, and tags `v1.0.0`.
+This sub-phase runs the full-scale latency and memory soak benchmarks (`PERF-1`..`PERF-5`) against a 50M-row database and log-normal TTFF stub cluster. It also verifies crash-safe `llmroller backup` (`REL-6`) and all CLI exit codes `0..14` (`SRDD Section 5.5, Section 7.1, Section 7.2`).
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 7.4`, `Section 8.2`, `Section 12.1`; Requirements `POR-1`, `SEC-10`, `SEC-11` |
-| Crates touched | `.github/workflows/release.yml`, `Dockerfile`, `docker-compose.yml` |
-| TDD step (`Red -> Green`) | Run the release packaging smoke test (`scripts/verify_release_package.sh`, `#[doc = "Spec: POR-1, SEC-11"]`) asserting: (1) container image compressed/uncompressed size is `< 50 MB`, (2) container runs as UID `65532` with a read-only root filesystem, (3) `llmroller --version`, `llmroller backup`, `llmroller rotate-master-key`, and `llmroller verify-audit-log` succeed on a fresh container start, and (4) SHA-256 checksums and SBOM validate cleanly. |
-| Atomic commits | 1. `ci(release/7.5): add multi-arch musl build matrix, distroless Dockerfile (<50MB), SBOM, and cosign signing [Spec: POR-1, SEC-10, SEC-11]` |
-| Risks and resolutions | **Risk:** `zstd` C bindings complicate cross-compilation to `aarch64-unknown-linux-musl`. **Resolution:** Compile with `cargo-zigbuild` in CI (which provides a hermetic musl C/C++ cross-toolchain for `x86_64` and `aarch64`) or enable pure-Rust compression fallback where needed. |
+| SRDD references | `Section 5.5`, `Section 7.1`, `Section 7.2`, `Section 21.8`; Requirements `PERF-1`..`PERF-5`, `REL-1`..`REL-6` |
+| Crates touched | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `crates/server::backup`, `crates/server::cli` |
+| TDD step (`Red -> Green`) | 1. Seed a SQLite database with `50,000,000` `usage_events` rows, 7 days of `usage_rollups_5min` for 500 keys, and `250,000` confirmed pins; assert cold start to `/readyz` HTTP 200 completes in `<= 2 s` and idle RSS (up to 10,000 routes) stays `<= 50 MB` (`PERF-4`). 2. Run the load harness (`500 req/s` for `<= 256 KiB` bodies and `budget / (mean_body * ttff)` for `64 KiB`, `512 KiB`, and `2 MiB` bodies against the log-normal TTFF stub, plus `2,000` open SSE streams with `traceability_config.enabled` both `false` and `true`) and assert: p50 overhead `<= 1 ms` and p99 `<= 5 ms` (`PERF-1`), per-frame forwarding delay `<= 1 ms` (`PERF-2`), RSS `<= 300 MB` plus in-flight pre-first-byte bodies (`PERF-3`), and traceability RSS within `PERF-3` plus the `256 MiB` global trace accumulator budget using the 2-thread sealer pool (`PERF-5`). 3. Run `llmroller backup --out <dest>` during active write load and verify it writes `<dest>.tmp` in the destination directory, `fsync`s the file, runs `PRAGMA integrity_check`, renames to `<dest>`, `fsync`s the directory, refuses to overwrite without `--overwrite`, and outputs JSON including `master_key_id` (`REL-6`). 4. Verify deterministic CLI exit codes `0` and `2..14` (`SRDD Section 5.5`). |
+| Atomic commits | 1. `feat(server/7.3): implement crash-safe fsync llmroller backup CLI with master_key_id output and verify exit codes 0..14 [Spec: REL-6]` 2. `perf(workspace/7.3): verify PERF-1 through PERF-5 and REL-1 through REL-5 against 50M-row DB and 2,000-stream soak [Spec: PERF-1, PERF-2, PERF-3, PERF-4, PERF-5, REL-1, REL-2, REL-3, REL-4, REL-5]` |
+| Risks and resolutions | **Risk:** Writing `<dest>.tmp` in `/tmp` fails `rename` (`EXDEV`) when `<dest>` is on another mount, and omitting file/directory `fsync` leaves a truncated backup on power loss. **Resolution:** Create `<dest>.tmp` inside the parent directory of `<dest>` and `fsync` both the file and parent directory around `rename` (`SRDD Section 5.5`). |
+
+## 7.4 Sub-phase 7.4: Headless CLI harness compatibility (`COM-1`), Responses session inheritance, and network sandbox egress check (`PRIV-1`)
+
+This sub-phase runs headless E2E workflows with `Claude Code`, `Codex CLI`, `opencode`, and the official OpenAI and Anthropic SDKs (`COM-1`). It also verifies stateful `previous_response_id` session inheritance, network sandbox egress isolation (`PRIV-1`), and the opt-in live provider scripts (`SRDD Section 7.3, Section 19.2`).
+
+| Attribute | Details |
+| --- | --- |
+| SRDD references | `Section 7.3`, `Section 7.4`, `Section 16.5.5`, `Section 19.2`; Requirements `COM-1`, `OBS-1`, `PRIV-1` |
+| Crates touched | `tests/e2e_cli_harnesses.rs`, `tests/e2e_lifecycle.rs`, `scripts/verify_cache_affinity.sh` |
+| TDD step (`Red -> Green`) | Run `tests/e2e_cli_harnesses.rs` (`#[doc = "Spec: COM-1, OBS-1, PRIV-1"]`) pointing each CLI harness and SDK at LLMRoller backed by multi-turn tool-calling stub upstreams: (1) verify that `Claude Code` (including subagents with `x-claude-code-agent-id` and `POST /v1/messages/count_tokens`), `Codex CLI` (chaining `previous_response_id` across turns into a single `session_hash`, one `pins` row, and a unified multi-turn chat preview), `opencode`, and Python/TypeScript SDKs complete multi-turn streaming tool-call loops with 100% pin stickiness, and (2) verify under network namespace monitoring that LLMRoller emits zero outbound packets to any host outside configured upstream origins (`PRIV-1`). |
+| Atomic commits | 1. `test(e2e/7.4): add headless CLI harness suite for Claude Code, Codex CLI Responses chains, opencode, and SDKs with egress sandbox check [Spec: COM-1, OBS-1, PRIV-1]` 2. `feat(scripts/7.4): add opt-in live cache-affinity and /usage verification script [Spec: RTE-2, USG-4]` |
+| Risks and resolutions | **Risk:** `Codex CLI` rotates `previous_response_id` on every turn (`resp_A`, `resp_B`, `resp_C`), which would split a stateful conversation into separate `session_hash` pins if `previous_response_id` were hashed as a session ID. **Resolution:** Inherit `link.session_hash` from `response_links` (`SRDD Section 11.1.2`) so all turns of a Codex conversation share one `session_hash` and one multi-turn chat preview. |
+
+## 7.5 Sub-phase 7.5: Multi-arch static builds, `< 50 MB` distroless container, CycloneDX SBOM, `cosign` signing, and `v1.0.0` release
+
+This sub-phase packages static binaries for all five `POR-1` targets, verifies `llmroller --version`, and builds the `< 50 MB` distroless container (`POR-1`, `SEC-11`). It then generates the CycloneDX SBOM, signs all release files with `cosign`, and tags `v1.0.0`.
+
+| Attribute | Details |
+| --- | --- |
+| SRDD references | `Section 5.5`, `Section 7.4`, `Section 8.2`; Requirements `POR-1`, `SEC-10`, `SEC-11` |
+| Crates touched | `.github/workflows/release.yml`, `Dockerfile`, `docker-compose.yml`, `scripts/verify_release_package.sh` |
+| TDD step (`Red -> Green`) | Run `scripts/verify_release_package.sh` (`#[doc = "Spec: POR-1, SEC-10, SEC-11"]`) asserting: (1) container image size is `< 50 MB`, runs as UID `65532` with all Linux capabilities dropped and a read-only root filesystem, (2) `llmroller --version` prints `llmroller 1.0.0 (<git sha>, schema <n>)` and exits `0`, (3) `llmroller generate-master-key`, `llmroller backup`, `llmroller rotate-master-key`, `llmroller verify-audit-log`, and `llmroller reset-admin` succeed against a test data directory, and (4) SHA-256 checksums, CycloneDX SBOM, and `cosign` signatures validate cleanly. |
+| Atomic commits | 1. `ci(release/7.5): finalize multi-arch static release packaging, <50MB distroless container, SBOM, cosign signing, and --version contract [Spec: POR-1, SEC-10, SEC-11]` |
+| Risks and resolutions | **Risk:** Drift between the split SRDD / Big-Bang files and the combined bundle files at release time. **Resolution:** Run `cargo xtask docs-bundle --check`, `cargo xtask doc-consistency`, and `cargo xtask traceability --milestone M6` as mandatory release gates before tagging `v1.0.0`. |
