@@ -310,7 +310,7 @@ The control plane enforces strict authorization checks on every HTTP handler and
 | Set per-model priority overrides on routes | Yes (global routes and own personal routes) | Yes (own personal and shared routes only via `user_route_preferences`; cannot override weights on global routes) | No |
 | Create, rotate, restrict, or revoke client keys (`llr_...`) | Yes (own keys and any user's keys) | Yes (own client keys only) | Uses key for bearer auth |
 | View usage dashboard, time series, and CSV or JSON exports | Yes (instance-wide and filtered by any user, key, provider, or model) | Yes (strictly scoped to own client keys and traffic served by own personal keys) | Via `GET /v1/usage` for own client key |
-| View, unpin, or move active session pins | Yes (all pins via `/admin/api/pins` and `/admin/api/users/{id}/pins`) | Yes (pins belonging to own client keys only) | Implicit via requests |
+| View active pins, recently active sessions per client key, or unpin/move pins | Yes (all pins and per-client-key recently active sessions with live pinned provider and upstream key via `/admin/api/pins`, `/admin/api/users/{id}/pins`, and `/admin/api/client-keys/{id}/sessions`) | Yes (pins and recently active sessions belonging to own client keys via `/api/user/pins` and `/api/user/client-keys/{id}/sessions`, with live pinned provider and `project_key`-redacted upstream key) | Implicit via requests (and current session pin via `GET /v1/usage`) |
 | Enable, scope, or purge content traceability mode | Yes (instance-wide and scoped targets; lowering retention takes `"confirm_purge": true`) | No (read-only visibility into whether traceability is active on own traffic) | No |
 | View read-only Session Chat Preview of recorded turns | Yes (all traced sessions, logged once per 30 minutes per `(admin, session_hash)` in `audit_log`) | Yes (traced sessions belonging to own client keys only; never sees grantee transcripts on shared keys) | No |
 | View audit log | Yes (all instance events) | Yes (events where actor or target belongs to the user) | No |
@@ -591,7 +591,7 @@ The user role subsystem enforces multi-tenant isolation between standard users a
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
 | USR-1 | P0 | The system must support two human user roles (`admin` and `user`) and one internal system actor variant (`ActorScope::System { task: SystemTask }`). Every control-plane request must resolve an `ActorScope::User { user_id, role }`. |
-| USR-2 | P0 | A standard `user` must be able to create, view, edit, test, calibrate, and delete their own `personal` providers and upstream keys, manage outgoing and incoming shares, set `user_route_preferences` on own and shared routes, manage their own client keys, and view their own usage and active pins. |
+| USR-2 | P0 | A standard `user` must be able to create, view, edit, test, calibrate, and delete their own `personal` providers and upstream keys, manage outgoing and incoming shares, set `user_route_preferences` on own and shared routes, manage their own client keys (including inspecting recently active sessions from each client key and which provider and upstream key each session is pinned to right now), and view their own usage and active pins. |
 | USR-3 | P0 | A standard `user` must receive HTTP 404 (`not_found`) for any resource they are not authorized to read (whether or not the ID exists, preventing existence oracles), and HTTP 403 (`permission_error`) only when trying to modify a resource they are authorized to read (such as a shared key or global catalog entry). |
 | USR-4 | P0 | Every user-facing API and template must pass upstream key metadata through `project_key(viewer, key)` so a standard `user` never sees raw secrets, `secret_last4`, key IDs, administrative labels, priorities, or `health_until` of `global` upstream keys (which render as `"global pool"`), nor `secret_last4` or raw `/usage` JSON of shared keys. |
 | USR-5 | P0 | An `admin` must be able to set `can_use_global_providers` (boolean, default true) and `global_budget_micro_usd_month` (optional integer micro-USD cap enforced via the UTC monthly accumulator) on each `user` account. |
@@ -712,9 +712,10 @@ The content traceability subsystem lets an admin record full request and respons
 | TRC-3 | P0 | For streaming SSE responses across `chat`, `responses`, and `messages`, `TraceTap` reassembles text, reasoning, and tool-call deltas into a `NormalizedTurnOutput` and submits a `SealJob` at turn end to the fixed 2-thread OS sealer pool (`crossbeam_channel::bounded(64)` with reusable `zstd::bulk::Compressor`), never allocating per-stream zstd encoders or delaying client chunk forwarding (`PERF-2`, `PERF-5`). |
 | TRC-4 | P0 | Each turn is stored as self-contained content-addressed blocks in `trace_blocks` (`PRIMARY KEY (owner_user_id, block_hash)`) linked via `trace_record_blocks` and a `trace_records` row (`StoredTurnTrace v2` containing `request_skeleton` with `{"$blk":"<hash>"}` references, `block_refs`, and `response`), ordered by immutable `(ts, request_id)` and tagged with `thread_id` (`subagent_id` or `'main'`). |
 | TRC-5 | P0 | The read-only chat preview endpoints (`GET /admin/api/sessions/{session_hash}/chat` and `GET /api/user/sessions/{session_hash}/chat`) must paginate by cursor (`?after=<ts>:<request_id>&limit=50`, loading one predecessor row per page and capping decrypted bytes at 8 MiB per page) and compute Longest Common Prefix (`LCP`) directly over `block_refs` hash arrays without decrypting unchanged prefix blocks. |
-| TRC-6 | P0 | The Session Chat Preview response and UI must carry `canonical_model` and `protocol` per turn and `system_instructions` and `tools` per thread (with `system_changed`), pass key labels through `project_key`, render assistant Markdown via `pulldown-cmark` (raw HTML disabled) + `ammonia`, and render reasoning, user text, tool arguments, tool results, and raw JSON as auto-escaped text inside `<pre>`. |
+| TRC-6 | P0 | The Session Chat Preview response and UI must carry `canonical_model` and `protocol` per turn, `current_pins` (live `PinStore` provider and `project_key`-redacted upstream key bindings right now) per session, and `system_instructions` and `tools` per thread (with `system_changed`), pass key labels through `project_key`, render assistant Markdown via `pulldown-cmark` (raw HTML disabled) + `ammonia`, and render reasoning, user text, tool arguments, tool results, and raw JSON as auto-escaped text inside `<pre>`. |
 | TRC-7 | P0 | Admins must be able to configure `traceability_config.retention_days` (`1..=90`, default 14 days; lowering `retention_days` returns HTTP 409 with the affected row count unless `"confirm_purge": true` is sent) and purge traces globally or per session (`DELETE /admin/api/traces`, `DELETE /admin/api/sessions/{session_hash}/trace`), deleting unreferenced `trace_blocks` while leaving `usage_events` intact. |
 | TRC-8 | P0 | LLMRoller never exposes a grantee's recorded traces or `trace_blocks` to a share grantor through any LLMRoller interface (`owner_user_id` isolation). Grantees must explicitly accept each share after viewing the destination endpoint disclosure (`SHR-3`), as LLMRoller cannot prevent the operator of the external endpoint or upstream account from observing traffic sent to it. |
+| TRC-9 | P0 | For any client key (`llr_...`), the control plane (`GET /api/user/client-keys/{id}/sessions` for the key owner and `GET /admin/api/client-keys/{id}/sessions` for admins, cursor-paginated up to 50 sessions per read transaction) must list recently active sessions (`session_hash IS NOT NULL`, default trailing 24 hours) ordered by `last_active_at DESC`, joining logged request telemetry from `usage_events` and `trace_records` (`request_count`, `error_count`, tokens, `cost_micro_usd`, `traced_turn_count`, `has_traces`, `first_active_at`, `last_active_at`, and `last_served_route`) with live `PinStore` state (`current_pins`: per-model `pin_state`, `pool_tier`, `provider_id`, `provider_name`, `provider_kind`, `provider_scope`, `project_key`-redacted `upstream_key_id`/`upstream_key_label`, `expires_ms`, and `repin_count`, or empty when unpinned/expired). |
 
 ### 6.11 Web UI and audit logging (UI & AUD)
 
@@ -725,7 +726,7 @@ The web UI and audit subsystem provide full self-service and administrative visi
 | UI-1 | P0 | The embedded web UI must provide role-aware navigation: admins see both the Admin Console (`/admin/*`) and Personal Workspace (`/app/*`), while standard users see the Personal Workspace (`/app/*`) covering Overview, Personal Providers & Keys, Shared With Me (with share acceptance disclosure), Share Grants, Routing Overrides (with aggregated `"Global pool"` column), Client Keys, Active Sessions, and Usage Explorer. |
 | UI-2 | P0 | The UI must display both local window ring spend and reconciled `UpstreamObservation` gauges side-by-side on each upstream key card, projected disk usage (`A6`), live key health from `RuntimeState`, a "Refresh `/usage`" button, and a modal to inspect decrypted raw `/usage` JSON (for authorized personal owners and admins). |
 | UI-3 | P0 | All HTML templates, CSS, HTMX (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`), and chart scripts (`uPlot`) must be compiled into the Rust binary with zero external CDN requests and zero `hx-on:*` or `js:` attributes. |
-| UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Active Sessions and Usage Explorer screens must display a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a persistent global banner whenever traceability is enabled. |
+| UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Client Keys (Recently Active Sessions drawer), Active Sessions, and Usage Explorer screens must display each session's live pinned provider and upstream key (`project_key`-redacted) right now, a "View Requests" filter link, and a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a persistent global banner whenever traceability is enabled. |
 | AUD-1 | P0 | Every state-changing action by an `admin`, `user`, or `SystemTask` (plus admin chat-trace views, deduplicated to one `trace.viewed` row per `(admin, session_hash)` per 30 minutes) must append an HMAC-SHA256 hash-chained row (`seq`, `prev_hash`, `hash`) to `audit_log` inside the same transaction without logging secrets, and emit an `audit_anchor` structured log line to `stdout` every 100 rows and at least hourly. |
 
 ## 7. Non-functional requirements
@@ -1264,6 +1265,8 @@ CREATE TABLE usage_events (
 CREATE INDEX idx_usage_ts ON usage_events(ts);
 CREATE INDEX idx_usage_owner_ts ON usage_events(owner_user_id, ts);
 CREATE INDEX idx_usage_client_key_ts ON usage_events(client_key_id, ts);
+CREATE INDEX idx_usage_client_key_session_ts ON usage_events(client_key_id, session_hash, ts DESC)
+  WHERE session_hash IS NOT NULL;
 
 CREATE TABLE usage_attempts (
   request_id TEXT NOT NULL,
@@ -1353,6 +1356,7 @@ CREATE TABLE trace_records (
 );
 CREATE INDEX idx_trace_session_order ON trace_records(owner_user_id, session_hash, ts ASC, request_id ASC);
 CREATE INDEX idx_trace_owner_ts ON trace_records(owner_user_id, ts DESC);
+CREATE INDEX idx_trace_client_key_session ON trace_records(client_key_id, session_hash, ts DESC);
 CREATE INDEX idx_trace_expires ON trace_records(expires_at);
 
 CREATE TABLE trace_record_blocks (
@@ -2108,13 +2112,32 @@ Because each turn record is self-contained via `block_refs`, dropping, truncatin
 
 #### 12.6.1 Session Chat Preview JSON contract (`SessionChatPreviewResponse`)
 
-Because one session can span multiple models and subagent threads, `canonical_model` and `protocol` live on each turn. Similarly, `system_instructions` and `tools` live per thread. Upstream key metadata is projected through `project_key(viewer, key)` so standard users see `"global pool"` on global routes.
+Because one session can span multiple models and subagent threads, `canonical_model` and `protocol` live on each turn. Similarly, `system_instructions` and `tools` live per thread. The response also includes `current_pins` from `PinStore` so the viewer sees which provider and upstream key (`project_key`-redacted) the session is pinned to right now.
 
 ```json
 {
   "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
   "owner_user_id": "01J9X0USER...",
+  "client_key_id": "01J9X0CLK...",
   "client_key_prefix": "llr_7f9a",
+  "client_key_label": "laptop-claude-code",
+  "current_pins": [
+    {
+      "canonical_model": "claude-sonnet-4.6",
+      "pin_state": "confirmed",
+      "pool_tier": "own",
+      "provider_id": "01J9X1PROV...",
+      "provider_name": "my-opencode-go",
+      "provider_kind": "opencode_go",
+      "provider_scope": "personal",
+      "upstream_key_id": "01J9X1B...",
+      "upstream_key_label": "my-opencode-go-1",
+      "pinned_since_ms": 1792401000000,
+      "last_used_ms": 1792401050000,
+      "expires_ms": 1792487450000,
+      "repin_count": 0
+    }
+  ],
   "total_turns": 2,
   "pagination": {
     "after": null,
@@ -2163,6 +2186,71 @@ Because one session can span multiple models and subagent threads, `canonical_mo
         "output_tokens": 95,
         "reasoning_tokens": 42,
         "cost_micro_usd": 7820
+      }
+    }
+  ]
+}
+```
+#### 12.6.2 Recently active sessions per client key (`ClientKeySessionsResponse`)
+
+Operators and standard users often start troubleshooting from an LLMRoller client key (`llr_...`). They need to see which sessions recently used that key and which provider and key each session is pinned to right now. They also need to see which sessions have logged requests or recorded traces (`TRC-9`).
+
+`GET /api/user/client-keys/{id}/sessions` (scoped to `actor.user_id`) and `GET /admin/api/client-keys/{id}/sessions` run a paged read query (`<= 50` sessions per read transaction, default `since_ms = now_ms - 86_400_000`) against `usage_events` (`idx_usage_client_key_session_ts`) and `trace_records` (`idx_trace_client_key_session`). For each discovered `(session_hash, canonical_id)`, the handler looks up `PinKey = (client_key_id, canonical_id, session_hash)` in `PinStore` and merges any active `PinStore` entries for that `client_key_id`. Every upstream key in `current_pins` and `last_served_route` passes through `project_key(viewer, key)`. Standard users therefore see the provider name and `"global pool"` on global pins.
+
+```json
+{
+  "client_key_id": "01J9X0CLK...",
+  "client_key_prefix": "llr_7f9a",
+  "client_key_label": "laptop-claude-code",
+  "since_ms": 1792314650000,
+  "pagination": {
+    "after": null,
+    "limit": 50,
+    "next_after": null
+  },
+  "sessions": [
+    {
+      "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+      "first_active_at": 1792401000000,
+      "last_active_at": 1792401050000,
+      "request_count": 14,
+      "error_count": 0,
+      "traced_turn_count": 14,
+      "has_traces": true,
+      "input_uncached_tokens": 24100,
+      "cache_read_tokens": 182000,
+      "cache_write_tokens": 15400,
+      "output_tokens": 6200,
+      "cost_micro_usd": 148900,
+      "models_used": ["claude-sonnet-4.6"],
+      "current_pins": [
+        {
+          "canonical_model": "claude-sonnet-4.6",
+          "pin_state": "confirmed",
+          "pool_tier": "own",
+          "provider_id": "01J9X1PROV...",
+          "provider_name": "my-opencode-go",
+          "provider_kind": "opencode_go",
+          "provider_scope": "personal",
+          "upstream_key_id": "01J9X1B...",
+          "upstream_key_label": "my-opencode-go-1",
+          "pinned_since_ms": 1792401000000,
+          "last_used_ms": 1792401050000,
+          "expires_ms": 1792487450000,
+          "repin_count": 0
+        }
+      ],
+      "last_served_route": {
+        "request_id": "01J9X5REQ14...",
+        "ts": 1792401050000,
+        "canonical_model": "claude-sonnet-4.6",
+        "provider_id": "01J9X1PROV...",
+        "provider_name": "my-opencode-go",
+        "provider_kind": "opencode_go",
+        "provider_scope": "personal",
+        "upstream_key_id": "01J9X1B...",
+        "upstream_key_label": "my-opencode-go-1",
+        "pin_outcome": "followed"
       }
     }
   ]
@@ -2371,8 +2459,8 @@ Every `/api/user/*` endpoint scopes queries to `actor.user_id`, returns HTTP 404
 | Source `/usage` inspection | `GET /api/user/upstream-keys/{id}/usage` (returns latest snapshot + history, decrypted `raw_json` for own keys, `sanitized_json` for shared keys), `POST /api/user/upstream-keys/{id}/usage/refresh` (owner only, 10 s min interval) |
 | Personal provider sharing | `GET /api/user/shares/outgoing`, `POST /api/user/shares` (returns 409 `share_overlap` on provider/key overlap or if `usage_url_cross_origin_ack = 1`), `PATCH /api/user/shares/{id}`, `DELETE /api/user/shares/{id}` (also deletes grantee `user_route_preferences`), `GET /api/user/shares/incoming`, `POST /api/user/shares/{id}/accept` (grantee only; body must echo `config_fingerprint`) |
 | Personal route overrides | `GET /api/user/routes?model=`, `PUT /api/user/routes/{upstream_key_id}/{canonical_id}` (sets `user_route_preferences.priority_override` and `enabled` on own or accepted shared routes) |
-| Client keys | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}` (including `routing_scope` and `constant_session_mode`), `POST /api/user/client-keys/{id}/rotate` (accepts `grace_period_secs` `0..=86400`, default `300`), `DELETE /api/user/client-keys/{id}` |
-| Active session pins | `GET /api/user/pins` (applies `project_key`), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` (validates `C1`..`C8` on target key before calling `PinStore::admin_move`) |
+| Client keys & recent sessions | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}` (including `routing_scope` and `constant_session_mode`), `POST /api/user/client-keys/{id}/rotate` (accepts `grace_period_secs` `0..=86400`, default `300`), `DELETE /api/user/client-keys/{id}`, `GET /api/user/client-keys/{id}/sessions?since_ms=&after=&limit=50` (lists recently active sessions from that client key with logged request stats, trace counts, and live `PinStore` provider and `project_key`-redacted upstream key bindings right now, `TRC-9`) |
+| Active session pins | `GET /api/user/pins?client_key_id=` (returns live `PinStore` pins with provider name/kind and `project_key`-redacted upstream key), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` (validates `C1`..`C8` on target key before calling `PinStore::admin_move`) |
 | Session chat preview (read-only) | `GET /api/user/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (reconstructed timeline for caller's own session), `GET /api/user/traces/{request_id}` (single turn trace and reconstructed raw JSON) |
 | Scoped usage analytics | `GET /api/user/usage/summary`, `GET /api/user/usage/timeseries`, `GET /api/user/usage/breakdown`, `GET /api/user/usage/events` (paged `<= 5,000` rows per read tx), `GET /api/user/usage/export.csv` |
 | Scoped audit log | `GET /api/user/audit` (events where `actor_user_id == me` or target belongs to `me`) |
@@ -2384,7 +2472,7 @@ Every `/admin/api/*` endpoint rejects non-admin callers with HTTP 403.
 | Resource group | Endpoints and methods |
 | --- | --- |
 | First-run setup (`users == 0`) | `GET /setup`, `GET /admin/api/setup/status`, `POST /admin/api/setup` (all three return HTTP 404 permanently once any user exists per `AUTH-3`) |
-| User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}` |
+| User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}`, `GET /admin/api/client-keys/{id}/sessions?since_ms=&after=&limit=50` (lists recently active sessions for any client key with logged request stats, trace counts, and live pinned provider and upstream key right now, `TRC-9`) |
 | Admin override on user resources | `GET /admin/api/users/{id}/providers`, `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `GET /admin/api/users/{id}/shares`, `DELETE /admin/api/shares/{id}`, `POST /admin/api/shares/{id}/approve` (approves `custom` provider share), `GET /admin/api/users/{id}/pins` (every action logs `target_type` and owner `user_id` in `audit_log`) |
 | Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/reset-health`, `GET /admin/api/upstream-keys/{id}/usage`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
 | Model catalog and price book | `GET /admin/api/models` (includes `merge_state` and `origin` filters), `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`), `POST /admin/api/models/{canonical_id}/confirm-merge`, `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases` (body `{alias, canonical_id}`), `DELETE /admin/api/model-aliases?alias=<urlencoded>`, `GET /admin/api/prices`, `PUT /admin/api/prices` (body carries `{provider_id, provider_kind, upstream_model_id, ...}`), `POST /admin/api/prices/sync` |
@@ -2403,9 +2491,9 @@ The web interface is server-rendered with Askama templates and HTMX partial upda
 | Personal Providers & Keys | `user` & `admin` | Add personal provider from preset or custom URL; add personal upstream keys; Test button; Refresh `/usage` button; modal showing decrypted raw source provider `/usage` JSON; configure budget windows and manual calibration. |
 | Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key (preventing overlapping provider/key shares), set allowed models and monthly USD cap, view per-grantee token and dollar consumption (including charged failed tries), revoke share. **Shared With Me tab:** inspect pending and accepted shares, view provider kind, `base_url` host, key label, and the explicit disclosure `"Requests you send through this share travel to the endpoint above and are visible to its operator"`, and click **Accept Share** (`POST /api/user/shares/{id}/accept`). |
 | Routing Matrix | `user` (`Own` + `Shared` + aggregated `"Global pool"` via `project_key`) & `admin` (full catalog) | Matrix of canonical models (rows) by upstream keys (columns). For standard users, all global keys are aggregated into a single `"Global pool"` column showing the combined projected share without leaking global key labels or priorities. Displays protocol chips (`chat`, `responses`, `messages`), inline editable per-model `priority_override` on `Own` and `Shared` routes, effective weight, and projected percentage share. |
-| Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once in a confirmation modal), select `routing_scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), configure `constant_session_mode` (`flag` or `fingerprint_generic_ids`), restrict models, set RPM or monthly USD cap, rotate with configurable `grace_period_secs`, or revoke. |
-| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins in `PinStore`: session hash prefix, client key, model, pinned upstream key (projected via `project_key`) and tier badge (`Own`, `Shared`, `Global`, `Blended`), age, turn count, `repin_count`, constant-session warning badge, and **Preview Chat** button. Supports Unpin and Move Pin. |
-| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay paginated by `(ts, request_id)` cursor: renders per-thread system instructions and tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs (auto-escaped in `<pre>`), assistant Markdown sanitized via `pulldown-cmark` (raw HTML off) + `ammonia`, context-compaction dividers, per-turn telemetry chips (with `project_key` redaction), and a raw JSON inspector drawer. |
+| Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once in a confirmation modal), select `routing_scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), configure `constant_session_mode` (`flag` or `fingerprint_generic_ids`), restrict models, set RPM or monthly USD cap, rotate with configurable `grace_period_secs`, or revoke. Includes a **Recently Active Sessions** drawer per client key (`TRC-9`) showing each recent `session_hash`, which provider and upstream key (`project_key`-redacted) it is pinned to right now (or `"unpinned / expired"` with last-served route), logged request and traced-turn counts, **View Requests** filter link, and **Preview Chat** button. |
+| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins in `PinStore` filterable by `client_key_id` (with a toggle to include recently active sessions from `usage_events` whose pins expired): session hash prefix, client key, model, pinned provider name/kind and upstream key (projected via `project_key`), tier badge (`Own`, `Shared`, `Global`, `Blended`), age, logged request count, `repin_count`, constant-session warning badge, **View Requests** link, and **Preview Chat** button. Supports Unpin and Move Pin. |
+| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay paginated by `(ts, request_id)` cursor: header displays the originating `client_key_prefix`/`label` and live `current_pins` badges showing which provider and upstream key (`project_key`-redacted) the session is pinned to right now; timeline renders per-thread system instructions and tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs (auto-escaped in `<pre>`), assistant Markdown sanitized via `pulldown-cmark` (raw HTML off) + `ammonia`, context-compaction dividers, per-turn telemetry chips (with `project_key` redaction), and a raw JSON inspector drawer. |
 | Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, model, or `cost_source` (`provider`, `price_book`, `fallback_rate`, `estimated_incomplete`, `estimated_attempt`). Paged event table (`<= 5,000` rows per read tx) with `usage_attempts` breakdown and formula-sanitized CSV or JSON export. |
 | Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, review `pending_review` cross-vendor model merges, force-expose or disable models, merge or split models over `model_pk`, edit aliases and prices, and approve `custom` provider shares. |
 | Admin: Users, Settings & Audit | `admin` only | Create, disable, or delete user accounts (`?confirm=<username>`), inspect `deleted_users`, set per-user global pool access and monthly global caps, edit the 13 validated runtime settings, and inspect the hash-chained `audit_log`. |
@@ -2642,7 +2730,7 @@ Every requirement ID in this SRDD is registered in `docs/srdd/requirements.toml`
 | `RTE-1`..`RTE-13` | `M2` (`3.3`, `3.4`, `3.5`, `3.6a`, `3.6b`, `3.7`) | `crates/core::router`, `crates/core::wrr`, `crates/core::pins`, `crates/core::session` | `core::wrr::proptests::*`, `core::session::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (`PinStore` 10-way 429 loser adoption, durable `response_links` session inheritance, `HardKey` no-failover, `OriginBreaker`) + `cargo-mutants` |
 | `API-1`..`API-8`, `TRN-1`..`TRN-3` | `M1` (`2.3`..`2.7`), `M2` (`3.6a`, `3.6b`), `M3` (`4.1`), `M4` (`4b.2`) | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (duplicate-key 400, response header `R1`..`R5`, 64 KiB frame filter, `RequestLifecycle` disconnect guard, 5-class error classifier) |
 | `USG-1`..`USG-8`, `LIM-1` | `M2` (`3.0a`, `3.0b`), `M3` (`4.1`, `4.2`, `4.3`, `4.6`), `M4` (`4b.1`, `4b.2`) | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (`usage_attempts`, `usage_rollups_5min` `< 2 s` rebuild, 30-min `UpstreamObservation` decay, single-flight polling, `raw_json_enc`) |
-| `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` | `M3b` (`5.1`..`5.4`), `M5` (`6.5`) | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (`trace_blocks` dedup, 2-thread `zstd::bulk::Compressor` pool, block-hash LCP, `(ts, request_id)` cursor pagination, `ammonia` + `<pre>` XSS tests) |
+| `TRC-1`..`TRC-9`, `PERF-5`, `SEC-19` | `M3b` (`5.1`..`5.4`), `M5` (`6.2`, `6.4`, `6.5`) | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (`trace_blocks` dedup, 2-thread `zstd::bulk::Compressor` pool, block-hash LCP, `(ts, request_id)` cursor pagination, per-client-key recently active sessions with live `PinStore` provider/key projection, `ammonia` + `<pre>` XSS tests) |
 | `UI-1`..`UI-4`, `AUD-1` | `M0` (`1.5`), `M5` (`6.1`..`6.5`) | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (`audit_anchor` truncation detection, HTMX CSP lint, share acceptance UI, `"Global pool"` matrix column, preview drawer) |
 | `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `M0` (`1.1`, `1.6`), `M1` (`2.2`, `2.5`, `2.7`), `M3` (`4.3`, `4.7`), `M4` (`4b.1`), `M6` (`7.1`..`7.5`) | `crates/server`, workspace-wide | `tests/workspace_boundaries.rs`, metric label allow-list test | `benches/proxy_latency.rs` (log-normal TTFF stub), `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
 | `SEC-1`..`SEC-19` | `M0` (`1.1`..`1.5`), `M1` (`2.1`..`2.4`), `M2` (`3.2`, `3.3`), `M3b` (`5.3`, `5.4`), `M4` (`4b.2`), `M5` (`6.1`), `M6` (`7.1`, `7.5`) | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf`, `crates/admin::traces` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
@@ -2662,7 +2750,7 @@ The table below defines the scope, deliverables, and exit criteria for each mile
 | `M2`: Pure Pricing/Windows Core, Catalog, Consented Sharing, Smooth WRR, and Pinning (`Epic 3`: `3.0a`..`3.7`) | Pure `crates/core::pricing` + binary-aware estimator (`3.0a`), pure `WindowState` (360-bucket rings, day-clamped calendar months, decaying `UpstreamObservation`, cache-aware `try_reserve`) (`3.0b`), pure UTC monthly accumulators + gate `G7` (`3.0c`), `/models` discovery + digit-preserving normalization + surrogate `model_pk` merge/split (`3.1`), consented `provider_shares` (`effective_share`, `share_config_fingerprint`, `custom` approval) (`3.2`), 8-step session resolver + 21-slot detector + `Shared`/`Global` carrier stripping (`3.3`), `C1`..`C8` + 3-tier pool selector (`3.4`), per-group `WrrState` (`3.5`), pure health/5-class classifier/`OriginBreaker` (`3.6a`), `PinStore` mutex state machine + durable `response_links` inheritance + failover (`3.6b`), and orchestrator v2 (`3.7`). | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` tests pass; zero surviving mutants in `crates/core`. |
 | `M3`: Usage Pipeline, 5-Min & Hourly Rollups, Orchestrator v3, and Retention (`Epic 4`: `4.1`..`4.3`, `4.6`, `4.7`) | Inline `SseUsageTap` and `JsonUsageExtractor` with unified `cache_read` and `cache_write` subtraction (`4.1`), `models.dev` price sync and body-based price APIs (`4.2`), three-queue writer (`durable_state`, `rollups`, `raw_events` `VecDeque` dropping oldest) + `usage_events` + `usage_attempts` + `usage_rollups_5min` + `usage_rollups_hourly` + `SIGKILL` recovery (`4.3`), orchestrator v3 wiring live usage and reservations (`4.6`), and general retention sweeper + 30 s/256 MiB WAL checkpointer + `SQLITE_FULL` handling (`4.7`). | `SHR-6`, `API-5`, `USG-1`..`USG-3`, `REL-2`, `REL-3`, `PRIV-1` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
 | `M4`: Window Persistence, `< 2 s` Startup Reconstruction, and Source Provider `/usage` Engine (`Epic 4b`: `4b.1`, `4b.2`) | Startup reconstruction (`< 2 s`) of all window rings and UTC monthly accumulators from `usage_rollups_5min`, window-instance-bound `budget_adjustments`, and `upstream_usage_snapshots` (`4b.1`), plus single-flight `/usage` poller (8-permit concurrency semaphore, `local_at_observation` at `t0`, `raw_json_enc` sealing, allow-list `sanitized_json`, decaying `UpstreamObservation` sync, and header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw`) (`4b.2`). | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `PERF-4`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
-| `M3b`: Opt-In Content Traceability and Session Chat Preview API (`Epic 5`: `5.1`..`5.4`) | Request-start `traceability_config` matcher + `"confirm_purge": true` guard (`5.1`), bounded `TraceTap` (`mpsc(256)` + `64 MiB` in-flight + `1 MiB` per-stream output cap + 2,000-stream memory soak) (`5.2`), content-addressed `trace_blocks` + 2-thread OS sealer pool (`crossbeam::bounded(64)` + `zstd::bulk::Compressor`) (`5.3`), and block-hash LCP reconstructor + `(ts, request_id)` cursor pagination + 30-min deduplicated `trace.viewed` audit logging (`5.4`). | `TRC-1`..`TRC-5`, `TRC-7`, `TRC-8`, `PERF-5`, `SEC-19` tests pass. |
+| `M3b`: Opt-In Content Traceability and Session Chat Preview API (`Epic 5`: `5.1`..`5.4`) | Request-start `traceability_config` matcher + `"confirm_purge": true` guard (`5.1`), bounded `TraceTap` (`mpsc(256)` + `64 MiB` in-flight + `1 MiB` per-stream output cap + 2,000-stream memory soak) (`5.2`), content-addressed `trace_blocks` + 2-thread OS sealer pool (`crossbeam::bounded(64)` + `zstd::bulk::Compressor`) (`5.3`), and block-hash LCP reconstructor + `(ts, request_id)` cursor pagination + per-client-key recently active sessions with live `PinStore` provider/key lookup + 30-min deduplicated `trace.viewed` audit logging (`5.4`). | `TRC-1`..`TRC-5`, `TRC-7`..`TRC-9`, `PERF-5`, `SEC-19` tests pass. |
 | `M5`: Dual-Workspace HTMX Web UI and Session Chat Preview UI (`Epic 6`: `6.1`..`6.5`) | Embedded Askama + HTMX shell (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`) + CSRF middleware (`6.1`), Personal Workspace `/app/*` and `/api/user/*` with share-acceptance modal and `project_key` verification (`6.2`), Admin Console `/admin/*` and `/admin/api/*` with user-resource override routes and `model_pk` merge/split (`6.3`), Overview dashboard (`uPlot`, dual gauges, disk budget `A6`) + Active Sessions + paged Usage Explorer (`6.4`), and read-only Session Chat Preview UI (`6.5`). | `UI-1`..`UI-4`, `TRC-6`, `SEC-5` E2E browser and HTMX tests pass. |
 | `M6`: Extended Fuzzing, Full Soak Verification, Live Harnesses, and v1.0.0 Release (`Epic 7`: `7.1`..`7.5`) | Extended 24-hour fuzzing across all 6 fuzz targets + full-stack canary redaction test (`7.1`), full-workspace `cargo mutants --workspace` + `cargo xtask traceability --milestone M6` + `cargo xtask doc-consistency` (`7.2`), 500 req/s and 2,000-stream soak benchmark against 50M-row DB + `llmroller backup` `fsync` + exit codes `0..14` (`7.3`), headless CLI harness compatibility (`COM-1`) (`7.4`), and multi-arch static release + `< 50 MB` distroless container + SBOM + `cosign` + `llmroller --version` (`7.5`). | All `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `POR-1`, `COM-1`, `SEC-11` checks pass; `cargo xtask traceability --milestone M6` reports 100% coverage. |
 

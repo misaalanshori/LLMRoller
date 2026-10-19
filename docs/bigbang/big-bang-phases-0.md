@@ -84,6 +84,6 @@ The table below maps the eight implementation epics (`big-bang-phases-1.md` thro
 | `big-bang-phases-3.md` | Core pricing/windows/accumulators, model catalog, sharing, smooth WRR, pinning, and orchestrator v2 | `M2` | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` |
 | `big-bang-phases-4.md` | Usage taps, three-queue batching writer, 5-minute & hourly rollups, orchestrator v3, and retention | `M3` | `API-5`, `USG-1`..`USG-3`, `SHR-6`, `REL-2`, `REL-3` |
 | `big-bang-phases-4b.md` | Startup 5-minute rollup reconstruction and source provider `/usage` poller, observations, and pass-through | `M4` | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `SEC-18` |
-| `big-bang-phases-5.md` | Opt-in content traceability mode, content-addressed blocks, 2-thread sealer pool, and chat reconstructor | `M3b` | `TRC-1`..`TRC-5`, `TRC-7`, `TRC-8`, `PERF-5`, `SEC-19` |
+| `big-bang-phases-5.md` | Opt-in content traceability mode, content-addressed blocks, 2-thread sealer pool, and chat reconstructor | `M3b` | `TRC-1`..`TRC-5`, `TRC-7`..`TRC-9`, `PERF-5`, `SEC-19` |
 | `big-bang-phases-6.md` | Dual-workspace HTMX web UI, key projection, share consent modals, and Session Chat Preview UI | `M5` | `UI-1`..`UI-4`, `TRC-6` |
 | `big-bang-phases-7.md` | System hardening, fuzzing, load verification, live harness E2E, and v1.0.0 release | `M6` | `PERF-1`..`PERF-4`, `REL-6`, `COM-1`, `POR-1`, `PRIV-1`, `SEC-11` |

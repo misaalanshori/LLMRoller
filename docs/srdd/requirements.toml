@@ -505,6 +505,13 @@ milestone = "M3b"
 delivering_subphase = "5.4"
 tests = ["tests/integration_content_traceability.rs"]
 
+[requirements.TRC-9]
+priority = "P0"
+milestone = "M3b"
+delivering_subphase = "5.4"
+partial_subphases = ["4.3", "6.2", "6.4", "6.5"]
+tests = ["tests/integration_content_traceability.rs", "tests/e2e_dashboard_htmx.rs"]
+
 # --- 6.11 Web UI and audit logging (UI & AUD) ---
 [requirements.UI-1]
 priority = "P0"
