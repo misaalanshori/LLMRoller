@@ -26,8 +26,8 @@ Every sub-phase in Epics 1 through 7 is built through a strict seven-step loop. 
 | 3 | Write failing test (`Red`) | Write unit, property (`proptest`), or integration tests against the observable contract. Annotate each test with `#[doc = "Spec: <REQ-ID>"]` and run `cargo nextest run` to confirm it fails for the expected reason. |
 | 4 | Write minimal code (`Green`) | Write the smallest, clearest implementation in safe Rust (`#![forbid(unsafe_code)]`) that makes the new test pass while keeping all prior tests green. |
 | 5 | Refactor under green | Remove duplication, simplify control flow, and run `cargo clippy --all-targets -- -D warnings` plus `cargo nextest run`. |
-| 6 | Kill surviving mutants | Run `cargo mutants --in-diff HEAD~1..HEAD` (or against the working tree diff). If any mutant survives, add a boundary or negative test until zero mutants survive (`SRDD Section 16.5.6`). |
-| 7 | Commit atomically | Run `python3 scripts/verify_traceability.py`, stage the test and implementation together, and create one atomic commit following Section 0.4. |
+| 6 | Kill surviving mutants | Generate the working diff (`git diff HEAD~1..HEAD > target/commit.diff`) and run `cargo mutants --in-diff target/commit.diff`. If any mutant survives, add a boundary or negative test until zero mutants survive (`SRDD Section 16.5.6`). |
+| 7 | Commit atomically | Run `python3 scripts/verify_traceability.py --milestone M<N>`, stage the test and implementation together, and create one atomic commit following Section 0.4. |
 
 ## 0.3 Failing test triage: expected vs. unexpected failures
 

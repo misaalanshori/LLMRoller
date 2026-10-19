@@ -12,7 +12,7 @@ This sub-phase implements the default-off `content_traceability_mode` setting, s
 | Crates touched | `crates/core::trace_config`, `crates/store::settings`, `crates/admin::trace_settings` |
 | TDD step (`Red -> Green`) | Write unit and integration tests (`core::trace_config::tests`, `#[doc = "Spec: TRC-1, TRC-7, AUD-1"]`) verifying: (1) fresh instances have `content_traceability_mode = Disabled`, (2) standard `user` callers receive HTTP 403 on `PUT /admin/api/settings/traceability`, (3) scoping traceability to `users: [alice_id]` records traces for Alice's client keys while recording zero trace rows for Bob's client keys, and (4) toggling the setting appends a hash-chained `audit_log` row. |
 | Atomic commits | 1. `feat(core/5.1): implement default-off TraceabilityConfig and scope matcher in ConfigSnapshot [Spec: TRC-1, TRC-7]` 2. `feat(admin/5.1): implement PUT /admin/api/settings/traceability with audit logging [Spec: TRC-1, AUD-1]` |
-| Risks and resolutions | **Risk:** An admin enables content traceability for debugging and forgets to turn it off. **Resolution:** Support an optional `auto_disable_after_hours` timer in `TraceabilityConfig` and display a persistent top banner in the web UI whenever content traceability mode is active (`UI-4`). |
+| Risks and resolutions | **Risk:** An admin enables content traceability for debugging and forgets to turn it off. **Resolution:** Support an optional `auto_disable_at` epoch-millisecond timer in `TraceabilityConfig` and display a persistent top banner in the web UI whenever content traceability mode is active (`UI-4`). |
 
 ## 5.2 Sub-phase 5.2: Non-blocking request capture and SSE delta reassembler (`TraceTap`)
 

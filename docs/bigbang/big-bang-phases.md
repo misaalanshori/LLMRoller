@@ -31,8 +31,8 @@ Every sub-phase in Epics 1 through 7 is built through a strict seven-step loop. 
 | 3 | Write failing test (`Red`) | Write unit, property (`proptest`), or integration tests against the observable contract. Annotate each test with `#[doc = "Spec: <REQ-ID>"]` and run `cargo nextest run` to confirm it fails for the expected reason. |
 | 4 | Write minimal code (`Green`) | Write the smallest, clearest implementation in safe Rust (`#![forbid(unsafe_code)]`) that makes the new test pass while keeping all prior tests green. |
 | 5 | Refactor under green | Remove duplication, simplify control flow, and run `cargo clippy --all-targets -- -D warnings` plus `cargo nextest run`. |
-| 6 | Kill surviving mutants | Run `cargo mutants --in-diff HEAD~1..HEAD` (or against the working tree diff). If any mutant survives, add a boundary or negative test until zero mutants survive (`SRDD Section 16.5.6`). |
-| 7 | Commit atomically | Run `python3 scripts/verify_traceability.py`, stage the test and implementation together, and create one atomic commit following Section 0.4. |
+| 6 | Kill surviving mutants | Generate the working diff (`git diff HEAD~1..HEAD > target/commit.diff`) and run `cargo mutants --in-diff target/commit.diff`. If any mutant survives, add a boundary or negative test until zero mutants survive (`SRDD Section 16.5.6`). |
+| 7 | Commit atomically | Run `python3 scripts/verify_traceability.py --milestone M<N>`, stage the test and implementation together, and create one atomic commit following Section 0.4. |
 
 ### 0.3 Failing test triage: expected vs. unexpected failures
 
@@ -92,7 +92,7 @@ The table below maps the seven implementation epics (`big-bang-phases-1.md` thro
 
 ## Epic 1: Foundation, storage engine, cryptography, and multi-role auth
 
-Epic 1 builds the Cargo workspace, the six seam traits, the 20-table SQLite WAL store, and the `XChaCha20-Poly1305` secret sealer. It also implements atomic `/setup` and role-based access control for `admin` and `user` accounts. It corresponds to Milestone `M0` (`SRDD Sections 4, 5, 6.1, 6.2, 8, 9, 15, 16`).
+Epic 1 builds the Cargo workspace, the six seam traits, the 21-table SQLite WAL store, and the `XChaCha20-Poly1305` secret sealer. It also implements atomic `/setup` and role-based access control for `admin` and `user` accounts. It corresponds to Milestone `M0` (`SRDD Sections 4, 5, 6.1, 6.2, 8, 9, 15, 16`).
 
 ### 1.1 Sub-phase 1.1: Cargo workspace, lint gates, and traceability harness
 
@@ -102,7 +102,7 @@ This sub-phase initializes the six-crate repository layout (`SRDD Section 15.2`)
 | --- | --- |
 | SRDD references | `Section 15.1`, `Section 15.2`, `Section 16.6`; Requirements `MNT-1`, `MNT-2`, `SEC-10` |
 | Crates touched | Root `Cargo.toml`, `deny.toml`, `.cargo/mutants.toml`, `scripts/verify_traceability.py`, skeleton `crates/{core,proto,store,proxy,admin,server}` |
-| TDD step (`Red -> Green`) | Write an architectural dependency test (`tests/workspace_boundaries.rs`, `#[doc = "Spec: MNT-1, MNT-2"]`) that parses `cargo metadata` and asserts: (1) every crate has `#![forbid(unsafe_code)]`, and (2) `crates/core` has zero dependency edges to `sqlx`, `reqwest`, `hyper`, or `axum`. |
+| TDD step (`Red -> Green`) | Write an architectural dependency test (`tests/workspace_boundaries.rs`, `#[doc = "Spec: MNT-1, MNT-2"]`) that inspects root `Cargo.toml` (`[workspace.lints.rust] unsafe_code = "forbid"`) plus each crate's `src/lib.rs` / `src/main.rs` header (`#![forbid(unsafe_code)]`), and parses `cargo metadata` to assert `crates/core` has zero dependency edges to `tokio`, `sqlx`, `reqwest`, `hyper`, or `axum`. |
 | Atomic commits | 1. `ci(workspace/1.1): initialize six-crate workspace with forbid(unsafe_code) and deny.toml [Spec: MNT-1, SEC-10]` 2. `test(workspace/1.1): add cargo-metadata boundary test and verify_traceability.py [Spec: MNT-2]` |
 | Risks and resolutions | **Risk:** Transitive dependencies pull in duplicate TLS stacks (`openssl-sys`) or unmaintained crates. **Resolution:** Set `default-features = false` on `reqwest` and `sqlx` immediately and run `cargo deny check bans licenses advisories` on the very first commit. |
 
@@ -120,14 +120,14 @@ This sub-phase defines the fundamental domain primitives in `crates/core` (`ULID
 
 ### 1.3 Sub-phase 1.3: Cryptographic sealer (`XChaCha20-Poly1305`) and SQLite WAL store
 
-This sub-phase implements master-key derivation (`HKDF-SHA256`), AEAD encryption with row-bound Associated Data (`AAD`), key rotation, and the 20-table SQLite WAL migration (`SRDD Section 8.2, Section 9.1`).
+This sub-phase implements master-key derivation (`HKDF-SHA256`), AEAD encryption with row-bound Associated Data (`AAD`), key rotation, and the 21-table SQLite WAL migration (`SRDD Section 8.2, Section 9.1`).
 
 | Attribute | Details |
 | --- | --- |
 | SRDD references | `Section 5.5`, `Section 8.2`, `Section 9.1`, `Section 9.2`; Requirements `PRV-5`, `SEC-1`, `SEC-2`, `SEC-3`, `SEC-14` (and HKDF subkey prerequisite for `SEC-19`) |
 | Crates touched | `crates/store::crypto`, `crates/store::migrations`, `crates/store::pool` |
-| TDD step (`Red -> Green`) | 1. Write unit tests (`store::crypto::tests`, `#[doc = "Spec: SEC-1, SEC-2, PRV-5"]`) verifying that: (a) missing or `< 32-byte` `LLMROLLER_MASTER_KEY` returns `StartupError::InvalidMasterKey`, (b) sealing the same secret twice yields distinct ciphertexts (random 24-byte nonce), (c) swapping ciphertext blobs between two `upstream_key.id` rows fails AEAD authentication (`AAD` mismatch), and (d) `rotate_master_key` re-seals all rows under a new `master_key_id`. 2. Write SQLite WAL migration tests verifying all 20 tables and foreign-key constraints. |
-| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 domain-separated subkeys, XChaCha20-Poly1305 sealer, and rotate-master-key CLI [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add 20-table SQLite WAL migration and connection pool [Spec: REL-2, SEC-17]` |
+| TDD step (`Red -> Green`) | 1. Write unit tests (`store::crypto::tests`, `#[doc = "Spec: SEC-1, SEC-2, PRV-5"]`) verifying that: (a) missing or `< 32-byte` `LLMROLLER_MASTER_KEY` returns `StartupError::InvalidMasterKey`, (b) sealing the same secret twice yields distinct ciphertexts (random 24-byte nonce), (c) swapping ciphertext blobs between two `upstream_key.id` rows fails AEAD authentication (`AAD` mismatch), and (d) `rotate_master_key` re-seals all rows under a new `master_key_id`. 2. Write SQLite WAL migration tests verifying all 21 tables and foreign-key constraints. |
+| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 domain-separated subkeys, persistent session_hmac_secret, XChaCha20-Poly1305 sealer, and generate/rotate-master-key CLI [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add flock single-instance guard, 21-table SQLite WAL migration, and serialized batch writer actor [Spec: REL-2, SEC-17]` |
 | Risks and resolutions | **Risk:** `SQLITE_BUSY` errors under concurrent read and write load. **Resolution:** Configure `SqliteConnectOptions` with `journal_mode(Wal)`, `synchronous(Normal)`, `busy_timeout(5s)`, an 8-connection read-only pool, and a single serialized writer connection (`SRDD Section 9.2`). |
 
 ### 1.4 Sub-phase 1.4: Atomic first-admin `/setup` and `Argon2id` + `TOTP` authentication
@@ -151,7 +151,7 @@ This sub-phase implements the cryptographic hash chain on `audit_log` (`AUD-1`, 
 | SRDD references | `Section 5.4`, `Section 6.11`, `Section 8.2`; Requirements `AUD-1`, `REL-4`, `SEC-13` |
 | Crates touched | `crates/store::audit`, `crates/core::snapshot`, `crates/server::snapshot_sync` |
 | TDD step (`Red -> Green`) | Write unit and integration tests (`store::audit::tests::hash_chain_verification`, `#[doc = "Spec: AUD-1, SEC-13"]`) that insert 10 audit rows, verify `verify_audit_chain()` returns `Ok(())`, mutate one character in row 4 via raw SQL, and assert `verify_audit_chain()` detects the exact tampered row ID. Write a snapshot test (`#[doc = "Spec: REL-4"]`) proving that mutating a user or key swaps `ArcSwap<ConfigSnapshot>` within 10 ms. |
-| Atomic commits | 1. `sec(store/1.5): implement SHA-256 hash-chained audit_log and verifier CLI [Spec: AUD-1, SEC-13]` 2. `feat(core/1.5): implement lock-free ArcSwap<ConfigSnapshot> reload pipeline [Spec: REL-4]` |
+| Atomic commits | 1. `sec(store/1.5): implement HMAC-SHA256 hash-chained audit_log with monotonic seq and verifier CLI [Spec: AUD-1, SEC-13]` 2. `feat(core/1.5): implement generation-locked ArcSwap<ConfigSnapshot> reload pipeline, /healthz, /readyz, and /metrics listeners [Spec: REL-4, OBS-1, SEC-9]` |
 | Risks and resolutions | **Risk:** Concurrent admin actions race on `prev_hash` when appending to `audit_log`. **Resolution:** Route all `audit_log` inserts through the serialized SQLite writer transaction so `prev_hash` is read and written atomically. |
 
 #### 1.5.1 Incremental `ConfigSnapshot` evolution across Epics 1 through 5
@@ -256,7 +256,7 @@ This sub-phase implements `/models` polling (`MDL-1`), canonical normalization (
 | --- | --- |
 | SRDD references | `Section 6.6`, `Section 10.6`, `Section 14.2.2`, `Section 19.1 (ADR-7)`; Requirements `MDL-1`..`MDL-7` |
 | Crates touched | `crates/core::catalog`, `crates/proto::discovery`, `crates/store::models`, `crates/proxy::models` |
-| TDD step (`Red -> Green`) | Write unit and integration tests (`core::catalog::tests::normalization_and_intersection`, `#[doc = "Spec: MDL-1, MDL-2, MDL-3, MDL-4, MDL-5, MDL-6, MDL-7"]`) asserting: (1) `deepseek/deepseek-v4.1-flash` and `deepseek-v4.1-flash` normalize to `deepseek-v4.1-flash`, while `deepseek-v4-flash` stays a distinct canonical model (`ADR-7`), (2) a model with `exposed = NULL` is exposed in the global pool if and only if every enabled global provider with at least one enabled key serves it (`MDL-3`), (3) a standard user with a personal key serving `claude-sonnet-4-6` sees that model on `GET /v1/models` even if global providers lack it (`MDL-5`), and (4) `GET /v1/models` with `anthropic-version` returns the Anthropic list schema (`MDL-7`). |
+| TDD step (`Red -> Green`) | Write unit and integration tests (`core::catalog::tests::normalization_and_intersection`, `#[doc = "Spec: MDL-1, MDL-2, MDL-3, MDL-4, MDL-5, MDL-6, MDL-7"]`) asserting: (1) `deepseek/deepseek-v4.1-flash` and `deepseek-v4.1-flash` normalize to `deepseek-v4.1-flash`, while `deepseek-v4-flash` stays a distinct canonical model (`ADR-7`), (2) a model with `exposed = NULL` is exposed in the global pool under the default union rule when at least one enabled global provider key serves it (and supports opt-in intersection mode, `MDL-3`), (3) a standard user with a personal key serving `claude-sonnet-4-6` sees that model on `GET /v1/models` even if global providers lack it (`MDL-5`), and (4) `GET /v1/models` with `anthropic-version` returns the Anthropic list schema (`MDL-7`). |
 | Atomic commits | 1. `feat(core/3.1): implement 6-step canonical model normalization, model merge, alias CRUD, and exposure rules [Spec: MDL-2, MDL-3, MDL-4, MDL-5, MDL-6]` 2. `feat(server/3.1): implement scheduled /models discovery job and GET /v1/models handler [Spec: MDL-1, MDL-7]` |
 | Risks and resolutions | **Risk:** One provider's `/models` endpoint is temporarily unreachable during startup or periodic refresh, which could shrink the global intersection set if treated as an empty catalog. **Resolution:** Keep the last successful `model_routes` rows for a key when a `/models` refresh fails with a network or 5xx error, only removing routes when `/models` returns HTTP 200 without that model or when the key is disabled. |
 
@@ -282,7 +282,7 @@ This sub-phase implements the nine-step session ID precedence (`SRDD Section 11.
 | Crates touched | `crates/core::session`, `crates/proto::affinity` |
 | TDD step (`Red -> Green`) | Write table-driven tests (`core::session::tests`, `#[doc = "Spec: RTE-1, SEC-16"]`) testing all nine precedence levels, verifying that `x-claude-code-agent-id` does not split a parent `x-claude-code-session-id` pin, that values `> 256` bytes or containing control characters are rejected/hashed safely, that two different users sending the same `session_id = "abc"` on a `global` or `shared` key emit distinct outbound affinity tokens (`SEC-16`), and that 21 distinct opening prompts on one `session_hash` set `suspected_constant_session_id = true`. |
 | Atomic commits | 1. `feat(core/3.3): implement nine-step session ID resolver, HMAC hashing, and constant-session detector [Spec: RTE-1]` 2. `sec(proto/3.3): implement tenant-salted outbound affinity hint generator [Spec: SEC-16]` |
-| Risks and resolutions | **Risk:** Stateless SDK callers send no session header, and their system prompt changes slightly on turn 2, breaking the Step 9 fallback hash. **Resolution:** Hash only the first 4 KiB of the static system prompt plus the **first** user message (`messages[0..=1]`), which remains constant across multi-turn stateless history arrays. |
+| Risks and resolutions | **Risk:** Stateless SDK callers send no session header, and their system prompt changes slightly on turn 2, breaking the Step 9 fallback hash. **Resolution:** Hash the first 4 KiB of the top-level system prompt plus the first message entry matching `role == "user"` (never indexing `messages[1]` blindly when no system message is present), and mix `owner_user_id` into `session_hash` so tenant hashes never collide. |
 
 ### 3.4 Sub-phase 3.4: Eight-check candidate eligibility engine and `routing_scope` pool selector
 
@@ -306,7 +306,7 @@ This sub-phase implements nginx's smooth weighted round-robin algorithm (`SRDD S
 | Crates touched | `crates/core::wrr` |
 | TDD step (`Red -> Green`) | Write both the worked-example unit test from `SRDD Section 10.3.1` (`deepseek-v4.1-flash` at `100:60:30` and `mimo-v2.6-pro` at `60:20:15`) and the `proptest` convergence and burstiness suite (`core::wrr::proptests`, `#[doc = "Spec: RTE-4, RTE-5, RTE-6, RTE-13"]`). Verify that over 100,000 picks across random weight vectors, empirical shares stay within `0.5%` of exact weights and consecutive runs never exceed `ceil(max(W) / min(W))`. |
 | Atomic commits | 1. `feat(core/3.5): implement smooth weighted round-robin, per-model priority overrides, strict tiers, and headroom scaling [Spec: RTE-4, RTE-5, RTE-6, RTE-13]` |
-| Risks and resolutions | **Risk:** When a route temporarily leaves the candidate set (e.g., enters `cooling_down`) and later returns, stale `current_weight` counters could cause a sudden burst. **Resolution:** Reset a route's `current_weight` to `0` whenever the active candidate set membership changes for that `(pool_scope, canonical_model_id)`, preserving the invariant `sum(current_weight) == 0`. |
+| Risks and resolutions | **Risk:** When a route temporarily leaves the candidate set (e.g., enters `cooling_down`) and later returns, stale `current_weight` counters could cause a sudden burst. **Resolution:** Maintain `current_weight` per `(pool_owner_scope, upstream_key_id, canonical_model_id)` and run nginx subset-tolerant smooth WRR over the active candidate set `C` (clamping `current_weight` to `[-10 * sum_W, 10 * sum_W]`), never zeroing counters on transient cooldowns. |
 
 ### 3.6 Sub-phase 3.6: Single-flight session pinning, `previous_response_id` links, and pre-first-byte failover
 
@@ -398,7 +398,7 @@ This sub-phase implements the default-off `content_traceability_mode` setting, s
 | Crates touched | `crates/core::trace_config`, `crates/store::settings`, `crates/admin::trace_settings` |
 | TDD step (`Red -> Green`) | Write unit and integration tests (`core::trace_config::tests`, `#[doc = "Spec: TRC-1, TRC-7, AUD-1"]`) verifying: (1) fresh instances have `content_traceability_mode = Disabled`, (2) standard `user` callers receive HTTP 403 on `PUT /admin/api/settings/traceability`, (3) scoping traceability to `users: [alice_id]` records traces for Alice's client keys while recording zero trace rows for Bob's client keys, and (4) toggling the setting appends a hash-chained `audit_log` row. |
 | Atomic commits | 1. `feat(core/5.1): implement default-off TraceabilityConfig and scope matcher in ConfigSnapshot [Spec: TRC-1, TRC-7]` 2. `feat(admin/5.1): implement PUT /admin/api/settings/traceability with audit logging [Spec: TRC-1, AUD-1]` |
-| Risks and resolutions | **Risk:** An admin enables content traceability for debugging and forgets to turn it off. **Resolution:** Support an optional `auto_disable_after_hours` timer in `TraceabilityConfig` and display a persistent top banner in the web UI whenever content traceability mode is active (`UI-4`). |
+| Risks and resolutions | **Risk:** An admin enables content traceability for debugging and forgets to turn it off. **Resolution:** Support an optional `auto_disable_at` epoch-millisecond timer in `TraceabilityConfig` and display a persistent top banner in the web UI whenever content traceability mode is active (`UI-4`). |
 
 ### 5.2 Sub-phase 5.2: Non-blocking request capture and SSE delta reassembler (`TraceTap`)
 
