@@ -1,6 +1,7 @@
 # LLMRoller: Software Requirements and Design Document
 
-Version 1.0 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, and TDD specification.
+Version 1.1 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, and TDD specification.
+
 
 ## 0. Introduction
 
@@ -438,6 +439,37 @@ LLMRoller binds three independent TCP listeners by default, as listed in the tab
 | Control plane listener | `127.0.0.1:8081` | Serves `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Loopback binding prevents accidental internet exposure. |
 | Metrics listener | `127.0.0.1:9090` | Serves `/metrics` in Prometheus text format on loopback. |
 
+### 5.5 Command-line interface (`llmroller`) contract and exit codes
+
+The `llmroller` binary in `crates/server` uses `clap` derive macros to expose one daemon command (`serve`) and four maintenance subcommands. Every subcommand returns a deterministic POSIX exit code so systemd units, Kubernetes probes, and cron scripts can automate recovery.
+
+| Subcommand and arguments | Operational behavior | Exit codes |
+| --- | --- | --- |
+| `llmroller serve [--listen <addr>] [--admin-listen <addr>] [--metrics-listen <addr>] [--data-dir <path>] [--dev-insecure-cookies]` | Validates `LLMROLLER_MASTER_KEY`, runs pending SQLite WAL migrations, loads `ArcSwap<ConfigSnapshot>`, rebuilds rolling window rings from `usage_events`, spawns background jobs, and binds the three TCP listeners until `SIGTERM` or `SIGINT`. | `0` clean drain; `2` invalid CLI flag or env var; `3` missing or invalid master key (`SEC-2`); `4` SQLite migration or lock error; `5` listener bind error |
+| `llmroller backup --out <dest_path> [--data-dir <path>]` | Opens the active SQLite WAL database in shared mode and runs the SQLite Online Backup API (`sqlite3_backup_init` / `step` / `finish`) into `<dest_path>.tmp`, verifies `PRAGMA integrity_check` on the snapshot, and atomically renames it to `<dest_path>` (`REL-6`). | `0` verified backup written; `4` source DB locked or corrupt; `6` destination I/O error |
+| `llmroller rotate-master-key --old-key-env <VAR> --new-key-env <VAR> --new-key-id <id> [--data-dir <path>]` | Opens a `BEGIN IMMEDIATE` transaction on the writer connection, decrypts every `upstream_keys.secret_enc`, `users.totp_secret_enc`, and `trace_records.payload_enc` row using the old master key and row-specific `AAD`, re-encrypts each row with a fresh 24-byte random nonce under the new HKDF subkey, updates `master_key_id`, and appends a hash-chained `audit_log` entry (`SEC-1`). | `0` all rows rotated; `3` key decode or length error; `7` AEAD authentication failure on any existing row (transaction rolled back cleanly) |
+| `llmroller verify-audit-log [--data-dir <path>] [--json]` | Streams all rows from `audit_log` ordered by `ts ASC, id ASC`, recomputes the canonical length-prefixed SHA-256 chain from the genesis seed (`0x00 * 32`), and reports total verified rows or the exact first tampered `audit_log.id` (`SEC-13`). | `0` chain intact; `8` hash mismatch or missing predecessor detected |
+| `llmroller generate-master-key` | Reads 32 bytes from `OsRng`, base64-encodes the key, writes it to `stdout` with a trailing newline, and zeroizes the buffer before exiting. | `0` success |
+
+### 5.6 Environment variables and runtime `settings` registry
+
+LLMRoller separates static bootstrap parameters from dynamic runtime policies. Static bootstrap parameters come from environment variables or CLI flags at startup. Runtime policies live in the SQLite `settings` table and hot-reload into `ArcSwap<ConfigSnapshot>` within 1 s (`REL-4`).
+
+| Environment variable | Type & default | Validation rule and architectural effect |
+| --- | --- | --- |
+| `LLMROLLER_MASTER_KEY` | Base64 string (mandatory unless `_FILE` set) | Must decode to at least 32 raw bytes (`SEC-2`). Used as the root IKM for `HKDF-SHA256` subkey derivation. |
+| `LLMROLLER_MASTER_KEY_FILE` | Filesystem path (`None`) | Path to a file (`0400` or `0600` permissions) containing the base64 master key; mutually exclusive with `LLMROLLER_MASTER_KEY`. |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string (`"mk_default"`) | Identifier recorded in `master_key_id` columns on newly sealed rows (`SEC-1`). |
+| `LLMROLLER_DATA_DIR` | Filesystem path (`"/var/lib/llmroller"`) | Directory holding `llmroller.db`, `llmroller.db-wal`, and `llmroller.db-shm`. |
+| `LLMROLLER_LISTEN` | Socket address (`"0.0.0.0:8080"`) | Data-plane HTTP/HTTPS bind address serving `/v1/*`, `/healthz`, and `/readyz`. |
+| `LLMROLLER_ADMIN_LISTEN` | Socket address (`"127.0.0.1:8081"`) | Control-plane HTTP/HTTPS bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login` (`SEC-9`). |
+| `LLMROLLER_METRICS_LISTEN` | Socket address (`"127.0.0.1:9090"`) | Prometheus `/metrics` listener bind address (`OBS-1`, `SEC-9`). |
+| `LLMROLLER_SETUP_TOKEN` | ASCII string (auto-generated 32-char base62) | One-time bootstrap secret checked by `POST /admin/api/setup` (`AUTH-2`). |
+| `LLMROLLER_SETUP_TOKEN_REQUIRED` | Boolean (`true`) | When `false`, skips the setup token check during initial first-admin bootstrap (`AUTH-2`). |
+| `LLMROLLER_MAX_BODY_MB` | Integer `1..=128` (`32`) | Maximum inbound HTTP request body size in MiB enforced at the proxy edge (`SEC-8`). |
+| `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY` | Filesystem paths (`None`) | Optional PEM certificate chain and private key enabling native `rustls` HTTPS on the listeners (`A4`). |
+| `LLMROLLER_LOG` | Filter string (`"info,llmroller=info"`) | Structured JSON log level filter passed to `tracing_subscriber::EnvFilter` (`OBS-1`). |
+
 ## 6. Functional requirements
 
 This section specifies all functional requirements for LLMRoller version 1.0. Every requirement has a unique ID, a priority (`P0`, `P1`, or `P2`), and a clear pass or fail condition linked to Section 16.
@@ -517,7 +549,7 @@ The model catalog normalizes model identifiers across providers and determines w
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
 | MDL-1 | P0 | LLMRoller must discover available models for each enabled upstream key by calling the provider's `/models` endpoint on key creation, on manual refresh, and every 6 hours. |
-| MDL-2 | P0 | Discovered upstream model IDs must be normalized to a `canonical_id` (lowercase, vendor prefix stripped, version separators unified) while preserving the exact `upstream_model_id` on the `model_routes` row for outbound requests. |
+| MDL-2 | P0 | Discovered upstream model IDs must be normalized to a `canonical_id` using the deterministic six-step algorithm in Section 10.6 (lowercase, vendor prefix and routing tags stripped, version separators unified without merging distinct version numbers) while preserving the exact `upstream_model_id` on the `model_routes` row for outbound requests. |
 | MDL-3 | P0 | For the global pool, a model with `exposed = NULL` (automatic mode) is exposed by default when every enabled global provider with at least one enabled key serves it. |
 | MDL-4 | P0 | An admin can force-enable (`exposed = 1`) any canonical model across the global catalog even if only a subset of global providers serve it, or force-disable (`exposed = 0`) any model, and can merge, split, or alias canonical model IDs. |
 | MDL-5 | P0 | For a user with personal or shared keys, any model served by an enabled personal or shared key available to that user is also exposed to that user's client keys (unless disabled on that personal route by the user). |
@@ -532,7 +564,7 @@ The routing engine pins existing conversations to their upstream key and distrib
 | --- | --- | --- |
 | RTE-1 | P0 | Inbound session IDs must be resolved by the nine-step precedence order in Section 11.1 and hashed with HMAC-SHA256 (`session_hash`). |
 | RTE-2 | P0 | A session pin binds `(client_key_id, canonical_model_id, session_hash)` to one `upstream_key_id`. While the pinned route remains eligible for that client key, every turn in that session must route to that `upstream_key_id`. |
-| RTE-3 | P0 | A route is eligible for a request only when: (a) the client key's owner is authorized to use the upstream key (via own personal ownership, active within-cap share grant, or allowed global pool access), (b) the provider, upstream key, and route are enabled, (c) key health is `healthy`, (d) no budget window on the key or route is exhausted, (e) the circuit breaker is closed or half-open for a probe, and (f) the route natively supports the inbound wire protocol (`chat`, `responses`, or `messages`). |
+| RTE-3 | P0 | A route is eligible for a request only when: (a) the client key's owner is authorized to use the upstream key under the active `routing_scope` (via own personal ownership, active within-cap share grant, or allowed global pool access), (b) the provider, upstream key, and route are enabled, (c) both `upstream_keys.health` and `model_routes.route_health` are `healthy` (or their cooldown `health_until` has expired), (d) no budget window on the key or route is exhausted, (e) the provider circuit breaker is closed or half-open for a probe, and (f) the route natively supports the inbound wire protocol (`chat`, `responses`, or `messages`). |
 | RTE-4 | P0 | When no usable pin exists, the router must select a route from the eligible pool (governed by `routing_scope`) using smooth weighted round-robin (`smooth_wrr`) weighted by effective priority. |
 | RTE-5 | P0 | A route's effective priority is the user's or admin's per-model `priority_override` (`1` to `1000`) for that `(upstream_key_id, canonical_id)` pair if set, and otherwise the upstream key's default `priority`. |
 | RTE-6 | P0 | Each canonical model (and personal routing profile) must support two distribution modes: `weighted` (default smooth WRR across all eligible routes) and `strict` (routes only to the highest-priority eligible tier, falling back to lower tiers only when higher tiers are ineligible). |
@@ -688,7 +720,7 @@ Every security requirement is mandatory (`P0`) for version 1.0 unless marked `P1
 
 | ID | Pri | Requirement specification |
 | --- | --- | --- |
-| SEC-1 | P0 | All upstream key secrets must be encrypted with `XChaCha20-Poly1305` (192-bit random nonce per encryption, authenticated associated data binding `upstream_key.id` and `provider_id`) using a 256-bit subkey derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY`. Each row stores `key_id` to support zero-downtime master key rotation (`llmroller rotate-master-key`). |
+| SEC-1 | P0 | All upstream key secrets must be encrypted with `XChaCha20-Poly1305` (192-bit random nonce per encryption, authenticated associated data `AAD = upstream_key.id || "|" || provider_id`) using a 256-bit domain-separated subkey derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY` (using distinct HKDF `info` labels: `"llmroller.v1.upstream_key"`, `"llmroller.v1.totp_secret"`, `"llmroller.v1.trace_record"`, and `"llmroller.v1.session_hmac"`). Each row stores `master_key_id` to support atomic master key rotation (`llmroller rotate-master-key`). |
 | SEC-2 | P0 | The master key must be supplied via `LLMROLLER_MASTER_KEY` or `LLMROLLER_MASTER_KEY_FILE` (32 raw bytes encoded in base64) and must never be written to SQLite or logs. The binary must refuse to start if the master key is missing or has fewer than 32 decoded bytes. |
 | SEC-3 | P0 | Client keys (`llr_...`) must contain 256 bits of cryptographic randomness (`OsRng`), be stored solely as a SHA-256 digest, and be verified in constant time (`subtle::ConstantTimeEq`). |
 | SEC-4 | P0 | User and admin passwords must be hashed with `Argon2id` (`m = 19456 KiB`, `t = 2`, `p = 1`, 128-bit random salt) following the [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html). |
@@ -700,7 +732,7 @@ Every security requirement is mandatory (`P0`) for version 1.0 unless marked `P1
 | SEC-10 | P0 | `Cargo.lock` must be committed. CI must run `cargo audit`, `cargo deny check advisories bans licenses sources`, and `cargo vet`. GitHub Actions workflows must pin third-party actions by full 40-character commit SHA. |
 | SEC-11 | P0 | Release artifacts must include SHA-256 checksums, a CycloneDX SBOM, and a `cosign` signature. Container images must use a distroless base, run as UID `65532` (non-root), drop all Linux capabilities, and mount the root filesystem read-only. |
 | SEC-12 | P0 | Failed client-key authentication requests must be rate-limited per source IP (default 20 failures per minute), and failed login or setup requests must be rate-limited per IP and username (default five failures per 15 minutes). |
-| SEC-13 | P0 | Each `audit_log` row must compute `hash = SHA256(prev_hash || id || ts || actor_id || action || target_type || target_id || detail)` so any deletion or edit of historical audit records breaks the chain (`llmroller verify-audit-log`). |
+| SEC-13 | P0 | Each `audit_log` row must compute `hash = hex(SHA256(canonical_frame(prev_hash, id, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json)))` using the length-prefixed framing in Section 9.2.1 so any deletion or edit of any column in historical audit records breaks the chain (`llmroller verify-audit-log`). |
 | SEC-14 | P0 | All in-memory secret strings (master key, decrypted upstream API keys, raw client tokens, CSRF secrets) must be wrapped in `secrecy::SecretString` or `SecretBox<[u8]>` with `ZeroizeOnDrop`. |
 | SEC-15 | P0 | The HTTP edge must reject requests containing both `Content-Length` and `Transfer-Encoding`, multiple `Host` headers, or non-ASCII control characters in header values, and must strip all hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`) and `Set-Cookie` headers in both directions. |
 | SEC-16 | P1 | When routing through a shared or global upstream key on a provider that uses a body or header cache key, LLMRoller should mix the caller's `owner_user_id` into the outbound synthetic affinity key (`HMAC(server_secret, owner_user_id || session_id)`) so two different users cannot collide on or probe each other's prompt cache. |
@@ -894,6 +926,10 @@ CREATE TABLE model_routes (
   protocols TEXT NOT NULL, -- JSON array: ["chat","responses","messages"]
   enabled INTEGER NOT NULL DEFAULT 1,
   priority_override INTEGER CHECK (priority_override BETWEEN 1 AND 1000),
+  route_health TEXT NOT NULL DEFAULT 'healthy'
+    CHECK (route_health IN ('healthy', 'cooling_down', 'exhausted', 'unavailable')),
+  route_health_until INTEGER,
+  last_error TEXT,
   discovered_at INTEGER NOT NULL,
   PRIMARY KEY (upstream_key_id, canonical_id)
 );
@@ -988,7 +1024,9 @@ CREATE TABLE usage_rollups_hourly (
   owner_user_id TEXT NOT NULL,
   client_key_id TEXT NOT NULL,
   upstream_key_id TEXT NOT NULL,
-  provider_scope TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared')),
+  share_id TEXT NOT NULL DEFAULT '', -- Empty string '' when not routed via provider_shares
   canonical_id TEXT NOT NULL,
   requests INTEGER NOT NULL,
   errors INTEGER NOT NULL,
@@ -998,9 +1036,10 @@ CREATE TABLE usage_rollups_hourly (
   output_tokens INTEGER NOT NULL,
   reasoning_tokens INTEGER NOT NULL,
   cost_micro_usd INTEGER NOT NULL,
-  PRIMARY KEY (hour_ms, client_key_id, upstream_key_id, canonical_id)
+  PRIMARY KEY (hour_ms, client_key_id, upstream_key_id, canonical_id, share_id)
 );
 CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);
+CREATE INDEX idx_rollups_share_hour ON usage_rollups_hourly(share_id, hour_ms);
 
 CREATE TABLE trace_records (
   usage_event_id TEXT PRIMARY KEY REFERENCES usage_events(id) ON DELETE CASCADE,
@@ -1049,12 +1088,115 @@ Six storage rules keep SQLite fast and crash-safe under concurrent streaming loa
 
 | Rule | Implementation mechanism |
 | --- | --- |
-| Single batching writer | Read queries run across a pool of eight read-only SQLite connections. All high-frequency writes (`usage_events`, `usage_rollups_hourly`, `pins`, and `response_links`) go through one dedicated writer task that commits batches of up to 200 rows or every 250 ms in one transaction. |
+| Single batching writer | Read queries run across a pool of eight read-only SQLite connections. All high-frequency writes go through one dedicated writer task that commits batches of up to 200 items or every 250 ms in one `BEGIN IMMEDIATE` transaction ordered strictly as: (1) `usage_events`, (2) `usage_rollups_hourly`, (3) `trace_records` (satisfying `FOREIGN KEY (usage_event_id)`), and (4) `pins`, `response_links`, and `client_keys.last_used_at`. |
 | Envelope encryption | `upstream_keys.secret_enc` and `users.totp_secret_enc` store a 24-byte `XChaCha20` nonce plus `Poly1305` ciphertext and tag, with `upstream_key.id` (or `user.id`) bound in the AEAD Associated Data (`AAD`) so a ciphertext blob cannot be copied between rows. |
 | Provider scope recording | Each `usage_events` row records `provider_scope` (`global`, `personal`, or `shared`) and `share_id` (when routed via `provider_shares`) at request time. Historical share accounting and monthly share caps stay exact even if a share is later modified. |
 | Snapshot history cap | The `upstream_usage_snapshots` table keeps the most recent 100 snapshots per upstream key. Older snapshots are pruned by the retention task, allowing the dashboard and `/v1/usage` endpoint to read the latest upstream quota state in O(1) time. |
 | Compressed and encrypted traces | When content traceability mode is active, `trace_records.payload_enc` stores `24-byte nonce || XChaCha20-Poly1305(zstd(json_bytes))` with `request_id || owner_user_id || session_hash` bound in the AEAD `AAD`. Compression happens on a background worker thread before the batch writer transaction. |
 | Retention policies | Raw `usage_events` rows are kept for 400 days, `trace_records` for 14 days (configurable via `trace_retention_days`), `response_links` for 30 days, expired `pins` and `web_sessions` are swept every 60 s, and `usage_rollups_hourly` and `audit_log` rows are kept indefinitely. |
+
+#### 9.2.1 Canonical `audit_log` hash-chain serialization
+
+Nullable columns (`actor_user_id`, `ip_addr`, `target_id`, `detail_json`) can be `NULL` or contain delimiter characters. To prevent canonicalization collisions, `crates/store::audit` computes `audit_log.hash` (`SEC-13`) over a length-prefixed byte buffer. The genesis `prev_hash` for the first row is 64 ASCII zeros (`"0000000000000000000000000000000000000000000000000000000000000000"`).
+
+```text
+canonical_frame =
+    "llmroller.audit.v1\0"
+ || u32_be(len(prev_hash))       || utf8(prev_hash)
+ || u32_be(len(id))              || utf8(id)
+ || i64_be(ts)
+ || u32_be(len(actor_user_id))   || utf8(coalesce(actor_user_id, ""))
+ || u32_be(len(ip_addr))         || utf8(coalesce(ip_addr, ""))
+ || u32_be(len(action))          || utf8(action)
+ || u32_be(len(target_type))     || utf8(target_type)
+ || u32_be(len(target_id))       || utf8(coalesce(target_id, ""))
+ || u32_be(len(detail_json))     || utf8(coalesce(detail_json, ""))
+
+hash = hex_lower(SHA256(canonical_frame))
+```
+
+### 9.3 JSON column schemas and runtime `settings` structures
+
+Four SQLite columns (`providers.config_json`, `prices.tiers_json`, `prices.schedule_json`, and `settings.value_json`) store structured JSON documents. `crates/core` validates these documents with `serde` before persistence and compiles them into `ConfigSnapshot`.
+
+#### 9.3.1 `providers.config_json` (`ProviderConfigJson`)
+
+Every provider row stores a serialized `ProviderConfigJson` object. This object parameterizes `ProviderAdapter` without hard-coding vendor branches in `crates/core`.
+
+```json
+{
+  "paths": {
+    "chat": "/chat/completions",
+    "responses": "/responses",
+    "messages": "/messages",
+    "models": "/models"
+  },
+  "auth": {
+    "chat": "bearer",
+    "responses": "bearer",
+    "messages": "x_api_key_or_bearer"
+  },
+  "strip_headers": ["x-experimental-*"],
+  "add_headers": {},
+  "ua_policy": "label",
+  "session_profile": {
+    "headers_if_absent": ["x-opencode-session"],
+    "body_field_if_absent": null,
+    "max_len": 256
+  },
+  "usage_profile": {
+    "enabled": true,
+    "endpoints": ["https://opencode.ai/zen/go/v1/usage"],
+    "parser_kind": "opencode_go"
+  },
+  "error_classifiers": {
+    "quota_exhausted_substrings": ["quota_exceeded", "window_limit_reached", "insufficient_credits"],
+    "plan_invalid_substrings": ["upgrade_required", "invalid_api_key"]
+  }
+}
+```
+
+#### 9.3.2 `prices.tiers_json` and `prices.schedule_json`
+
+Context-length pricing tiers (`tiers_json`) and UTC time-of-day multipliers (`schedule_json`) use the following deterministic schemas:
+
+```json
+{
+  "tiers": [
+    {
+      "min_total_input_tokens": 200001,
+      "max_total_input_tokens": null,
+      "input_per_mtok_micro_usd": 4000000,
+      "output_per_mtok_micro_usd": 16000000,
+      "cache_read_per_mtok_micro_usd": 400000,
+      "cache_write_per_mtok_micro_usd": 5000000
+    }
+  ],
+  "schedules": [
+    {
+      "name": "deepseek_weekday_peak",
+      "iso_weekdays": [1, 2, 3, 4, 5],
+      "utc_minute_ranges": [[60, 240], [360, 600]],
+      "multiplier_num": 2,
+      "multiplier_den": 1
+    }
+  ]
+}
+```
+
+#### 9.3.3 Runtime `settings` table keys
+
+The `settings` table stores instance-wide runtime configuration keys. Admins can update these keys via `PATCH /admin/api/settings` or `PUT /admin/api/settings/traceability`.
+
+| `settings.key` | Default `value_json` | Purpose and hot-reload target in `ConfigSnapshot` |
+| --- | --- | --- |
+| `pin_ttl_secs` | `86400` | Sliding idle expiration window in seconds for confirmed session pins (`RTE-10`). |
+| `usage_poll_interval_secs` | `300` | Periodic polling interval in seconds for active upstream keys' `/usage` endpoints (`USG-4`). |
+| `headroom_scaling_enabled` | `false` | Enables scaling WRR route weights by `max(0.05, remaining_budget_ratio)` (`RTE-13`). |
+| `repin_on_personal_recovery` | `true` | When `true`, a `personal_first` session that fell back to a `global` key repins back to the owner's `personal` key once its cooldown or window resets. |
+| `price_sync_catalog_url` | `{"enabled":false,"url":"https://models.dev/api.json"}` | Opt-in external price-book synchronization configuration (`PRIV-1`, `MDL-4`). |
+| `drain_timeout_secs` | `60` | Maximum seconds to wait for open SSE streams to finish after `SIGTERM` (`REL-1`). |
+| `traceability_config` | `{"enabled":false,"scope":"all","user_ids":[],"client_key_ids":[],"models":[],"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
 
 ## 10. Routing design
 
@@ -1071,7 +1213,7 @@ Consider a request authenticated by `client_key` (owned by `user_id = U`) for ca
 | 3 | Model `M` is exposed in the pool being checked (for global routes, `M` satisfies the global auto-intersection or `exposed == 1` rule; for personal or shared routes, `R.enabled == 1`). | `models.exposed`, `model_routes.enabled`, `user_route_preferences.enabled` |
 | 4 | Provider, upstream key `K`, and route `R` all have `enabled == 1`. | `providers`, `upstream_keys`, `model_routes` |
 | 5 | Route `R.protocols` includes the inbound request protocol `P` (`chat`, `responses`, or `messages`). | `model_routes.protocols` |
-| 6 | Key `K.health` is `healthy` (or `cooling_down` where `now >= K.health_until`). | In-memory key health table |
+| 6 | Both key health `K.health` and route health `R.route_health` are `healthy` (or `cooling_down` where `now >= health_until`). | In-memory key and route health tables |
 | 7 | The provider's circuit breaker is `Closed` (or `HalfOpen` with a free probe slot). | In-memory circuit breaker |
 | 8 | Every budget window attached to key `K` or route `(K, M)` has `used_micro_usd + reserve_micro_usd < limit_micro_usd` AND the latest reconciled `upstream_usage_snapshot` has `used_percent < (100 - reserve_pct)`. | In-memory window counters and `upstream_usage_snapshots` |
 
@@ -1124,7 +1266,7 @@ Session pins live in an in-memory `moka::sync::Cache` keyed by `PinKey = (client
 | --- | --- |
 | Single-flight provisional pin (`RTE-7`) | When two or more parallel requests arrive simultaneously for a new session, `moka::Cache::try_get_with` runs the route selector once and inserts a `provisional` pin so all concurrent turn-1 requests route to the same upstream key. |
 | Confirmation on first byte (`RTE-8`) | When the upstream responds with HTTP 200 and yields its first body byte, the proxy marks the pin `confirmed` and updates `last_used_at` and `expires_at = now + pin_ttl_ms` (default 24 h). |
-| Repin on ineligibility (`RTE-11`) | If a later turn finds that the pinned `upstream_key_id` fails any eligibility check in Section 10.1 (such as an exhausted 5-hour window, a cooling key, or a revoked personal share), the router picks a new candidate via `smooth_wrr`, replaces the pin, increments `repin_count`, and records `pin_outcome = 'repin'`. |
+| Repin on ineligibility (`RTE-11`) | If a later turn finds that the pinned route `(upstream_key_id, canonical_id)` fails any eligibility check in Section 10.1 (including an exhausted window, a cooling key or route, a revoked share, or a changed `client_key.routing_scope` that now forbids the pinned key's `ownership_scope`), the router picks a new candidate via `smooth_wrr`, replaces the pin, increments `repin_count`, and records `pin_outcome = 'repin'`. |
 | Stateful Responses override (`RTE-12`) | If a `POST /v1/responses` request includes `previous_response_id`, the router looks up `response_links(previous_response_id)`. If found and owned by the same `client_key_id`, the router routes directly to that `upstream_key_id` (`pin_outcome = 'response_link'`), bypassing `smooth_wrr`. |
 
 ### 10.5 Key health state machine and pre-first-byte failover
@@ -1142,6 +1284,39 @@ Each upstream key maintains an atomic health state and transitions according to 
 | HTTP 401 or 403 authentication failure (or Command Code `403 upgrade_required`) | Retry on next eligible candidate; never forward upstream 401 to client. | After two consecutive auth failures, set key to `invalid` until manual reset and raise a dashboard alert. |
 | HTTP 400, 413, or 422 (invalid client request or context length exceeded) | Do not retry. Forward status and body directly to client. | Key stays `healthy`; no breaker failure counted. |
 | Mid-stream disconnect after first byte | Never retry. Close client stream cleanly and mark usage event `incomplete = 1`. | Count soft breaker failure if upstream reset the connection. |
+
+#### 10.5.1 Provider circuit breaker state machine and failure thresholds
+
+Per-key health (`upstream_keys.health`) and per-route health (`model_routes.route_health`) isolate failures on a single credential or model. In addition, each `provider_id` maintains an atomic `ProviderCircuitBreaker` in `crates/core` to guard against host-wide outages (`REL-5`, `RTE-3`). Client errors (`400`, `413`, `422`), single-key rate limits (`429`), and single-key auth errors (`401`, `402`, `403`) never trip the provider breaker. Only transport errors and upstream `500`/`502`/`503`/`504` server errors count toward the provider breaker.
+
+| Current state | Event or condition | Next state | Action taken |
+| --- | --- | --- | --- |
+| `Closed` | Upstream returns HTTP 200..=499 (any status other than transport timeout/error or 500/502/503/504) | `Closed` | Reset `consecutive_host_failures = 0`. |
+| `Closed` | `consecutive_host_failures` reaches `5` within a rolling `60 s` window across the provider's keys | `Open` | Record `opened_at = now_ms` and `open_duration_ms = min(120_000, 15_000 * 2^open_streak)`. Exclude all routes on this provider from Check 7 (`RTE-3`). |
+| `Open` | Request arrives while `now_ms < opened_at + open_duration_ms` | `Open` | Route immediately fails Check 7 with zero network I/O. |
+| `Open` | Request arrives when `now_ms >= opened_at + open_duration_ms` and `probe_in_flight == false` | `HalfOpen` | Atomically set `probe_in_flight = true` (`compare_exchange`) and allow exactly one probe request through to the provider. Concurrent requests see `HalfOpen` with no free probe slot and route elsewhere. |
+| `HalfOpen` | Probe request receives first valid response byte (HTTP 200) | `Closed` | Reset `consecutive_host_failures = 0`, `open_streak = 0`, and `probe_in_flight = false`. |
+| `HalfOpen` | Probe request fails with transport error or HTTP 5xx before first byte | `Open` | Increment `open_streak`, set `probe_in_flight = false`, and re-open breaker for `min(120_000, 15_000 * 2^open_streak)`. |
+
+### 10.6 Deterministic canonical model ID normalization algorithm
+
+The function `crates/core::catalog::normalize_model_id(raw_id: &str) -> String` implements `MDL-2` and `ADR-7` in six deterministic steps:
+1. Trim leading and trailing ASCII whitespace and convert all ASCII uppercase bytes (`A..=Z`) to lowercase (`a..=z`).
+2. Strip any vendor prefix up to and including the last `/` character (for example, `deepseek/deepseek-v4.1-flash` becomes `deepseek-v4.1-flash`).
+3. Strip aggregator routing tags (`:free`, `:extended`, `:nitro`, `:floor`), and convert `:thinking` into `-thinking` so reasoning variants stay distinct.
+4. Replace all `_` characters and spaces with `-`, and collapse consecutive hyphens (`--`) into one hyphen (`-`).
+5. Strip trailing date stamps (`-202[4-9][0-1][0-9][0-3][0-9]`) when a base family exists, while keeping distinct version numbers (`v4` vs. `v4.1`) separate (`ADR-7`).
+6. Look up the resulting slug in `model_aliases`; return `model_aliases.canonical_id` when `confirmed = 1`, or the slug itself otherwise.
+
+| Raw upstream `id` from provider `/models` | Provider kind | Normalized `canonical_id` (`MDL-2`) | Preserved `upstream_model_id` (`model_routes`) |
+| --- | --- | --- | --- |
+| `deepseek-v4.1-flash` | `open_design_amr` | `deepseek-v4.1-flash` | `deepseek-v4.1-flash` |
+| `deepseek/deepseek-v4.1-flash` | `command_code` | `deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
+| `deepseek-v4-flash` | `opencode_go` | `deepseek-v4-flash` (kept distinct per `ADR-7`) | `deepseek-v4-flash` |
+| `anthropic/claude-sonnet-4.6` | `openrouter` | `claude-sonnet-4.6` (aliased with `claude-sonnet-4-6`) | `anthropic/claude-sonnet-4.6` |
+| `claude-sonnet-4-6-20260514` | `command_code` | `claude-sonnet-4-6` | `claude-sonnet-4-6-20260514` |
+| `openai/gpt-5.4-pro:free` | `openrouter` | `gpt-5.4-pro` | `openai/gpt-5.4-pro:free` |
+| `mimo/mimo_v2.6_pro` | `command_code` | `mimo-v2.6-pro` | `mimo/mimo_v2.6_pro` |
 
 ## 11. Session identification and hints
 
@@ -1233,6 +1408,15 @@ When an upstream response starts, the forwarder wraps the `reqwest` byte stream 
 3. If `strip_injected_usage_chunk` is `true` on a `chat` stream, the stream adapter inspects SSE `data:` frames that contain `"usage"` with `"choices":[]`; it feeds that frame to `SseUsageTap` and suppresses it from the client output so strict clients do not fail on an unexpected empty-choices chunk (`API-5`).
 4. If the client closes its TCP connection mid-stream, `hyper` drops the response stream. This drops the `reqwest` future and closes the upstream request within 1 s (`API-7`).
 
+#### 12.4.1 SSE chunk framing, partial-line holdback, and UTF-8 carryover state machine
+
+TCP packets and HTTP/2 `DATA` frames can split an SSE stream at any byte offset. They can split a `data: {...}\n\n` line or a multi-byte UTF-8 character (`0xC2..=0xF4`). LLMRoller handles chunk boundaries with two decoupled state machines so client forwarding delay stays under 1 ms (`PERF-2`).
+
+| Component | State machine behavior across arbitrary `Bytes` chunk splits |
+| --- | --- |
+| Outbound client stream (`crates/proxy::forward`) | **Case A (`strip_injected_usage_chunk == false`):** Forwards every `Bytes` chunk to the client socket immediately with zero line buffering. **Case B (`strip_injected_usage_chunk == true`):** Streams all chunks immediately while `finish_reason` has not yet been seen. Once an SSE frame containing a non-null `finish_reason` is forwarded, enters `PostFinishReasonHoldback` (holding at most 16 KiB until `\n\n`) to inspect the final `data:` frame: if it matches `"choices":[]` with a `"usage"` object, suppresses that frame from the client stream and forwards `data: [DONE]\n\n` (`API-5`). |
+| Asynchronous tap (`SseUsageTap` and `TraceTap` in `crates/proto`) | Receives `Bytes::clone` chunks over an in-memory ring buffer (64 KiB max line buffer). Maintains a 1-to-3 byte `utf8_carryover: [u8; 3]` buffer for trailing incomplete UTF-8 codepoints across chunk boundaries, splits complete lines on `\n` (stripping optional `\r`), ignores SSE comment lines starting with `:`, and parses `event:` and `data:` lines into token counts and `NormalizedTurnTrace` deltas. |
+
 ### 12.5 Token and cost extraction across protocols
 
 The `SseUsageTap` (for `text/event-stream`) and `JsonUsageExtractor` (for `application/json`) normalize token counts across the three wire protocols into five mutually exclusive integer fields.
@@ -1265,6 +1449,57 @@ All turns in one conversation share a pinned `session_hash`. The reconstructor (
 | Stateless turns (`chat` and `messages`) | Turn `k` resends prior messages `[m_1..m_p]` plus new user or `tool_result` blocks. The reconstructor hashes each block `(role, content_hash, tool_call_id)`, emits only new input blocks on turn `k`, and appends turn `k`'s `reasoning`, `tool_calls`, `assistant_text`, and telemetry badge. |
 | Stateful turns (`responses` with `previous_response_id`) | Each turn already holds only new delta inputs and new assistant outputs, so the reconstructor links them directly in `turn_index` order. |
 | Context compaction or forked turns | When the input prefix on turn `k` diverges from turn `k - 1`, the reconstructor inserts a `context_compacted_or_branched` divider card in the timeline. |
+
+#### 12.6.1 `NormalizedTurnTrace` and Session Chat Preview JSON contract
+
+Each `trace_records.payload_enc` blob decrypts and decompresses (`zstd`) to a `StoredTurnTrace` JSON document. The endpoints `GET /api/user/sessions/{session_hash}/chat` and `GET /admin/api/sessions/{session_hash}/chat` return a `SessionChatPreviewResponse` matching the schema below (`TRC-4`, `TRC-5`, `TRC-6`).
+
+```json
+{
+  "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+  "owner_user_id": "01J9X0USER...",
+  "client_key_prefix": "llr_7f9a",
+  "canonical_model": "claude-sonnet-4-6",
+  "protocol": "messages",
+  "total_turns": 2,
+  "pagination": { "from_turn": 1, "limit": 50, "next_turn": null },
+  "system_instructions": "You are an expert Rust systems engineer.",
+  "tools": [
+    { "name": "bash", "description": "Run a shell command", "parameters": { "type": "object" } }
+  ],
+  "timeline": [
+    {
+      "turn_index": 1,
+      "request_id": "01J9X5REQ1...",
+      "ts": 1792401000000,
+      "pin_outcome": "new_pin",
+      "upstream_key_label": "my-opencode-go-1",
+      "provider_scope": "personal",
+      "context_compacted_or_branched": false,
+      "truncated_content": false,
+      "new_input_messages": [
+        { "role": "user", "content": "Check why cargo test fails in crates/core." }
+      ],
+      "assistant_reasoning": "Let us run cargo test -p llmroller-core first.",
+      "assistant_tool_calls": [
+        { "id": "toolu_01A", "name": "bash", "arguments_json": "{"cmd":"cargo test -p llmroller-core"}" }
+      ],
+      "assistant_text": "",
+      "metrics": {
+        "status": 200,
+        "ttfb_ms": 410,
+        "latency_ms": 1250,
+        "input_uncached_tokens": 1850,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 1500,
+        "output_tokens": 95,
+        "reasoning_tokens": 42,
+        "cost_micro_usd": 7820
+      }
+    }
+  ]
+}
+```
 
 ## 13. Pricing, limits, and source provider usage engine
 
@@ -1304,6 +1539,13 @@ Built-in presets seed the documented plan windows automatically when a user or a
 2. The [Command Code GOAT](https://commandcode.ai/docs/plans/goat) preset seeds rolling 5 h ($14), rolling 7 d ($35), anchored 1 mo ($70), and per-model boosted route allowances.
 3. The Open Design Go preset seeds rolling 5 h ($10), rolling 7 d ($30), and anchored 1 mo ($120).
 
+#### 13.2.1 RAII in-flight budget reservation guard (`InFlightBudgetGuard`)
+
+Concurrent requests arriving at 97.9% window spend could otherwise pass Check 8 (`Section 10.1`) together and overshoot a cap. To prevent this, `crates/core::windows` enforces an optimistic in-flight reservation using an RAII guard (`InFlightBudgetGuard`):
+1. Check 8 evaluates `used_micro_usd + in_flight_reserved_micro_usd + reserve_micro_usd < limit_micro_usd` on every attached window and share grant.
+2. Selecting a route atomically adds `default_in_flight_reservation_micro_usd` (`50_000` micro-USD = `$0.05`) to `in_flight_reserved_micro_usd` (`AtomicI64::fetch_add`) and returns an `InFlightBudgetGuard`.
+3. When the stream finishes, fails over, or aborts, `InFlightBudgetGuard::drop` atomically subtracts `50_000` micro-USD (`fetch_sub`) and records the actual `cost_micro_usd`.
+
 ### 13.3 Source provider `/usage` polling, parsing, and auto-reconciliation
 
 Local token accounting can drift from a provider's ledger when keys are used outside LLMRoller, when promotions apply, or when window boundaries shift. To remove drift, LLMRoller runs an upstream `/usage` poller and reconciler in each `ProviderAdapter`.
@@ -1335,6 +1577,12 @@ When a valid snapshot arrives from the source provider, the budget engine applie
 | Reset boundary sync | If the snapshot provides `resets_at` for a window (`5h`, `7d`, `1mo`), LLMRoller updates that window's `resets_at_ms` to match the provider's clock. |
 | Usage reconciliation | If the snapshot reports `used_micro_usd` (or `used_percent`, converted via `round(used_percent / 100.0 * limit_micro_usd)`), LLMRoller compares `upstream_used` with `local_used`. If `abs(upstream_used - local_used) > 0.5% of limit`, LLMRoller inserts an automatic `budget_adjustments` row (`source = 'upstream_usage_sync'`, `delta_micro_usd = upstream_used - local_used`) so the window gauge and admission check match the provider's ledger. |
 | Exhaustion state transition | If the snapshot reports `status != "ok"`, `used_percent >= (100 - reserve_pct)`, or `limit_remaining <= 0`, LLMRoller marks the key (or window) `exhausted` until `resets_at_ms`. If a poll after `resets_at_ms` reports `used_percent < (100 - reserve_pct)`, the key returns to `healthy`. |
+
+#### 13.3.3 Strict allow-list PII sanitizer for `sanitized_json` (`USG-8`, `SEC-18`)
+
+When saving an `upstream_usage_snapshots` row, `crates/proto::usage_poller` builds `sanitized_json` using a strict allow-list projection. This prevents newly added upstream fields from leaking account PII on shared or global keys:
+1. Only the normalized quota structure (`{"provider_kind", "fetched_at", "plan_tier", "is_free_tier", "windows": [{"kind", "status", "used_percent", "resets_at"}]}`) is copied into `sanitized_json`.
+2. Any raw key-value pair whose field name matches the case-insensitive regex `(email|user|whoami|name|org|workspace|account|billing|card|payment|invoice|ip|key|token|secret|id|customer)` is unconditionally stripped before constructing `sanitized_json`.
 
 ### 13.4 Source provider `/usage` pass-through API (`GET /v1/usage` and `GET /v1/key`)
 
@@ -1656,7 +1904,7 @@ Integration tests run against temporary SQLite WAL databases and local `wiremock
 | Concurrency and single-flight pinning (`RTE-7`) | Spawn 100 concurrent Tokio tasks sending turn 1 of the same session ID simultaneously; assert that `MockUpstreamTransport` receives all 100 calls on one `upstream_key_id` and creates one pin row. |
 | Failover before first byte vs. post-first-byte no-retry (`RTE-9`) | Verify that a connect timeout, 503, 429, or 401 before the first byte fails over to the next candidate and re-pins, while a stream drop after yielding 1 byte never retries and marks `incomplete = 1`. |
 | Personal provider sharing and revocation isolation (`SHR-1`..`SHR-6`, `SEC-17`, `SEC-18`) | User A creates a personal provider, adds a key, and shares it with User B with a $5 monthly cap and `allowed_models = ["deepseek-v4.1-flash"]`. Verify that User B routes `deepseek-v4.1-flash`, gets HTTP 403 on other models, never sees User A's secret or raw `/usage` email, re-pins to global when the $5 cap hits or User A revokes the share, and cannot re-share with User C. |
-| Security and canary redaction (`SEC-1`..`SEC-18`) | Plant canary secret `sk-canary-9988776655443322` as an upstream key, trigger upstream 401 and 500 errors, invalid JSON, and panics, and assert the canary never appears in logs, HTTP responses, SQLite error columns, or `/metrics`. Verify SSRF rejection on `127.0.0.1`, `169.254.169.254`, and HTTP 302 redirects. |
+| Security and canary redaction (`SEC-1`..`SEC-19`) | Plant canary secret `sk-canary-9988776655443322` as an upstream key, trigger upstream 401 and 500 errors, invalid JSON, and panics, and assert the canary never appears in logs, HTTP responses, SQLite error columns, or `/metrics`. Verify SSRF rejection on `127.0.0.1`, `169.254.169.254`, and HTTP 302 redirects. |
 
 #### 16.5.4 Level 4: Regression test suite
 
@@ -1705,8 +1953,8 @@ Every requirement ID in this SRDD maps to concrete source modules and automated 
 | `USG-1`..`USG-8`, `LIM-1` | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (OpenCode Go, Command Code, OpenRouter `/usage` sync, auto-adjustment, `/v1/usage` & `/v1/key` sanitization) |
 | `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (default-off check, streaming delta reassembly, Grantor A blocked from Grantee B trace, XSS sanitization in chat preview, purge & TTL) + `cargo-mutants` |
 | `UI-1`..`UI-4`, `AUD-1` | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (admin and standard user UI flows, read-only session chat preview drawer, zero external asset check, audit tamper detection) |
-| `PERF-1`..`PERF-4`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `crates/server`, workspace-wide | `crates/core` zero-I/O dependency test | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
-| `SEC-1`..`SEC-18` | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
+| `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `crates/server`, workspace-wide | `crates/core` zero-I/O dependency test | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
+| `SEC-1`..`SEC-19` | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf`, `crates/admin::traces` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
 
 ## 17. Roadmap and milestones
 

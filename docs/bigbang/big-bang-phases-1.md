@@ -32,10 +32,10 @@ This sub-phase implements master-key derivation (`HKDF-SHA256`), AEAD encryption
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 8.2`, `Section 9.1`, `Section 9.2`; Requirements `PRV-5`, `SEC-1`, `SEC-2`, `SEC-3`, `SEC-14`, `SEC-19` |
+| SRDD references | `Section 5.5`, `Section 8.2`, `Section 9.1`, `Section 9.2`; Requirements `PRV-5`, `SEC-1`, `SEC-2`, `SEC-3`, `SEC-14` (and HKDF subkey prerequisite for `SEC-19`) |
 | Crates touched | `crates/store::crypto`, `crates/store::migrations`, `crates/store::pool` |
 | TDD step (`Red -> Green`) | 1. Write unit tests (`store::crypto::tests`, `#[doc = "Spec: SEC-1, SEC-2, PRV-5"]`) verifying that: (a) missing or `< 32-byte` `LLMROLLER_MASTER_KEY` returns `StartupError::InvalidMasterKey`, (b) sealing the same secret twice yields distinct ciphertexts (random 24-byte nonce), (c) swapping ciphertext blobs between two `upstream_key.id` rows fails AEAD authentication (`AAD` mismatch), and (d) `rotate_master_key` re-seals all rows under a new `master_key_id`. 2. Write SQLite WAL migration tests verifying all 20 tables and foreign-key constraints. |
-| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 and XChaCha20-Poly1305 sealer with AAD binding [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add 20-table SQLite WAL migration and connection pool [Spec: REL-2, SEC-17]` |
+| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 domain-separated subkeys, XChaCha20-Poly1305 sealer, and rotate-master-key CLI [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add 20-table SQLite WAL migration and connection pool [Spec: REL-2, SEC-17]` |
 | Risks and resolutions | **Risk:** `SQLITE_BUSY` errors under concurrent read and write load. **Resolution:** Configure `SqliteConnectOptions` with `journal_mode(Wal)`, `synchronous(Normal)`, `busy_timeout(5s)`, an 8-connection read-only pool, and a single serialized writer connection (`SRDD Section 9.2`). |
 
 ## 1.4 Sub-phase 1.4: Atomic first-admin `/setup` and `Argon2id` + `TOTP` authentication
@@ -50,7 +50,7 @@ This sub-phase implements the one-time setup token, serializable first-admin cre
 | Atomic commits | 1. `feat(store/1.4): implement user repository with Argon2id, TOTP, and last-admin guard [Spec: AUTH-4, AUTH-5, AUTH-6, AUTH-9, USR-5, SEC-4]` 2. `feat(admin/1.4): implement atomic first-admin setup, session cookies, and login rate limiter [Spec: AUTH-1, AUTH-2, AUTH-3, AUTH-7, AUTH-8, SEC-5, SEC-12]` |
 | Risks and resolutions | **Risk:** `Argon2id` (`19 MiB` memory per hash) can exhaust RAM if 100 concurrent login requests run at once. **Resolution:** Bound concurrent `Argon2id` verifications with a `tokio::sync::Semaphore` (4 permits) and apply the per-IP rate limiter (`SEC-12`) before hashing. |
 
-## 1.5 Sub-phase 1.5:Tamper-evident hash-chained `audit_log` and `ArcSwap<ConfigSnapshot>`
+## 1.5 Sub-phase 1.5: Tamper-evident hash-chained `audit_log` and `ArcSwap<ConfigSnapshot>`
 
 This sub-phase implements the cryptographic hash chain on `audit_log` (`AUD-1`, `SEC-13`) and the lock-free `ArcSwap<ConfigSnapshot>` loader (`REL-4`).
 
@@ -61,3 +61,17 @@ This sub-phase implements the cryptographic hash chain on `audit_log` (`AUD-1`, 
 | TDD step (`Red -> Green`) | Write unit and integration tests (`store::audit::tests::hash_chain_verification`, `#[doc = "Spec: AUD-1, SEC-13"]`) that insert 10 audit rows, verify `verify_audit_chain()` returns `Ok(())`, mutate one character in row 4 via raw SQL, and assert `verify_audit_chain()` detects the exact tampered row ID. Write a snapshot test (`#[doc = "Spec: REL-4"]`) proving that mutating a user or key swaps `ArcSwap<ConfigSnapshot>` within 10 ms. |
 | Atomic commits | 1. `sec(store/1.5): implement SHA-256 hash-chained audit_log and verifier CLI [Spec: AUD-1, SEC-13]` 2. `feat(core/1.5): implement lock-free ArcSwap<ConfigSnapshot> reload pipeline [Spec: REL-4]` |
 | Risks and resolutions | **Risk:** Concurrent admin actions race on `prev_hash` when appending to `audit_log`. **Resolution:** Route all `audit_log` inserts through the serialized SQLite writer transaction so `prev_hash` is read and written atomically. |
+
+### 1.5.1 Incremental `ConfigSnapshot` evolution across Epics 1 through 5
+
+Sub-Phase 1.5 introduces `ArcSwap<ConfigSnapshot>` while Epics 1 through 5 populate its domain tables. Engineers extend `ConfigSnapshot` additively at each sub-phase boundary without breaking earlier tests.
+
+| Sub-phase | New domain slices added to `ConfigSnapshot` | Triggering control-plane mutations that call `reload_snapshot()` |
+| --- | --- | --- |
+| `1.5` | `users: HashMap<UserId, UserRecord>`, `settings: RuntimeSettings` | User creation, role/budget update, disable/delete, settings update |
+| `2.1` | `providers: HashMap<ProviderId, ProviderRecord>`, `upstream_keys: HashMap<UpstreamKeyId, UpstreamKeyRecord>` | Provider or upstream key CRUD, enable/disable (`PRV-8`) |
+| `2.2` | `client_keys_by_hash: HashMap<[u8; 32], ClientKeyRecord>` | Client key creation, rotation, revocation (`CLK-4`), CIDR/RPM edit |
+| `3.1` | `models: HashMap<CanonicalModelId, ModelRecord>`, `aliases: HashMap<String, CanonicalModelId>`, `routes: HashMap<CanonicalModelId, Vec<RouteRecord>>` | `/models` discovery refresh, force-expose toggle, model merge, alias CRUD |
+| `3.2` | `shares_by_grantee: HashMap<UserId, Vec<ShareGrant>>`, `user_route_prefs: HashMap<(UserId, UpstreamKeyId, CanonicalModelId), RoutePref>` | Share grant creation, cap edit, or revocation (`SHR-5`), personal route priority override |
+| `4.2` & `4.4` | `prices: HashMap<(ProviderKind, String), PriceEntry>`, `budget_windows: HashMap<UpstreamKeyId, Vec<BudgetWindowSpec>>` | Price book edit or `models.dev` sync, budget window rule update |
+| `5.1` | `traceability: TraceabilityConfig` | `PUT /admin/api/settings/traceability` (`TRC-1`) |

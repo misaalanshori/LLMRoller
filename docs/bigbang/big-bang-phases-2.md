@@ -60,11 +60,7 @@ This sub-phase implements the zero-buffering chunk forwarder (`PERF-2`, `API-6`)
 | Crates touched | `crates/proxy::forward`, `crates/proto::sse_frame` |
 | TDD step (`Red -> Green`) | Write integration tests (`tests/integration_wire_transparency.rs`, `#[doc = "Spec: API-5, API-6, API-7, PERF-2, TRN-3"]`) using a local stub server that emits 5 SSE chunks spaced 50 ms apart: (1) assert each chunk arrives at the client within 1 ms of emission (`PERF-2`), (2) assert that an injected `include_usage` chunk (`"choices":[]`) is captured by the tap and omitted from the client stream when the client did not ask for it (`API-5`), and (3) drop the client TCP connection after chunk 2 and assert the stub server observes socket closure within 100 ms (`API-7`). |
 | Atomic commits | 1. `feat(proxy/2.5): implement unbuffered SSE stream forwarder and injected usage chunk filter [Spec: API-5, API-6, PERF-2, TRN-3]` 2. `feat(proxy/2.5): wire client disconnect drop guard to abort upstream request within 1s [Spec: API-7]` |
-| Risks and resolutions | **Risk:** An SSE frame (`data: ...
-
-`) splits across two TCP `Bytes` chunks right in the middle of the final usage event. **Resolution:** For standard pass-through chunks (`strip_injected_usage_chunk == false`), forward raw `Bytes` immediately without waiting for `
-
-` while feeding a line-reassembling ring buffer inside the asynchronous `SseUsageTap`. When `strip_injected_usage_chunk == true`, hold only an incomplete trailing line at the very end of the stream (after `finish_reason` has already been flushed). |
+| Risks and resolutions | **Risk:** An SSE frame (`data: ...\n\n`) splits across two TCP `Bytes` chunks right in the middle of the final usage event or mid-UTF-8 codepoint. **Resolution:** Follow the two-state machine in `SRDD Section 12.4.1`: when `strip_injected_usage_chunk == false`, forward raw `Bytes` immediately without waiting for `\n\n` while feeding the 64 KiB line-reassembling ring buffer (with 1-to-3 byte UTF-8 carryover) inside `SseUsageTap`. When `strip_injected_usage_chunk == true`, enter `PostFinishReasonHoldback` only after `finish_reason` has already been flushed to the client. |
 
 ## 2.6 Sub-phase 2.6: Built-in `ProviderAdapter` implementations and preset TOML files
 
@@ -74,6 +70,6 @@ This sub-phase implements the `ProviderAdapter` trait (`MNT-2`) and ships the fo
 | --- | --- |
 | SRDD references | `Section 2.3`, `Section 6.3`, `Section 7.4`, `Section 11.2`; Requirements `PRV-2`, `PRV-3`, `PRV-6`, `API-1`, `API-8`, `MNT-2` |
 | Crates touched | `crates/proto::adapters`, `presets/*.toml` |
-| TDD step (`Red -> Green`) | Write adapter contract tests (`proto::adapters::tests`, `#[doc = "Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2"]`) verifying URL construction, auth header injection (`Bearer` vs. `x-api-key`), outbound session hint injection (`x-opencode-session`, `x-session-id`, `x-session-affinity`, `prompt_cache_key`), and upstream error classification (401/403 auth vs. 403 `upgrade_required` on Command Code vs. 429 rate limit vs. 400 client error). |
+| TDD step (`Red -> Green`) | Write adapter contract tests (`proto::adapters::tests`, `#[doc = "Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2"]`) verifying URL construction (including `POST /v1/messages/count_tokens`), auth header injection (`Bearer` vs. `x-api-key`), outbound session hint injection (`x-opencode-session`, `x-session-id`, `x-session-affinity`, `prompt_cache_key`), Stage-1 key testing against `/models` (`PRV-6`, with `/usage` probe added in Sub-Phase 4.5), and upstream error classification (401/403 auth vs. 403 `upgrade_required` on Command Code vs. 429 rate limit vs. 400 client error). |
 | Atomic commits | 1. `feat(proto/2.6): implement ProviderAdapter trait and built-in presets for OpenCode Go, Command Code, Open Design AMR, and OpenRouter [Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2]` |
 | Risks and resolutions | **Risk:** OpenCode Go changes which models sit behind `/chat/completions` vs. `/messages` (`SRDD Section 2.3`). **Resolution:** Store supported protocols per route in `model_routes.protocols` discovered from `/models` or configured in the preset, never hard-coded in Rust branches. |

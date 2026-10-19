@@ -1,6 +1,7 @@
 # LLMRoller: Big-Bang Development Phases and TDD Execution Guide
 
-Version 1.0 · 19 October 2026 · Adaptive ground-up engineering guide from `git init` to `v1.0.0` with full traceability to the LLMRoller SRDD.
+Version 1.1 · 19 October 2026 · Adaptive ground-up engineering guide from `git init` to `v1.0.0` with full traceability to the LLMRoller SRDD.
+
 
 ## Epic 0: Engineering governance, TDD workflow, atomic commits, and adaptive playbook
 
@@ -86,7 +87,7 @@ The table below maps the seven implementation epics (`big-bang-phases-1.md` thro
 | `big-bang-phases-3.md` | Model catalog, personal sharing, smooth WRR routing, and session pinning | `M2` | `SHR-1`..`SHR-6`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `SEC-16` |
 | `big-bang-phases-4.md` | Usage pipeline, price book, budget windows, and source `/usage` engine | `M3`, `M4` | `USG-1`..`USG-8`, `LIM-1`, `REL-2`, `REL-3`, `SEC-18` |
 | `big-bang-phases-5.md` | Opt-in content traceability mode and read-only session chat preview | `M3`, `M5` | `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` |
-| `big-bang-phases-6.md` | Dual-workspace HTMX web UI and control plane APIs | `M5` | `UI-1`..`UI-4`, `USR-2`..`USR-4`, `SEC-5`, `SEC-9` |
+| `big-bang-phases-6.md` | Dual-workspace HTMX web UI and control plane APIs | `M5` | `UI-1`..`UI-4`, `USR-1`..`USR-5`, `SEC-5`, `SEC-9` |
 | `big-bang-phases-7.md` | System hardening, fuzzing, load verification, live harness E2E, and v1.0.0 release | `M6` | `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `OBS-1`, `PRIV-1`, `SEC-11` |
 
 ## Epic 1: Foundation, storage engine, cryptography, and multi-role auth
@@ -123,10 +124,10 @@ This sub-phase implements master-key derivation (`HKDF-SHA256`), AEAD encryption
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 8.2`, `Section 9.1`, `Section 9.2`; Requirements `PRV-5`, `SEC-1`, `SEC-2`, `SEC-3`, `SEC-14`, `SEC-19` |
+| SRDD references | `Section 5.5`, `Section 8.2`, `Section 9.1`, `Section 9.2`; Requirements `PRV-5`, `SEC-1`, `SEC-2`, `SEC-3`, `SEC-14` (and HKDF subkey prerequisite for `SEC-19`) |
 | Crates touched | `crates/store::crypto`, `crates/store::migrations`, `crates/store::pool` |
 | TDD step (`Red -> Green`) | 1. Write unit tests (`store::crypto::tests`, `#[doc = "Spec: SEC-1, SEC-2, PRV-5"]`) verifying that: (a) missing or `< 32-byte` `LLMROLLER_MASTER_KEY` returns `StartupError::InvalidMasterKey`, (b) sealing the same secret twice yields distinct ciphertexts (random 24-byte nonce), (c) swapping ciphertext blobs between two `upstream_key.id` rows fails AEAD authentication (`AAD` mismatch), and (d) `rotate_master_key` re-seals all rows under a new `master_key_id`. 2. Write SQLite WAL migration tests verifying all 20 tables and foreign-key constraints. |
-| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 and XChaCha20-Poly1305 sealer with AAD binding [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add 20-table SQLite WAL migration and connection pool [Spec: REL-2, SEC-17]` |
+| Atomic commits | 1. `sec(store/1.3): implement HKDF-SHA256 domain-separated subkeys, XChaCha20-Poly1305 sealer, and rotate-master-key CLI [Spec: SEC-1, SEC-2, PRV-5]` 2. `feat(store/1.3): add 20-table SQLite WAL migration and connection pool [Spec: REL-2, SEC-17]` |
 | Risks and resolutions | **Risk:** `SQLITE_BUSY` errors under concurrent read and write load. **Resolution:** Configure `SqliteConnectOptions` with `journal_mode(Wal)`, `synchronous(Normal)`, `busy_timeout(5s)`, an 8-connection read-only pool, and a single serialized writer connection (`SRDD Section 9.2`). |
 
 ### 1.4 Sub-phase 1.4: Atomic first-admin `/setup` and `Argon2id` + `TOTP` authentication
@@ -141,7 +142,7 @@ This sub-phase implements the one-time setup token, serializable first-admin cre
 | Atomic commits | 1. `feat(store/1.4): implement user repository with Argon2id, TOTP, and last-admin guard [Spec: AUTH-4, AUTH-5, AUTH-6, AUTH-9, USR-5, SEC-4]` 2. `feat(admin/1.4): implement atomic first-admin setup, session cookies, and login rate limiter [Spec: AUTH-1, AUTH-2, AUTH-3, AUTH-7, AUTH-8, SEC-5, SEC-12]` |
 | Risks and resolutions | **Risk:** `Argon2id` (`19 MiB` memory per hash) can exhaust RAM if 100 concurrent login requests run at once. **Resolution:** Bound concurrent `Argon2id` verifications with a `tokio::sync::Semaphore` (4 permits) and apply the per-IP rate limiter (`SEC-12`) before hashing. |
 
-### 1.5 Sub-phase 1.5:Tamper-evident hash-chained `audit_log` and `ArcSwap<ConfigSnapshot>`
+### 1.5 Sub-phase 1.5: Tamper-evident hash-chained `audit_log` and `ArcSwap<ConfigSnapshot>`
 
 This sub-phase implements the cryptographic hash chain on `audit_log` (`AUD-1`, `SEC-13`) and the lock-free `ArcSwap<ConfigSnapshot>` loader (`REL-4`).
 
@@ -152,6 +153,20 @@ This sub-phase implements the cryptographic hash chain on `audit_log` (`AUD-1`, 
 | TDD step (`Red -> Green`) | Write unit and integration tests (`store::audit::tests::hash_chain_verification`, `#[doc = "Spec: AUD-1, SEC-13"]`) that insert 10 audit rows, verify `verify_audit_chain()` returns `Ok(())`, mutate one character in row 4 via raw SQL, and assert `verify_audit_chain()` detects the exact tampered row ID. Write a snapshot test (`#[doc = "Spec: REL-4"]`) proving that mutating a user or key swaps `ArcSwap<ConfigSnapshot>` within 10 ms. |
 | Atomic commits | 1. `sec(store/1.5): implement SHA-256 hash-chained audit_log and verifier CLI [Spec: AUD-1, SEC-13]` 2. `feat(core/1.5): implement lock-free ArcSwap<ConfigSnapshot> reload pipeline [Spec: REL-4]` |
 | Risks and resolutions | **Risk:** Concurrent admin actions race on `prev_hash` when appending to `audit_log`. **Resolution:** Route all `audit_log` inserts through the serialized SQLite writer transaction so `prev_hash` is read and written atomically. |
+
+#### 1.5.1 Incremental `ConfigSnapshot` evolution across Epics 1 through 5
+
+Sub-Phase 1.5 introduces `ArcSwap<ConfigSnapshot>` while Epics 1 through 5 populate its domain tables. Engineers extend `ConfigSnapshot` additively at each sub-phase boundary without breaking earlier tests.
+
+| Sub-phase | New domain slices added to `ConfigSnapshot` | Triggering control-plane mutations that call `reload_snapshot()` |
+| --- | --- | --- |
+| `1.5` | `users: HashMap<UserId, UserRecord>`, `settings: RuntimeSettings` | User creation, role/budget update, disable/delete, settings update |
+| `2.1` | `providers: HashMap<ProviderId, ProviderRecord>`, `upstream_keys: HashMap<UpstreamKeyId, UpstreamKeyRecord>` | Provider or upstream key CRUD, enable/disable (`PRV-8`) |
+| `2.2` | `client_keys_by_hash: HashMap<[u8; 32], ClientKeyRecord>` | Client key creation, rotation, revocation (`CLK-4`), CIDR/RPM edit |
+| `3.1` | `models: HashMap<CanonicalModelId, ModelRecord>`, `aliases: HashMap<String, CanonicalModelId>`, `routes: HashMap<CanonicalModelId, Vec<RouteRecord>>` | `/models` discovery refresh, force-expose toggle, model merge, alias CRUD |
+| `3.2` | `shares_by_grantee: HashMap<UserId, Vec<ShareGrant>>`, `user_route_prefs: HashMap<(UserId, UpstreamKeyId, CanonicalModelId), RoutePref>` | Share grant creation, cap edit, or revocation (`SHR-5`), personal route priority override |
+| `4.2` & `4.4` | `prices: HashMap<(ProviderKind, String), PriceEntry>`, `budget_windows: HashMap<UpstreamKeyId, Vec<BudgetWindowSpec>>` | Price book edit or `models.dev` sync, budget window rule update |
+| `5.1` | `traceability: TraceabilityConfig` | `PUT /admin/api/settings/traceability` (`TRC-1`) |
 
 ## Epic 2: Transparent wire proxy, protocol normalizer, and provider adapters
 
@@ -215,11 +230,7 @@ This sub-phase implements the zero-buffering chunk forwarder (`PERF-2`, `API-6`)
 | Crates touched | `crates/proxy::forward`, `crates/proto::sse_frame` |
 | TDD step (`Red -> Green`) | Write integration tests (`tests/integration_wire_transparency.rs`, `#[doc = "Spec: API-5, API-6, API-7, PERF-2, TRN-3"]`) using a local stub server that emits 5 SSE chunks spaced 50 ms apart: (1) assert each chunk arrives at the client within 1 ms of emission (`PERF-2`), (2) assert that an injected `include_usage` chunk (`"choices":[]`) is captured by the tap and omitted from the client stream when the client did not ask for it (`API-5`), and (3) drop the client TCP connection after chunk 2 and assert the stub server observes socket closure within 100 ms (`API-7`). |
 | Atomic commits | 1. `feat(proxy/2.5): implement unbuffered SSE stream forwarder and injected usage chunk filter [Spec: API-5, API-6, PERF-2, TRN-3]` 2. `feat(proxy/2.5): wire client disconnect drop guard to abort upstream request within 1s [Spec: API-7]` |
-| Risks and resolutions | **Risk:** An SSE frame (`data: ...
-
-`) splits across two TCP `Bytes` chunks right in the middle of the final usage event. **Resolution:** For standard pass-through chunks (`strip_injected_usage_chunk == false`), forward raw `Bytes` immediately without waiting for `
-
-` while feeding a line-reassembling ring buffer inside the asynchronous `SseUsageTap`. When `strip_injected_usage_chunk == true`, hold only an incomplete trailing line at the very end of the stream (after `finish_reason` has already been flushed). |
+| Risks and resolutions | **Risk:** An SSE frame (`data: ...\n\n`) splits across two TCP `Bytes` chunks right in the middle of the final usage event or mid-UTF-8 codepoint. **Resolution:** Follow the two-state machine in `SRDD Section 12.4.1`: when `strip_injected_usage_chunk == false`, forward raw `Bytes` immediately without waiting for `\n\n` while feeding the 64 KiB line-reassembling ring buffer (with 1-to-3 byte UTF-8 carryover) inside `SseUsageTap`. When `strip_injected_usage_chunk == true`, enter `PostFinishReasonHoldback` only after `finish_reason` has already been flushed to the client. |
 
 ### 2.6 Sub-phase 2.6: Built-in `ProviderAdapter` implementations and preset TOML files
 
@@ -229,7 +240,7 @@ This sub-phase implements the `ProviderAdapter` trait (`MNT-2`) and ships the fo
 | --- | --- |
 | SRDD references | `Section 2.3`, `Section 6.3`, `Section 7.4`, `Section 11.2`; Requirements `PRV-2`, `PRV-3`, `PRV-6`, `API-1`, `API-8`, `MNT-2` |
 | Crates touched | `crates/proto::adapters`, `presets/*.toml` |
-| TDD step (`Red -> Green`) | Write adapter contract tests (`proto::adapters::tests`, `#[doc = "Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2"]`) verifying URL construction, auth header injection (`Bearer` vs. `x-api-key`), outbound session hint injection (`x-opencode-session`, `x-session-id`, `x-session-affinity`, `prompt_cache_key`), and upstream error classification (401/403 auth vs. 403 `upgrade_required` on Command Code vs. 429 rate limit vs. 400 client error). |
+| TDD step (`Red -> Green`) | Write adapter contract tests (`proto::adapters::tests`, `#[doc = "Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2"]`) verifying URL construction (including `POST /v1/messages/count_tokens`), auth header injection (`Bearer` vs. `x-api-key`), outbound session hint injection (`x-opencode-session`, `x-session-id`, `x-session-affinity`, `prompt_cache_key`), Stage-1 key testing against `/models` (`PRV-6`, with `/usage` probe added in Sub-Phase 4.5), and upstream error classification (401/403 auth vs. 403 `upgrade_required` on Command Code vs. 429 rate limit vs. 400 client error). |
 | Atomic commits | 1. `feat(proto/2.6): implement ProviderAdapter trait and built-in presets for OpenCode Go, Command Code, Open Design AMR, and OpenRouter [Spec: PRV-2, PRV-3, PRV-6, API-8, MNT-2]` |
 | Risks and resolutions | **Risk:** OpenCode Go changes which models sit behind `/chat/completions` vs. `/messages` (`SRDD Section 2.3`). **Resolution:** Store supported protocols per route in `model_routes.protocols` discovered from `/models` or configured in the preset, never hard-coded in Rust branches. |
 
@@ -243,10 +254,10 @@ This sub-phase implements `/models` polling (`MDL-1`), canonical normalization (
 
 | Attribute | Details |
 | --- | --- |
-| SRDD references | `Section 6.6`, `Section 19.1 (ADR-7)`; Requirements `MDL-1`..`MDL-7` |
+| SRDD references | `Section 6.6`, `Section 10.6`, `Section 14.2.2`, `Section 19.1 (ADR-7)`; Requirements `MDL-1`..`MDL-7` |
 | Crates touched | `crates/core::catalog`, `crates/proto::discovery`, `crates/store::models`, `crates/proxy::models` |
 | TDD step (`Red -> Green`) | Write unit and integration tests (`core::catalog::tests::normalization_and_intersection`, `#[doc = "Spec: MDL-1, MDL-2, MDL-3, MDL-4, MDL-5, MDL-6, MDL-7"]`) asserting: (1) `deepseek/deepseek-v4.1-flash` and `deepseek-v4.1-flash` normalize to `deepseek-v4.1-flash`, while `deepseek-v4-flash` stays a distinct canonical model (`ADR-7`), (2) a model with `exposed = NULL` is exposed in the global pool if and only if every enabled global provider with at least one enabled key serves it (`MDL-3`), (3) a standard user with a personal key serving `claude-sonnet-4-6` sees that model on `GET /v1/models` even if global providers lack it (`MDL-5`), and (4) `GET /v1/models` with `anthropic-version` returns the Anthropic list schema (`MDL-7`). |
-| Atomic commits | 1. `feat(core/3.1): implement canonical model normalization, alias table, and global/personal exposure rules [Spec: MDL-2, MDL-3, MDL-4, MDL-5, MDL-6]` 2. `feat(server/3.1): implement scheduled /models discovery job and GET /v1/models handler [Spec: MDL-1, MDL-7]` |
+| Atomic commits | 1. `feat(core/3.1): implement 6-step canonical model normalization, model merge, alias CRUD, and exposure rules [Spec: MDL-2, MDL-3, MDL-4, MDL-5, MDL-6]` 2. `feat(server/3.1): implement scheduled /models discovery job and GET /v1/models handler [Spec: MDL-1, MDL-7]` |
 | Risks and resolutions | **Risk:** One provider's `/models` endpoint is temporarily unreachable during startup or periodic refresh, which could shrink the global intersection set if treated as an empty catalog. **Resolution:** Keep the last successful `model_routes` rows for a key when a `/models` refresh fails with a network or 5xx error, only removing routes when `/models` returns HTTP 200 without that model or when the key is disabled. |
 
 ### 3.2 Sub-phase 3.2: Personal provider and key sharing (`provider_shares`)
@@ -306,7 +317,7 @@ This sub-phase implements `moka` single-flight provisional pinning (`RTE-7`), fi
 | SRDD references | `Section 6.7`, `Section 10.4`, `Section 10.5`; Requirements `RTE-2`, `RTE-7`..`RTE-12`, `API-8` |
 | Crates touched | `crates/core::pins`, `crates/core::router`, `crates/store::pins`, `crates/proxy::failover` |
 | TDD step (`Red -> Green`) | Write the 100-way concurrency race test (`tests/integration_routing_and_failover.rs`, `#[doc = "Spec: RTE-2, RTE-7, RTE-8, RTE-9, RTE-10, RTE-11, RTE-12"]`): (1) 100 parallel first-turn requests for one new session ID select the exact same `upstream_key_id`, (2) upstream 503/429/401 before the first byte retries up to 2 alternative candidates, updates key health (`cooling_down`, `exhausted`, `invalid`), and confirms the pin on the candidate that yields the first byte, (3) `429` with `Retry-After: 1` sleeps 1 s on `FakeClock` and retries the **same** key once to preserve cache, and (4) stream failure after 1 byte never retries. |
-| Atomic commits | 1. `feat(core/3.6): implement single-flight provisional and confirmed pin cache and response_links [Spec: RTE-2, RTE-7, RTE-8, RTE-10, RTE-11, RTE-12]` 2. `feat(proxy/3.6): implement pre-first-byte failover loop and key health state transitions [Spec: RTE-9, API-8]` |
+| Atomic commits | 1. `feat(core/3.6): implement single-flight pin cache, routing_scope pin re-validation, and response_links [Spec: RTE-2, RTE-7, RTE-8, RTE-10, RTE-11, RTE-12]` 2. `feat(proxy/3.6): implement pre-first-byte failover, key/route health transitions, provider circuit breaker, and GET/DELETE/compact /v1/responses/{id} [Spec: RTE-9, RTE-12, API-8, REL-5]` |
 | Risks and resolutions | **Risk:** If the winning task inside `moka::try_get_with` panics or is cancelled by client disconnect before upstream responds, waiting tasks could hang. **Resolution:** Keep `try_get_with` strictly synchronous in `crates/core` (inserting the `provisional` pin in `< 10 µs`), and if the first upstream call fails before the first byte, atomically CAS-update the provisional pin to the failover candidate. |
 
 ## Epic 4: Usage pipeline, price book, budget windows, and source `/usage` engine
@@ -334,7 +345,7 @@ This sub-phase implements 128-bit integer micro-USD cost calculation (`SRDD Sect
 | SRDD references | `Section 2.3`, `Section 6.9`, `Section 13.1`; Requirements `USG-3` |
 | Crates touched | `crates/core::pricing`, `presets/*.toml` |
 | TDD step (`Red -> Green`) | Write property-based and table-driven tests (`core::pricing::proptests`, `#[doc = "Spec: USG-3"]`) verifying: (1) provider-reported `usage.cost` wins (`cost_source = 'provider'`), (2) price-book math uses `i128` ceiling division with zero overflow up to `10^9` tokens, (3) prompts `> 200,000` tokens select the high-context tier rate, and (4) DeepSeek calls at `02:30 UTC` on Tuesday apply the 2x peak multiplier while `02:30 UTC` on Saturday uses the off-peak rate. |
-| Atomic commits | 1. `feat(core/4.2): implement i128 micro-USD pricing engine with context tiers and UTC schedules [Spec: USG-3]` |
+| Atomic commits | 1. `feat(core/4.2): implement i128 micro-USD pricing engine with context tiers and UTC schedules [Spec: USG-3]` 2. `feat(admin/4.2): implement opt-in models.dev price catalog importer and POST /admin/api/prices/sync [Spec: USG-3, PRIV-1]` |
 | Risks and resolutions | **Risk:** A newly discovered model has no entry in `prices`. **Resolution:** Record `cost_micro_usd = NULL` and `cost_source = 'unpriced'` (never `$0`), surface an "Unpriced models" badge on the dashboard, and support one-click baseline import from `models.dev`. |
 
 ### 4.3 Sub-phase 4.3: Batching SQLite usage writer, bounded overflow queue, and hourly rollups
@@ -346,7 +357,7 @@ This sub-phase implements the non-blocking `mpsc` usage queue (10,000 slots) and
 | SRDD references | `Section 7.2`, `Section 9.1`, `Section 9.2`; Requirements `USG-1`, `REL-2`, `REL-3` |
 | Crates touched | `crates/store::usage_writer`, `crates/store::rollups` |
 | TDD step (`Red -> Green`) | Write fault-injection and crash tests (`tests/integration_usage_writer.rs`, `#[doc = "Spec: USG-1, REL-2, REL-3"]`): (1) pause the SQLite writer task and send 10,500 usage events; assert that inference requests complete in `< 1 ms`, the oldest 500 events drop cleanly, and `llmroller_usage_dropped_total == 500` (`REL-3`), and (2) verify that every committed batch updates `usage_rollups_hourly` in the same SQLite transaction. |
-| Atomic commits | 1. `feat(store/4.3): implement batching SQLite usage writer, hourly rollups, and non-blocking overflow ring [Spec: USG-1, REL-2, REL-3]` |
+| Atomic commits | 1. `feat(store/4.3): implement ordered batching SQLite usage writer, share-aware hourly rollups, and non-blocking overflow ring [Spec: USG-1, SHR-6, REL-2, REL-3]` |
 | Risks and resolutions | **Risk:** On `SIGTERM`, buffered events in the `mpsc` channel could be lost if the process exits immediately. **Resolution:** During the `SIGTERM` drain phase (`REL-1`), close the inbound listener first, wait for active streams to finish, and flush all remaining items in the usage channel before closing the SQLite pool. |
 
 ### 4.4 Sub-phase 4.4: Rolling (`5h`, `7d`) and anchored (`1mo`) budget window ring counters
@@ -358,7 +369,7 @@ This sub-phase implements the in-memory rolling ring counters and anchored month
 | SRDD references | `Section 6.9`, `Section 13.2`; Requirements `LIM-1`, `RTE-3` |
 | Crates touched | `crates/core::windows`, `crates/store::budgets` |
 | TDD step (`Red -> Green`) | Write deterministic clock-driven tests (`core::windows::tests`, `#[doc = "Spec: LIM-1, RTE-3"]`) using `FakeClock`: advance time minute-by-minute across a 5-hour rolling window and a 30-day anchored window, asserting that buckets expire at the exact millisecond boundary, that routes are excluded at `98%` spend (`reserve_pct = 2`), and that restarting the store reconstructs identical bucket sums from SQLite. |
-| Atomic commits | 1. `feat(core/4.4): implement rolling bucket ring counters, anchored windows, and admission reserve checks [Spec: LIM-1, RTE-3]` |
+| Atomic commits | 1. `feat(core/4.4): implement rolling bucket ring counters, anchored windows, RAII InFlightBudgetGuard, and admission reserve checks [Spec: LIM-1, RTE-3]` |
 | Risks and resolutions | **Risk:** High concurrency allows several new requests to pass admission simultaneously when a window is at `97.9%`. **Resolution:** Increment an optimistic in-flight reservation counter (`reserved_in_flight_micro_usd`, default `$0.05` per active stream) while the stream is open and replace it with actual cost when the stream finishes. |
 
 ### 4.5 Sub-phase 4.5: Source provider `/usage` poller, auto-reconciliation, and `/v1/usage` pass-through
@@ -370,7 +381,7 @@ This sub-phase implements upstream `/usage` polling and automatic `budget_adjust
 | SRDD references | `Section 2.4`, `Section 6.9`, `Section 8.2`, `Section 13.3`, `Section 13.4`; Requirements `USG-4`..`USG-8`, `SEC-18` |
 | Crates touched | `crates/proto::usage_poller`, `crates/store::usage_snapshots`, `crates/proxy::usage_passthrough`, `fixtures/usage/*` |
 | TDD step (`Red -> Green`) | Write golden parser and integration tests (`tests/integration_usage_and_passthrough.rs`, `#[doc = "Spec: USG-4, USG-5, USG-6, USG-7, USG-8, SEC-18"]`): (1) replay `fixtures/usage/opencode_go.json`, `command_code_credits.json`, and `openrouter_key.json`, (2) assert that when OpenCode Go reports `percent: 25` and `resetsAt` while local spend is `10%`, LLMRoller inserts an automatic `upstream_usage_sync` adjustment so the window gauge reads `25%` (`USG-6`), (3) assert `GET /v1/usage` returns raw `source_provider_usage` for a user's own personal key, and (4) assert `GET /v1/usage` on a shared or global key strips `email`, `whoami`, `user_id`, and `workspace_id` (`USG-8`, `SEC-18`). |
-| Atomic commits | 1. `feat(proto/4.5): implement source provider /usage parsers and PII sanitizer [Spec: USG-4, USG-5, SEC-18]` 2. `feat(core/4.5): implement automatic window reset and spend reconciliation from /usage snapshots [Spec: USG-6]` 3. `feat(proxy/4.5): implement GET /v1/usage, GET /v1/key, and GET /v1/usage/raw pass-through endpoints [Spec: USG-7, USG-8]` |
+| Atomic commits | 1. `feat(proto/4.5): implement source provider /usage parsers and strict allow-list PII sanitizer [Spec: PRV-6, USG-4, USG-5, SEC-18]` 2. `feat(core/4.5): implement automatic window reset and spend reconciliation from /usage snapshots [Spec: USG-6]` 3. `feat(proxy/4.5): implement GET /v1/usage, GET /v1/key, and GET /v1/usage/raw pass-through endpoints [Spec: USG-7, USG-8]` |
 | Risks and resolutions | **Risk:** Command Code's `/alpha/billing/credits` endpoint changes a field name or Open Design AMR's `/v1/usage` returns 404 ([open-design#8674](https://github.com/nexu-io/open-design/issues/8674)). **Resolution:** Keep `raw_json` intact in `upstream_usage_snapshots`, treat missing normalized fields as `None` (falling back cleanly to local window counters without failing key health), and surface a non-fatal schema notice in the admin UI (`R2`). |
 
 ## Epic 5: Opt-in content traceability mode and read-only session chat preview
@@ -411,7 +422,7 @@ This sub-phase implements background `zstd` compression and `XChaCha20-Poly1305`
 | Crates touched | `crates/store::traces`, `crates/server::jobs` |
 | TDD step (`Red -> Green`) | Write cryptographic and storage tests (`store::traces::tests`, `#[doc = "Spec: TRC-4, TRC-7, SEC-19"]`) verifying: (1) raw SQLite inspection of `trace_records.payload_enc` contains zero plaintext substrings of the prompt or completion, (2) tampering with `owner_user_id` or `session_hash` on a `trace_records` row causes AEAD decryption to fail (`SEC-19`), and (3) `DELETE /admin/api/sessions/{session_hash}/trace` deletes all `trace_records` for that session while leaving `usage_events` token and cost rows intact (`TRC-7`). |
 | Atomic commits | 1. `sec(store/5.3): implement zstd compression and XChaCha20-Poly1305 encryption for trace_records [Spec: TRC-4, PERF-5, SEC-19]` 2. `feat(store/5.3): implement trace retention sweeper and selective session trace purge [Spec: TRC-7]` |
-| Risks and resolutions | **Risk:** `zstd` compression on large prompts competes with Tokio HTTP worker threads. **Resolution:** Run `zstd::encode_all` (level 3) and `XChaCha20-Poly1305` sealing inside the background trace worker via `tokio::task::spawn_blocking` (bounded semaphore of 2 threads), completely off the async SSE forwarding loop (`PERF-5`). |
+| Risks and resolutions | **Risk 1:** `zstd` compression on large prompts competes with Tokio HTTP worker threads. **Resolution 1:** Run `zstd::encode_all` (level 3) and `XChaCha20-Poly1305` sealing on the background `spawn_blocking` pool (2 threads max, `PERF-5`). **Risk 2:** `trace_records.usage_event_id` references `usage_events(id)` under `PRAGMA foreign_keys = ON`, so inserting a trace before its parent usage event commits would fail with `SQLITE_CONSTRAINT_FOREIGNKEY`. **Resolution 2:** Send the sealed `TraceRecord` into the single SQLite batch writer (`SRDD Section 9.2`), which commits `(1) usage_events -> (2) usage_rollups_hourly -> (3) trace_records` in one atomic transaction. |
 
 ### 5.4 Sub-phase 5.4: Multi-turn session chat timeline reconstructor and privacy-isolated preview API
 

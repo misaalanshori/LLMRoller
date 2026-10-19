@@ -82,5 +82,5 @@ The table below maps the seven implementation epics (`big-bang-phases-1.md` thro
 | `big-bang-phases-3.md` | Model catalog, personal sharing, smooth WRR routing, and session pinning | `M2` | `SHR-1`..`SHR-6`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `SEC-16` |
 | `big-bang-phases-4.md` | Usage pipeline, price book, budget windows, and source `/usage` engine | `M3`, `M4` | `USG-1`..`USG-8`, `LIM-1`, `REL-2`, `REL-3`, `SEC-18` |
 | `big-bang-phases-5.md` | Opt-in content traceability mode and read-only session chat preview | `M3`, `M5` | `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` |
-| `big-bang-phases-6.md` | Dual-workspace HTMX web UI and control plane APIs | `M5` | `UI-1`..`UI-4`, `USR-2`..`USR-4`, `SEC-5`, `SEC-9` |
+| `big-bang-phases-6.md` | Dual-workspace HTMX web UI and control plane APIs | `M5` | `UI-1`..`UI-4`, `USR-1`..`USR-5`, `SEC-5`, `SEC-9` |
 | `big-bang-phases-7.md` | System hardening, fuzzing, load verification, live harness E2E, and v1.0.0 release | `M6` | `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `OBS-1`, `PRIV-1`, `SEC-11` |
