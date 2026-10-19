@@ -1,0 +1,5 @@
+# Text is LF everywhere, always: the request-assembly snapshot and any
+# other committed-bytes comparison reads what this checkout wrote, and
+# a Windows core.autocrlf default would hand it CRLF for the same file
+# every other platform reads as LF.
+* text=auto eol=lf
