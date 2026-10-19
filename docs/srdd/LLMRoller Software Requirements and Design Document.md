@@ -1,7 +1,6 @@
 # LLMRoller: Software Requirements and Design Document
 
-Version 1.0 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, multi-role RBAC, and TDD specification.
-
+Version 1.0 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, and TDD specification.
 
 ## 0. Introduction
 
@@ -20,7 +19,8 @@ Sections 1 through 8 define what the system must do, who uses it, and how securi
 | Global providers managed by admins and personal providers managed and shared by any user | Commercial billing, customer invoicing, or public resale to external third parties |
 | Admin and standard user roles with full role-based access control | Multi-node clustering and distributed consensus across hosts |
 | Session pinning, smooth weighted round-robin, and per-model key priority overrides | Automatic cross-protocol request translation in the base release |
-| Local cost accounting plus source provider `/usage` polling, reconciliation, and pass-through | Persistent storage of prompt or completion text (disabled by default) |
+| Local cost accounting plus source provider `/usage` polling, reconciliation, and pass-through | Unconditional or silent prompt logging (content recording is off by default and strictly opt-in) |
+| Admin opt-in content traceability mode with encrypted turn storage and read-only session chat preview | Automatic cross-tenant prompt inspection on shared personal keys |
 | Single static Rust binary, SQLite in WAL mode, and an embedded HTMX web interface | External single-page JavaScript build pipelines or CDN asset dependencies |
 
 ### 0.2 Requirement priorities and conventions
@@ -33,7 +33,7 @@ Every requirement in this specification carries a unique identifier and a releas
 | P1 | should | Expected in version 1.0 unless a documented engineering trade-off defers it to a point release. |
 | P2 | may | Planned for a future release. Schema hooks and trait boundaries accommodate it now. |
 
-Requirement identifiers use a short prefix for each subsystem. Functional prefixes include `AUTH`, `USR`, `PRV`, `SHR`, `CLK`, `MDL`, `RTE`, `API`, `USG`, `LIM`, `UI`, and `AUD`. Non-functional requirements use `PERF`, `REL`, `TRN`, `COM`, `POR`, `MNT`, `OBS`, and `PRIV`, while security requirements use `SEC`.
+Requirement identifiers use a short prefix for each subsystem. Functional prefixes include `AUTH`, `USR`, `PRV`, `SHR`, `CLK`, `MDL`, `RTE`, `API`, `USG`, `LIM`, `TRC`, `UI`, and `AUD`. Non-functional requirements use `PERF`, `REL`, `TRN`, `COM`, `POR`, `MNT`, `OBS`, and `PRIV`, while security requirements use `SEC`.
 
 ### 0.3 Definitions and glossary
 
@@ -56,6 +56,8 @@ The terms in the table below have one fixed meaning throughout all twenty-one se
 | Protocol | One of three wire formats: `chat` (OpenAI Chat Completions), `responses` (OpenAI Responses), or `messages` (Anthropic Messages). |
 | Affinity hint | The session identifier field or header that LLMRoller writes into an outbound request according to the target provider's session profile. |
 | Upstream usage snapshot | The quota, credit, and reset-time record retrieved from a source provider's native usage or key endpoint. |
+| Content traceability mode | An admin-controlled opt-in setting that records compressed, encrypted request and response contents (prompts, reasoning, tool calls, and completions) per turn. |
+| Session chat preview | A read-only dashboard view that reconstructs and renders the multi-turn conversation timeline across all traced requests sharing a pinned `session_hash`. |
 
 ### 0.4 Document map
 
@@ -103,7 +105,7 @@ When a new session starts, LLMRoller selects an eligible upstream key using smoo
 
 ### 1.3 Core architectural pillars
 
-The system design rests on eight engineering decisions that govern every module in the workspace.
+The system design rests on nine engineering decisions that govern every module in the workspace.
 
 | Pillar | Design decision |
 | --- | --- |
@@ -113,6 +115,7 @@ The system design rests on eight engineering decisions that govern every module 
 | Dual provider scopes | Support both admin-managed `global` providers (usable by all authorized users) and user-managed `personal` providers (usable by the owner and explicitly shared grantees). |
 | First-class standard users | Ship full role-based access control in version 1.0 for both `admin` and `user` accounts, giving standard users self-service personal providers, sharing controls, client keys, and scoped analytics. |
 | Hybrid usage and `/usage` pass-through | Compute request cost locally in integer micro-USD while polling and reconciling source provider `/usage` endpoints where available, and expose upstream usage via pass-through APIs. |
+| Opt-in content traceability | Record prompts, reasoning, tool calls, and responses when enabled by an admin, and render a read-only session chat preview in the dashboard. |
 | Zero-dependency operations | Ship one static Rust binary with an embedded HTMX web interface and one SQLite database in WAL mode. |
 | Strict TDD and mutation testing | Develop all controlled logic under Red-Green-Refactor discipline with full requirement-to-test traceability and automated mutation testing via [cargo-mutants](https://mutants.rs/). |
 
@@ -188,7 +191,7 @@ Each inference protocol places token usage in a different event or JSON object d
 
 ### 2.6 Summary of findings that drive the architecture
 
-Ten empirical findings shape the requirements and design in the remaining sections.
+Eleven empirical findings shape the requirements and design in the remaining sections.
 
 | Finding ID | Topic | Architectural implication |
 | --- | --- | --- |
@@ -202,6 +205,7 @@ Ten empirical findings shape the requirements and design in the remaining sectio
 | F8 | Stream truncation detection | Upstreams occasionally close streams early without a terminal event ([command-code#785](https://github.com/CommandCodeAI/command-code/issues/785)). LLMRoller detects missing terminal events and marks usage rows `incomplete`. |
 | F9 | Multi-user key isolation | Teams share pooled global keys while individuals also bring personal subscriptions or share a personal key with a teammate. The router enforces strict ownership and share scopes. |
 | F10 | Supply-chain hardening | Gateways hold high-value credentials and are prime targets, as shown by the [March 2026 LiteLLM PyPI compromise](https://docs.litellm.ai/blog/security-update-march-2026). LLMRoller ships as a minimal, audited Rust binary. |
+| F11 | Session-pinned chat reconstruction | Because agents send a stable session ID per conversation, opt-in recording of request and SSE response turns lets the dashboard render a read-only chat preview per session. |
 
 ## 3. Goals, non-goals, and assumptions
 
@@ -209,7 +213,7 @@ This section establishes the operational goals, explicit version 1.0 boundaries,
 
 ### 3.1 Goals
 
-LLMRoller pursues eight measurable engineering goals in version 1.0.
+LLMRoller pursues nine measurable engineering goals in version 1.0.
 
 | ID | Goal | Success measure |
 | --- | --- | --- |
@@ -218,9 +222,10 @@ LLMRoller pursues eight measurable engineering goals in version 1.0.
 | G3 | Support both admin-managed global providers and user-managed personal providers with granular user-to-user sharing. | Standard users can add personal providers, share them with specific peers, and route traffic without admin intervention. |
 | G4 | Stay transparent to coding agents and upstream providers. | Streaming chunks incur under 1 ms of forwarding delay, and request bodies keep their exact key and message order. |
 | G5 | Provide accurate cost, token, and quota visibility by combining local price-book math with source provider `/usage` endpoints. | Local window counters reconcile automatically with upstream `/usage` snapshots, and clients can query `/v1/usage` directly. |
-| G6 | Protect upstream secrets, client keys, and user privacy at rest, in memory, and in logs. | Zero secret leaks in canary log tests, XChaCha20-Poly1305 encryption at rest, and zero prompt storage by default. |
+| G6 | Protect upstream secrets, client keys, and user privacy at rest, in memory, and in logs. | Zero secret leaks in canary log tests, XChaCha20-Poly1305 encryption at rest, and zero prompt storage unless content traceability is enabled. |
 | G7 | Operate as a single, low-overhead static Rust binary with an embedded web interface. | Idle memory stays under 50 MB, and p99 proxy overhead before first upstream byte stays under 5 ms at 500 req/s. |
 | G8 | Enforce strict Test-Driven Development and mutation testing across all controlled logic. | Every requirement maps to automated tests, and `cargo-mutants` reports zero surviving mutants in core routing and protocol crates. |
+| G9 | Support admin opt-in content traceability and a read-only session chat preview. | When enabled by an admin, traced sessions render prompts, reasoning, tool calls, and responses in chronological order with zero XSS risk. |
 
 ### 3.2 Non-goals for version 1.0
 
@@ -233,7 +238,7 @@ Eight capabilities are intentionally excluded from version 1.0 to keep the attac
 | NG3 | Automatic cross-protocol translation in Milestone 1 | Translating between `chat`, `responses`, and `messages` can drop reasoning blocks ([open-design#8687](https://github.com/nexu-io/open-design/issues/8687)). Base routing matches native support; opt-in translation is deferred to a later milestone. |
 | NG4 | Multi-node active-active clustering | A single Rust process with SQLite WAL handles 500 req/s and 2,000 open streams, which exceeds single-team coding-agent load. |
 | NG5 | Payment processing, invoicing, or Stripe integration | Budget tracking exists to prevent quota exhaustion and monitor spend, not to bill external customers. |
-| NG6 | Persistent storage of prompts and completions | Storing conversation text creates a privacy and compliance liability. A temporary 15-minute debug capture is opt-in only. |
+| NG6 | Unconditional or silent prompt logging | Prompt and response recording is strictly off by default and activates only when an admin enables content traceability mode (`TRC-1`). |
 | NG7 | Consumer OAuth browser session scraping | Version 1.0 authenticates upstream using standard API keys only. |
 | NG8 | Non-inference media endpoints | Image, audio, and embedding endpoints do not use multi-turn prompt caching and are outside version 1.0 scope. |
 
@@ -282,6 +287,8 @@ The control plane enforces strict authorization checks on every HTTP handler and
 | Create, rotate, restrict, or revoke client keys (`llr_...`) | Yes (own keys and any user's keys) | Yes (own client keys only) | Uses key for bearer auth |
 | View usage dashboard, time series, and CSV or JSON exports | Yes (instance-wide and filtered by any user, key, provider, or model) | Yes (strictly scoped to own client keys and traffic served by own personal keys) | Via `GET /v1/usage` for own client key |
 | View, unpin, or move active session pins | Yes (all pins) | Yes (pins belonging to own client keys only) | Implicit via requests |
+| Enable, scope, or purge content traceability mode | Yes (instance-wide and scoped targets) | No (read-only visibility into whether traceability is active on own traffic) | No |
+| View read-only Session Chat Preview of recorded turns | Yes (all traced sessions, logged in `audit_log`) | Yes (traced sessions belonging to own client keys only; never sees grantee transcripts on shared keys) | No |
 | View audit log | Yes (all instance events) | Yes (events where actor or target belongs to the user) | No |
 
 ### 4.3 Provider ownership scopes: global and personal
@@ -337,7 +344,7 @@ When Grantee `B` routes a request through a personal key owned by Grantor `A`, t
 
 | Actor | Visibility and privacy boundaries |
 | --- | --- |
-| Grantor `A` (key owner) | Sees the total tokens and cost consumed on their personal upstream key, plus a breakdown showing how much Grantee `B` consumed against the share grant. Grantor `A` never sees Grantee `B`'s client key labels or session hashes. |
+| Grantor `A` (key owner) | Sees the total tokens and cost consumed on their personal upstream key, plus a breakdown showing how much Grantee `B` consumed against the share grant. Grantor `A` never sees Grantee `B`'s client key labels, session hashes, or recorded chat transcripts (`TRC-8`). |
 | Grantee `B` (share recipient) | Sees all requests made by `B`'s own client keys, including which requests routed through the shared key (`shared: <owner_username>/<key_label>`), along with `B`'s remaining monthly share allowance. Grantee `B` never sees Grantor `A`'s own usage or other grantees' usage on that key. |
 
 ## 5. System architecture
@@ -357,7 +364,7 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |  +----------------------- Data Plane Listener (:8080) -------------------+  |
 |  | Proxy Edge -> Normalizer -> Model & Scope Resolver -> Session Resolver|  |
 |  |     -> Router (Pin Lookup / Smooth WRR / Failover)                    |  |
-|  |     -> Provider Adapter -> Unbuffered Stream Forwarder & Usage Tap    |  |
+|  |     -> Provider Adapter -> Stream Forwarder, Usage & Trace Tap        |  |
 |  |     -> /v1/usage & /v1/key Pass-Through Handler                       |  |
 |  +-----------------------------------------------------------------------+  |
 |                     |                                     ^                 |
@@ -372,7 +379,7 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |                     |                                     ^                 |
 |                     v (async mpsc batch)                  | (reload)        |
 |  +----------------------- Storage & Background Jobs ---------------------+  |
-|  |  - SQLite (WAL mode): 19 tables, single batching writer task          |  |
+|  |  - SQLite (WAL mode): 20 tables, single batching writer task          |  |
 |  |  - Jobs: Model Discovery, Upstream /usage Poller, Price Sync,         |  |
 |  |          Hourly Rollups, Retention Sweeper                            |  |
 |  +-----------------------------------------------------------------------+  |
@@ -398,7 +405,7 @@ Each subsystem lives in a dedicated module or workspace crate with explicit trai
 | Proxy edge (`proxy`) | Authenticates client keys (`llr_...`), enforces body size and per-key rate limits, dispatches `/v1/*` inference and `/v1/usage` routes, and streams responses without buffering. | `axum`, `hyper-util`, `tower`, `reqwest` (`rustls`) |
 | Routing core (`core`) | Pure deterministic logic with zero I/O: resolves session IDs, filters candidate routes by ownership, share grants, protocol, health, and budgets, runs smooth weighted round-robin, and manages the pin state machine. | `arc-swap`, `moka`, `dashmap` |
 | Provider adapters (`proto`) | Implements `ProviderAdapter` per provider type: builds upstream URLs, headers, auth, and session hints, parses `/models` and source `/usage` responses, and classifies upstream HTTP errors. | `serde`, `serde_json`, `bytes` |
-| Usage tap and pipeline (`proto`, `store`) | Tees raw SSE chunks to a non-blocking parser, extracts normalized token counts and provider costs, and sends `UsageEvent` records over a bounded channel to the batching SQLite writer. | `tokio::sync::mpsc`, `async-compression`, `sqlx` |
+| Usage and trace tap (`proto`, `store`) | Tees raw SSE chunks to a non-blocking parser, extracts token counts and costs, and (when content traceability is on) reassembles prompts, reasoning, tool calls, and completions into compressed, encrypted `trace_records`. | `tokio::sync::mpsc`, `async-compression`, `zstd`, `sqlx` |
 | Catalog, health, and `/usage` service (`server`) | Runs background tasks for `/models` discovery, upstream `/usage` endpoint polling and budget reconciliation, key cooldown timers, and circuit breaker state transitions. | `tokio`, `time` |
 | Control plane (`admin`) | Serves the JSON APIs and server-rendered HTMX web interface for both `admin` and `user` roles, handles cookie sessions, Argon2id logins, TOTP, CSRF verification, and hash-chained audit logging. | `askama`, `rust-embed`, `argon2`, `chacha20poly1305` |
 
@@ -417,7 +424,7 @@ Every inference request on `/v1/chat/completions`, `/v1/responses`, or `/v1/mess
 | 7 | Build and send request | Build the outbound request via the provider adapter, inject the decrypted upstream key and session affinity hint, apply surgical body edits, and send upstream. |
 | 8 | Failover before first byte | If the upstream call fails before yielding the first body byte, update key health, delete or move the provisional pin, and retry on up to two other routes. |
 | 9 | Confirm pin and stream | When the first response byte arrives, promote the pin to `confirmed`, refresh its sliding TTL, and stream every chunk to the client while teeing the usage tap. |
-| 10 | Record usage and reconcile | Emit a `UsageEvent` to the batch writer, increment in-memory window counters, and trigger an async upstream `/usage` poll if spend crosses a warning threshold. |
+| 10 | Record usage, trace, and reconcile | Emit a `UsageEvent` (and an encrypted `TraceRecord` when content traceability is active) to the batch writer, update window counters, and trigger `/usage` polls when needed. |
 
 ### 5.4 Hot-path state and listener isolation
 
@@ -568,7 +575,22 @@ The usage and budget subsystem combines local token and cost accounting with liv
 | USG-8 | P0 | To protect multi-tenant privacy on `GET /v1/usage`, a standard user's client key must receive raw `source_provider_usage` payloads only for the user's own personal upstream keys; for shared personal keys and global keys, `GET /v1/usage` must return sanitized window availability (`status`, `used_percent`, `resets_at`) without exposing account-identifying fields (`whoami`, email, workspace ID, or billing details). |
 | LIM-1 | P0 | Admins (for global keys) and users (for own personal keys) must be able to configure rolling (`5h`, `7d`, custom hours or days) and anchored (`1mo`, billing cycle anchor) budget windows in micro-USD on each upstream key and route, with a configurable admission reserve (default 2%) and manual calibration adjustments. |
 
-### 6.10 Web UI and audit logging (UI & AUD)
+### 6.10 Content traceability mode and session chat preview (TRC)
+
+The content traceability subsystem lets an admin record full request and response contents. It also renders a read-only multi-turn chat preview per pinned session.
+
+| ID | Pri | Requirement specification |
+| --- | --- | --- |
+| TRC-1 | P0 | Content traceability mode must be disabled (`off`) by default. Only an `admin` can enable, scope (`all`, `users`, `client_keys`, or `models`), or disable content traceability mode (`PUT /admin/api/settings/traceability`), and every change must write an `audit_log` entry. |
+| TRC-2 | P0 | When content traceability mode is active for a request, LLMRoller must asynchronously capture the inbound request and outbound response contents, extracting: system instructions, input messages, tool definitions, model parameters, assistant reasoning or thinking blocks, assistant tool calls (`id`, `name`, `arguments`), tool results, final assistant output text, and error payloads. |
+| TRC-3 | P0 | For streaming SSE responses across `chat`, `responses`, and `messages`, the trace tap must reassemble chunked deltas (`delta.content`, `delta.reasoning_content`, `delta.tool_calls`, `response.output_text.delta`, `response.reasoning_summary_text.delta`, and `content_block_delta`) into a complete turn record without buffering or delaying the client stream (`PERF-2`). |
+| TRC-4 | P0 | Each `trace_records` row must link to `usage_events.id`, `request_id`, `session_hash`, `client_key_id`, `owner_user_id`, and `turn_index` (ordered by timestamp `ts` within `session_hash`) so all turns of a pinned session form a deterministic sequence. |
+| TRC-5 | P0 | The control plane must expose read-only session chat preview endpoints (`GET /admin/api/sessions/{session_hash}/chat` for admins and `GET /api/user/sessions/{session_hash}/chat` for a user's own sessions) that reconstruct the full multi-turn conversation by deduplicating repeated message prefixes across stateless turns and chaining `previous_response_id` turns. |
+| TRC-6 | P0 | The dashboard must render a read-only Session Chat Preview screen and drawer displaying chronological turns with collapsible sections for system prompts, tool schemas, user prompts, reasoning blocks, tool call arguments, tool outputs, assistant responses, raw JSON toggle, and per-turn metrics (model, upstream key, TTFB, latency, tokens, cache hit rate, and cost). |
+| TRC-7 | P0 | Admins must be able to set a dedicated retention window (`trace_retention_days`, default 14 days) and purge recorded trace contents globally or for a single `session_hash` (`DELETE /admin/api/traces`, `DELETE /admin/api/sessions/{session_hash}/trace`) without deleting the underlying token and cost rows in `usage_events`. |
+| TRC-8 | P0 | Multi-tenant trace isolation: A standard `user` may view recorded traces and chat previews only for sessions created by their own `client_keys`. When Grantee B routes through a personal key shared by Grantor A, Grantor A must never have access to Grantee B's recorded prompts, reasoning, tool calls, or responses. |
+
+### 6.11 Web UI and audit logging (UI & AUD)
 
 The web UI and audit subsystem provide full self-service and administrative visibility without external JavaScript dependencies.
 
@@ -577,7 +599,8 @@ The web UI and audit subsystem provide full self-service and administrative visi
 | UI-1 | P0 | The embedded web UI must provide role-aware navigation: admins see both the Admin Console (`/admin/*`) and Personal Workspace (`/app/*`), while standard users see the Personal Workspace (`/app/*`) covering Overview, Personal Providers & Keys, Shared With Me, Share Grants, Routing Overrides, Client Keys, Active Sessions, and Usage Explorer. |
 | UI-2 | P0 | The UI must display both local estimated window spend and source provider `/usage` gauges side-by-side on each upstream key card, with a "Refresh `/usage`" button and a modal to inspect the raw source provider `/usage` JSON (for authorized owners and admins). |
 | UI-3 | P0 | All HTML templates, CSS, HTMX, and chart scripts (`uPlot`) must be compiled into the Rust binary with zero external CDN requests. |
-| AUD-1 | P0 | Every state-changing action by an `admin` or `user` (login, account changes, provider or key creation, share grant or revocation, route override, calibration, pin move, client key creation or revocation) must append a tamper-evident hash-chained row (`prev_hash`, `hash`) to `audit_log` without logging secrets. |
+| UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Active Sessions and Usage Explorer screens must display a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a global banner showing when content traceability mode is active. |
+| AUD-1 | P0 | Every state-changing action by an `admin` or `user` (login, account changes, provider or key creation, share grant or revocation, route override, calibration, pin move, client key creation or revocation, content traceability toggle, or admin inspection of another user's chat trace) must append a tamper-evident hash-chained row (`prev_hash`, `hash`) to `audit_log` without logging secrets. |
 
 ## 7. Non-functional requirements
 
@@ -593,6 +616,7 @@ Speed and capacity targets apply to a reference host with 2 vCPU and 2 GB RAM 
 | PERF-2 | P0 | Each SSE chunk received from an upstream stream must reach the client socket write buffer within 1 ms at p99, with zero full-response buffering. | Timestamped chunk-forwarding test in `crates/proxy` |
 | PERF-3 | P0 | The process must sustain 2,000 open SSE streams and 500 req/s within 300 MB of resident memory (`RSS`). | Soak test with 2,000 slow-dripping stub streams |
 | PERF-4 | P0 | Idle resident memory must stay below 50 MB, and cold start time to readiness (`/readyz` HTTP 200) must stay below 2 s with 100,000 stored usage rows. | Startup benchmark in CI |
+| PERF-5 | P0 | Enabling content traceability mode must add at most 0.5 ms to p99 TTFB and zero delay to SSE chunk forwarding (`PERF-2`). Compression (`zstd`) and AEAD encryption must run on a background worker with a 4 MiB cap per turn. | Load benchmark with `content_traceability_mode` enabled vs. disabled |
 
 ### 7.2 Reliability and availability (REL)
 
@@ -634,11 +658,11 @@ Operational quality attributes keep the binary portable, auditable, observable, 
 
 Warning: Do not expose the control-plane listener (`LLMROLLER_ADMIN_LISTEN`) to an untrusted network without TLS. Bind it to `127.0.0.1` or place it behind an authenticated VPN or reverse proxy.
 
-LLMRoller holds high-value upstream credentials across global and personal accounts. The security design encrypts all upstream secrets at rest, hashes client keys and session identifiers, enforces strict tenant and share boundaries, and eliminates prompt storage.
+LLMRoller holds high-value upstream credentials across global and personal accounts. The security design encrypts all upstream secrets and opt-in trace payloads at rest, hashes client keys and session IDs, and enforces strict tenant boundaries.
 
 ### 8.1 Threat model
 
-Fourteen concrete threats drive the security controls in LLMRoller.
+Fifteen concrete threats drive the security controls in LLMRoller.
 
 | ID | Threat description | Primary mitigations |
 | --- | --- | --- |
@@ -656,6 +680,7 @@ Fourteen concrete threats drive the security controls in LLMRoller.
 | T12 | Standard User A crafts control-plane API calls (IDOR) to read, edit, share, or route through User B's unshared personal provider or inspect User B's usage. | `USR-3`, `USR-4`, `SEC-17` |
 | T13 | Grantee B abuses a shared personal key from Grantor A to extract A's raw API key or read A's personal account metadata via `GET /v1/usage`. | `SHR-4`, `USG-8`, `SEC-18` |
 | T14 | An attacker tampers with SQLite `audit_log` rows to hide unauthorized configuration or share changes. | `AUD-1`, `SEC-13` |
+| T15 | An attacker with disk access, a Grantor on a shared key, or a crafted model response reads sensitive prompts in `trace_records` or triggers XSS in the chat preview UI. | `TRC-8`, `SEC-19`, `SEC-5` |
 
 ### 8.2 Security requirements (SEC)
 
@@ -681,10 +706,11 @@ Every security requirement is mandatory (`P0`) for version 1.0 unless marked `P1
 | SEC-16 | P1 | When routing through a shared or global upstream key on a provider that uses a body or header cache key, LLMRoller should mix the caller's `owner_user_id` into the outbound synthetic affinity key (`HMAC(server_secret, owner_user_id || session_id)`) so two different users cannot collide on or probe each other's prompt cache. |
 | SEC-17 | P0 | Every repository method in `crates/store` and handler in `crates/admin` that accesses providers, upstream keys, shares, routes, client keys, pins, or usage must take an `&ActorScope` parameter and enforce SQL-level `WHERE` predicates scoping rows to `owner_user_id` or `grantee_user_id` whenever `actor.role != Role::Admin`. |
 | SEC-18 | P0 | Upstream `/usage` pass-through responses (`GET /v1/usage`, `GET /v1/key`, and `/api/user/upstream-keys/{id}/usage`) must strip raw provider account identifiers (email, organization ID, payment method, billing address, raw key prefix) whenever the caller is not the owner of a `personal` key or an `admin`. |
+| SEC-19 | P0 | All recorded prompt, reasoning, tool-call, and completion payloads in `trace_records` must be compressed with `zstd` and encrypted at rest using `XChaCha20-Poly1305` (with a subkey derived via `HKDF-SHA256` from `LLMROLLER_MASTER_KEY` and `AAD` binding `request_id || owner_user_id || session_hash`). Rendering the read-only Session Chat Preview in the dashboard must sanitize all HTML and Markdown via `ammonia` (and strict DOM escaping under CSP) so prompt-injected script tags or event handlers never run in the browser. |
 
 ### 8.3 Privacy and operator compliance
 
-LLMRoller is built for data minimization. It never stores prompt text, system instructions, tool arguments, or model completions by default. It never stores raw client session IDs; it hashes every session ID with a server-side HMAC secret before persisting pins or usage rows.
+LLMRoller is built for data minimization. It never stores prompt text, system instructions, tool arguments, or model completions unless an admin explicitly enables content traceability mode (`TRC-1`). When enabled, all recorded payloads are encrypted at rest (`SEC-19`), isolated to the client key owner (`TRC-8`), and purged after `trace_retention_days` (`TRC-7`). It never stores raw client session IDs; it hashes every session ID with a server-side HMAC secret before persisting pins or usage rows.
 
 Because LLMRoller forwards non-credential headers unchanged, privacy headers sent by agents (such as Command Code's `x-cmd-zdr: 1` zero-data-retention header) reach the upstream provider intact. Operators and users who share keys must review each provider's terms of service on pooled access (tracked as Risk `R1` in Section 18).
 
@@ -694,7 +720,7 @@ LLMRoller stores all persistent state in a single SQLite database running in Wri
 
 ### 9.1 Complete SQLite DDL schema
 
-The SQLite schema has 19 tables across five logical domains. These domains cover accounts, providers and sharing, models and pricing, session pins, and usage and operations.
+The SQLite schema has 20 tables across five logical domains. These domains cover accounts, providers and sharing, models and pricing, session pins, and usage, traces, and operations.
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -976,6 +1002,25 @@ CREATE TABLE usage_rollups_hourly (
 );
 CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);
 
+CREATE TABLE trace_records (
+  usage_event_id TEXT PRIMARY KEY REFERENCES usage_events(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL UNIQUE,
+  ts INTEGER NOT NULL,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL,
+  turn_index INTEGER NOT NULL,
+  canonical_id TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
+  truncated_content INTEGER NOT NULL DEFAULT 0,
+  payload_enc BLOB NOT NULL, -- XChaCha20-Poly1305(zstd(NormalizedTurnTrace + raw request and response JSON))
+  master_key_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_trace_session_ts ON trace_records(session_hash, ts ASC);
+CREATE INDEX idx_trace_owner_ts ON trace_records(owner_user_id, ts DESC);
+CREATE INDEX idx_trace_expires ON trace_records(expires_at);
+
 CREATE TABLE audit_log (
   id TEXT PRIMARY KEY,
   ts INTEGER NOT NULL,
@@ -1000,7 +1045,7 @@ CREATE TABLE settings (
 
 ### 9.2 Storage invariants and write batching
 
-Five storage rules keep SQLite fast and crash-safe under concurrent streaming load.
+Six storage rules keep SQLite fast and crash-safe under concurrent streaming load.
 
 | Rule | Implementation mechanism |
 | --- | --- |
@@ -1008,7 +1053,8 @@ Five storage rules keep SQLite fast and crash-safe under concurrent streaming lo
 | Envelope encryption | `upstream_keys.secret_enc` and `users.totp_secret_enc` store a 24-byte `XChaCha20` nonce plus `Poly1305` ciphertext and tag, with `upstream_key.id` (or `user.id`) bound in the AEAD Associated Data (`AAD`) so a ciphertext blob cannot be copied between rows. |
 | Provider scope recording | Each `usage_events` row records `provider_scope` (`global`, `personal`, or `shared`) and `share_id` (when routed via `provider_shares`) at request time. Historical share accounting and monthly share caps stay exact even if a share is later modified. |
 | Snapshot history cap | The `upstream_usage_snapshots` table keeps the most recent 100 snapshots per upstream key. Older snapshots are pruned by the retention task, allowing the dashboard and `/v1/usage` endpoint to read the latest upstream quota state in O(1) time. |
-| Retention policies | Raw `usage_events` rows are kept for 400 days, `response_links` for 30 days, expired `pins` and `web_sessions` are swept every 60 s, and `usage_rollups_hourly` and `audit_log` rows are kept indefinitely. |
+| Compressed and encrypted traces | When content traceability mode is active, `trace_records.payload_enc` stores `24-byte nonce || XChaCha20-Poly1305(zstd(json_bytes))` with `request_id || owner_user_id || session_hash` bound in the AEAD `AAD`. Compression happens on a background worker thread before the batch writer transaction. |
+| Retention policies | Raw `usage_events` rows are kept for 400 days, `trace_records` for 14 days (configurable via `trace_retention_days`), `response_links` for 30 days, expired `pins` and `web_sessions` are swept every 60 s, and `usage_rollups_hourly` and `audit_log` rows are kept indefinitely. |
 
 ## 10. Routing design
 
@@ -1202,6 +1248,24 @@ The `SseUsageTap` (for `text/event-stream`) and `JsonUsageExtractor` (for `appli
 
 Warning: OpenAI `prompt_tokens` and `input_tokens` include `cached_tokens`, whereas Anthropic `input_tokens` excludes `cache_read_input_tokens` and `cache_creation_input_tokens`. Subtracting `cached_tokens` on `chat` and `responses` before multiplying by `input_per_mtok_micro_usd` prevents double-charging cached tokens.
 
+### 12.6 SSE delta reassembly and session chat reconstruction for content traceability
+
+When content traceability mode is active (`TRC-2`, `TRC-3`), `SseUsageTap` and `JsonUsageExtractor` build a `NormalizedTurnTrace`. They also keep the raw request and response JSON.
+
+| Protocol | Inbound fields parsed | Streamed SSE deltas reassembled into `NormalizedTurnTrace` |
+| --- | --- | --- |
+| OpenAI `chat` | `messages[]` (`system`, `developer`, `user`, `assistant`, `tool`), `tools[]`, `temperature`, `reasoning_effort` | Concatenates `choices[0].delta.content` into `assistant_text`, `choices[0].delta.reasoning_content` into `reasoning_text`, and merges `choices[0].delta.tool_calls[i]` by `index` into complete `ToolCall { id, name, arguments_json }` objects. |
+| OpenAI `responses` | `instructions`, `input` (string or item array), `tools[]`, `previous_response_id`, `reasoning` | Accumulates `response.output_text.delta` events into `assistant_text`, `response.reasoning_summary_text.delta` into `reasoning_text`, and `response.function_call_arguments.delta` (or completed `function_call` items in `response.completed`) into `ToolCall` records. |
+| Anthropic `messages` | `system` (string or block array), `messages[]` (`user` text/tool_result and `assistant` text/thinking/tool_use blocks), `tools[]`, `thinking` | Tracks active content blocks from `content_block_start` (`text`, `thinking`, `tool_use`) and appends `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta`) until `content_block_stop`. |
+
+All turns in one conversation share a pinned `session_hash`. The reconstructor (`crates/core::chat_preview`) builds a clean read-only chat timeline from the ordered `trace_records` rows (`turn_index = 1..N`).
+
+| Turn pattern | Timeline reconstruction rule |
+| --- | --- |
+| Stateless turns (`chat` and `messages`) | Turn `k` resends prior messages `[m_1..m_p]` plus new user or `tool_result` blocks. The reconstructor hashes each block `(role, content_hash, tool_call_id)`, emits only new input blocks on turn `k`, and appends turn `k`'s `reasoning`, `tool_calls`, `assistant_text`, and telemetry badge. |
+| Stateful turns (`responses` with `previous_response_id`) | Each turn already holds only new delta inputs and new assistant outputs, so the reconstructor links them directly in `turn_index` order. |
+| Context compaction or forked turns | When the input prefix on turn `k` diverges from turn `k - 1`, the reconstructor inserts a `context_compacted_or_branched` divider card in the timeline. |
+
 ## 13. Pricing, limits, and source provider usage engine
 
 LLMRoller combines a deterministic local micro-USD pricing and window-budget engine with live polling, reconciliation, and pass-through of each source provider's `/usage` API.
@@ -1394,6 +1458,7 @@ Every `/api/user/*` endpoint scopes queries and mutations to `actor.user_id`.
 | Personal route overrides | `GET /api/user/routes?model=`, `PUT /api/user/routes/{upstream_key_id}/{canonical_id}` (sets `user_route_preferences.priority_override` and `enabled`) |
 | Client keys | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}`, `POST /api/user/client-keys/{id}/rotate`, `DELETE /api/user/client-keys/{id}` |
 | Active session pins | `GET /api/user/pins` (caller's client keys only), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` |
+| Session chat preview (read-only) | `GET /api/user/sessions/{session_hash}/chat` (reconstructed multi-turn chat timeline for caller's own session), `GET /api/user/traces/{request_id}` (single turn trace and raw JSON) |
 | Scoped usage analytics | `GET /api/user/usage/summary`, `GET /api/user/usage/timeseries`, `GET /api/user/usage/breakdown`, `GET /api/user/usage/events`, `GET /api/user/usage/export.csv` |
 | Scoped audit log | `GET /api/user/audit` (events where `actor_user_id == me` or target belongs to `me`) |
 
@@ -1408,6 +1473,7 @@ Every `/admin/api/*` endpoint rejects non-admin callers with HTTP 403.
 | Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
 | Model catalog and price book | `GET /admin/api/models`, `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`), `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `PUT /admin/api/model-aliases/{alias}`, `DELETE /admin/api/model-aliases/{alias}`, `GET /admin/api/prices`, `PUT /admin/api/prices/{provider_kind}/{upstream_model_id}`, `POST /admin/api/prices/sync` |
 | Global routing and pins | `GET /admin/api/routes`, `PATCH /admin/api/routes/{upstream_key_id}/{canonical_id}`, `GET /admin/api/pins` (all users), `DELETE /admin/api/pins`, `POST /admin/api/pins/move` |
+| Content traceability & chat preview | `GET /admin/api/settings/traceability`, `PUT /admin/api/settings/traceability` (enable, scope, set retention TTL), `GET /admin/api/sessions/{session_hash}/chat`, `GET /admin/api/traces/{request_id}`, `DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces` |
 | Instance usage and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown` (group by `user`, `client_key`, `upstream_key`, `provider`, `provider_scope`, `model`), `GET /admin/api/audit`, `PATCH /admin/api/settings` |
 
 ### 14.3 Web UI screens and metric definitions
@@ -1422,7 +1488,8 @@ The web interface is server-rendered with Askama templates and HTMX partial upda
 | Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key to another username, set allowed models and monthly USD cap, view per-grantee token and dollar consumption, revoke share. **Shared With Me tab:** inspect keys shared by teammates, health badge, allowed models, and remaining monthly share cap. |
 | Routing Matrix | `user` (personal + shared + global weights) & `admin` (global catalog) | Matrix of canonical models (rows) by upstream keys (columns). Displays protocol chips (`chat`, `responses`, `messages`), key default priority, inline editable per-model `priority_override`, effective weight, and projected percentage share of new sessions. |
 | Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once with copy button), select `routing_scope` (`personal_first`, `blended`, `personal_only`, `global_only`), restrict models, set RPM or monthly USD cap, rotate, or revoke. |
-| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins: session hash prefix, client key, model, pinned upstream key and scope badge (`personal`, `shared`, `global`), age, turn count, `repin_count`, and constant-session warning badge. Supports Unpin and Move Pin. |
+| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins: session hash prefix, client key, model, pinned upstream key and scope badge (`personal`, `shared`, `global`), age, turn count, `repin_count`, constant-session warning badge, and **Preview Chat** button (when trace rows exist). Supports Unpin and Move Pin. |
+| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay for a `session_hash`: renders system instructions, tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs, assistant Markdown/code blocks (sanitized via `ammonia`), context-compaction markers, per-turn telemetry badges (TTFB, latency, tokens, cache hit ratio, cost, upstream key), and a raw request/response JSON inspector drawer. |
 | Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, or model. Paged event table with status, TTFB, total latency, token breakdown, `cost_source` badge (`provider` vs. `price_book`), and CSV or JSON export. |
 | Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, force-expose or hide models, edit canonical aliases, edit price book rates, and trigger catalog discovery. |
 | Admin: Users, Settings & Audit | `admin` only | Create or disable `admin` and `user` accounts, set per-user global pool access and monthly global budget caps, configure instance settings (pin TTL, `/usage` poll interval, retention), and inspect the hash-chained audit log. |
@@ -1443,7 +1510,8 @@ Every dependency is chosen for predictable speed, memory safety, zero external r
 | Database | SQLite in WAL mode via `sqlx 0.9` | Zero-configuration single-file persistence with compile-time and migration-tested SQL queries. | PostgreSQL (needs an external database server for single-node installs). |
 | Cryptography | `chacha20poly1305`, `hkdf`, `sha2`, `hmac`, `argon2`, `totp-rs`, `subtle`, `secrecy`, `zeroize` | Pure-Rust audited RustCrypto implementations for XChaCha20-Poly1305 AEAD, Argon2id, HMAC-SHA256, and memory zeroization. | OpenSSL (`openssl-sys` C bindings complicate static musl builds). |
 | In-memory state & caches | `arc-swap` (`ConfigSnapshot`), `moka` (`sync::Cache` for pins and response links), `dashmap` (WRR and window ring counters) | Lock-free atomic snapshot reads on the hot path and single-flight cache loaders for concurrent turn-1 pinning (`RTE-7`). | Global `RwLock<Config>` (writer starvation under 500 req/s). |
-| Web UI & templates | `askama` (compile-time HTML templates), `rust-embed`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates compiled into the binary with zero Node.js build step and zero runtime CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
+| Web UI & safe chat rendering | `askama`, `rust-embed`, `pulldown-cmark`, `ammonia`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates and strict HTML/Markdown sanitization (`ammonia`) for the read-only Session Chat Preview with zero CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
+| Compression | `zstd` (`async-compression`) | High-ratio fast compression for recorded `trace_records` payloads before AEAD encryption, plus gzip/br stream decoding in the usage tap. | Uncompressed JSON blobs in SQLite. |
 | Observability | `tracing`, `tracing-subscriber` (JSON formatter), `metrics`, `metrics-exporter-prometheus` | Structured JSON request logs with `request_id` correlation and low-overhead Prometheus counters and histograms. | Heavy OpenTelemetry gRPC exporters in v1.0 core. |
 | Testing & verification | `cargo-nextest`, `proptest`, `wiremock`, `insta`, `cargo-llvm-cov`, `cargo-mutants`, `cargo-fuzz`, `cargo-deny`, `cargo-audit`, `cargo-vet` | Enforces fast parallel tests, property testing, wire stubbing, line coverage, and automated mutation testing ([cargo-mutants](https://mutants.rs/)). | Standard `cargo test` alone without mutation verification. |
 
@@ -1502,7 +1570,7 @@ A disciplined test suite tests the logic that the engineering team controls and 
 | Smooth weighted round-robin counter math, per-model priority overrides, and strict tier fallback (`RTE-4`, `RTE-5`, `RTE-6`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
 | Inbound session precedence, HMAC privacy hashing, and tenant-salted outbound affinity hints (`RTE-1`, `SEC-16`) | Whether `sha2`, `chacha20poly1305`, or `argon2` implements its underlying mathematical primitives correctly |
 | Surgical top-level JSON span editing (`model`, `prompt_cache_key`, `include_usage`) without altering message byte order (`TRN-1`, `TRN-2`, `API-4`, `API-5`) | Whether `serde_json` parses valid RFC 8259 JSON strings in general |
-| SSE usage tap state machines, OpenAI vs. Anthropic cached token subtraction, integer micro-USD cost math, and truncation detection (`USG-1`..`USG-3`) | Whether SQLite's `PRAGMA journal_mode = WAL` writes frames to the `-wal` file on the OS filesystem |
+| SSE usage and trace tap state machines, OpenAI vs. Anthropic cached token subtraction, SSE delta reassembly (`text`, `reasoning`, `tool_calls`), session chat deduplication, and integer micro-USD cost math (`USG-1`..`USG-3`, `TRC-2`..`TRC-5`) | Whether SQLite's `PRAGMA journal_mode = WAL` writes frames to the `-wal` file on the OS filesystem |
 | Source provider `/usage` response parsing, window reconciliation math, and PII sanitization on shared and global pass-through (`USG-4`..`USG-8`, `SEC-18`) | Live third-party provider uptime during automated CI runs (live upstream checks run only in an opt-in manual harness) |
 | Our SQL query predicates (`WHERE owner_user_id = ?`), migration invariants, AEAD associated-data binding, and audit hash chaining in `crates/store` (`SEC-1`, `SEC-13`, `SEC-17`) | Static constant values in preset files unless validating that every preset parses into a valid `ProviderConfig` |
 
@@ -1635,7 +1703,8 @@ Every requirement ID in this SRDD maps to concrete source modules and automated 
 | `RTE-1`..`RTE-13` | `crates/core::router`, `crates/core::wrr`, `crates/core::pins` | `core::wrr::proptests::*`, `core::router::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (100-way single-flight race, pre-first-byte failover, post-first-byte no-retry, `previous_response_id`) + `cargo-mutants` |
 | `API-1`..`API-8`, `TRN-1`..`TRN-3` | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (byte-identical pass-through, injected `include_usage` chunk stripping, 1 s disconnect abort) |
 | `USG-1`..`USG-8`, `LIM-1` | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (OpenCode Go, Command Code, OpenRouter `/usage` sync, auto-adjustment, `/v1/usage` & `/v1/key` sanitization) |
-| `UI-1`..`UI-3`, `AUD-1` | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (admin and standard user UI flows, zero external asset check, audit tamper detection) |
+| `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19` | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (default-off check, streaming delta reassembly, Grantor A blocked from Grantee B trace, XSS sanitization in chat preview, purge & TTL) + `cargo-mutants` |
+| `UI-1`..`UI-4`, `AUD-1` | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (admin and standard user UI flows, read-only session chat preview drawer, zero external asset check, audit tamper detection) |
 | `PERF-1`..`PERF-4`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `crates/server`, workspace-wide | `crates/core` zero-I/O dependency test | `benches/proxy_latency.rs`, `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
 | `SEC-1`..`SEC-18` | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
 
@@ -1649,12 +1718,12 @@ The table below defines the scope, deliverables, and exit criteria for each mile
 
 | Milestone | Scope and deliverables | Exit criteria (must pass before starting next milestone) |
 | --- | --- | --- |
-| `M0`: Foundation, RBAC, and Auth | Cargo workspace setup, SQLite WAL migrations (19 tables), XChaCha20-Poly1305 secret sealer, Argon2id + TOTP auth, atomic first-admin `/setup`, `admin` and `user` account management, `ActorScope` RBAC middleware, hash-chained `audit_log`, and CI gates (`clippy`, `cargo-deny`, `cargo-audit`, `cargo-mutants`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `SEC-1`..`SEC-5`, `SEC-10`, `SEC-12`..`SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
+| `M0`: Foundation, RBAC, and Auth | Cargo workspace setup, SQLite WAL migrations (20 tables), XChaCha20-Poly1305 secret sealer, Argon2id + TOTP auth, atomic first-admin `/setup`, `admin` and `user` account management, `ActorScope` RBAC middleware, hash-chained `audit_log`, and CI gates (`clippy`, `cargo-deny`, `cargo-audit`, `cargo-mutants`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `SEC-1`..`SEC-5`, `SEC-10`, `SEC-12`..`SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
 | `M1`: Transparent Pass-Through Proxy | Global and personal provider records, upstream key encryption and `/models` test endpoint, client key issuance (`llr_...`), SSRF-safe `reqwest` transport, header policy, surgical JSON span editor, and unbuffered SSE streaming for `chat`, `responses`, and `messages`. | `PRV-1`..`PRV-8`, `CLK-1`..`CLK-5`, `API-1`..`API-8`, `TRN-1`..`TRN-3`, `SEC-6`..`SEC-8`, `SEC-15` tests pass; `COM-1` passes against a single provider. |
 | `M2`: Routing, Pinning, and Sharing | Model catalog discovery and normalization, global auto-intersection and force exposure, personal provider and key sharing (`provider_shares`), `routing_scope` pool resolution (`personal_first`, `blended`, `personal_only`, `global_only`), smooth WRR with per-model overrides, single-flight session pinning, `previous_response_id` links, and pre-first-byte failover. | `SHR-1`..`SHR-6`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `USR-2`..`USR-5`, `SEC-16` tests pass; 100-way concurrency race test and `proptest` WRR suite pass with zero surviving mutants in `crates/core`. |
-| `M3`: Usage Pipeline and Price Book | `SseUsageTap` and `JsonUsageExtractor` for all three protocols, OpenAI vs. Anthropic cache token normalization, integer micro-USD price book with context tiers and UTC peak schedules, batching SQLite writer, and hourly rollups. | `USG-1`..`USG-3`, `REL-2`, `REL-3` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
+| `M3`: Usage Pipeline, Price Book, and Content Traceability | `SseUsageTap`, `JsonUsageExtractor`, and opt-in `TraceTap` delta reassembler for all three protocols; OpenAI vs. Anthropic cache token normalization; integer micro-USD price book; `zstd` + `XChaCha20-Poly1305` `trace_records` storage; session chat timeline reconstructor; batching SQLite writer and hourly rollups. | `USG-1`..`USG-3`, `TRC-1`..`TRC-8`, `PERF-5`, `SEC-19`, `REL-2`, `REL-3` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
 | `M4`: Budget Windows and Source Provider `/usage` Engine | Rolling (`5h`, `7d`) and anchored (`1mo`) budget window ring counters, source provider `/usage` poller and parsers for OpenCode Go (`/zen/go/v1/usage`), Command Code (`/alpha/billing/credits`), OpenRouter (`/api/v1/key`), and custom endpoints, automatic window reconciliation, and `/v1/usage` + `/v1/key` pass-through with PII sanitization. | `USG-4`..`USG-8`, `LIM-1`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
-| `M5`: Embedded Web UI for Admins and Standard Users | Server-rendered Askama + HTMX screens for both the Personal Workspace (`/app/*`) and Admin Console (`/admin/*`), vendored `uPlot` charts, inline routing matrix editor, share management UI, raw `/usage` inspection modal, active session pin controls, and CSV or JSON exports. | `UI-1`..`UI-3` E2E browser and HTMX tests pass; CSP and zero-external-asset checks pass. |
+| `M5`: Embedded Web UI and Read-Only Session Chat Preview | Server-rendered Askama + HTMX screens for both the Personal Workspace (`/app/*`) and Admin Console (`/admin/*`), vendored `uPlot` charts, inline routing matrix editor, share management UI, raw `/usage` inspection modal, active session pin controls, XSS-safe read-only Session Chat Preview screen, and CSV or JSON exports. | `UI-1`..`UI-4`, `TRC-5`, `TRC-6` E2E browser and HTMX tests pass; CSP and zero-external-asset checks pass. |
 | `M6`: Hardening, Load Verification, and Release Packaging | `cargo-fuzz` targets on JSON span scanner, SSE parser, and header normalizer; 500 req/s and 2,000-stream benchmark verification (`PERF-1`..`PERF-4`); `SIGTERM` drain and `SIGKILL` recovery verification; live CLI harness verification (`Claude Code`, `Codex CLI`, `opencode`); signed static binaries, SBOM, and distroless container image under 50 MB. | All `PERF-*`, `REL-*`, `POR-1`, `COM-1`, `SEC-11` checks pass; `scripts/verify_traceability.py` reports 100% requirement test coverage. |
 
 ### 17.2 Post-1.0 roadmap (`P2` items)
@@ -1667,7 +1736,7 @@ Capabilities scheduled after version 1.0 ship behind clean extension traits with
 
 ## 18. Risks and mitigations
 
-Fourteen technical, vendor, security, and operational risks are tracked below alongside their concrete architectural mitigations.
+Fifteen technical, vendor, security, and operational risks are tracked below alongside their concrete architectural mitigations.
 
 ### 18.1 Risk register
 
@@ -1689,6 +1758,7 @@ Each risk lists its likelihood, impact, and the specific design mechanisms and r
 | R12 | Losing `LLMROLLER_MASTER_KEY` renders all encrypted `upstream_keys.secret_enc` blobs unrecoverable. | Low | High | Validate the master key at startup (`SEC-2`), document master-key backup procedures in the operator guide, and provide `llmroller rotate-master-key` (`SEC-1`). |
 | R13 | Tests become brittle or allow subtle logic regressions in routing, budget math, or RBAC checks to slip into production. | Medium | High | Enforce strict TDD contract testing, boundary discipline, the Expected vs. Unexpected failure protocol (`Section 16.2`), and automated mutation testing with `cargo-mutants` (`Section 16.5.6`). |
 | R14 | A single-node SQLite instance experiences hardware failure. | Low | Medium | Persist pins and usage in WAL mode (`REL-2`), keep startup recovery under 2 s (`PERF-4`), and provide `llmroller backup --out <path>` for online cron backups (`REL-6`). |
+| R15 | Enabling content traceability mode increases SQLite disk usage or exposes sensitive prompts across shared personal keys. | Medium | High | Keep content traceability strictly off by default (`TRC-1`), compress with `zstd` and encrypt with `XChaCha20-Poly1305` (`SEC-19`), cap captured turns at 4 MiB (`PERF-5`), enforce a 14-day default TTL (`TRC-7`), and block shared-key grantors from reading grantee traces (`TRC-8`). |
 
 ## 19. Architectural decisions and open questions
 
@@ -1696,7 +1766,7 @@ This section records the architectural decisions resolved during specification r
 
 ### 19.1 Resolved architectural decisions (ADRs)
 
-Eight core design questions from the initial draft and product brief are formally resolved below for version 1.0.
+Nine core design questions from the initial draft and product brief are formally resolved below for version 1.0.
 
 | ADR ID | Topic | Decision for version 1.0 | Rationale |
 | --- | --- | --- | --- |
@@ -1708,6 +1778,7 @@ Eight core design questions from the initial draft and product brief are formall
 | `ADR-6` | Cross-protocol translation | Route requests in version 1.0 only to candidates that natively support the inbound protocol (`chat`, `responses`, or `messages`); defer opt-in cross-protocol translation to post-1.0 (`P2`). | Prevents silent loss of reasoning blocks ([open-design#8687](https://github.com/nexu-io/open-design/issues/8687)) and tool-call schema mismatches. |
 | `ADR-7` | Canonical model normalization | Normalize vendor prefixes and casing (`deepseek/deepseek-v4.1-flash` to `deepseek-v4.1-flash`) but never merge distinct version numbers (`deepseek-v4-flash` != `deepseek-v4.1-flash`). | Prevents routing a client request to a different model generation while still matching identical models across providers. |
 | `ADR-8` | Test governance and mutation testing | Mandate Red-Green-Refactor TDD, contract-level testing within our controlled boundary, strict Expected vs. Unexpected failure handling, and zero surviving mutants in `cargo-mutants`. | Guarantees that tests verify actual behavioral invariants rather than superficial line coverage. |
+| `ADR-9` | Opt-in content traceability and read-only session chat preview | Provide an admin opt-in `content_traceability_mode` that records compressed, AEAD-encrypted turn payloads (`trace_records`) and reconstructs a deduplicated read-only chat preview per pinned `session_hash` in the dashboard. | Enables deep debugging and session replay when needed while preserving zero-prompt-storage privacy by default and strict multi-tenant isolation (`TRC-1`..`TRC-8`, `SEC-19`). |
 
 ### 19.2 Operational verification items for Milestone 1 (`M1`)
 
