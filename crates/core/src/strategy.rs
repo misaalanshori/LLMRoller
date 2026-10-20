@@ -4,9 +4,13 @@
 //! Spec: ./docs/srdd/10. SRDD - Routing Design.md#103-pluggable-routing-strategy-engine-effective-priority-and-headroom-scaling
 //! Spec: ./docs/srdd/10. SRDD - Routing Design.md#1031-common-routeselector-trait-and-routingstrategy-enum-rte-4-rte-14
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::{ModelPk, UpstreamKeyId, UserId};
@@ -85,7 +89,198 @@ pub fn filter_strict_tier<T: Copy>(candidates: &[(T, Option<i64>)]) -> Vec<T> {
     }
 }
 
-/// Configurable routing strategy algorithms.
+/// State for an unweighted naive round-robin group.
+#[derive(Debug, Default)]
+pub struct NaiveRrGroup {
+    pub cursor: AtomicU64,
+    pub last_used_ms: AtomicI64,
+}
+
+/// Unweighted cyclic round-robin selector (naive_rr) (RTE-14).
+#[derive(Debug, Default)]
+pub struct NaiveRrSelector {
+    groups: Mutex<HashMap<WrrGroupKey, Arc<NaiveRrGroup>>>,
+}
+
+impl NaiveRrSelector {
+    pub fn new() -> Self {
+        Self {
+            groups: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RouteSelector for NaiveRrSelector {
+    fn strategy(&self) -> RoutingStrategy {
+        RoutingStrategy::NaiveRr
+    }
+
+    fn select_next(
+        &self,
+        group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        now_ms: i64,
+        _entropy: &dyn EntropySource,
+        _load_tracker: Option<&dyn RouteLoadTracker>,
+    ) -> Option<RouteId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let group = {
+            let mut lock = self.groups.lock();
+            lock.entry(group_key.clone())
+                .or_insert_with(|| Arc::new(NaiveRrGroup::default()))
+                .clone()
+        };
+        group.last_used_ms.store(now_ms, Ordering::Relaxed);
+        let seq = group.cursor.fetch_add(1, Ordering::Relaxed);
+        let idx = (seq % (candidates.len() as u64)) as usize;
+        Some(candidates[idx].0)
+    }
+
+    fn on_weights_updated(&self, _group_key: &WrrGroupKey) {}
+
+    fn reset_group(&self, group_key: &WrrGroupKey) {
+        let mut lock = self.groups.lock();
+        lock.remove(group_key);
+    }
+
+    fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64) {
+        let mut lock = self.groups.lock();
+        lock.retain(|_, g| now_ms - g.last_used_ms.load(Ordering::Relaxed) < max_idle_ms);
+    }
+}
+
+/// Uniform pseudo-random selector (uniform_random / random) (RTE-14).
+#[derive(Debug, Default)]
+pub struct UniformRandomSelector;
+
+impl RouteSelector for UniformRandomSelector {
+    fn strategy(&self) -> RoutingStrategy {
+        RoutingStrategy::UniformRandom
+    }
+
+    fn select_next(
+        &self,
+        _group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        _now_ms: i64,
+        entropy: &dyn EntropySource,
+        _load_tracker: Option<&dyn RouteLoadTracker>,
+    ) -> Option<RouteId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let draw = entropy.next_u64_bounded(candidates.len() as u64) as usize;
+        Some(candidates[draw].0)
+    }
+
+    fn on_weights_updated(&self, _group_key: &WrrGroupKey) {}
+    fn reset_group(&self, _group_key: &WrrGroupKey) {}
+    fn evict_idle_groups(&self, _now_ms: i64, _max_idle_ms: i64) {}
+}
+
+/// Weighted pseudo-random cumulative prefix binary search selector (weighted_random) (RTE-14).
+#[derive(Debug, Default)]
+pub struct WeightedRandomSelector;
+
+impl RouteSelector for WeightedRandomSelector {
+    fn strategy(&self) -> RoutingStrategy {
+        RoutingStrategy::WeightedRandom
+    }
+
+    fn select_next(
+        &self,
+        _group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        _now_ms: i64,
+        entropy: &dyn EntropySource,
+        _load_tracker: Option<&dyn RouteLoadTracker>,
+    ) -> Option<RouteId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut prefix = Vec::with_capacity(candidates.len());
+        let mut acc: i64 = 0;
+        for (_, w) in candidates {
+            acc += (*w).max(1);
+            prefix.push(acc);
+        }
+        let draw = entropy.next_u64_bounded(acc as u64) as i64;
+        let idx = prefix.partition_point(|&cum| cum <= draw);
+        let safe_idx = idx.min(candidates.len() - 1);
+        Some(candidates[safe_idx].0)
+    }
+
+    fn on_weights_updated(&self, _group_key: &WrrGroupKey) {}
+    fn reset_group(&self, _group_key: &WrrGroupKey) {}
+    fn evict_idle_groups(&self, _now_ms: i64, _max_idle_ms: i64) {}
+}
+
+/// Power of Two Choices selector (power_of_two_choices / p2c) (RTE-14).
+#[derive(Debug, Default)]
+pub struct PowerOfTwoChoicesSelector;
+
+impl RouteSelector for PowerOfTwoChoicesSelector {
+    fn strategy(&self) -> RoutingStrategy {
+        RoutingStrategy::PowerOfTwoChoices
+    }
+
+    fn select_next(
+        &self,
+        group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        now_ms: i64,
+        entropy: &dyn EntropySource,
+        load_tracker: Option<&dyn RouteLoadTracker>,
+    ) -> Option<RouteId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].0);
+        }
+
+        let wr = WeightedRandomSelector;
+        let first = wr.select_next(group_key, candidates, now_ms, entropy, load_tracker)?;
+
+        let remaining: Vec<(RouteId, i64)> = candidates
+            .iter()
+            .filter(|(r, _)| *r != first)
+            .copied()
+            .collect();
+        let second = if remaining.is_empty() {
+            first
+        } else {
+            wr.select_next(group_key, &remaining, now_ms, entropy, load_tracker)?
+        };
+
+        if let Some(tracker) = load_tracker {
+            let score = |r: &RouteId| -> (u64, RouteId) {
+                let in_flight = tracker.in_flight(r) as u64;
+                let ttfb_ms = tracker.ewma_ttfb_ms(r).max(1);
+                let w = candidates
+                    .iter()
+                    .find(|(candidate_r, _)| candidate_r == r)
+                    .map(|(_, weight)| *weight)
+                    .unwrap_or(1)
+                    .max(1) as u64;
+                (((in_flight + 1) * ttfb_ms * 1000) / w, *r)
+            };
+            let winner = score(&first).min(score(&second)).1;
+            Some(winner)
+        } else {
+            Some(first)
+        }
+    }
+
+    fn on_weights_updated(&self, _group_key: &WrrGroupKey) {}
+    fn reset_group(&self, _group_key: &WrrGroupKey) {}
+    fn evict_idle_groups(&self, _now_ms: i64, _max_idle_ms: i64) {}
+}
+
+#[cfg(test)]
+pub mod proptests;
 ///
 /// Partial: RTE-14
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
