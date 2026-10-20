@@ -51,6 +51,15 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             "/v1/messages/count_tokens",
             post(crate::orchestrator::post_messages_count_tokens),
         )
+        .route(
+            "/v1/usage",
+            get(crate::usage_passthrough::get_v1_usage_handler),
+        )
+        .route("/v1/key", get(crate::usage_passthrough::get_v1_key_handler))
+        .route(
+            "/v1/usage/raw",
+            get(crate::usage_passthrough::get_v1_usage_raw_handler),
+        )
         .layer(from_fn_with_state(
             state.clone(),
             client_key_auth_middleware,
