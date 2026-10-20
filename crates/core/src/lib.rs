@@ -19,3 +19,4 @@ pub mod shares;
 pub mod snapshot;
 pub mod strategy;
 pub mod windows;
+pub mod wrr;

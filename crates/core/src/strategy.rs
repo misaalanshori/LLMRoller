@@ -9,6 +9,82 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::ids::{ModelPk, UpstreamKeyId, UserId};
+use crate::seams::EntropySource;
+
+/// Key identifying a target selection group so one user's cursor never perturbs another (Section 10.3.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WrrGroupKey {
+    pub user_id: UserId,
+    pub model_pk: ModelPk,
+    pub protocol: String,
+    pub pool_tier: u8,
+}
+
+/// Composite route identifier (upstream_key_id, model_pk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RouteId {
+    pub upstream_key_id: UpstreamKeyId,
+    pub model_pk: ModelPk,
+}
+
+/// Trait providing live upstream load metrics for Power of Two Choices.
+pub trait RouteLoadTracker: Send + Sync {
+    fn in_flight(&self, route: &RouteId) -> u32;
+    fn ewma_ttfb_ms(&self, route: &RouteId) -> u64;
+}
+
+/// Common thread-safe selector trait implemented by all six routing algorithms.
+pub trait RouteSelector: Send + Sync {
+    fn strategy(&self) -> RoutingStrategy;
+    fn select_next(
+        &self,
+        group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        now_ms: i64,
+        entropy: &dyn EntropySource,
+        load_tracker: Option<&dyn RouteLoadTracker>,
+    ) -> Option<RouteId>;
+    fn on_weights_updated(&self, group_key: &WrrGroupKey);
+    fn reset_group(&self, group_key: &WrrGroupKey);
+    fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64);
+}
+
+/// Computes effective weight W_eff scaled by remaining budget headroom basis points (RTE-13).
+pub fn compute_effective_weight(
+    base_weight: i64,
+    windows: &[(i64, i64, i64)],
+    headroom_scaling_enabled: bool,
+) -> i64 {
+    let base = base_weight.clamp(1, 1000);
+    if !headroom_scaling_enabled || windows.is_empty() {
+        return base;
+    }
+    let mut min_bps = 10_000i64;
+    for &(limit, used, reserved) in windows {
+        if limit > 0 {
+            let remaining = (limit - used - reserved).max(0);
+            let bps = (10_000 * remaining) / limit;
+            min_bps = min_bps.min(bps);
+        }
+    }
+    let bps = min_bps.clamp(500, 10_000);
+    ((base * bps) / 10_000).max(1)
+}
+
+/// Filters candidates to minimum strict tier when models.distribution == 'strict' (RTE-6).
+pub fn filter_strict_tier<T: Copy>(candidates: &[(T, Option<i64>)]) -> Vec<T> {
+    let min_tier = candidates.iter().filter_map(|(_, t)| *t).min();
+    match min_tier {
+        Some(best) => candidates
+            .iter()
+            .filter(|(_, t)| *t == Some(best))
+            .map(|(c, _)| *c)
+            .collect(),
+        None => candidates.iter().map(|(c, _)| *c).collect(),
+    }
+}
+
 /// Configurable routing strategy algorithms.
 ///
 /// Partial: RTE-14
