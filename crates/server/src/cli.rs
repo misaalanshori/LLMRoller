@@ -45,6 +45,22 @@ pub(crate) enum Command {
     VerifyAuditLog(VerifyAuditLogArgs),
     /// Probe the container readiness endpoint.
     Healthcheck(HealthcheckArgs),
+    /// Create a crash-safe atomic backup of the database (REL-6).
+    Backup(BackupArgs),
+}
+
+/// Arguments for `llmroller backup`.
+#[derive(Debug, Args)]
+pub(crate) struct BackupArgs {
+    /// Destination output path.
+    #[arg(long)]
+    pub(crate) out: PathBuf,
+    /// Overwrite destination if it already exists.
+    #[arg(long, default_value_t = false)]
+    pub(crate) overwrite: bool,
+    /// Data directory containing `llmroller.db`.
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 /// Arguments for `llmroller healthcheck`.
@@ -111,7 +127,48 @@ pub(crate) async fn main() -> ExitCode {
         Command::ResetAdmin(args) => run_reset_admin(args).await,
         Command::VerifyAuditLog(args) => run_verify_audit_log(args).await,
         Command::Healthcheck(args) => run_healthcheck(args).await,
+        Command::Backup(args) => run_backup_cmd(args).await,
     }
+}
+
+async fn run_backup_cmd(args: BackupArgs) -> ExitCode {
+    match backup_command(args).await {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            eprintln!("error: {}", failure.message);
+            ExitCode::from(failure.code)
+        }
+    }
+}
+
+async fn backup_command(args: BackupArgs) -> Result<serde_json::Value, CliFailure> {
+    let data_dir = resolve_data_dir(args.data_dir);
+    let master_key_id = load_master_key_id_from_env().unwrap_or_else(|_| "key-0".to_string());
+    let database = data_dir.join("llmroller.db");
+    if !database.exists() {
+        return Err(CliFailure::new(
+            10,
+            format!("database not found: {}", database.display()),
+        ));
+    }
+    let pool = open_pool(&database, Role::Reader)
+        .await
+        .map_err(|e| CliFailure::new(13, format!("cannot open database: {e}")))?;
+
+    let res =
+        llmroller_server::backup::run_backup(&pool, &args.out, args.overwrite, &master_key_id)
+            .await
+            .map_err(|e| match e {
+                llmroller_server::backup::BackupError::AlreadyExists => {
+                    CliFailure::new(2, e.to_string())
+                }
+                _ => CliFailure::new(13, e.to_string()),
+            })?;
+
+    Ok(res)
 }
 
 async fn run_healthcheck(args: HealthcheckArgs) -> ExitCode {
