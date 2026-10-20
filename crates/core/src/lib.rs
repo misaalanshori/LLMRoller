@@ -13,3 +13,4 @@ pub mod seams;
 pub mod settings;
 pub mod snapshot;
 pub mod strategy;
+pub mod windows;
