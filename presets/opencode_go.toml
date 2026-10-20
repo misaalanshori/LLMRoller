@@ -1,0 +1,24 @@
+# OpenCode Go provider preset.
+# Spec: ./docs/srdd/2. SRDD - Research Findings.md#23-target-provider-endpoints-protocols-and-quotas
+
+kind = "opencode_go"
+name = "OpenCode Go"
+base_url = "https://opencode.ai/zen/go/v1"
+ua_policy = "label"
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+usage = "/usage"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "native"
+
+[aliases]
+"claude-sonnet-4-6" = "claude-sonnet-4.6"

@@ -1,0 +1,24 @@
+# Command Code provider preset.
+# Spec: ./docs/srdd/2. SRDD - Research Findings.md#23-target-provider-endpoints-protocols-and-quotas
+
+kind = "command_code"
+name = "Command Code"
+base_url = "https://api.commandcode.ai/provider/v1"
+ua_policy = "pass"
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+usage = "/alpha/billing/credits"
+
+[aux_endpoints]
+count_tokens = true
+responses_compact = true
+
+[usage_reporting]
+chat_stream = "native"
+
+[aliases]
+"claude-sonnet-4-6" = "claude-sonnet-4.6"

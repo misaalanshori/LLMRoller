@@ -1,0 +1,20 @@
+# Custom provider preset.
+# Spec: ./docs/srdd/6. SRDD - Functional Requirements.md#63-provider-and-upstream-key-management-prv
+
+kind = "custom"
+name = "Custom Provider"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"

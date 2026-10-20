@@ -1,0 +1,24 @@
+# Open Design AMR provider preset.
+# Spec: ./docs/srdd/2. SRDD - Research Findings.md#23-target-provider-endpoints-protocols-and-quotas
+
+kind = "open_design_amr"
+name = "Open Design AMR"
+base_url = "https://amr-link.open-design.ai/v1"
+ua_policy = "pass"
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+usage = "/usage"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[aliases]
+"deepseek-v4-flash" = "deepseek-v4.1-flash"
