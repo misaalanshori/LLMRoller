@@ -38,6 +38,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Documentation consistency
+        run: |
+          cargo xtask doc-consistency
+          cargo xtask docs-bundle --check
+
       - name: Supply-chain policy
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:

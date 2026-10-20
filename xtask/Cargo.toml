@@ -13,3 +13,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
