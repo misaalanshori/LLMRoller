@@ -21,5 +21,6 @@ pub mod settings;
 pub mod shares;
 pub mod snapshot;
 pub mod strategy;
+pub mod trace_config;
 pub mod windows;
 pub mod wrr;
