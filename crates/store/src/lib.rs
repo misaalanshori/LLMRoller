@@ -13,5 +13,6 @@ pub mod pool;
 pub mod providers;
 pub mod rotation;
 pub mod settings;
+pub mod shares;
 pub mod users;
 pub mod writer;
