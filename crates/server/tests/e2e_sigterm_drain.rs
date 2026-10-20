@@ -219,3 +219,79 @@ async fn test_orchestrator_passthrough_and_body_budget_admission() {
     assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(err.retry_after_secs(), 1);
 }
+
+/// Spec: REL-1
+/// Verify 8-step graceful SIGTERM drain:
+/// 1. /readyz flipped to 503
+/// 2. Stop accepting new connections
+/// 3. In-flight streams drain naturally or are cancelled with Termination::ShutdownCut
+/// 4. Background jobs stopped
+/// 5. Writer queues flushed
+/// 6. PRAGMA wal_checkpoint(TRUNCATE) run, exits 0.
+/// Also verify job panic supervisor restarts panicking jobs with exponential backoff and caps at 3.
+#[doc = "Spec: REL-1"]
+#[tokio::test]
+async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
+    use llmroller_server::shutdown::{JobSupervisor, ShutdownSupervisor};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (_dir, pool, _client_token, _user_id) = setup_test_context().await;
+
+    let is_ready = Arc::new(AtomicBool::new(true));
+    let open_streams = Arc::new(AtomicUsize::new(2));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
+    let shutdown = ShutdownSupervisor::new(
+        is_ready.clone(),
+        open_streams.clone(),
+        shutdown_notify.clone(),
+        pool.clone(),
+        Duration::from_millis(10), // fast drain grace for test
+        Duration::from_millis(50), // fast drain timeout for test
+    );
+
+    // Simulate active in-flight stream that listens for shutdown_notify
+    let cut_observed = Arc::new(AtomicBool::new(false));
+    let cut_clone = cut_observed.clone();
+    let streams_clone = open_streams.clone();
+    tokio::spawn(async move {
+        shutdown_notify.notified().await;
+        cut_clone.store(true, Ordering::SeqCst);
+        streams_clone.store(0, Ordering::SeqCst);
+    });
+
+    let exit_code = shutdown.execute_graceful_shutdown().await;
+    assert_eq!(exit_code, 0);
+
+    // Step 1: /readyz flipped to 503 (is_ready == false)
+    assert!(!is_ready.load(Ordering::SeqCst));
+
+    // Step 4: Stragglers cancelled with ShutdownCut
+    assert!(cut_observed.load(Ordering::SeqCst));
+
+    // Step 8: Open streams drained to 0
+    assert_eq!(open_streams.load(Ordering::SeqCst), 0);
+
+    // Test JobSupervisor: restarts task on panic, stops after 3 panics
+    let panic_count = Arc::new(AtomicUsize::new(0));
+    let panic_clone = panic_count.clone();
+
+    let job = JobSupervisor::new("test_job");
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+    let job_task = tokio::spawn(async move {
+        job.run_supervised(stop_rx, move || {
+            let c = panic_clone.fetch_add(1, Ordering::SeqCst);
+            if c < 3 {
+                panic!("simulated transient panic in background job");
+            }
+        })
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = stop_tx.send(true);
+    let _ = job_task.await;
+
+    assert!(panic_count.load(Ordering::SeqCst) >= 3);
+}

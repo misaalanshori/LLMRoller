@@ -5,3 +5,4 @@
 //! Spec: ./docs/srdd/21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md#2162-versioned-configsnapshot-publication-reloader
 
 pub mod reloader;
+pub mod shutdown;
