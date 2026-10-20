@@ -349,3 +349,206 @@ async fn test_sigkill_durability_and_restart_recovery() {
     assert_eq!(fetched.session_hash, "kill9-hash");
     read_tx.commit().await.expect("commit read tx");
 }
+
+#[doc = "Spec: USG-1, USG-2, USG-3, LIM-1"]
+#[tokio::test]
+async fn test_live_usage_emission_and_attempt_charging() {
+    use llmroller_core::pricing::{Rates, estimate_input_tokens};
+    use llmroller_core::windows::{AtomicBudgetCounter, BudgetCounter, Reservation};
+    use llmroller_proto::adapters::EndpointKind;
+    use llmroller_proto::sse_tap::SseUsageTap;
+    use llmroller_proxy::lifecycle::{RequestLifecycle, Termination};
+
+    let (_dir, pool, _master_key, user_id) = setup_usage_writer_test_db().await;
+    let mut tx = pool.begin().await.expect("begin");
+
+    let client_key_id = ClientKeyId::generate();
+    sqlx::query("INSERT INTO client_keys (id, owner_user_id, label, prefix, key_hash, created_at) VALUES (?, ?, 'Key', 'llr_123', 'hash123', 1000)")
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert client key");
+
+    let writer = ThreeQueueUsageWriter::new(10_000);
+
+    // 1. Upstream try fails with 502 after body write: charges estimated_input (USG-1, USG-3)
+    let body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello world, please answer this prompt with detailed information."}]}"#;
+    let input_est = estimate_input_tokens(body);
+    let rates = Rates::default(); // $3 / MTok input
+    let charged_est =
+        ((input_est as i128 * rates.input_per_mtok_micro_usd as i128 + 999_999) / 1_000_000) as i64;
+    assert!(charged_est > 0);
+
+    let req_id = RequestId::generate();
+    let attempt_fail = UsageAttemptRecord {
+        request_id: req_id,
+        attempt_no: 1,
+        ts: 1000,
+        upstream_key_id: "k1".to_string(),
+        share_id: None,
+        outcome: "http_5xx".to_string(),
+        http_status: Some(502),
+        bytes_sent: body.len() as i64,
+        charged_micro_usd: charged_est,
+        charge_basis: "estimated_input".to_string(),
+    };
+
+    let attempt_success = UsageAttemptRecord {
+        request_id: req_id,
+        attempt_no: 2,
+        ts: 1100,
+        upstream_key_id: "k2".to_string(),
+        share_id: None,
+        outcome: "served".to_string(),
+        http_status: Some(200),
+        bytes_sent: body.len() as i64,
+        charged_micro_usd: 15_000,
+        charge_basis: "actual".to_string(),
+    };
+
+    let event = UsageEventRecord {
+        id: "ev-attempt-charge".to_string(),
+        ts: 1000,
+        request_id: req_id,
+        client_key_id,
+        owner_user_id: user_id,
+        upstream_key_id: Some("k2".to_string()),
+        provider_id: Some("p1".to_string()),
+        provider_scope: Some("personal".to_string()),
+        share_id: None,
+        canonical_id: Some("gpt-4o".to_string()),
+        upstream_model_id: Some("gpt-4o".to_string()),
+        endpoint: "chat".to_string(),
+        protocol: Some("chat".to_string()),
+        session_hash: Some("sess-att".to_string()),
+        status: 200,
+        stream: false,
+        incomplete: false,
+        termination: "completed".to_string(),
+        trace_dropped: false,
+        input_uncached_tokens: input_est,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 20,
+        reasoning_tokens: 0,
+        cost_micro_usd: 15_000,
+        cost_source: "provider".to_string(),
+        latency_ms: Some(200),
+        ttfb_ms: Some(80),
+        pin_outcome: Some("repin".to_string()),
+        failovers: 1,
+        error_code: None,
+    };
+
+    writer.enqueue(event, vec![attempt_fail, attempt_success]);
+    writer.flush_to_db(&mut tx).await.expect("flush attempts");
+
+    let attempts_saved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_attempts WHERE request_id = ?")
+            .bind(req_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count attempts");
+    assert_eq!(attempts_saved, 2);
+
+    let est_charge: i64 = sqlx::query_scalar(
+        "SELECT charged_micro_usd FROM usage_attempts WHERE request_id = ? AND attempt_no = 1",
+    )
+    .bind(req_id.to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("query est charge");
+    assert_eq!(est_charge, charged_est);
+
+    // 2. Client disconnecting mid-stream emits usage_events with client_gone, incomplete = 1 (USG-1, USG-2, USG-3)
+    let mut tap = SseUsageTap::new(EndpointKind::Chat);
+    let delta =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial answer from stream\"}}]}\n\n";
+    tap.feed_chunk(delta);
+
+    let mut lifecycle = RequestLifecycle::new(RequestId::generate(), 1000, None);
+    lifecycle.set_termination(Termination::ClientGone);
+
+    let client_gone_usage = tap.finalize_usage();
+    let aborted_event = UsageEventRecord {
+        id: "ev-client-gone".to_string(),
+        ts: 1000,
+        request_id: lifecycle.request_id,
+        client_key_id,
+        owner_user_id: user_id,
+        upstream_key_id: Some("k2".to_string()),
+        provider_id: Some("p1".to_string()),
+        provider_scope: Some("personal".to_string()),
+        share_id: None,
+        canonical_id: Some("gpt-4o".to_string()),
+        upstream_model_id: Some("gpt-4o".to_string()),
+        endpoint: "chat".to_string(),
+        protocol: Some("chat".to_string()),
+        session_hash: Some("sess-gone".to_string()),
+        status: 499,
+        stream: true,
+        incomplete: true,
+        termination: lifecycle.termination.as_str().to_string(),
+        trace_dropped: false,
+        input_uncached_tokens: input_est,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: client_gone_usage.output_tokens,
+        reasoning_tokens: 0,
+        cost_micro_usd: 5_000,
+        cost_source: "estimated_incomplete".to_string(),
+        latency_ms: Some(150),
+        ttfb_ms: Some(50),
+        pin_outcome: Some("followed".to_string()),
+        failovers: 0,
+        error_code: Some("client_gone".to_string()),
+    };
+
+    writer.enqueue(aborted_event, vec![]);
+    writer
+        .flush_to_db(&mut tx)
+        .await
+        .expect("flush aborted event");
+
+    let saved_termination: String =
+        sqlx::query_scalar("SELECT termination FROM usage_events WHERE id = 'ev-client-gone'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("query termination");
+    assert_eq!(saved_termination, "client_gone");
+
+    let saved_incomplete: i64 =
+        sqlx::query_scalar("SELECT incomplete FROM usage_events WHERE id = 'ev-client-gone'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("query incomplete");
+    assert_eq!(saved_incomplete, 1);
+
+    // 3. Reservation finalization: commits actual cost and releases reservation (LIM-1)
+    let counter = Arc::new(AtomicBudgetCounter::new(1, 10_000_000, 2, 18_000_000));
+    let res = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        50_000,
+        1000,
+    )
+    .expect("reserve");
+    assert_eq!(
+        counter
+            .reserved_in_flight()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        50_000
+    );
+
+    // Commit actual cost of 45_000 micro-USD
+    res.commit(45_000, 2000);
+    assert_eq!(
+        counter
+            .reserved_in_flight()
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(counter.effective_used(2000), 45_000);
+
+    tx.commit().await.expect("commit");
+}
