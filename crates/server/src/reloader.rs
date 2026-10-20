@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::snapshot::{ConfigDomain, ConfigSnapshot};
+use llmroller_store::client_keys::{ClientKeyError, load_client_key_records_tx};
 use llmroller_store::providers::{
     ProviderError, load_provider_records_tx, load_upstream_key_records_tx,
 };
@@ -33,6 +34,8 @@ pub enum ReloaderError {
     User(#[from] UserError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error(transparent)]
+    ClientKey(#[from] ClientKeyError),
     #[error("reloader version notification timed out")]
     Timeout,
     #[error("reloader channel closed")]
@@ -109,10 +112,15 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
         .await?
         .unwrap_or(0);
 
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+
     let users = load_user_records_tx(&mut tx).await?;
     let settings = load_settings_tx(&mut tx).await?;
     let providers = load_provider_records_tx(&mut tx).await?;
     let upstream_keys = load_upstream_key_records_tx(&mut tx).await?;
+    let client_keys = load_client_key_records_tx(&mut tx, now_ms).await?;
     tx.commit().await?;
 
     Ok(ConfigSnapshot {
@@ -121,6 +129,7 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
         settings: Arc::new(settings),
         providers: Arc::new(providers),
         upstream_keys: Arc::new(upstream_keys),
+        client_keys_by_hash: Arc::new(client_keys),
     })
 }
 
@@ -239,6 +248,23 @@ pub fn start_reloader(
                     current.upstream_keys.clone()
                 };
 
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+
+                let next_client_keys =
+                    if reload_all || changed_domains.contains(&ConfigDomain::ClientKeys) {
+                        match load_client_key_records_tx(&mut tx, now_ms).await {
+                            Ok(keys) => Arc::new(keys),
+                            Err(err) => {
+                                tracing::error!("reloader failed to load client_keys slice: {err}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        current.client_keys_by_hash.clone()
+                    };
+
                 if let Err(err) = tx.commit().await {
                     tracing::error!("reloader failed to commit read transaction: {err}");
                     continue;
@@ -250,6 +276,7 @@ pub fn start_reloader(
                     settings: next_settings,
                     providers: next_providers,
                     upstream_keys: next_upstream_keys,
+                    client_keys_by_hash: next_client_keys,
                 };
 
                 // Store new snapshot atomically

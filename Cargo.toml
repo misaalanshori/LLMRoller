@@ -37,6 +37,7 @@ bytes = "1.12.1"
 toml = "1.1.8"
 time = { version = "0.3.55", features = ["serde"] }
 url = "2.5.8"
+ipnet = { version = "2.12.2", features = ["serde"] }
 
 # Identifiers, secrets, and cryptography
 ulid = { version = "3.0.0", features = ["serde"] }

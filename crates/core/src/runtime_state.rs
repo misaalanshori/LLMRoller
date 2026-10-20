@@ -65,7 +65,8 @@ impl RuntimeState {
                 CacheInvalidationEvent::StrategyChanged
                 | CacheInvalidationEvent::SettingsChanged
                 | CacheInvalidationEvent::ProviderChanged(_)
-                | CacheInvalidationEvent::UpstreamKeyChanged(_) => {
+                | CacheInvalidationEvent::UpstreamKeyChanged(_)
+                | CacheInvalidationEvent::ClientKeyChanged(_) => {
                     self.health.bump_version();
                 }
                 CacheInvalidationEvent::UserChanged(_)

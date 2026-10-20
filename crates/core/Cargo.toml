@@ -13,10 +13,13 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+ipnet.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 secrecy.workspace = true
 serde.workspace = true
+sha2.workspace = true
 ulid.workspace = true
 zeroize.workspace = true
 

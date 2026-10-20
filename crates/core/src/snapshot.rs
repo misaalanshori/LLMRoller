@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ids::{ProviderId, UpstreamKeyId, UserId};
+use crate::client_key::{ClientKeyRecord, HashRole};
+use crate::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
 use crate::provider::ProviderKind;
 use crate::rbac::{OwnershipScope, Role};
 use crate::settings::RuntimeSettings;
@@ -80,6 +81,7 @@ pub enum CacheInvalidationEvent {
     StrategyChanged,
     ProviderChanged(ProviderId),
     UpstreamKeyChanged(UpstreamKeyId),
+    ClientKeyChanged(ClientKeyId),
 }
 
 /// Immutable configuration snapshot loaded into [`arc_swap::ArcSwap`].
@@ -90,6 +92,7 @@ pub struct ConfigSnapshot {
     pub settings: Arc<RuntimeSettings>,
     pub providers: Arc<HashMap<ProviderId, ProviderRecord>>,
     pub upstream_keys: Arc<HashMap<UpstreamKeyId, UpstreamKeyRecord>>,
+    pub client_keys_by_hash: Arc<HashMap<[u8; 32], (ClientKeyRecord, HashRole)>>,
 }
 
 impl ConfigSnapshot {
@@ -126,6 +129,7 @@ impl Default for ConfigSnapshot {
             settings: Arc::new(RuntimeSettings::default()),
             providers: Arc::new(HashMap::new()),
             upstream_keys: Arc::new(HashMap::new()),
+            client_keys_by_hash: Arc::new(HashMap::new()),
         }
     }
 }

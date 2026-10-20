@@ -4,8 +4,10 @@
 //! Spec: ./docs/srdd/6. SRDD - Functional Requirements.md#65-client-keys-clk
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
+use llmroller_core::client_key::{ClientKeyRecord, HashRole};
 use llmroller_core::ids::{ClientKeyId, UserId};
 use llmroller_core::rbac::ActorScope;
 use llmroller_core::seams::{EntropySource, SecretString, secret_string};
@@ -373,6 +375,138 @@ pub async fn delete_client_key(
     delete_client_key_tx(&mut tx, actor, id).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Rotate an existing client key in place with a grace window inside an active transaction.
+pub async fn rotate_client_key_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    id: ClientKeyId,
+    grace_period_secs: i64,
+    entropy: &dyn EntropySource,
+    now_ms: i64,
+) -> Result<CreateClientKeyResult, ClientKeyError> {
+    let existing = get_client_key_tx(tx, actor, id).await?;
+    let (raw_token, new_prefix, new_hash) = generate_client_key_token(entropy);
+
+    let prev_expires = now_ms + grace_period_secs * 1000;
+
+    sqlx::query(
+        "UPDATE client_keys SET
+            prefix = ?, key_hash = ?, prev_key_hash = ?, prev_key_expires_at = ?
+         WHERE id = ?",
+    )
+    .bind(&new_prefix)
+    .bind(&new_hash)
+    .bind(&existing.key_hash)
+    .bind(prev_expires)
+    .bind(id.to_string())
+    .execute(&mut **tx)
+    .await?;
+
+    let updated = ClientKey {
+        id,
+        owner_user_id: existing.owner_user_id,
+        label: existing.label,
+        prefix: new_prefix,
+        key_hash: new_hash,
+        prev_key_hash: Some(existing.key_hash),
+        prev_key_expires_at: Some(prev_expires),
+        routing_scope: existing.routing_scope,
+        allowed_models: existing.allowed_models,
+        rate_limit_rpm: existing.rate_limit_rpm,
+        budget_micro_usd_month: existing.budget_micro_usd_month,
+        allowed_cidrs: existing.allowed_cidrs,
+        constant_session_flagged_at: existing.constant_session_flagged_at,
+        constant_session_mode: existing.constant_session_mode,
+        disabled: existing.disabled,
+        revoked_at: existing.revoked_at,
+        expires_at: existing.expires_at,
+        created_at: existing.created_at,
+        last_used_at: existing.last_used_at,
+    };
+
+    Ok(CreateClientKeyResult {
+        client_key: updated,
+        raw_token: secret_string(&raw_token),
+    })
+}
+
+/// Rotate an existing client key in place with a grace window.
+pub async fn rotate_client_key(
+    pool: &SqlitePool,
+    actor: &ActorScope,
+    id: ClientKeyId,
+    grace_period_secs: i64,
+    entropy: &dyn EntropySource,
+    now_ms: i64,
+) -> Result<CreateClientKeyResult, ClientKeyError> {
+    let mut tx = pool.begin().await?;
+    let res = rotate_client_key_tx(&mut tx, actor, id, grace_period_secs, entropy, now_ms).await?;
+    tx.commit().await?;
+    Ok(res)
+}
+
+/// Load all client keys into in-memory projections mapped by binary SHA-256 hash.
+pub async fn load_client_key_records_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    now_ms: i64,
+) -> Result<HashMap<[u8; 32], (ClientKeyRecord, HashRole)>, ClientKeyError> {
+    let rows = sqlx::query("SELECT * FROM client_keys")
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut map = HashMap::with_capacity(rows.len() * 2);
+    for row in rows {
+        let k = client_key_from_row(&row)?;
+        let key_hash_bytes = hex_to_32bytes(&k.key_hash);
+        let prev_hash_bytes = k.prev_key_hash.as_ref().map(|h| hex_to_32bytes(h));
+
+        let record = ClientKeyRecord {
+            id: k.id,
+            owner_user_id: k.owner_user_id,
+            label: k.label,
+            prefix: k.prefix,
+            key_hash: key_hash_bytes,
+            prev_key_hash: prev_hash_bytes,
+            prev_key_expires_at: k.prev_key_expires_at,
+            routing_scope: k.routing_scope,
+            allowed_models: k.allowed_models,
+            rate_limit_rpm: k.rate_limit_rpm,
+            budget_micro_usd_month: k.budget_micro_usd_month,
+            allowed_cidrs: k.allowed_cidrs,
+            constant_session_mode: k.constant_session_mode,
+            disabled: k.disabled,
+            revoked_at: k.revoked_at,
+            expires_at: k.expires_at,
+        };
+
+        // Primary hash
+        map.insert(key_hash_bytes, (record.clone(), HashRole::Current));
+
+        // Predecessor hash if within grace period
+        if let (Some(prev_hash), Some(exp)) = (prev_hash_bytes, k.prev_key_expires_at)
+            && now_ms < exp
+            && !k.disabled
+            && k.revoked_at.is_none()
+        {
+            map.insert(prev_hash, (record, HashRole::Previous));
+        }
+    }
+
+    Ok(map)
+}
+
+fn hex_to_32bytes(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if hex.len() == 64 {
+        for i in 0..32 {
+            if let Ok(byte) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                out[i] = byte;
+            }
+        }
+    }
+    out
 }
 
 fn client_key_from_row(row: &SqliteRow) -> Result<ClientKey, ClientKeyError> {
