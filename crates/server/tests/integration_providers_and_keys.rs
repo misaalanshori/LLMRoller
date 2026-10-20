@@ -9,6 +9,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use http_body_util::BodyExt as _;
+use llmroller_admin::auth::{AuthAppState, AuthConfig};
+use llmroller_admin::setup::SetupAppState;
+use llmroller_admin::{ApiAppState, control_plane_router_full};
+use tower::ServiceExt as _;
+
 use arc_swap::ArcSwap;
 use llmroller_core::ids::{UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
@@ -545,4 +553,245 @@ async fn test_provider_and_key_reloader_propagation_and_slice_isolation() {
     assert!(Arc::ptr_eq(&snap2.users, &snap1.users));
     assert!(Arc::ptr_eq(&snap2.settings, &snap1.settings));
     assert!(Arc::ptr_eq(&snap2.providers, &snap1.providers));
+}
+
+/// Spec: PRV-1, PRV-4, PRV-5, Partial: CLK-1
+/// End-to-end JSON control-plane CRUD handlers for providers, keys, client keys, and settings
+/// through Axum router and session auth per SRDD Section 14.2.
+#[doc = "Spec: PRV-1, PRV-4, PRV-5, Partial: CLK-1"]
+#[tokio::test]
+async fn test_json_crud_endpoints_via_control_plane_router() {
+    let (dir, writer_pool, _reader_pool, master_key, _admin_id, _user_id) =
+        setup_test_context().await;
+
+    let auth_config = AuthConfig {
+        trusted_proxies: vec![],
+        dev_insecure_cookies: true,
+        require_tls: false,
+    };
+    let auth_state = AuthAppState::new(writer_pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: writer_pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    // 1. GET /login to retrieve CSRF token
+    let login_page_req = Request::builder()
+        .method("GET")
+        .uri("/login")
+        .body(Body::empty())
+        .expect("login page req");
+    let login_page_res = app.clone().oneshot(login_page_req).await.expect("res");
+    assert_eq!(login_page_res.status(), StatusCode::OK);
+
+    let login_cookie = login_page_res
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("login set-cookie")
+        .to_str()
+        .expect("str")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string();
+    let login_csrf = login_page_res
+        .headers()
+        .get("x-csrf-token")
+        .expect("login csrf")
+        .to_str()
+        .expect("str")
+        .to_string();
+
+    // 2. POST /api/auth/login as admin_user
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header(header::COOKIE, &login_cookie)
+        .header("x-csrf-token", &login_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "username": "admin_user",
+                "password": "supersecretadminpass123",
+            })
+            .to_string(),
+        ))
+        .expect("login req");
+    let login_res = app.clone().oneshot(login_req).await.expect("res");
+    assert_eq!(login_res.status(), StatusCode::OK);
+
+    let session_cookie = login_res
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("str")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string();
+    let session_csrf = login_res
+        .headers()
+        .get("x-csrf-token")
+        .expect("session csrf")
+        .to_str()
+        .expect("str")
+        .to_string();
+
+    // 3. POST /api/user/providers -> create personal provider via JSON API
+    let create_prov_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/providers")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "json_personal_prov",
+                "kind": "custom",
+                "base_url": "https://custom.api/v1",
+                "config_json": "{\"paths\":{\"chat\":\"/chat/completions\"}}",
+            })
+            .to_string(),
+        ))
+        .expect("create prov req");
+    let create_prov_res = app.clone().oneshot(create_prov_req).await.expect("res");
+    assert_eq!(create_prov_res.status(), StatusCode::CREATED);
+
+    let prov_bytes = create_prov_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let prov_json: serde_json::Value = serde_json::from_slice(&prov_bytes).expect("parse json");
+    let provider_id = prov_json["id"].as_str().expect("provider id");
+    assert_eq!(prov_json["name"], "json_personal_prov");
+    assert_eq!(prov_json["ownership_scope"], "personal");
+    assert!(
+        !prov_json["share_config_fingerprint"]
+            .as_str()
+            .expect("fp")
+            .is_empty()
+    );
+
+    // 4. POST /api/user/providers/{id}/keys -> create upstream key via JSON API
+    let create_key_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/user/providers/{provider_id}/keys"))
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "label": "json_key_1",
+                "secret": "sk-secret-payload-9999",
+                "priority": 120,
+            })
+            .to_string(),
+        ))
+        .expect("create key req");
+    let create_key_res = app.clone().oneshot(create_key_req).await.expect("res");
+    assert_eq!(create_key_res.status(), StatusCode::CREATED);
+
+    let key_bytes = create_key_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let key_json: serde_json::Value = serde_json::from_slice(&key_bytes).expect("parse json");
+    assert_eq!(key_json["label"], "json_key_1");
+    assert_eq!(key_json["secret_last4"], "9999");
+    assert_eq!(key_json["priority"], 120);
+    // PRV-5: Secret is never echoed in API response!
+    assert!(key_json.get("secret").is_none());
+    assert!(key_json.get("secret_plain").is_none());
+
+    // 5. POST /api/user/client-keys -> create client key via JSON API
+    let create_ck_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/client-keys")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "label": "agent_key",
+                "routing_scope": "personal_first",
+            })
+            .to_string(),
+        ))
+        .expect("create ck req");
+    let create_ck_res = app.clone().oneshot(create_ck_req).await.expect("res");
+    assert_eq!(create_ck_res.status(), StatusCode::CREATED);
+
+    let ck_bytes = create_ck_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let ck_json: serde_json::Value = serde_json::from_slice(&ck_bytes).expect("parse json");
+    let raw_token = ck_json["token"].as_str().expect("raw token");
+    assert!(raw_token.starts_with("llr_"));
+    assert_eq!(ck_json["client_key"]["label"], "agent_key");
+
+    // 6. GET /admin/api/settings -> fetch settings
+    let get_settings_req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/settings")
+        .header(header::COOKIE, &session_cookie)
+        .body(Body::empty())
+        .expect("get settings req");
+    let get_settings_res = app.clone().oneshot(get_settings_req).await.expect("res");
+    assert_eq!(get_settings_res.status(), StatusCode::OK);
+
+    // 7. PATCH /admin/api/settings -> valid update
+    let patch_settings_req = Request::builder()
+        .method("PATCH")
+        .uri("/admin/api/settings")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "pin_ttl_secs": 95000,
+            })
+            .to_string(),
+        ))
+        .expect("patch settings req");
+    let patch_settings_res = app.clone().oneshot(patch_settings_req).await.expect("res");
+    assert_eq!(patch_settings_res.status(), StatusCode::OK);
+
+    let set_bytes = patch_settings_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let set_json: serde_json::Value = serde_json::from_slice(&set_bytes).expect("parse json");
+    assert_eq!(set_json["pin_ttl_secs"], 95000);
+
+    // 8. PATCH /admin/api/settings -> invalid unknown key rejected with 422
+    let bad_settings_req = Request::builder()
+        .method("PATCH")
+        .uri("/admin/api/settings")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "unknown_key": "val",
+            })
+            .to_string(),
+        ))
+        .expect("bad settings req");
+    let bad_settings_res = app.clone().oneshot(bad_settings_req).await.expect("res");
+    assert_eq!(bad_settings_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

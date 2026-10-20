@@ -6,7 +6,7 @@
 
 use std::str::FromStr;
 
-use llmroller_core::settings::*;
+pub use llmroller_core::settings::*;
 use llmroller_core::strategy::RoutingStrategy;
 use sqlx::{Row as _, SqlitePool, Transaction};
 use thiserror::Error;
