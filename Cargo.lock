@@ -1036,6 +1036,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "llmroller-core",
+ "parking_lot",
  "secrecy",
  "serde",
  "serde_json",

@@ -9,4 +9,6 @@ pub mod instance;
 pub mod migrations;
 pub mod pool;
 pub mod rotation;
+pub mod settings;
 pub mod users;
+pub mod writer;
