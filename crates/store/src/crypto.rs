@@ -28,6 +28,9 @@ pub const MASTER_KEY_ENV: &str = "LLMROLLER_MASTER_KEY";
 /// Environment variable pointing at a permission-restricted base64 master-key file.
 pub const MASTER_KEY_FILE_ENV: &str = "LLMROLLER_MASTER_KEY_FILE";
 
+/// Environment variable naming the active master key.
+pub const MASTER_KEY_ID_ENV: &str = "LLMROLLER_MASTER_KEY_ID";
+
 const MASTER_KEY_LEN: usize = 32;
 const INSTANCE_ID_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
@@ -84,8 +87,14 @@ pub enum MasterKeyError {
     /// The key file grants permissions to the group or other users.
     #[error("master key file must not have group or other permission bits set")]
     InsecurePermissions,
+    /// `LLMROLLER_MASTER_KEY_ID` was not provided.
+    #[error("LLMROLLER_MASTER_KEY_ID is required")]
+    MissingKeyId,
+    /// `LLMROLLER_MASTER_KEY_ID` was empty.
+    #[error("LLMROLLER_MASTER_KEY_ID must not be empty")]
+    EmptyKeyId,
     /// An environment variable is not valid UTF-8.
-    #[error("master key environment variable is not valid UTF-8")]
+    #[error("master-key environment variable is not valid UTF-8")]
     NonUnicodeEnvironment,
 }
 
@@ -216,6 +225,21 @@ pub fn load_master_key_from_env() -> Result<MasterKey, MasterKeyError> {
         Err(env::VarError::NotUnicode(_)) => return Err(MasterKeyError::NonUnicodeEnvironment),
     };
     load_master_key(None, inline.as_deref())
+}
+
+/// Load the active master-key identifier from `LLMROLLER_MASTER_KEY_ID`.
+///
+/// # Errors
+///
+/// Returns a [`MasterKeyError`] with exit code `3` when the identifier is
+/// missing, empty, or not valid UTF-8.
+pub fn load_master_key_id_from_env() -> Result<String, MasterKeyError> {
+    match env::var(MASTER_KEY_ID_ENV) {
+        Ok(value) if value.is_empty() => Err(MasterKeyError::EmptyKeyId),
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Err(MasterKeyError::MissingKeyId),
+        Err(env::VarError::NotUnicode(_)) => Err(MasterKeyError::NonUnicodeEnvironment),
+    }
 }
 
 /// Canonical length-prefixed Associated Data for a sealed domain.

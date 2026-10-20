@@ -18,7 +18,14 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+clap.workspace = true
+llmroller-core = { path = "../core" }
+llmroller-store = { path = "../store" }
+tokio.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
 toml.workspace = true

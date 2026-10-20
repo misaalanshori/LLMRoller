@@ -695,13 +695,13 @@ tests = ["tests/e2e_cli_harnesses.rs"]
 priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.3"
-tests = ["crates/store/src/crypto/tests.rs"]
+tests = ["crates/store/src/crypto/tests.rs", "crates/store/src/instance/tests.rs", "crates/store/src/rotation/tests.rs", "crates/server/tests/cli_rotation.rs"]
 
 [requirements.SEC-2]
 priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.3"
-tests = ["crates/store/src/crypto/tests.rs"]
+tests = ["crates/store/src/crypto/tests.rs", "crates/store/src/instance/tests.rs", "crates/store/src/rotation/tests.rs", "crates/server/tests/cli_rotation.rs"]
 
 [requirements.SEC-3]
 priority = "P0"
