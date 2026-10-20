@@ -5,6 +5,7 @@
 //! Spec: ./docs/srdd/14. SRDD - API and Web UI Specification.md#142-control-plane-json-api-apiuser-and-adminapi
 
 pub mod api;
+pub mod assets;
 pub mod auth;
 pub mod setup;
 
@@ -32,5 +33,6 @@ pub fn control_plane_router_full(
         .merge(setup::router(setup_state))
         .merge(auth::router(auth_state))
         .merge(api::router(api_state))
+        .merge(assets::router())
         .layer(from_fn(auth::security_headers_middleware))
 }

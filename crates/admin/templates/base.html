@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{{ title }} - LLMRoller</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <link rel="stylesheet" href="/static/uPlot.min.css">
+    <script src="/static/htmx.min.js"></script>
+    <script src="/static/app.js"></script>
+    <script src="/static/uPlot.iife.min.js"></script>
+</head>
+<body hx-headers='{"x-csrf-token": "{{ csrf_token }}"}'>
+    {% if traceability_enabled %}
+    <div id="traceability-banner" class="traceability-banner">
+        Content Traceability Mode is active. Turn content is being retained.
+    </div>
+    {% endif %}
+
+    <nav class="navbar">
+        <a href="/app">Workspace</a>
+        {% if is_admin %}
+        <a href="/admin">Admin Console</a>
+        {% endif %}
+    </nav>
+
+    <main class="content">
+        {{ content }}
+    </main>
+</body>
+</html>
