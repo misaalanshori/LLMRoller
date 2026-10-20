@@ -8,6 +8,7 @@
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
 use llmroller_core::rbac::OwnershipScope;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Smuggling and header format errors.
@@ -309,6 +310,116 @@ pub fn apply_response_header_pipeline(
     }
 
     out
+}
+
+/// User-Agent policy modes per Section 12.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UaPolicy {
+    /// Forward the client's User-Agent header unchanged, or send llmroller/1.0 if empty.
+    #[default]
+    Pass,
+    /// Forward coding-agent User-Agent strings, and replace generic HTTP library strings with llmroller/1.0.
+    Label,
+    /// Return HTTP 400 if the client sends an empty or generic library User-Agent.
+    Reject,
+}
+
+/// Error returned when a User-Agent is rejected by policy.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid user-agent rejected by policy: {0:?}")]
+pub struct UaPolicyRejectedError(pub String);
+
+/// Resolve the effective outbound User-Agent header string per Section 12.2.
+pub fn resolve_user_agent(
+    policy: UaPolicy,
+    incoming_ua: Option<&str>,
+) -> Result<String, UaPolicyRejectedError> {
+    const DEFAULT_UA: &str = "llmroller/1.0";
+    match policy {
+        UaPolicy::Pass => match incoming_ua {
+            Some(ua) if !ua.trim().is_empty() => Ok(ua.to_string()),
+            _ => Ok(DEFAULT_UA.to_string()),
+        },
+        UaPolicy::Label => match incoming_ua {
+            Some(ua) if is_coding_agent_ua(ua) => Ok(ua.to_string()),
+            _ => Ok(DEFAULT_UA.to_string()),
+        },
+        UaPolicy::Reject => match incoming_ua {
+            Some(ua) if !ua.trim().is_empty() && !is_generic_library_ua(ua) => Ok(ua.to_string()),
+            Some(ua) => Err(UaPolicyRejectedError(ua.to_string())),
+            None => Err(UaPolicyRejectedError("<empty>".to_string())),
+        },
+    }
+}
+
+/// Determine whether a User-Agent identifies a recognized coding agent per Section 12.2.
+#[must_use]
+pub fn is_coding_agent_ua(ua: &str) -> bool {
+    let lower = ua.to_ascii_lowercase();
+    lower.starts_with("claude-cli/")
+        || lower.starts_with("codex-cli/")
+        || lower.starts_with("opencode/")
+        || lower.starts_with("hermes/")
+}
+
+/// Determine whether a User-Agent identifies a generic HTTP library.
+#[must_use]
+pub fn is_generic_library_ua(ua: &str) -> bool {
+    let lower = ua.to_ascii_lowercase();
+    lower.starts_with("curl/")
+        || lower.starts_with("python-requests/")
+        || lower.starts_with("node-fetch/")
+        || lower.starts_with("postman")
+}
+
+/// Scrub sensitive tokens and known canaries from logs and error strings per SEC-6.
+#[must_use]
+pub fn scrub_canary_tokens(input: &str, canaries: &[&str]) -> String {
+    let mut result = input.to_string();
+    for canary in canaries {
+        if !canary.is_empty() {
+            result = result.replace(canary, "[REDACTED_CANARY]");
+        }
+    }
+    scrub_secret_prefixes(&result)
+}
+
+/// Scrub any tokens starting with sk- or llr_ in text.
+#[must_use]
+pub fn scrub_secret_prefixes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for word in input.split_inclusive(|c: char| !c.is_alphanumeric() && c != '-' && c != '_') {
+        let trimmed_word =
+            word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+        let trailing = &word[trimmed_word.len()..];
+        if (trimmed_word.starts_with("sk-") && trimmed_word.len() > 7)
+            || (trimmed_word.starts_with("llr_") && trimmed_word.len() > 8)
+        {
+            out.push_str("[REDACTED]");
+        } else {
+            out.push_str(trimmed_word);
+        }
+        out.push_str(trailing);
+    }
+    out
+}
+
+/// Sanitize CSV cells against formula injection per SEC-6.
+/// Prefixes cells starting with '=', '+', '-', '@', '\t', '\r' with '\''.
+#[must_use]
+pub fn sanitize_csv_cell(cell: &str) -> String {
+    if cell.starts_with('=')
+        || cell.starts_with('+')
+        || cell.starts_with('-')
+        || cell.starts_with('@')
+        || cell.starts_with('\t')
+        || cell.starts_with('\r')
+    {
+        format!("'{cell}")
+    } else {
+        cell.to_string()
+    }
 }
 
 #[cfg(test)]

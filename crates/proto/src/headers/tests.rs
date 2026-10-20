@@ -8,8 +8,9 @@ use http::{HeaderMap, HeaderValue, header};
 use llmroller_core::rbac::OwnershipScope;
 
 use crate::headers::{
-    SmugglingError, apply_request_header_pipeline, apply_response_header_pipeline,
-    validate_header_value_bytes, validate_request_smuggling,
+    SmugglingError, UaPolicy, apply_request_header_pipeline, apply_response_header_pipeline,
+    resolve_user_agent, sanitize_csv_cell, scrub_canary_tokens, validate_header_value_bytes,
+    validate_request_smuggling,
 };
 
 /// Spec: API-2, API-3, SEC-8, SEC-15
@@ -271,4 +272,73 @@ fn test_response_header_pipeline() {
         "10000"
     );
     assert!(out_own.get("x-llmroller-upstream-scope").is_none());
+}
+
+/// Spec: API-3
+/// Verify User-Agent policy modes: pass, label, reject.
+#[doc = "Spec: API-3"]
+#[test]
+fn test_user_agent_policy_modes() {
+    // 1. Pass mode
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Pass, Some("custom-client/1.0")).expect("pass UA"),
+        "custom-client/1.0"
+    );
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Pass, None).expect("empty UA default"),
+        "llmroller/1.0"
+    );
+
+    // 2. Label mode: Coding agents pass through, generic HTTP libraries get replaced with llmroller/1.0
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Label, Some("claude-cli/1.0.5")).expect("coding agent"),
+        "claude-cli/1.0.5"
+    );
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Label, Some("curl/7.81.0")).expect("curl replaced"),
+        "llmroller/1.0"
+    );
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Label, Some("python-requests/2.28.1"))
+            .expect("python replaced"),
+        "llmroller/1.0"
+    );
+
+    // 3. Reject mode: Generic HTTP libraries or empty are rejected with error (maps to HTTP 400)
+    assert!(resolve_user_agent(UaPolicy::Reject, Some("curl/7.81.0")).is_err());
+    assert!(resolve_user_agent(UaPolicy::Reject, None).is_err());
+    assert!(resolve_user_agent(UaPolicy::Reject, Some("   ")).is_err());
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Reject, Some("opencode/2.0"))
+            .expect("valid agent in reject mode"),
+        "opencode/2.0"
+    );
+}
+
+/// Spec: SEC-6
+/// Verify canary secret scrubbing and CSV formula injection prevention.
+#[doc = "Spec: SEC-6"]
+#[test]
+fn test_canary_scrubber_and_csv_sanitizer() {
+    let canary = "sk-canary-9988776655443322";
+    let text = format!(
+        "upstream returned error: invalid key {canary} and also token sk-live-1234567890abcdef"
+    );
+    let scrubbed = scrub_canary_tokens(&text, &[canary]);
+
+    assert!(!scrubbed.contains(canary));
+    assert!(!scrubbed.contains("sk-live-1234567890abcdef"));
+    assert!(scrubbed.contains("[REDACTED_CANARY]"));
+    assert!(scrubbed.contains("[REDACTED]"));
+
+    // CSV formula injection protection
+    assert_eq!(sanitize_csv_cell("=1+1"), "'=1+1");
+    assert_eq!(
+        sanitize_csv_cell("+cmd|' /C calc'!A0"),
+        "'+cmd|' /C calc'!A0"
+    );
+    assert_eq!(sanitize_csv_cell("-5+2"), "'-5+2");
+    assert_eq!(sanitize_csv_cell("@SUM(A1:A10)"), "'@SUM(A1:A10)");
+    assert_eq!(sanitize_csv_cell("\tleading_tab"), "'\tleading_tab");
+    assert_eq!(sanitize_csv_cell("normal_text"), "normal_text");
 }

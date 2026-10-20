@@ -1378,6 +1378,7 @@ dependencies = [
  "http-body-util",
  "llmroller-admin",
  "llmroller-core",
+ "llmroller-proto",
  "llmroller-proxy",
  "llmroller-store",
  "reqwest",

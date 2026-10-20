@@ -10,6 +10,7 @@ use http::Uri;
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope, Role, SystemSeal, SystemTask};
 use llmroller_core::seams::OsEntropy;
+use llmroller_proto::headers::{sanitize_csv_cell, scrub_canary_tokens};
 use llmroller_proxy::ssrf::{GuardedConnector, SsrfError};
 use llmroller_store::crypto::MasterKey;
 use llmroller_store::instance::load_or_initialize;
@@ -229,4 +230,29 @@ async fn test_guarded_connector_and_save_time_ssrf_blocking() {
         .await
         .expect_err("GuardedConnector must block 6to4 socket connect");
     assert!(matches!(err_6to4, SsrfError::BlockedIp(_)));
+}
+
+/// Spec: SEC-6
+/// Automated canary tests: verify that a planted secret string is scrubbed and never echoed,
+/// and CSV cells starting with formula prefixes are sanitized.
+#[doc = "Spec: SEC-6"]
+#[tokio::test]
+async fn test_canary_secret_redaction_and_formula_injection() {
+    let planted_canary = "sk-canary-9988776655443322";
+
+    // 1. Scrub canary tokens from error messages
+    let log_msg = format!("upstream connection error: request with token {planted_canary} failed");
+    let scrubbed = scrub_canary_tokens(&log_msg, &[planted_canary]);
+    assert!(!scrubbed.contains(planted_canary));
+    assert!(scrubbed.contains("[REDACTED_CANARY]"));
+
+    // 2. CSV formula injection protection
+    for prefix in ['=', '+', '-', '@', '\t', '\r'] {
+        let malicious = format!("{prefix}1+1");
+        let sanitized = sanitize_csv_cell(&malicious);
+        assert!(
+            sanitized.starts_with('\''),
+            "cell starting with {prefix:?} must be prefixed with single quote"
+        );
+    }
 }
