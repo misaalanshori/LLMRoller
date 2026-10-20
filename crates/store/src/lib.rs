@@ -11,6 +11,7 @@ pub mod migrations;
 pub mod models;
 pub mod pins;
 pub mod pool;
+pub mod prices;
 pub mod providers;
 pub mod rotation;
 pub mod settings;

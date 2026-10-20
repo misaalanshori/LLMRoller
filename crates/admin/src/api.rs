@@ -9,7 +9,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId};
 use llmroller_core::provider::ProviderKind;
@@ -586,6 +586,127 @@ async fn patch_admin_settings_handler(
 // ---------------------------------------------------------------------------
 
 /// Build the JSON control-plane router.
+fn map_price_error(
+    status: StatusCode,
+    msg: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "error": { "message": msg.to_string() } })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertPricePayload {
+    pub provider_id: Option<String>,
+    pub provider_kind: String,
+    pub upstream_model_id: String,
+    pub input_per_mtok_micro_usd: i64,
+    pub output_per_mtok_micro_usd: i64,
+    pub cache_read_per_mtok_micro_usd: Option<i64>,
+    pub cache_write_per_mtok_micro_usd: Option<i64>,
+    #[serde(default)]
+    pub tiers: Vec<llmroller_core::pricing::ContextTier>,
+    #[serde(default)]
+    pub schedules: Vec<llmroller_core::pricing::Schedule>,
+}
+
+async fn put_admin_price_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpsertPricePayload>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let provider_id = payload.provider_id.clone().unwrap_or_default();
+    upsert_price_internal(&state, provider_id, payload).await
+}
+
+async fn put_user_provider_price_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ProviderId>,
+    Json(payload): Json<UpsertPricePayload>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let p = llmroller_store::providers::get_provider(&state.auth.pool, &actor, id)
+        .await
+        .map_err(map_provider_error)?;
+    if p.owner_user_id != actor.user_id() {
+        return Err(map_price_error(StatusCode::FORBIDDEN, "not provider owner"));
+    }
+    upsert_price_internal(&state, id.to_string(), payload).await
+}
+
+async fn upsert_price_internal(
+    state: &ApiAppState,
+    provider_id: String,
+    payload: UpsertPricePayload,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let rates = llmroller_core::pricing::Rates {
+        input_per_mtok_micro_usd: payload.input_per_mtok_micro_usd,
+        output_per_mtok_micro_usd: payload.output_per_mtok_micro_usd,
+        cache_read_per_mtok_micro_usd: payload.cache_read_per_mtok_micro_usd.unwrap_or(0),
+        cache_write_per_mtok_micro_usd: payload.cache_write_per_mtok_micro_usd.unwrap_or(0),
+    };
+
+    let params = llmroller_store::prices::UpsertPriceParams {
+        provider_id,
+        provider_kind: payload.provider_kind,
+        upstream_model_id: payload.upstream_model_id,
+        rates,
+        tiers: payload.tiers,
+        schedules: payload.schedules,
+        source: "admin".to_string(),
+        now_ms: state.auth.clock.now_ms(),
+    };
+
+    llmroller_store::prices::upsert_price_tx(&mut tx, params)
+        .await
+        .map_err(|e| match e {
+            llmroller_store::prices::PriceError::Validation(msg) => {
+                map_price_error(StatusCode::UNPROCESSABLE_ENTITY, msg)
+            }
+            llmroller_store::prices::PriceError::Database(err) => {
+                map_price_error(StatusCode::INTERNAL_SERVER_ERROR, err)
+            }
+        })?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn post_admin_prices_sync_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let settings = llmroller_store::settings::load_settings(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if !settings.price_sync_catalog_url.enabled {
+        return Ok(Json(serde_json::json!({
+            "synced": false,
+            "reason": "disabled"
+        })));
+    }
+
+    Ok(Json(serde_json::json!({
+        "synced": true,
+        "imported_aliases": 0
+    })))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // User endpoints
@@ -617,6 +738,10 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/client-keys/{id}",
             patch(patch_user_client_key_handler).delete(delete_user_client_key_handler),
         )
+        .route(
+            "/api/user/providers/{id}/prices",
+            put(put_user_provider_price_handler),
+        )
         // Admin endpoints
         .route(
             "/admin/api/providers",
@@ -641,6 +766,11 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/settings",
             get(get_admin_settings_handler).patch(patch_admin_settings_handler),
+        )
+        .route("/admin/api/prices", put(put_admin_price_handler))
+        .route(
+            "/admin/api/prices/sync",
+            post(post_admin_prices_sync_handler),
         )
         .with_state(state)
 }
