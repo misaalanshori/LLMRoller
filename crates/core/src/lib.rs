@@ -6,6 +6,7 @@
 pub mod accumulators;
 pub mod breaker;
 pub mod catalog;
+pub mod chat_preview;
 pub mod client_key;
 pub mod eligibility;
 pub mod health;
