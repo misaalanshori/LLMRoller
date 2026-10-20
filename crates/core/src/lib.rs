@@ -6,6 +6,7 @@
 pub mod accumulators;
 pub mod catalog;
 pub mod client_key;
+pub mod eligibility;
 pub mod ids;
 pub mod pricing;
 pub mod provider;
