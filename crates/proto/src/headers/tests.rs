@@ -1,0 +1,274 @@
+//! Tests for request and response header pipelines, smuggling rejection, and strip_header_tokens.
+//!
+//! Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#121-request-and-response-header-policies
+//! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
+//! Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+
+use http::{HeaderMap, HeaderValue, header};
+use llmroller_core::rbac::OwnershipScope;
+
+use crate::headers::{
+    SmugglingError, apply_request_header_pipeline, apply_response_header_pipeline,
+    validate_header_value_bytes, validate_request_smuggling,
+};
+
+/// Spec: API-2, API-3, SEC-8, SEC-15
+/// Verify HTTP smuggling rejection:
+/// 1. Both Content-Length and Transfer-Encoding -> 400
+/// 2. Duplicate Host headers -> 400
+/// 3. Control characters in header values -> 400
+#[doc = "Spec: API-2, API-3, SEC-8, SEC-15"]
+#[test]
+fn test_http_smuggling_guards() {
+    // 1. Both Content-Length and Transfer-Encoding
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+    headers.insert(
+        header::TRANSFER_ENCODING,
+        HeaderValue::from_static("chunked"),
+    );
+    let err = validate_request_smuggling(&headers).expect_err("CL + TE must be rejected");
+    assert_eq!(err, SmugglingError::BothContentLengthAndTransferEncoding);
+
+    // 2. Multiple Host headers
+    let mut headers = HeaderMap::new();
+    headers.append(header::HOST, HeaderValue::from_static("api.openai.com"));
+    headers.append(header::HOST, HeaderValue::from_static("evil.com"));
+    let err = validate_request_smuggling(&headers).expect_err("multiple Host must be rejected");
+    assert_eq!(err, SmugglingError::MultipleHostHeaders);
+
+    // 3. Control characters in header value
+    let err = validate_header_value_bytes("x-custom", b"hello\x07world")
+        .expect_err("control char must be rejected");
+    assert!(matches!(err, SmugglingError::ControlCharacterInHeader(_)));
+
+    // 4. Valid headers pass cleanly
+    let mut valid = HeaderMap::new();
+    valid.insert(header::HOST, HeaderValue::from_static("api.openai.com"));
+    valid.insert(header::CONTENT_LENGTH, HeaderValue::from_static("100"));
+    valid.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer token"),
+    );
+    assert!(validate_request_smuggling(&valid).is_ok());
+}
+
+/// Spec: API-2, API-3, SEC-8, SEC-15
+/// Verify request header pipeline:
+/// 1. On Own-tier keys, x-claude-code-session-id passes through verbatim.
+/// 2. Multiple anthropic-beta headers preserve their per-name relative order.
+/// 3. strip_header_tokens removes configured comma-separated tokens.
+/// 4. Hop-by-hop and org headers are stripped.
+/// 5. accept-encoding is forced to identity.
+#[doc = "Spec: API-2, API-3, SEC-8, SEC-15"]
+#[test]
+fn test_request_header_pipeline() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("llmroller.internal"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close, x-foo"));
+    headers.insert(
+        header::HeaderName::from_static("x-foo"),
+        HeaderValue::from_static("hop_val"),
+    );
+    headers.insert(header::COOKIE, HeaderValue::from_static("session=123"));
+    headers.insert(
+        header::HeaderName::from_static("openai-organization"),
+        HeaderValue::from_static("org-123"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-claude-code-session-id"),
+        HeaderValue::from_static("sess-abc-456"),
+    );
+    headers.append(
+        header::HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static("prompt-caching-2024-07-31"),
+    );
+    headers.append(
+        header::HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static("unsupported-beta, computer-use-2024-10-22"),
+    );
+
+    let strip_tokens = vec!["unsupported-beta".to_string()];
+    let strip_headers = vec![];
+    let auth_header = Some(("authorization", "Bearer sk-upstream-secret-real"));
+
+    // Case A: Own/Personal tier
+    let out_own = apply_request_header_pipeline(
+        &headers,
+        OwnershipScope::Personal,
+        auth_header,
+        &strip_headers,
+        &strip_tokens,
+    )
+    .expect("apply pipeline");
+
+    // Host, Connection, x-foo, Cookie, openai-organization stripped
+    assert!(out_own.get(header::HOST).is_none());
+    assert!(out_own.get(header::CONNECTION).is_none());
+    assert!(out_own.get("x-foo").is_none());
+    assert!(out_own.get(header::COOKIE).is_none());
+    assert!(out_own.get("openai-organization").is_none());
+
+    // accept-encoding forced to identity
+    assert_eq!(
+        out_own
+            .get(header::ACCEPT_ENCODING)
+            .expect("accept-encoding header"),
+        "identity"
+    );
+
+    // Authorization replaced with upstream credential
+    assert_eq!(
+        out_own.get(header::AUTHORIZATION).expect("auth header"),
+        "Bearer sk-upstream-secret-real"
+    );
+
+    // On Own tier: x-claude-code-session-id preserved
+    assert_eq!(
+        out_own
+            .get("x-claude-code-session-id")
+            .expect("session header"),
+        "sess-abc-456"
+    );
+
+    // anthropic-beta preserves relative order, with "unsupported-beta" stripped
+    let betas: Vec<&str> = out_own
+        .get_all("anthropic-beta")
+        .iter()
+        .map(|v| v.to_str().expect("str"))
+        .collect();
+    assert_eq!(betas.len(), 2);
+    assert_eq!(betas[0], "prompt-caching-2024-07-31");
+    assert_eq!(betas[1], "computer-use-2024-10-22");
+
+    // Case B: Global tier: session headers stripped per SEC-16
+    let out_global = apply_request_header_pipeline(
+        &headers,
+        OwnershipScope::Global,
+        auth_header,
+        &strip_headers,
+        &strip_tokens,
+    )
+    .expect("apply pipeline global");
+
+    assert!(out_global.get("x-claude-code-session-id").is_none());
+}
+
+/// Spec: API-2, API-3, SEC-8, SEC-15
+/// Verify response header pipeline R1 through R5:
+/// 1. Hop-by-hop headers removed (R1)
+/// 2. content-length, content-encoding, set-cookie removed unconditionally (R2)
+/// 3. Allowlisted headers kept (R3)
+/// 4. On Shared/Global tier for standard user: openai-org, x-ratelimit-*, cf-ray, server, via stripped (R4)
+/// 5. x-llmroller-request-id and scope header added (R5)
+#[doc = "Spec: API-2, API-3, SEC-8, SEC-15"]
+#[test]
+fn test_response_header_pipeline() {
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("1024"));
+    resp_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    resp_headers.insert(header::SET_COOKIE, HeaderValue::from_static("tracking=xyz"));
+    resp_headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp_headers.insert(
+        header::HeaderName::from_static("openai-organization"),
+        HeaderValue::from_static("org-secret"),
+    );
+    resp_headers.insert(
+        header::HeaderName::from_static("x-ratelimit-remaining-requests"),
+        HeaderValue::from_static("500"),
+    );
+    resp_headers.insert(
+        header::HeaderName::from_static("anthropic-ratelimit-tokens"),
+        HeaderValue::from_static("10000"),
+    );
+    resp_headers.insert(
+        header::HeaderName::from_static("cf-ray"),
+        HeaderValue::from_static("12345-IAD"),
+    );
+    resp_headers.insert(header::SERVER, HeaderValue::from_static("cloudflare"));
+    resp_headers.insert(
+        header::HeaderName::from_static("via"),
+        HeaderValue::from_static("1.1 vegur"),
+    );
+    resp_headers.insert(
+        header::HeaderName::from_static("x-request-id"),
+        HeaderValue::from_static("req-upstream-001"),
+    );
+
+    // Case A: Global tier, non-admin user
+    let out_global = apply_response_header_pipeline(
+        &resp_headers,
+        OwnershipScope::Global,
+        false, // not admin
+        "01M5CE420F8JP4KE2B3JC4NX88",
+        &[],
+    );
+
+    // R1: Connection removed
+    assert!(out_global.get(header::CONNECTION).is_none());
+
+    // R2: content-length, content-encoding, set-cookie removed
+    assert!(out_global.get(header::CONTENT_LENGTH).is_none());
+    assert!(out_global.get(header::CONTENT_ENCODING).is_none());
+    assert!(out_global.get(header::SET_COOKIE).is_none());
+
+    // R3: content-type and x-request-id retained
+    assert_eq!(
+        out_global
+            .get(header::CONTENT_TYPE)
+            .expect("content-type header"),
+        "text/event-stream"
+    );
+    assert_eq!(
+        out_global.get("x-request-id").expect("x-request-id header"),
+        "req-upstream-001"
+    );
+
+    // R4: On Global tier: org, ratelimit, cf-ray, server, via stripped
+    assert!(out_global.get("openai-organization").is_none());
+    assert!(out_global.get("x-ratelimit-remaining-requests").is_none());
+    assert!(out_global.get("anthropic-ratelimit-tokens").is_none());
+    assert!(out_global.get("cf-ray").is_none());
+    assert!(out_global.get(header::SERVER).is_none());
+    assert!(out_global.get("via").is_none());
+
+    // R5: x-llmroller-request-id and scope header added
+    assert_eq!(
+        out_global
+            .get("x-llmroller-request-id")
+            .expect("request-id header"),
+        "01M5CE420F8JP4KE2B3JC4NX88"
+    );
+    assert_eq!(
+        out_global
+            .get("x-llmroller-upstream-scope")
+            .expect("scope header"),
+        "global"
+    );
+
+    // Case B: Own tier (personal key owner) -> rate limits preserved!
+    let out_own = apply_response_header_pipeline(
+        &resp_headers,
+        OwnershipScope::Personal,
+        false,
+        "01M5CE420F8JP4KE2B3JC4NX88",
+        &[],
+    );
+    assert_eq!(
+        out_own
+            .get("x-ratelimit-remaining-requests")
+            .expect("ratelimit reqs"),
+        "500"
+    );
+    assert_eq!(
+        out_own
+            .get("anthropic-ratelimit-tokens")
+            .expect("ratelimit tokens"),
+        "10000"
+    );
+    assert!(out_own.get("x-llmroller-upstream-scope").is_none());
+}

@@ -1332,6 +1332,14 @@ dependencies = [
 [[package]]
 name = "llmroller-proto"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "llmroller-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "llmroller-proxy"
