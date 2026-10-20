@@ -187,7 +187,7 @@ fn collect_rust_files(directory: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-#[doc = "Partial: POR-1, Partial: SEC-11"]
+#[doc = "Spec: POR-1, Spec: SEC-11"]
 fn dockerfile_is_multi_stage_hardened_and_distroless_by_default() {
     let dockerfile = read("Dockerfile");
     let stages: Vec<&str> = dockerfile
@@ -257,7 +257,7 @@ fn stage_body<'a>(dockerfile: &'a str, stage: &str) -> &'a str {
 }
 
 #[test]
-#[doc = "Partial: POR-1, Partial: SEC-11"]
+#[doc = "Spec: POR-1, Spec: SEC-11"]
 fn dockerignore_excludes_secrets_and_build_output() {
     let dockerignore = read(".dockerignore");
     for pattern in [
@@ -288,7 +288,7 @@ fn dockerignore_excludes_secrets_and_build_output() {
 }
 
 #[test]
-#[doc = "Partial: POR-1"]
+#[doc = "Spec: POR-1"]
 fn compose_manifest_is_valid_and_contains_production_and_dev_topologies() {
     let compose = read("docker-compose.yml");
     for service in [
@@ -346,7 +346,7 @@ fn compose_manifest_is_valid_and_contains_production_and_dev_topologies() {
 }
 
 #[test]
-#[doc = "Partial: POR-1, MNT-1"]
+#[doc = "Spec: POR-1, MNT-1"]
 fn ci_matrix_covers_all_por1_targets_and_gates() {
     let workflow = read(".github/workflows/ci.yml");
     for target in POR1_TARGETS {
@@ -378,7 +378,7 @@ fn cargo_xtask_alias_is_configured() {
 }
 
 #[test]
-#[doc = "Spec: SEC-10, Partial: POR-1"]
+#[doc = "Spec: SEC-10, Spec: POR-1"]
 fn lockfile_is_committed_despite_generic_lock_ignore() {
     let gitignore = read(".gitignore");
     assert!(
