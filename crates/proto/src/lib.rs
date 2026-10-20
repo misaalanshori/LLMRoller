@@ -5,3 +5,4 @@
 
 pub mod body_edit;
 pub mod headers;
+pub mod sse_frame;
