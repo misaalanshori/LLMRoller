@@ -10,6 +10,7 @@ pub mod client_key;
 pub mod eligibility;
 pub mod health;
 pub mod ids;
+pub mod pins;
 pub mod pricing;
 pub mod provider;
 pub mod rbac;
