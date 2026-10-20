@@ -79,6 +79,7 @@ pub enum CacheInvalidationEvent {
     OwnerDisabled(UserId),
     SettingsChanged,
     StrategyChanged,
+    CapChanged,
     ProviderChanged(ProviderId),
     UpstreamKeyChanged(UpstreamKeyId),
     ClientKeyChanged(ClientKeyId),

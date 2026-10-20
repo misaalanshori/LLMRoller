@@ -13,6 +13,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+dashmap.workspace = true
 ipnet.workspace = true
 parking_lot.workspace = true
 rand.workspace = true

@@ -64,6 +64,7 @@ impl RuntimeState {
             match inv {
                 CacheInvalidationEvent::StrategyChanged
                 | CacheInvalidationEvent::SettingsChanged
+                | CacheInvalidationEvent::CapChanged
                 | CacheInvalidationEvent::ProviderChanged(_)
                 | CacheInvalidationEvent::UpstreamKeyChanged(_)
                 | CacheInvalidationEvent::ClientKeyChanged(_) => {
