@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::{ProxyAuthState, client_key_auth_middleware};
@@ -21,6 +21,12 @@ use crate::metrics::metrics_handler;
 pub fn data_plane_router(state: ProxyAuthState) -> Router {
     let authed_v1 = Router::new()
         .route("/v1/models", get(v1_models_stub))
+        .route(
+            "/v1/chat/completions",
+            post(crate::orchestrator::post_chat_completions),
+        )
+        .route("/v1/responses", post(crate::orchestrator::post_responses))
+        .route("/v1/messages", post(crate::orchestrator::post_messages))
         .layer(from_fn_with_state(
             state.clone(),
             client_key_auth_middleware,

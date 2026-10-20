@@ -36,6 +36,7 @@ pub struct ProxyAuthState {
     pub ip_failures: Arc<Mutex<HashMap<IpAddr, Vec<i64>>>>,
     pub trusted_proxies: Vec<String>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -60,6 +61,7 @@ impl ProxyAuthState {
             ip_failures: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxies,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
         }
     }
 
