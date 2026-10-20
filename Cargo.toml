@@ -38,7 +38,7 @@ toml = "1.1.8"
 time = { version = "0.3.55", features = ["serde"] }
 
 # Identifiers, secrets, and cryptography
-ulid = "3.0.0"
+ulid = { version = "3.0.0", features = ["serde"] }
 secrecy = "0.10.3"
 zeroize = { version = "1.9.1", features = ["derive"] }
 chacha20poly1305 = "0.11.0"
@@ -51,6 +51,7 @@ totp-rs = "6.0.0"
 base64 = "0.22.1"
 getrandom = "0.4.3"
 rand = "0.10.3"
+rand_chacha = "0.10.0"
 
 # Concurrency and in-memory state
 arc-swap = "1.9.3"

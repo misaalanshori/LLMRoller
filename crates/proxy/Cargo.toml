@@ -13,3 +13,5 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+llmroller-core = { path = "../core" }
+tokio.workspace = true
