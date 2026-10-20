@@ -1,0 +1,526 @@
+-- LLMRoller schema version 1. Source: docs/srdd/9. SRDD - Data Model.md Section 9.1.
+
+-- 0. Schema Version, Instance Metadata, and Sealed Instance Secrets
+CREATE TABLE _llmroller_schema (
+  version INTEGER PRIMARY KEY
+);
+
+CREATE TABLE instance_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  instance_id BLOB NOT NULL CHECK (length(instance_id) = 16),
+  active_master_key_id TEXT NOT NULL,
+  config_version INTEGER NOT NULL DEFAULT 0,
+  rotation_state TEXT NOT NULL DEFAULT 'idle' CHECK (rotation_state IN ('idle', 'in_progress')),
+  rotation_from_key_id TEXT,
+  rotation_to_key_id TEXT,
+  rotation_cursor_table TEXT,
+  rotation_cursor_id TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE instance_secrets (
+  name TEXT PRIMARY KEY CHECK (name IN ('session_hmac_secret', 'audit_hmac_key')),
+  sealed BLOB NOT NULL, -- 0x01 || 24-byte nonce || ciphertext || 16-byte tag
+  master_key_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+-- 1. Accounts, Deleted-User History, Web Sessions, and Client Keys
+CREATE TABLE users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+  must_change_password INTEGER NOT NULL DEFAULT 0,
+  totp_secret_enc BLOB,
+  totp_master_key_id TEXT,
+  totp_enabled INTEGER NOT NULL DEFAULT 0,
+  totp_last_step INTEGER,
+  totp_recovery_hashes_json TEXT,
+  can_use_global_providers INTEGER NOT NULL DEFAULT 1,
+  global_budget_micro_usd_month INTEGER,
+  default_routing_scope TEXT NOT NULL DEFAULT 'personal_first'
+    CHECK (default_routing_scope IN ('personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
+  disabled INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  last_login_at INTEGER
+);
+
+CREATE TABLE deleted_users (
+  user_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL
+);
+
+CREATE TABLE web_sessions (
+  id_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  csrf_hash TEXT NOT NULL, -- SHA-256 of per-session random 256-bit CSRF token
+  ip_addr TEXT,
+  user_agent TEXT,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_web_sessions_user ON web_sessions(user_id);
+CREATE INDEX idx_web_sessions_expires ON web_sessions(expires_at);
+
+CREATE TABLE client_keys (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  prefix TEXT NOT NULL,
+  key_hash TEXT NOT NULL UNIQUE,
+  prev_key_hash TEXT,
+  prev_key_expires_at INTEGER,
+  routing_scope TEXT NOT NULL DEFAULT 'inherit'
+    CHECK (routing_scope IN ('inherit', 'personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
+  allowed_models TEXT, -- JSON array of canonical_id strings, or NULL for all accessible models
+  rate_limit_rpm INTEGER,
+  budget_micro_usd_month INTEGER,
+  allowed_cidrs TEXT, -- JSON array of CIDR strings, or NULL
+  constant_session_flagged_at INTEGER,
+  constant_session_mode TEXT NOT NULL DEFAULT 'flag'
+    CHECK (constant_session_mode IN ('flag', 'fingerprint_generic_ids')),
+  disabled INTEGER NOT NULL DEFAULT 0,
+  revoked_at INTEGER,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+CREATE INDEX idx_client_keys_owner ON client_keys(owner_user_id);
+CREATE UNIQUE INDEX uq_client_keys_prev_hash ON client_keys(prev_key_hash)
+  WHERE prev_key_hash IS NOT NULL;
+
+CREATE TRIGGER trg_client_keys_hash_disjoint_ins BEFORE INSERT ON client_keys
+WHEN EXISTS (
+  SELECT 1 FROM client_keys c
+  WHERE c.key_hash = NEW.prev_key_hash OR c.prev_key_hash = NEW.key_hash
+)
+BEGIN SELECT RAISE(ABORT, 'client key hash collision'); END;
+
+CREATE TRIGGER trg_client_keys_hash_disjoint_upd BEFORE UPDATE OF key_hash, prev_key_hash ON client_keys
+WHEN EXISTS (
+  SELECT 1 FROM client_keys c
+  WHERE c.id <> NEW.id AND (c.key_hash = NEW.prev_key_hash OR c.prev_key_hash = NEW.key_hash)
+)
+BEGIN SELECT RAISE(ABORT, 'client key hash collision'); END;
+
+-- 2. Global and Personal Providers, Upstream Keys, Shares, Budgets, and Upstream /usage Snapshots
+CREATE TABLE providers (
+  id TEXT PRIMARY KEY,
+  ownership_scope TEXT NOT NULL CHECK (ownership_scope IN ('global', 'personal')),
+  owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('opencode_go', 'command_code', 'open_design_amr', 'openrouter', 'custom')),
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  share_config_fingerprint TEXT NOT NULL DEFAULT '',
+  usage_url_cross_origin_ack INTEGER NOT NULL DEFAULT 0 CHECK (usage_url_cross_origin_ack IN (0, 1)),
+  allow_private_network INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  CHECK (
+    (ownership_scope = 'global' AND owner_user_id IS NULL) OR
+    (ownership_scope = 'personal' AND owner_user_id IS NOT NULL)
+  )
+);
+CREATE INDEX idx_providers_owner ON providers(owner_user_id);
+CREATE UNIQUE INDEX uq_providers_global_name ON providers(name)
+  WHERE ownership_scope = 'global';
+CREATE UNIQUE INDEX uq_providers_personal_name ON providers(owner_user_id, name)
+  WHERE ownership_scope = 'personal';
+
+CREATE TABLE upstream_keys (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  secret_enc BLOB NOT NULL,
+  master_key_id TEXT NOT NULL,
+  secret_last4 TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 1000),
+  strict_tier INTEGER NOT NULL DEFAULT 1 CHECK (strict_tier BETWEEN 1 AND 10),
+  health TEXT NOT NULL DEFAULT 'healthy' CHECK (health IN ('healthy', 'cooling_down', 'exhausted', 'invalid')),
+  health_until INTEGER,
+  health_version INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_upstream_keys_provider ON upstream_keys(provider_id);
+CREATE INDEX idx_upstream_keys_owner ON upstream_keys(owner_user_id);
+
+CREATE TRIGGER trg_upstream_keys_owner_ins BEFORE INSERT ON upstream_keys
+WHEN NEW.owner_user_id IS NOT (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'upstream_keys.owner_user_id must equal providers.owner_user_id'); END;
+
+CREATE TRIGGER trg_upstream_keys_owner_upd BEFORE UPDATE OF owner_user_id, provider_id ON upstream_keys
+WHEN NEW.owner_user_id IS NOT (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'upstream_keys.owner_user_id must equal providers.owner_user_id'); END;
+
+CREATE TABLE provider_shares (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  upstream_key_id TEXT REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  grantee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  allowed_models TEXT, -- JSON array of canonical_id strings, or NULL for all models served
+  max_monthly_micro_usd INTEGER,
+  accepted_at INTEGER,
+  accepted_config_fingerprint TEXT,
+  admin_approved_at INTEGER,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  CHECK (owner_user_id != grantee_user_id)
+);
+CREATE INDEX idx_provider_shares_grantee ON provider_shares(grantee_user_id, enabled);
+CREATE INDEX idx_provider_shares_owner ON provider_shares(owner_user_id);
+CREATE UNIQUE INDEX uq_share_key_active ON provider_shares(grantee_user_id, upstream_key_id)
+  WHERE upstream_key_id IS NOT NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX uq_share_provider_active ON provider_shares(grantee_user_id, provider_id)
+  WHERE upstream_key_id IS NULL AND revoked_at IS NULL;
+
+CREATE TRIGGER trg_shares_integrity_ins BEFORE INSERT ON provider_shares
+WHEN (SELECT ownership_scope FROM providers WHERE id = NEW.provider_id) <> 'personal'
+  OR (SELECT usage_url_cross_origin_ack FROM providers WHERE id = NEW.provider_id) <> 0
+  OR NEW.owner_user_id <> (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+  OR (NEW.upstream_key_id IS NOT NULL AND (SELECT provider_id FROM upstream_keys WHERE id = NEW.upstream_key_id) <> NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'invalid provider share'); END;
+
+CREATE TRIGGER trg_shares_integrity_upd BEFORE UPDATE OF provider_id, upstream_key_id, owner_user_id ON provider_shares
+WHEN (SELECT ownership_scope FROM providers WHERE id = NEW.provider_id) <> 'personal'
+  OR (SELECT usage_url_cross_origin_ack FROM providers WHERE id = NEW.provider_id) <> 0
+  OR NEW.owner_user_id <> (SELECT owner_user_id FROM providers WHERE id = NEW.provider_id)
+  OR (NEW.upstream_key_id IS NOT NULL AND (SELECT provider_id FROM upstream_keys WHERE id = NEW.upstream_key_id) <> NEW.provider_id)
+BEGIN SELECT RAISE(ABORT, 'invalid provider share'); END;
+
+-- 3. Model Catalog (Surrogate model_pk), Redirects, Aliases, Routes, Preferences, Budgets, and Price Book
+CREATE TABLE models (
+  model_pk TEXT PRIMARY KEY, -- Immutable 26-char ULID surrogate key
+  canonical_id TEXT NOT NULL UNIQUE,
+  display_name TEXT,
+  exposed INTEGER CHECK (exposed IN (0, 1)), -- NULL = automatic global exposure rule, 0 = forced off, 1 = forced on
+  distribution TEXT NOT NULL DEFAULT 'weighted' CHECK (distribution IN ('weighted', 'strict')),
+  routing_strategy TEXT CHECK (routing_strategy IN ('smooth_weighted_rr', 'naive_rr', 'weighted_rr', 'uniform_random', 'weighted_random', 'power_of_two_choices')), -- NULL = inherit settings.default_routing_strategy
+  merge_state TEXT NOT NULL DEFAULT 'confirmed' CHECK (merge_state IN ('confirmed', 'pending_review')),
+  origin TEXT NOT NULL DEFAULT 'global' CHECK (origin IN ('global', 'preset', 'personal')),
+  created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE model_redirects (
+  old_canonical_id TEXT PRIMARY KEY,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE model_aliases (
+  alias TEXT PRIMARY KEY,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  confirmed INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TRIGGER trg_alias_not_canonical BEFORE INSERT ON model_aliases
+WHEN EXISTS (SELECT 1 FROM models WHERE canonical_id = NEW.alias)
+BEGIN SELECT RAISE(ABORT, 'alias collides with canonical_id'); END;
+
+CREATE TABLE model_routes (
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  upstream_model_id TEXT NOT NULL,
+  vendor_prefix TEXT, -- Substring before the last '/', NULL when absent
+  protocols TEXT NOT NULL, -- JSON array: ["chat","responses","messages"]
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'missing', 'retired')),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  priority_override INTEGER CHECK (priority_override BETWEEN 1 AND 1000),
+  route_health TEXT NOT NULL DEFAULT 'healthy'
+    CHECK (route_health IN ('healthy', 'cooling_down', 'exhausted', 'unavailable')),
+  route_health_until INTEGER,
+  health_version INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  missing_since INTEGER,
+  discovered_at INTEGER NOT NULL,
+  PRIMARY KEY (upstream_key_id, model_pk)
+);
+
+CREATE TABLE route_protocol_blocks (
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
+  reason TEXT NOT NULL,
+  until_ms INTEGER NOT NULL,
+  PRIMARY KEY (upstream_key_id, model_pk, protocol)
+);
+
+CREATE TABLE user_route_preferences (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  priority_override INTEGER NOT NULL CHECK (priority_override BETWEEN 1 AND 1000),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (user_id, upstream_key_id, model_pk)
+);
+
+CREATE TABLE budget_windows (
+  id TEXT PRIMARY KEY,
+  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('upstream_key', 'route')),
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT REFERENCES models(model_pk) ON DELETE RESTRICT,
+  window_kind TEXT NOT NULL
+    CHECK (window_kind IN ('rolling', 'anchored_fixed', 'anchored_calendar_month', 'anchored_provider')),
+  period_ms INTEGER CHECK (period_ms BETWEEN 3600000 AND 2678400000), -- 1 h .. 31 d; NULL for calendar month
+  anchor_at INTEGER,
+  upstream_window_kind TEXT CHECK (upstream_window_kind IN ('5h', '7d', '1mo')),
+  limit_micro_usd INTEGER NOT NULL CHECK (limit_micro_usd > 0),
+  reserve_pct INTEGER NOT NULL DEFAULT 2 CHECK (reserve_pct BETWEEN 0 AND 50),
+  CHECK (
+    (scope_kind = 'upstream_key' AND model_pk IS NULL) OR
+    (scope_kind = 'route' AND model_pk IS NOT NULL)
+  ),
+  CHECK (
+    (window_kind = 'anchored_calendar_month' AND period_ms IS NULL) OR
+    (window_kind <> 'anchored_calendar_month' AND period_ms IS NOT NULL)
+  )
+);
+CREATE INDEX idx_budget_windows_key ON budget_windows(upstream_key_id);
+
+CREATE TABLE budget_adjustments (
+  id TEXT PRIMARY KEY,
+  budget_window_id TEXT NOT NULL REFERENCES budget_windows(id) ON DELETE CASCADE,
+  actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  delta_micro_usd INTEGER NOT NULL,
+  effective_at INTEGER NOT NULL,
+  window_instance_start INTEGER, -- Anchored windows: start of instance it applies to; NULL for rolling
+  source TEXT NOT NULL CHECK (source = 'manual_calibration'),
+  note TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_budget_adjustments_window ON budget_adjustments(budget_window_id, effective_at);
+
+CREATE TABLE upstream_usage_snapshots (
+  id TEXT PRIMARY KEY,
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  fetched_at INTEGER NOT NULL,
+  http_status INTEGER NOT NULL,
+  plan_name TEXT,
+  windows_json TEXT NOT NULL, -- [{"kind":"5h","status":"ok","used_pct":12.5,"used_micro_usd":null,"limit_micro_usd":null,"resets_at":1792400000000}]
+  balance_micro_usd INTEGER,
+  raw_json_enc BLOB NOT NULL, -- Sealed XChaCha20-Poly1305 blob (domain 'usage_raw')
+  master_key_id TEXT NOT NULL,
+  sanitized_json TEXT NOT NULL
+);
+CREATE INDEX idx_upstream_usage_key_ts ON upstream_usage_snapshots(upstream_key_id, fetched_at DESC);
+
+CREATE TABLE prices (
+  provider_id TEXT NOT NULL DEFAULT '',
+  provider_kind TEXT NOT NULL,
+  upstream_model_id TEXT NOT NULL,
+  input_per_mtok_micro_usd INTEGER NOT NULL,
+  output_per_mtok_micro_usd INTEGER NOT NULL,
+  cache_read_per_mtok_micro_usd INTEGER NOT NULL DEFAULT 0,
+  cache_write_per_mtok_micro_usd INTEGER NOT NULL DEFAULT 0,
+  tiers_json TEXT,
+  schedule_json TEXT,
+  source TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (provider_id, provider_kind, upstream_model_id)
+);
+
+-- 4. Confirmed Session Pins and Durable Stateful Response Links
+CREATE TABLE pins (
+  client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  pool_tier INTEGER NOT NULL DEFAULT 0 CHECK (pool_tier BETWEEN 0 AND 3),
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  repin_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (client_key_id, session_hash, model_pk)
+);
+CREATE INDEX idx_pins_expires ON pins(expires_at);
+CREATE INDEX idx_pins_upstream_key ON pins(upstream_key_id);
+
+CREATE TABLE response_links (
+  response_id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL,
+  client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
+  upstream_key_id TEXT NOT NULL REFERENCES upstream_keys(id) ON DELETE CASCADE,
+  model_pk TEXT NOT NULL REFERENCES models(model_pk) ON DELETE RESTRICT,
+  session_hash TEXT NOT NULL,
+  protocol TEXT NOT NULL DEFAULT 'responses' CHECK (protocol = 'responses'),
+  status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed', 'incomplete', 'failed')),
+  store_flag INTEGER NOT NULL CHECK (store_flag IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_response_links_expires ON response_links(expires_at);
+CREATE INDEX idx_response_links_session ON response_links(owner_user_id, session_hash);
+
+-- 5. Usage Events, Attempts, 5-Min & Hourly Rollups, Auth Counters, Content-Addressed Traces, Audit Log, and Settings
+CREATE TABLE usage_events (
+  id TEXT PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  client_key_id TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  upstream_key_id TEXT,
+  provider_id TEXT,
+  provider_scope TEXT CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
+  share_id TEXT,
+  canonical_id TEXT,
+  upstream_model_id TEXT,
+  endpoint TEXT NOT NULL
+    CHECK (endpoint IN ('chat', 'responses', 'messages', 'count_tokens', 'responses_get', 'responses_delete', 'responses_input_items', 'responses_cancel', 'responses_compact')),
+  protocol TEXT CHECK (protocol IN ('chat', 'responses', 'messages')),
+  session_hash TEXT,
+  status INTEGER NOT NULL,
+  stream INTEGER NOT NULL,
+  incomplete INTEGER NOT NULL DEFAULT 0,
+  termination TEXT NOT NULL DEFAULT 'completed'
+    CHECK (termination IN ('completed', 'upstream_truncated', 'client_gone', 'idle_timeout', 'shutdown_cut')),
+  trace_dropped INTEGER NOT NULL DEFAULT 0,
+  input_uncached_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cost_micro_usd INTEGER NOT NULL,
+  cost_source TEXT NOT NULL
+    CHECK (cost_source IN ('provider', 'price_book', 'fallback_rate', 'estimated_incomplete', 'estimated_attempt')),
+  latency_ms INTEGER,
+  ttfb_ms INTEGER,
+  pin_outcome TEXT
+    CHECK (pin_outcome IN ('new_pin', 'followed', 'repin', 'repin_recovery', 'unpinned_stateless', 'unpinned_capacity', 'response_link')),
+  failovers INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT
+);
+CREATE INDEX idx_usage_ts ON usage_events(ts);
+CREATE INDEX idx_usage_owner_ts ON usage_events(owner_user_id, ts);
+CREATE INDEX idx_usage_client_key_ts ON usage_events(client_key_id, ts);
+CREATE INDEX idx_usage_client_key_session_ts ON usage_events(client_key_id, session_hash, ts DESC)
+  WHERE session_hash IS NOT NULL;
+
+CREATE TABLE usage_attempts (
+  request_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 3),
+  ts INTEGER NOT NULL,
+  upstream_key_id TEXT NOT NULL,
+  share_id TEXT,
+  outcome TEXT NOT NULL
+    CHECK (outcome IN ('served', 'connect_error', 'write_stalled', 'http_429', 'http_402', 'http_401', 'http_403', 'http_5xx', 'wait_timeout', 'error_frame')),
+  http_status INTEGER,
+  bytes_sent INTEGER NOT NULL,
+  charged_micro_usd INTEGER NOT NULL DEFAULT 0,
+  charge_basis TEXT NOT NULL CHECK (charge_basis IN ('none', 'actual', 'estimated_input')),
+  PRIMARY KEY (request_id, attempt_no)
+);
+CREATE INDEX idx_usage_attempts_key_ts ON usage_attempts(upstream_key_id, ts);
+
+CREATE TABLE usage_rollups_5min (
+  bucket_ms INTEGER NOT NULL, -- floor(ts / 300000) * 300000
+  upstream_key_id TEXT NOT NULL, -- '' for pre-route rejections
+  canonical_id TEXT NOT NULL,
+  client_key_id TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
+  share_id TEXT NOT NULL DEFAULT '',
+  cost_micro_usd INTEGER NOT NULL,
+  requests INTEGER NOT NULL,
+  PRIMARY KEY (bucket_ms, upstream_key_id, canonical_id, client_key_id, share_id)
+);
+CREATE INDEX idx_rollups_5min_key ON usage_rollups_5min(upstream_key_id, bucket_ms);
+
+CREATE TABLE usage_rollups_hourly (
+  hour_ms INTEGER NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  client_key_id TEXT NOT NULL,
+  upstream_key_id TEXT NOT NULL, -- '' for pre-route rejections
+  provider_id TEXT NOT NULL, -- '' for pre-route rejections
+  provider_scope TEXT NOT NULL CHECK (provider_scope IN ('global', 'personal', 'shared', 'none')),
+  share_id TEXT NOT NULL DEFAULT '',
+  canonical_id TEXT NOT NULL,
+  requests INTEGER NOT NULL,
+  errors INTEGER NOT NULL,
+  input_uncached_tokens INTEGER NOT NULL,
+  cache_read_tokens INTEGER NOT NULL,
+  cache_write_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  reasoning_tokens INTEGER NOT NULL,
+  cost_micro_usd INTEGER NOT NULL,
+  PRIMARY KEY (hour_ms, client_key_id, upstream_key_id, canonical_id, share_id)
+);
+CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);
+CREATE INDEX idx_rollups_share_hour ON usage_rollups_hourly(share_id, hour_ms);
+
+CREATE TABLE auth_failure_counters (
+  minute_ms INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('unknown_key', 'disabled', 'expired', 'revoked', 'owner_disabled')),
+  ip_prefix TEXT NOT NULL, -- /24 for IPv4, /56 for IPv6
+  count INTEGER NOT NULL,
+  PRIMARY KEY (minute_ms, reason, ip_prefix)
+);
+
+CREATE TABLE trace_blocks (
+  block_hash TEXT NOT NULL, -- hex SHA-256 of canonical block bytes (cache_control and citations removed)
+  owner_user_id TEXT NOT NULL,
+  payload_enc BLOB NOT NULL, -- Sealed zstd(canonical block JSON), domain 'trace_block'
+  master_key_id TEXT NOT NULL,
+  byte_len INTEGER NOT NULL,
+  last_referenced_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_user_id, block_hash)
+);
+CREATE INDEX idx_trace_blocks_lastref ON trace_blocks(last_referenced_at);
+
+CREATE TABLE trace_records (
+  usage_event_id TEXT PRIMARY KEY REFERENCES usage_events(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL UNIQUE,
+  ts INTEGER NOT NULL,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  client_key_id TEXT NOT NULL REFERENCES client_keys(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL,
+  thread_id TEXT NOT NULL DEFAULT 'main', -- subagent_id or 'main'
+  canonical_id TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol IN ('chat', 'responses', 'messages')),
+  truncated_content INTEGER NOT NULL DEFAULT 0,
+  payload_enc BLOB NOT NULL, -- Sealed zstd(StoredTurnTrace v2), domain 'trace_record'
+  master_key_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_trace_session_order ON trace_records(owner_user_id, session_hash, ts ASC, request_id ASC);
+CREATE INDEX idx_trace_owner_ts ON trace_records(owner_user_id, ts DESC);
+CREATE INDEX idx_trace_client_key_session ON trace_records(client_key_id, session_hash, ts DESC);
+CREATE INDEX idx_trace_expires ON trace_records(expires_at);
+
+CREATE TABLE trace_record_blocks (
+  usage_event_id TEXT NOT NULL REFERENCES trace_records(usage_event_id) ON DELETE CASCADE,
+  owner_user_id TEXT NOT NULL,
+  block_hash TEXT NOT NULL,
+  PRIMARY KEY (usage_event_id, block_hash)
+);
+CREATE INDEX idx_trace_record_blocks_ref ON trace_record_blocks(owner_user_id, block_hash);
+
+CREATE TABLE audit_log (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  ts INTEGER NOT NULL,
+  actor_user_id TEXT,
+  ip_addr TEXT,
+  action TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT,
+  detail_json TEXT,
+  prev_hash TEXT NOT NULL,
+  hash TEXT NOT NULL
+);
+CREATE INDEX idx_audit_ts ON audit_log(ts DESC);
+CREATE INDEX idx_audit_actor ON audit_log(actor_user_id, ts DESC);
+
+CREATE TABLE settings (
+  key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);

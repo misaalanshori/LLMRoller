@@ -801,7 +801,7 @@ priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.2"
 partial_subphases = ["1.3", "3.2", "5.4"]
-tests = ["crates/core/src/rbac/tests.rs", "tests/integration_rbac_isolation.rs"]
+tests = ["crates/core/src/rbac/tests.rs", "crates/store/src/pool/tests.rs", "crates/store/src/migrations/tests.rs", "tests/integration_rbac_isolation.rs"]
 
 [requirements.SEC-18]
 priority = "P0"
