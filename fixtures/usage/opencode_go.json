@@ -1,0 +1,18 @@
+{
+  "status": "ok",
+  "plan": "pro",
+  "windows": [
+    {
+      "kind": "5h",
+      "status": "ok",
+      "used_percent": 25.0,
+      "resets_at": 1792400000000
+    },
+    {
+      "kind": "7d",
+      "status": "ok",
+      "used_percent": 40.0,
+      "resets_at": 1792900000000
+    }
+  ]
+}

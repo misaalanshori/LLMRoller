@@ -11,9 +11,9 @@ use crate::body_edit::ChatStreamMode;
 use crate::headers::UaPolicy;
 use llmroller_core::provider::ProviderKind;
 
-/// Spec: PRV-2, PRV-3, MNT-2, Partial: PRV-6, Partial: API-8
+/// Spec: PRV-2, PRV-3, MNT-2, PRV-6, Partial: API-8
 /// Verify adapter contract for URL construction, capabilities, presets, and Stage-1 key testing.
-#[doc = "Spec: PRV-2, PRV-3, MNT-2, Partial: PRV-6, Partial: API-8"]
+#[doc = "Spec: PRV-2, PRV-3, MNT-2, PRV-6, Partial: API-8"]
 #[test]
 fn test_provider_adapter_contracts() {
     for kind in [

@@ -1,0 +1,12 @@
+{
+  "data": {
+    "label": "My Key",
+    "usage": 12.50,
+    "limit": 100.00,
+    "is_free_tier": false,
+    "rate_limit": {
+      "requests": 100,
+      "interval": "10s"
+    }
+  }
+}

@@ -19,6 +19,7 @@ pub mod retention;
 pub mod rotation;
 pub mod settings;
 pub mod shares;
+pub mod usage_snapshots;
 pub mod usage_writer;
 pub mod users;
 pub mod writer;

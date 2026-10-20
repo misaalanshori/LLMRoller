@@ -1,0 +1,12 @@
+{
+  "credits_remaining": 15000000,
+  "plan": "tier1",
+  "windows": [
+    {
+      "kind": "1mo",
+      "status": "ok",
+      "used_percent": 10.0,
+      "resets_at": 1793500000000
+    }
+  ]
+}
