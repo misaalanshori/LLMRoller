@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod clock;
+pub mod failover;
 pub mod forward;
 pub mod lifecycle;
 pub mod listeners;

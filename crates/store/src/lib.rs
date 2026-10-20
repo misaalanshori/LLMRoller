@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod instance;
 pub mod migrations;
 pub mod models;
+pub mod pins;
 pub mod pool;
 pub mod providers;
 pub mod rotation;

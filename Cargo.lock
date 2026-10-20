@@ -1549,6 +1549,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "brotli",
+ "bytes",
  "clap",
  "flate2",
  "http",
