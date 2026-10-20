@@ -37,6 +37,7 @@ base64.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 llmroller-admin = { path = "../admin" }
+llmroller-proxy = { path = "../proxy" }
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true

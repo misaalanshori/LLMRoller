@@ -185,7 +185,11 @@ pub async fn create_provider_tx(
     new_provider: NewProvider,
     now_ms: i64,
 ) -> Result<Provider, ProviderError> {
-    // 1. RBAC enforcement
+    // 1. URL SSRF and scheme validation per PRV-7 and SEC-7
+    llmroller_proxy::ssrf::validate_url(&new_provider.base_url, new_provider.allow_private_network)
+        .map_err(|e| ProviderError::Validation(e.to_string()))?;
+
+    // 2. RBAC enforcement
     match new_provider.ownership_scope {
         OwnershipScope::Global => {
             if !actor.is_admin() && !actor.is_system() {
@@ -376,6 +380,9 @@ pub async fn patch_provider_tx(
         new_private_net,
         &new_config_json,
     );
+
+    llmroller_proxy::ssrf::validate_url(&new_base_url, new_private_net)
+        .map_err(|e| ProviderError::Validation(e.to_string()))?;
 
     sqlx::query(
         "UPDATE providers SET
