@@ -10,4 +10,5 @@ pub mod headers;
 pub mod json_usage;
 pub mod sse_frame;
 pub mod sse_tap;
+pub mod trace_tap;
 pub mod usage_poller;
