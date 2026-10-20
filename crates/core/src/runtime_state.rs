@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use crate::snapshot::CacheInvalidationEvent;
+
 /// Monotonic health version tracker for upstream keys and routes.
 #[derive(Debug, Default)]
 pub struct HealthState {
@@ -36,6 +38,8 @@ impl HealthState {
 pub struct RuntimeState {
     pub health: Arc<HealthState>,
     pub last_reload_ts: AtomicI64,
+    pub reload_count: AtomicU64,
+    pub applied_invalidations_count: AtomicU64,
 }
 
 impl RuntimeState {
@@ -44,6 +48,27 @@ impl RuntimeState {
         Self {
             health: Arc::new(HealthState::new()),
             last_reload_ts: AtomicI64::new(0),
+            reload_count: AtomicU64::new(0),
+            applied_invalidations_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Apply cache invalidation events immediately following atomic snapshot publication.
+    pub fn apply_invalidations(&self, invalidations: &[CacheInvalidationEvent], now_ms: i64) {
+        self.last_reload_ts.store(now_ms, Ordering::SeqCst);
+        self.reload_count.fetch_add(1, Ordering::SeqCst);
+        self.applied_invalidations_count
+            .fetch_add(invalidations.len() as u64, Ordering::SeqCst);
+
+        for inv in invalidations {
+            match inv {
+                CacheInvalidationEvent::StrategyChanged
+                | CacheInvalidationEvent::SettingsChanged => {
+                    self.health.bump_version();
+                }
+                CacheInvalidationEvent::UserChanged(_)
+                | CacheInvalidationEvent::OwnerDisabled(_) => {}
+            }
         }
     }
 }

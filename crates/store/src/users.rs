@@ -7,7 +7,7 @@
 //! Partial: SEC-4, SEC-12
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
@@ -17,8 +17,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use llmroller_core::ids::{RequestId, UserId};
 use llmroller_core::rbac::{ActorScope, Role};
 use llmroller_core::seams::{EntropySource, ExposeSecret, SecretString, secret_string};
+use llmroller_core::snapshot::UserRecord;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Connection as _, Row, SqlitePool};
+use sqlx::{Connection as _, Row, SqlitePool, Transaction};
 use thiserror::Error;
 use totp_rs::{Algorithm as TotpAlgorithm, Builder as TotpBuilder, Totp};
 
@@ -467,6 +468,59 @@ pub async fn list_users(pool: &SqlitePool, actor: &ActorScope) -> Result<Vec<Use
     .fetch_all(pool)
     .await?;
     rows.iter().map(user_from_row).collect()
+}
+
+/// Load all user accounts into [`UserRecord`] projections for [`ConfigSnapshot`].
+pub async fn load_user_records(
+    pool: &SqlitePool,
+) -> Result<HashMap<UserId, UserRecord>, UserError> {
+    let rows = sqlx::query(
+        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month
+         FROM users",
+    )
+    .fetch_all(pool)
+    .await?;
+    parse_user_records(&rows)
+}
+
+/// Load all user accounts into [`UserRecord`] projections within an active transaction.
+pub async fn load_user_records_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+) -> Result<HashMap<UserId, UserRecord>, UserError> {
+    let rows = sqlx::query(
+        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month
+         FROM users",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    parse_user_records(&rows)
+}
+
+fn parse_user_records(rows: &[SqliteRow]) -> Result<HashMap<UserId, UserRecord>, UserError> {
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id_str: String = row.try_get("id")?;
+        let user_id = UserId::from_str(&id_str).map_err(|_| UserError::Corrupt)?;
+        let username: String = row.try_get("username")?;
+        let role_str: String = row.try_get("role")?;
+        let role = role_from_str(&role_str)?;
+        let disabled: i64 = row.try_get("disabled")?;
+        let can_use_global: i64 = row.try_get("can_use_global_providers")?;
+        let global_budget: Option<i64> = row.try_get("global_budget_micro_usd_month")?;
+
+        map.insert(
+            user_id,
+            UserRecord {
+                id: user_id,
+                username,
+                role,
+                disabled: disabled != 0,
+                can_use_global_providers: can_use_global != 0,
+                global_budget_micro_usd_month: global_budget,
+            },
+        );
+    }
+    Ok(map)
 }
 
 /// Load one account by ULID without an authorization check.

@@ -37,6 +37,34 @@ impl fmt::Display for Role {
     }
 }
 
+/// Error returned when parsing an unrecognized role string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRoleError(pub String);
+
+impl fmt::Display for InvalidRoleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid role {:?}; expected admin or user",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidRoleError {}
+
+impl std::str::FromStr for Role {
+    type Err = InvalidRoleError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "admin" => Ok(Self::Admin),
+            "user" => Ok(Self::User),
+            other => Err(InvalidRoleError(other.to_owned())),
+        }
+    }
+}
+
 /// Ownership scope stored on every provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

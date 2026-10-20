@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 default-run = "llmroller"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "llmroller"
 path = "src/main.rs"
@@ -18,11 +21,15 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 clap.workspace = true
 llmroller-core = { path = "../core" }
 llmroller-store = { path = "../store" }
 serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

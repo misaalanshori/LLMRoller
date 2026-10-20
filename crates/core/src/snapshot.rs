@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::ids::UserId;
 use crate::rbac::Role;
+use crate::settings::RuntimeSettings;
 use serde::{Deserialize, Serialize};
 
 /// Configuration domains for selective slice reloading per Table 1.6.1.
@@ -52,7 +53,21 @@ pub enum CacheInvalidationEvent {
 pub struct ConfigSnapshot {
     pub config_version: i64,
     pub users: Arc<HashMap<UserId, UserRecord>>,
-    pub settings_json: Arc<HashMap<String, String>>,
+    pub settings: Arc<RuntimeSettings>,
+}
+
+impl ConfigSnapshot {
+    /// Lookup an in-memory user account by identifier.
+    #[must_use]
+    pub fn get_user(&self, user_id: &UserId) -> Option<&UserRecord> {
+        self.users.get(user_id)
+    }
+
+    /// Access active runtime settings slice.
+    #[must_use]
+    pub fn settings(&self) -> &RuntimeSettings {
+        &self.settings
+    }
 }
 
 impl Default for ConfigSnapshot {
@@ -60,7 +75,7 @@ impl Default for ConfigSnapshot {
         Self {
             config_version: 0,
             users: Arc::new(HashMap::new()),
-            settings_json: Arc::new(HashMap::new()),
+            settings: Arc::new(RuntimeSettings::default()),
         }
     }
 }
