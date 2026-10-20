@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_IMAGE=rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2
+ARG RUST_IMAGE=rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0
 ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 
@@ -9,7 +9,7 @@ ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475
 # -----------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS planner
 WORKDIR /src
-RUN cargo install cargo-chef --locked --version 0.1.71
+RUN cargo install cargo-chef --locked --version 0.1.78
 COPY Cargo.toml Cargo.lock deny.toml ./
 COPY xtask/Cargo.toml xtask/Cargo.toml
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
@@ -28,7 +28,7 @@ ARG TARGETARCH
 ARG GIT_SHA=unknown
 WORKDIR /src
 
-RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.71
+RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.78
 
 RUN case "${TARGETARCH:-amd64}" in       amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust_target ;;       arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;;       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;;     esac     && rustup target add "$(cat /tmp/rust_target)"
 

@@ -105,7 +105,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:2.9.1-alpine@sha256:663c83823d28073681e2c5f9b86c718193d689b8d9a22325f206f4e4596f7b0b
+    image: caddy:2.9.1-alpine@sha256:b4e3952384eb9524a887633ce65c752dd7c71314d2c2acf98cd5c715aaa534f0
     depends_on:
       llmroller:
         condition: service_healthy
@@ -141,7 +141,7 @@ services:
 
   prometheus:
     profiles: ["observability"]
-    image: prom/prometheus:v3.1.0@sha256:36259373f5b247829e3a1e4736c81f53e7b6a15c26149b176c6371a79d1e04b7
+    image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
     user: "65534:65534"
     read_only: true
     security_opt:

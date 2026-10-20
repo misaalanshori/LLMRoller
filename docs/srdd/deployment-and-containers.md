@@ -12,8 +12,8 @@ The table below defines the four stages in the `Dockerfile` and the security con
 
 | Stage name | Base image (pinned tag & digest) | Purpose and key invariants |
 | --- | --- | --- |
-| `planner` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Installs `cargo-chef` (`0.1.71`) and computes `recipe.json` from `Cargo.toml` and `Cargo.lock` so source edits in `crates/*` never invalidate cached third-party crate compilations. |
-| `builder` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Compiles cached dependencies via `cargo chef cook --release --locked --target <musl_target>`, verifies `cargo xtask doc-consistency`, compiles the static `llmroller` binary (`--locked`, stripped of debug symbols), and prepares empty `/var/lib/llmroller` and `/etc/llmroller/presets` directories owned by `65532:65532`. |
+| `planner` | `rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` | Installs `cargo-chef` (`0.1.78`) and computes `recipe.json` from `Cargo.toml` and `Cargo.lock` so source edits in `crates/*` never invalidate cached third-party crate compilations. |
+| `builder` | `rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` | Compiles cached dependencies via `cargo chef cook --release --locked --target <musl_target>`, verifies `cargo xtask doc-consistency`, compiles the static `llmroller` binary (`--locked`, stripped of debug symbols), and prepares empty `/var/lib/llmroller` and `/etc/llmroller/presets` directories owned by `65532:65532`. |
 | `runtime-distroless` (default production target) | `gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0` | Copies only `/usr/local/bin/llmroller` and `/etc/llmroller/presets/*.toml`. Runs as non-root `65532:65532` (`nonroot`), contains zero shell (`/bin/sh` absent) and zero package manager, keeps total uncompressed image size `< 50 MB` (`POR-1`), and uses `llmroller healthcheck` for native container probes. |
 | `runtime-dev` (development & CI target) | `debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a` | Installs `tini`, `ca-certificates`, `curl`, and `sqlite3`, creates non-root user `llmroller` (`65532:65532`), and runs under `/usr/bin/tini -- /usr/local/bin/llmroller` for interactive debugging and Compose smoke testing. |
 
@@ -59,7 +59,7 @@ The `Dockerfile` below is the normative container build manifest for `x86_64` (`
 ```dockerfile
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_IMAGE=rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2
+ARG RUST_IMAGE=rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0
 ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 
@@ -68,7 +68,7 @@ ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475
 # -----------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS planner
 WORKDIR /src
-RUN cargo install cargo-chef --locked --version 0.1.71
+RUN cargo install cargo-chef --locked --version 0.1.78
 COPY Cargo.toml Cargo.lock deny.toml ./
 COPY xtask/Cargo.toml xtask/Cargo.toml
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
@@ -87,7 +87,7 @@ ARG TARGETARCH
 ARG GIT_SHA=unknown
 WORKDIR /src
 
-RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.71
+RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.78
 
 RUN case "${TARGETARCH:-amd64}" in       amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust_target ;;       arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;;       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;;     esac     && rustup target add "$(cat /tmp/rust_target)"
 
@@ -270,7 +270,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:2.9.1-alpine@sha256:663c83823d28073681e2c5f9b86c718193d689b8d9a22325f206f4e4596f7b0b
+    image: caddy:2.9.1-alpine@sha256:b4e3952384eb9524a887633ce65c752dd7c71314d2c2acf98cd5c715aaa534f0
     depends_on:
       llmroller:
         condition: service_healthy
@@ -306,7 +306,7 @@ services:
 
   prometheus:
     profiles: ["observability"]
-    image: prom/prometheus:v3.1.0@sha256:36259373f5b247829e3a1e4736c81f53e7b6a15c26149b176c6371a79d1e04b7
+    image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
     user: "65534:65534"
     read_only: true
     security_opt:
