@@ -4,9 +4,11 @@
 //! Spec: ./docs/srdd/15. SRDD - Technology Choices and Workspace Layout.md#15.2
 
 pub mod accumulators;
+pub mod breaker;
 pub mod catalog;
 pub mod client_key;
 pub mod eligibility;
+pub mod health;
 pub mod ids;
 pub mod pricing;
 pub mod provider;
