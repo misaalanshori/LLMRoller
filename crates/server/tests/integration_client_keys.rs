@@ -7,10 +7,16 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use llmroller_core::client_key::{GateFailure, HashRole, evaluate_request_gates};
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
 use llmroller_core::seams::OsEntropy;
+use llmroller_proxy::auth::ProxyAuthState;
+use llmroller_proxy::listeners::data_plane_router;
+use llmroller_proxy::metrics::{CLOSED_LABEL_ALLOWLIST, validate_metric_labels};
 use llmroller_server::reloader::load_initial_snapshot;
 use llmroller_store::client_keys::{
     ClientKeyPatch, NewClientKey, create_client_key, patch_client_key, rotate_client_key,
@@ -22,6 +28,7 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
 use llmroller_store::users::{NewUser, create_user, set_disabled};
 use tempfile::tempdir;
+use tower::ServiceExt as _;
 
 async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, UserId) {
     let dir = tempdir().expect("temp dir");
@@ -244,4 +251,164 @@ async fn test_client_key_request_gates_and_owner_disable() {
     )
     .expect_err("disabled owner must fail G3");
     assert_eq!(err_g3, GateFailure::G3OwnerDisabled);
+}
+
+/// Spec: CLK-4, API-2, SEC-9, SEC-12, OBS-1
+/// (1) Revoking or disabling a client key rejects later data-plane calls with HTTP 401.
+/// (2) Data plane authenticates via Bearer token and x-api-key header.
+/// (3) Bad-token requests throttled at 20/min per IP, incrementing auth_failure_counters without usage_events rows.
+/// (4) Healthz returns 200, Readyz returns 503 until ready then 200, and metrics closed label allowlist holds.
+#[doc = "Spec: CLK-4, API-2, SEC-9, SEC-12, OBS-1"]
+#[tokio::test]
+async fn test_client_key_auth_middleware_and_listeners() {
+    let (_dir, pool, user_id) = setup_test_context().await;
+    let user_actor = ActorScope::user(user_id, Role::User);
+    let entropy = OsEntropy;
+    let now_ms = 3_000_000;
+
+    let res = create_client_key(
+        &pool,
+        &user_actor,
+        user_id,
+        NewClientKey {
+            label: "proxy_agent".to_string(),
+            routing_scope: Some("personal_first".to_string()),
+            allowed_models: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: None,
+            expires_at: None,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("create key");
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let raw_token = res.raw_token.expose_secret().to_string();
+
+    let snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::new(Arc::new(snapshot)));
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![]);
+    let app = data_plane_router(auth_state.clone());
+
+    // 1. /healthz returns 200 OK
+    let healthz_req = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .expect("req");
+    let healthz_res = app.clone().oneshot(healthz_req).await.expect("res");
+    assert_eq!(healthz_res.status(), StatusCode::OK);
+
+    // 2. /readyz returns 503 while is_ready is false
+    let readyz_req = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Body::empty())
+        .expect("req");
+    let readyz_res = app.clone().oneshot(readyz_req).await.expect("res");
+    assert_eq!(readyz_res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Flip ready to true -> /readyz returns 200 OK
+    auth_state
+        .is_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let readyz_req2 = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Body::empty())
+        .expect("req");
+    let readyz_res2 = app.clone().oneshot(readyz_req2).await.expect("res");
+    assert_eq!(readyz_res2.status(), StatusCode::OK);
+
+    // 3. API-2: Authenticate via Bearer token
+    let bearer_req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header(header::AUTHORIZATION, format!("Bearer {raw_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let bearer_res = app.clone().oneshot(bearer_req).await.expect("res");
+    assert_eq!(bearer_res.status(), StatusCode::OK);
+
+    // Authenticate via x-api-key header
+    let x_api_req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("x-api-key", &raw_token)
+        .body(Body::empty())
+        .expect("req");
+    let x_api_res = app.clone().oneshot(x_api_req).await.expect("res");
+    assert_eq!(x_api_res.status(), StatusCode::OK);
+
+    // 4. CLK-4: Disabling client key returns 401
+    patch_client_key(
+        &pool,
+        &user_actor,
+        res.client_key.id,
+        ClientKeyPatch {
+            disabled: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("disable key");
+
+    let updated_snap = load_initial_snapshot(&pool).await.expect("reload snapshot");
+    shared_snapshot.store(Arc::new(updated_snap));
+
+    let disabled_req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("x-api-key", &raw_token)
+        .body(Body::empty())
+        .expect("req");
+    let disabled_res = app.clone().oneshot(disabled_req).await.expect("res");
+    assert_eq!(disabled_res.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. SEC-12: Bad token requests are throttled at 20/min per IP,
+    // incrementing auth_failure_counters without inserting usage_events rows
+    auth_state.ip_failures.lock().clear();
+    for _ in 0..20 {
+        let bad_req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("x-api-key", "llr_badtoken123456789012345678901234")
+            .body(Body::empty())
+            .expect("req");
+        let bad_res = app.clone().oneshot(bad_req).await.expect("res");
+        assert_eq!(bad_res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 21st bad request must be throttled with 429
+    let throttled_req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("x-api-key", "llr_badtoken123456789012345678901234")
+        .body(Body::empty())
+        .expect("req");
+    let throttled_res = app.clone().oneshot(throttled_req).await.expect("res");
+    assert_eq!(throttled_res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Verify auth_failure_counters row count in DB
+    let failure_count: i64 = sqlx::query_scalar("SELECT SUM(count) FROM auth_failure_counters")
+        .fetch_one(&pool)
+        .await
+        .expect("count failures");
+    assert!(failure_count >= 20);
+
+    // Verify zero usage_events rows were inserted for unauthenticated requests
+    let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count usage");
+    assert_eq!(usage_count, 0);
+
+    // 6. OBS-1: Closed label allowlist check on Prometheus metrics
+    assert_eq!(CLOSED_LABEL_ALLOWLIST.len(), 10);
+    assert!(validate_metric_labels(&[("provider_kind", "custom"), ("protocol", "chat")]).is_ok());
+    assert!(validate_metric_labels(&[("illegal_label", "val")]).is_err());
 }

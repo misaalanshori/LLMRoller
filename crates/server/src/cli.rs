@@ -43,6 +43,19 @@ pub(crate) enum Command {
     ResetAdmin(ResetAdminArgs),
     /// Verify the audit-log HMAC chain.
     VerifyAuditLog(VerifyAuditLogArgs),
+    /// Probe the container readiness endpoint.
+    Healthcheck(HealthcheckArgs),
+}
+
+/// Arguments for `llmroller healthcheck`.
+#[derive(Debug, Args)]
+pub(crate) struct HealthcheckArgs {
+    /// URL to probe.
+    #[arg(long, default_value = "http://127.0.0.1:8080/readyz")]
+    pub(crate) url: String,
+    /// Timeout in milliseconds.
+    #[arg(long, default_value_t = 2000)]
+    pub(crate) timeout_ms: u64,
 }
 
 /// Arguments for `llmroller verify-audit-log`.
@@ -97,6 +110,22 @@ pub(crate) async fn main() -> ExitCode {
         Command::RotateMasterKey(args) => run_rotation(args).await,
         Command::ResetAdmin(args) => run_reset_admin(args).await,
         Command::VerifyAuditLog(args) => run_verify_audit_log(args).await,
+        Command::Healthcheck(args) => run_healthcheck(args).await,
+    }
+}
+
+async fn run_healthcheck(args: HealthcheckArgs) -> ExitCode {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(args.timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return ExitCode::from(1),
+    };
+
+    match client.get(&args.url).send().await {
+        Ok(resp) if resp.status().is_success() => ExitCode::SUCCESS,
+        _ => ExitCode::from(1),
     }
 }
 

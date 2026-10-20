@@ -25,6 +25,7 @@ arc-swap.workspace = true
 clap.workspace = true
 llmroller-core = { path = "../core" }
 llmroller-store = { path = "../store" }
+reqwest.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
