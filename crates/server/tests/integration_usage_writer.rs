@@ -552,3 +552,122 @@ async fn test_live_usage_emission_and_attempt_charging() {
 
     tx.commit().await.expect("commit");
 }
+
+#[doc = "Spec: REL-3, Partial: PERF-4"]
+#[tokio::test]
+async fn test_retention_sweeper_and_wal_checkpoint_supervisor() {
+    use llmroller_store::checkpoint::{
+        WAL_RESTART_THRESHOLD_BYTES, WAL_SATURATION_THRESHOLD_BYTES, WalCheckpointSupervisor,
+    };
+    use llmroller_store::retention::{
+        enforce_max_usage_events_rows, run_incremental_vacuum, sweep_expired_response_links,
+        sweep_expired_usage_events_chunk, sweep_expired_web_sessions,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    let (_dir, pool, _master_key, user_id) = setup_usage_writer_test_db().await;
+    let mut tx = pool.begin().await.expect("begin");
+
+    let client_key_id = ClientKeyId::generate();
+    sqlx::query("INSERT INTO client_keys (id, owner_user_id, label, prefix, key_hash, created_at) VALUES (?, ?, 'Key', 'llr_123', 'hash123', 1000)")
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert client key");
+
+    // Insert 5 usage_events
+    for i in 0..5 {
+        let req_id = RequestId::generate();
+        sqlx::query(
+            r#"INSERT INTO usage_events (
+                   id, ts, request_id, client_key_id, owner_user_id,
+                   endpoint, status, stream, incomplete, termination,
+                   trace_dropped, cost_micro_usd, cost_source
+               )
+               VALUES (?, ?, ?, ?, ?, 'chat', 200, 0, 0, 'completed', 0, 1000, 'provider')"#,
+        )
+        .bind(format!("01ARZ3NDEKTSV4RRFFQ69G5FA{i}"))
+        .bind(1_000_000 + i * 1000)
+        .bind(req_id.to_string())
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert event");
+    }
+
+    // 1. Sweeper deletes expired in 1,000-row chunks using portable subquery (REL-3)
+    let cutoff_id = "01ARZ3NDEKTSV4RRFFQ69G5FA3";
+    let deleted = sweep_expired_usage_events_chunk(&mut tx, cutoff_id, 1000)
+        .await
+        .expect("sweep chunk");
+    assert_eq!(deleted, 3); // 0, 1, 2 deleted
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count remaining");
+    assert_eq!(remaining, 2); // 3 and 4 remain
+
+    // Max rows enforcement
+    let deleted_excess = enforce_max_usage_events_rows(&mut tx, 1, 1000)
+        .await
+        .expect("enforce max");
+    assert_eq!(deleted_excess, 1);
+
+    // Expired web_sessions and response_links
+    let sessions_deleted = sweep_expired_web_sessions(&mut tx, 2_000_000)
+        .await
+        .expect("sweep sessions");
+    assert_eq!(sessions_deleted, 0);
+
+    let links_deleted = sweep_expired_response_links(&mut tx, 2_000_000)
+        .await
+        .expect("sweep links");
+    assert_eq!(links_deleted, 0);
+
+    tx.commit().await.expect("commit");
+
+    // Incremental vacuum (500 pages)
+    run_incremental_vacuum(&pool, 500)
+        .await
+        .expect("incremental vacuum");
+
+    // 2. WAL checkpoint supervisor (REL-3, Partial: PERF-4)
+    let is_ready = Arc::new(AtomicBool::new(true));
+    let supervisor = WalCheckpointSupervisor::new(Arc::clone(&is_ready));
+
+    // Under normal size: runs PASSIVE checkpoint, ready is true
+    supervisor
+        .run_checkpoint(&pool, 10 * 1024 * 1024)
+        .await
+        .expect("passive checkpoint");
+    assert!(is_ready.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Above 256 MiB: runs RESTART checkpoint
+    supervisor
+        .run_checkpoint(&pool, WAL_RESTART_THRESHOLD_BYTES + 1024)
+        .await
+        .expect("restart checkpoint");
+    assert!(is_ready.load(std::sync::atomic::Ordering::SeqCst));
+
+    // Above 1 GiB: sets /readyz to false (503)
+    supervisor
+        .run_checkpoint(&pool, WAL_SATURATION_THRESHOLD_BYTES + 1024)
+        .await
+        .expect("saturation checkpoint");
+    assert!(!is_ready.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 3. Simulated SQLITE_FULL
+    supervisor.handle_storage_full();
+    assert!(!is_ready.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        supervisor
+            .storage_full
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    supervisor.clear_storage_full();
+    assert!(is_ready.load(std::sync::atomic::Ordering::SeqCst));
+}

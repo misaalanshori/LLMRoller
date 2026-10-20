@@ -4,6 +4,7 @@
 //! Spec: ./docs/srdd/15. SRDD - Technology Choices and Workspace Layout.md#15.2
 
 pub mod audit;
+pub mod checkpoint;
 pub mod client_keys;
 pub mod crypto;
 pub mod instance;
@@ -13,6 +14,7 @@ pub mod pins;
 pub mod pool;
 pub mod prices;
 pub mod providers;
+pub mod retention;
 pub mod rotation;
 pub mod settings;
 pub mod shares;
