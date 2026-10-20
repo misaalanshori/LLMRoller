@@ -1462,6 +1462,7 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "parking_lot",
+ "proptest",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
  "secrecy",

@@ -5,6 +5,7 @@
 
 pub mod client_key;
 pub mod ids;
+pub mod pricing;
 pub mod provider;
 pub mod rbac;
 pub mod runtime_state;
