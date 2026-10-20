@@ -1,7 +1,7 @@
 <!-- Generated file - edit the numbered parts -->
 # LLMRoller: Software Requirements and Design Document
 
-Version 1.2 · 19 October 2026 · Complete software requirements, architecture, routing, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, concurrency/recovery model, and TDD specification.
+Version 1.3 · 20 October 2026 · Complete software requirements, architecture, pluggable routing strategy engine, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, concurrency/recovery model, Docker containerization & deployment specification, and TDD specification.
 
 ## 0. Introduction
 
@@ -11,7 +11,7 @@ LLMRoller is a self-hosted Rust gateway that pools upstream coding-plan and aggr
 
 This document specifies the software requirements and system design for LLMRoller version 1.0 (dated 19 October 2026). Engineers use this specification to build, test, and run the proxy, router, model catalog, usage pipeline, and web interface.
 
-Sections 1 through 8 define what the system must do, who uses it, and how security boundaries work. Sections 9 through 19 define the data model, internal architecture, algorithms, interfaces, and test governance. Section 20 lists the primary sources verified on 19 October 2026, and Section 21 consolidates the cross-cutting concurrency, resource lifecycle, and failure-recovery architecture.
+Sections 1 through 8 define what the system must do, who uses it, and how security boundaries work. Sections 9 through 19 define the data model, internal architecture, algorithms, interfaces, and test governance. Section 20 lists the primary sources verified on 19 October 2026. Section 21 consolidates the concurrency, lifecycle, and failure-recovery model, and Section 22 specifies containerization and deployment.
 
 | In scope for version 1.0 | Out of scope for version 1.0 |
 | --- | --- |
@@ -19,10 +19,10 @@ Sections 1 through 8 define what the system must do, who uses it, and how securi
 | Providers: OpenCode Go, Command Code, Open Design AMR, OpenRouter, and custom OpenAI or Anthropic compatible endpoints | OAuth consumer browser logins for ChatGPT Plus or Claude Pro web accounts |
 | Global providers managed by admins and personal providers managed and shared by any user with explicit grantee acceptance | Commercial billing, customer invoicing, or public resale to external third parties |
 | Admin and standard user roles with full role-based access control | Multi-node clustering and distributed consensus across hosts |
-| Session pinning, response-link session inheritance, smooth weighted round-robin, and per-model key priority overrides | Automatic cross-protocol request translation in the base release |
+| Session pinning, response-link inheritance, pluggable routing strategies (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`), and per-model priority overrides | Automatic cross-protocol request translation in the base release |
 | Local cost accounting plus source provider `/usage` polling, decaying observation reconciliation, and pass-through | Unconditional or silent prompt logging (content recording is off by default and strictly opt-in) |
 | Admin opt-in content traceability mode with content-addressed encrypted turn storage and read-only session chat preview | Automatic cross-tenant prompt inspection on shared personal keys |
-| Single static Rust binary, SQLite in WAL mode, and an embedded HTMX web interface | External single-page JavaScript build pipelines or CDN asset dependencies |
+| Single static Rust binary, distroless Docker and Compose deployment profiles, SQLite in WAL mode, and an embedded HTMX web interface | External single-page JavaScript build pipelines or CDN asset dependencies |
 
 ### 0.2 Requirement priorities and conventions
 
@@ -38,7 +38,7 @@ Requirement identifiers use a short prefix for each subsystem. Functional prefix
 
 ### 0.3 Definitions and glossary
 
-The terms in the table below have one fixed meaning throughout all twenty-two sections of this specification.
+The terms in the table below have one fixed meaning throughout all twenty-three sections of this specification.
 
 | Term | Definition |
 | --- | --- |
@@ -62,7 +62,7 @@ The terms in the table below have one fixed meaning throughout all twenty-two se
 
 ### 0.4 Document map
 
-The specification is split into twenty-two numbered Markdown files (`0` through `21`) plus the machine-readable `requirements.toml` registry so engineers can review and trace individual subsystems. The numbered split files and `requirements.toml` are the single authoritative source of truth. The combined file (`LLMRoller Software Requirements and Design Document.md`) is a generated bundle produced by `cargo xtask docs-bundle`. CI checks that concatenating the numbered files with shifted heading levels produces zero diff.
+The specification is split into twenty-three numbered Markdown files (`0` through `22`) plus the machine-readable `requirements.toml` registry so engineers can review and trace individual subsystems. The numbered split files and `requirements.toml` are the single authoritative source of truth. The combined file (`LLMRoller Software Requirements and Design Document.md`) is a generated bundle produced by `cargo xtask docs-bundle`. CI checks that concatenating the numbered files with shifted heading levels produces zero diff.
 
 | File | Title | Focus |
 | --- | --- | --- |
@@ -76,7 +76,7 @@ The specification is split into twenty-two numbered Markdown files (`0` through 
 | `7. SRDD - Non-Functional Requirements.md` | Non-functional requirements | Latency, memory budgets, streaming, compatibility, and operational targets |
 | `8. SRDD - Security and Privacy.md` | Security and privacy | Threat model, key hierarchy, SSRF connector, isolation, and supply-chain controls |
 | `9. SRDD - Data Model.md` | Data model | 31-table SQLite WAL schema, canonical AAD encryption rules, dual-queue writer, and retention policies |
-| `10. SRDD - Routing Design.md` | Routing design | Request gates, candidate checks, per-group smooth WRR, pin state machine, error classifier, and failover |
+| `10. SRDD - Routing Design.md` | Routing design | Request gates, candidate checks, pluggable routing strategy engine, pin state machine, error classifier, and failover |
 | `11. SRDD - Session Identification and Hints.md` | Session identification and hints | Eight-step inbound session extraction, response-link inheritance, hashing, and outbound hints |
 | `12. SRDD - Protocol Handling and Transparent Proxying.md` | Protocol handling and transparent proxying | Request and response header policies, surgical body edits, streaming tee, and token extraction |
 | `13. SRDD - Pricing, Limits, and Source Provider Usage Engine.md` | Pricing, limits, and source provider usage engine | Price book math, generalized rolling and anchored windows, reservations, and `/usage` observation sync |
@@ -88,6 +88,7 @@ The specification is split into twenty-two numbered Markdown files (`0` through 
 | `19. SRDD - Architectural Decisions and Open Questions.md` | Architectural decisions and open questions | Resolved design trade-offs and operator configuration choices |
 | `20. SRDD - Sources.md` | Sources | Verified primary links for providers, clients, gateways, and standards |
 | `21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md` | Concurrency, lifecycle, and failure-recovery model | Memory budgets, lock hierarchy, reloader ordering, writer durability queues, `RequestLifecycle`, and supervision |
+| `22. SRDD - Deployment and Containers.md` | Deployment and containers | Multi-stage `Dockerfile`, distroless and dev images, `docker-compose.yml` topologies, environment contract, and container healthchecks |
 | `requirements.toml` | Machine-readable requirement registry | Authoritative TOML mapping of requirement IDs to priorities, milestones, and delivering sub-phases |
 
 ## 1. Summary
@@ -104,7 +105,7 @@ Managing these keys by hand causes two failures. First, switching keys or provid
 
 LLMRoller solves both problems in one single-binary gateway. It reads the session identifier that coding agents already send, or inherits the parent session across `previous_response_id` chains. It then pins each conversation to one upstream key for its entire lifetime. Recognized fields include `x-claude-code-session-id`, `session_id`, `x-session-affinity`, `x-opencode-session`, and `prompt_cache_key`.
 
-When a new session starts, LLMRoller selects an eligible upstream key using smooth weighted round-robin within the caller's active pool tier. Each upstream key has a default priority weight. Operators and users can override that weight per model to match each provider's per-model dollar allowance.
+When a new session starts, LLMRoller selects an eligible upstream key using a configurable routing strategy within the caller's active pool tier. Supported strategies include `smooth_weighted_rr` (default), `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, and `power_of_two_choices`. Operators and users can override route weights per model to match each provider's dollar allowance.
 
 ### 1.3 Core architectural pillars
 
@@ -114,7 +115,7 @@ The system design rests on nine engineering decisions that govern every module i
 | --- | --- |
 | Transparent forwarding | Buffer each inbound request body once in reference-counted memory (`bytes::Bytes`, shared zero-copy across pre-first-byte failover retries) to parse `model` and session fields, forward the body byte-identically except for surgical top-level edits, and stream response SSE chunks without buffering after the first valid frame. |
 | Native session pinning | Extract the client's existing session identifier (or inherit the session across `response_links`), bind `(client_key_id, model_pk, session_hash)` to one upstream key, and emit the exact affinity field that the chosen provider expects. |
-| Per-model priority overrides | Use the upstream key's default priority weight unless the route or user defines a per-model override. Route new sessions with nginx-style smooth weighted round-robin inside per-user selection groups. |
+| Pluggable routing strategies and per-model weights | Use the upstream key's default priority weight unless the route or user defines a per-model override. Route new sessions through a pluggable `RouteSelector` engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`) inside per-user selection groups. |
 | Dual provider scopes and three-tier pools | Support both admin-managed `global` providers and user-managed `personal` providers across three ordered tiers (`Own`, `Shared`, `Global`) so grantees spend their own keys before consented shared keys under `personal_first`. |
 | First-class standard users | Ship full role-based access control in version 1.0 for both `admin` and `user` accounts, giving standard users self-service personal providers, consented sharing controls, client keys, and scoped analytics. |
 | Hybrid usage and `/usage` pass-through | Compute request cost locally in integer micro-USD while polling source provider `/usage` endpoints to update time-bounded `UpstreamObservation` projections, and expose upstream usage via role-sanitized pass-through APIs. |
@@ -221,7 +222,7 @@ LLMRoller pursues nine measurable engineering goals in version 1.0.
 | ID | Goal | Success measure |
 | --- | --- | --- |
 | G1 | Preserve upstream prompt cache locality across multi-turn coding sessions. | Requests carrying a valid session ID (or `previous_response_id` link) stay on their pinned upstream key while that route remains eligible, and recovery repins wait until the session has been idle for at least `recovery_repin_min_idle_secs` (default 300 s). |
-| G2 | Pool global, personal, and shared upstream keys with predictable session distribution. | Within any single selection group whose candidate set is constant for 100,000 consecutive selections, each route's share of selections stays within 0.5% of `W_eff_i / sum(W_eff)`; across a run in which candidates leave and rejoin, each route's share over all selections in which it was a candidate stays within 1% of its weight share over those same selections. |
+| G2 | Pool global, personal, and shared upstream keys with predictable session distribution across configurable routing strategies. | Under `smooth_weighted_rr` and `weighted_rr`, fixed candidate sets stay within 0.5% of `W_eff_i / sum(W_eff)` over 100,000 selections (`1.0%` under subset churn); under `naive_rr`, each of `N` healthy routes receives `1 / N` exactly over `K * N` selections; under `uniform_random` and `weighted_random`, empirical frequencies over 100,000 selections stay within `1.0%` of target probabilities (`p > 0.001` chi-squared gate). |
 | G3 | Support both admin-managed global providers and user-managed personal providers with granular, consented user-to-user sharing. | Standard users can add personal providers, share them with specific peers who accept the endpoint disclosure, and route traffic across ordered `Own`, `Shared`, and `Global` tiers without admin intervention. |
 | G4 | Stay transparent to coding agents and upstream providers. | Streaming chunks incur under 1 ms of forwarding delay per complete frame, and request bodies on own personal keys keep their exact key and message order. |
 | G5 | Provide accurate cost, token, and quota visibility by combining local price-book math with source provider `/usage` endpoints. | Local window counters combine with time-bounded `UpstreamObservation` projections from `/usage` snapshots without permanent stale-baseline lockouts, and clients can query `/v1/usage` directly. |
@@ -392,7 +393,7 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |  +----------------------- Data Plane Listener (:8080) -------------------+  |
 |  | Proxy Edge (Preflight Body Budget) -> Request Gates (G1..G7)          |  |
 |  |     -> Model & Constraint Resolver -> Session & Link Resolver         |  |
-|  |     -> Router (PinStore / Per-Group Smooth WRR / Pre-Frame Failover)  |  |
+|  |     -> Router (PinStore / Pluggable RouteSelector / Failover)         |  |
 |  |     -> GuardedConnector -> Stream Forwarder (64 KiB Hold Buffer)      |  |
 |  |     -> Inline SseUsageTap, Bounded TraceTap & RequestLifecycle Guard  |  |
 |  |     -> /v1/usage & /v1/key Pass-Through Handler                       |  |
@@ -404,7 +405,7 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |  |  - ArcSwap<ConfigSnapshot> (per-domain slices + config_version)       |  |
 |  |  - PinStore (DashMap<PinKey, Arc<Mutex<PinEntry>>>, max 250k pins)    |  |
 |  |  - Moka Response-Link Cache (backed by SQLite response_links)         |  |
-|  |  - RuntimeState: WrrState Groups, OriginBreakers, Window Rings,       |  |
+|  |  - RuntimeState: Strategy Groups, RouteLoadTracker, OriginBreakers,   |  |
 |  |    UpstreamObservations, UTC Month Accumulators, Health Versions      |  |
 |  +-----------------------------------------------------------------------+  |
 |                     |                                     ^                 |
@@ -435,7 +436,7 @@ Each subsystem lives in a dedicated module or workspace crate with explicit trai
 | Subsystem | Core responsibilities | Primary Rust crates |
 | --- | --- | --- |
 | Proxy edge (`proxy`) | Enforces `LLMROLLER_MAX_BODY_MB` and the `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` admission semaphore, evaluates request gates `G1` through `G7`, dispatches `/v1/*` routes through `GuardedConnector`, holds pre-first-frame bytes up to 64 KiB, and streams responses under an RAII `RequestLifecycle` completion guard. | `axum`, `hyper-util`, `tower`, `reqwest` (`rustls`), `async-compression` |
-| Routing core (`core`) | Pure deterministic logic with zero I/O: resolves eight-step session IDs and response-link inheritance, evaluates candidate checks `C1` through `C8` across `Own`, `Shared`, and `Global` tiers, runs per-group smooth WRR, and drives the `PinStore`, `OriginBreaker`, window ring, and reservation state machines. | `arc-swap`, `dashmap`, `parking_lot`, `smallvec` |
+| Routing core (`core`) | Pure deterministic logic with zero I/O: resolves eight-step session IDs and response-link inheritance, evaluates candidate checks `C1` through `C8` across `Own`, `Shared`, and `Global` tiers, runs the pluggable `RouteSelector` strategy engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`), and drives the `PinStore`, `OriginBreaker`, window ring, and reservation state machines. | `arc-swap`, `dashmap`, `parking_lot`, `smallvec`, `rand` |
 | Provider adapters (`proto`) | Implements `ProviderAdapter` per provider type: validates top-level JSON without duplicate keys, applies surgical edits, enforces request and response header policies, runs inline `SseUsageTap` and bounded `TraceTap`, parses `/models` and `/usage` payloads, and runs the five-class error classifier. | `serde`, `serde_json`, `bytes` |
 | Storage, sealer pool, and writer (`store`) | Manages connection pragmas via `connect_options(role)`, seals secrets and content-addressed `trace_blocks` on a dedicated 2-thread `zstd::bulk::Compressor` pool, and serializes writes through a dual-queue writer (`Control` priority queue plus `durable_state`, `rollups`, and `raw_events` data queues). | `sqlx`, `crossbeam-channel`, `zstd`, `chacha20poly1305`, `hkdf` |
 | Catalog, health, and `/usage` service (`server`) | Supervises background tasks with exponential-backoff panic recovery: `/models` discovery, single-flight `/usage` polling (8-permit concurrency cap), 60 s pin/WRR/detector sweep, 30 s WAL checkpoint and retention sweeper, and the single `Reloader` task. | `tokio`, `time`, `moka` |
@@ -452,7 +453,7 @@ Every inference request on `/v1/chat/completions`, `/v1/responses`, or `/v1/mess
 | 3 | Resolve canonical model and evaluate gates (`G6`, `G7`) | Normalize the requested model string, resolve through confirmed `model_aliases`, `model_redirects`, `models`, or unambiguous raw `upstream_model_id` to `model_pk`, and evaluate `G6` (`client_key.allowed_models`) and `G7` (client-key monthly accumulator reservation, returning `429 client_key_budget_exhausted` on exhaustion). |
 | 4 | Resolve session identity and routing constraint | Run `resolve_session_and_constraint` (Section 11.1.2): for `responses` requests with `previous_response_id` (or `/v1/responses/{id}/*`), look up `response_links` in `moka` or the SQLite read pool, verify `owner_user_id`, inherit `link.session_hash`, and set `RoutingConstraint::HardKey(link.upstream_key_id)`; otherwise extract the session ID via the eight-step precedence order and compute `session_hash`. |
 | 5 | Acquire pin ticket from `PinStore` | For `HardKey(K)`, validate `K` under the hard-route decision table (Section 10.4). Otherwise call `PinStore::acquire(req)` under the entry mutex: follow a valid `Confirmed` or `Provisional` pin (checking `repin_on_personal_recovery` after `recovery_repin_min_idle_secs`), or on miss/ineligibility select a route and insert `Provisional { K, gen, expires = now + 50s }`. |
-| 6 | Filter candidates (`C1`..`C8`) and run per-group smooth WRR | When selection runs inside `PinStore::acquire`, evaluate candidate checks `C1` through `C8` (including cache-aware `try_reserve` across key windows, route windows, share monthly cap, and user global cap) across the ordered tier groups for `routing_scope`, and select the winning route inside the `(user_id, canonical_id, protocol, pool_tier)` `WrrGroup` mutex. |
+| 6 | Filter candidates (`C1`..`C8`) and dispatch configured `RoutingStrategy` | When selection runs inside `PinStore::acquire`, evaluate candidate checks `C1` through `C8` (including cache-aware `try_reserve` across key windows, route windows, share monthly cap, and user global cap) across the ordered tier groups for `routing_scope`, resolve the effective `RoutingStrategy` (`models.routing_strategy` or `settings.default_routing_strategy`), and select the winning route via `RouteSelector::select_next` for `(user_id, canonical_id, protocol, pool_tier)`. |
 | 7 | Build and send outbound request | Strip client credentials and (on `Shared` and `Global` tiers) all recognized client session carriers, inject the decrypted upstream credential and provider affinity hint, apply surgical JSON edits with `serde_json` string escaping, and connect through `GuardedConnector`. |
 | 8 | Hold pre-first-frame bytes and classify failures | Hold upstream status, headers, and up to `64 KiB` of initial bytes until the first valid non-comment frame is verified. If a failover-eligible failure occurs before commit (and constraint is not `HardKey`), record a `usage_attempts` item, update key/route health or `OriginBreaker`, and call `PinStore::pre_first_byte_failure` (adopting the leader's key if a concurrent turn already advanced `generation`) for up to two retries within `failover_wall_clock_budget_ms` (`60 s`). |
 | 9 | Commit response, confirm pin, and stream | Upon verifying the first valid frame, release the preflight body budget permit, call `PinStore::first_valid_frame(ticket)` to promote the pin to `Confirmed` and enqueue a durable `pins` upsert (plus a durable `response_links` row on `response.created`), apply the response-header policy (Section 12.1.1), flush the held bytes, and stream chunks to the client while running inline `SseUsageTap` and bounded `TraceTap`. |
@@ -487,6 +488,7 @@ The `llmroller` binary in `crates/server` uses `clap` derive macros to expose on
 | `llmroller verify-audit-log [--anchor-seq <N>] [--anchor-hash <H>] [--data-dir <path>] [--json]` | Unseals `audit_hmac_key` from `instance_secrets` using the master key, streams all rows from `audit_log` ordered by `seq ASC`, verifies that no `seq` gaps exist and that every row's `HMAC_SHA256` matches from the 64-ASCII-zero genesis `prev_hash`, and when `--anchor-seq N --anchor-hash H` is given, verifies that row `N` has hash `H` and `max(seq) >= N` (`SEC-13`). |
 | `llmroller reset-admin --username <name> [--data-dir <path>]` | Offline break-glass recovery command. Acquires `flock(LOCK_EX \| LOCK_NB)` on `llmroller.lock`, sets `role = 'admin'`, `disabled = 0`, and `must_change_password = 1` on `<name>`, generates a temporary password printed once to `stderr`, and appends an `audit_log` row (`action = 'admin.break_glass'`, `actor_user_id = NULL`). |
 | `llmroller generate-master-key` | Reads 32 bytes from `OsRng`, base64-encodes the key, writes it to `stdout` with a trailing newline, and zeroizes the buffer before exiting. |
+| `llmroller healthcheck [--url <http_url>] [--timeout-ms <ms>]` | Container healthcheck subcommand for shell-free distroless images (`Section 22.3`). Issues a loopback HTTP `GET` to `<http_url>` (default `http://127.0.0.1:8080/readyz`, timeout `2,000 ms`) and exits `0` on HTTP `200` or `1` on any non-200 status or connection error. |
 | `llmroller --version` | Prints `llmroller <semver> (<git_sha>, schema <n>)` to `stdout` and exits with code `0`. |
 
 #### 5.5.1 Unified CLI exit codes
@@ -562,6 +564,10 @@ LLMRoller separates static bootstrap parameters from dynamic runtime policies. S
 | `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` | Integer (`min(1024, floor(0.40 * memory_limit_mb))`, `819` on 2 GB host) | Total MiB of buffered request bodies allowed simultaneously in the pre-first-valid-frame phase (`PERF-3`, `SEC-8`). |
 | `LLMROLLER_SQLITE_SYNCHRONOUS` | Enum `NORMAL \| FULL` (`"NORMAL"`) | Sets `PRAGMA synchronous` on the writer connection (`NORMAL` for standard WAL speed; `FULL` for power-loss durability of every transaction, `REL-2`). |
 | `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY` | Filesystem paths (`None`) | Optional PEM certificate chain and private key enabling native `rustls` HTTPS on the listeners (`A4`). |
+| `LLMROLLER_DEFAULT_ROUTING_STRATEGY` | Enum `smooth_weighted_rr \| naive_rr \| weighted_rr \| uniform_random \| weighted_random \| power_of_two_choices` (`"smooth_weighted_rr"`) | Sets the initial instance-wide `default_routing_strategy` in `settings` on first boot (or overrides it at startup when set); invalid strategy strings exit with code `2` (`RTE-4`, `RTE-14`). |
+| `LLMROLLER_MEMORY_LIMIT_MB` | Integer `256..=65536` (auto-detected from cgroup v2 `memory.max` or `2048`) | Explicit container memory ceiling in MiB used to size `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` and the `256 MiB` trace accumulator cap (`PERF-3`, `Section 22.3`). |
+| `LLMROLLER_DEFAULT_ROUTING_STRATEGY` | Enum `smooth_weighted_rr \| naive_rr \| weighted_rr \| uniform_random \| weighted_random \| power_of_two_choices` (`"smooth_weighted_rr"`) | Sets the initial instance-wide `default_routing_strategy` in `settings` on first boot (or overrides it at startup when set); invalid strategy strings exit with code `2` (`RTE-4`, `RTE-14`). |
+| `LLMROLLER_MEMORY_LIMIT_MB` | Integer `256..=65536` (auto-detected from cgroup v2 `memory.max` or `2048`) | Explicit container memory ceiling in MiB used to size `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` and the `256 MiB` trace accumulator cap (`PERF-3`, `Section 22.3`). |
 | `LLMROLLER_LOG` | Filter string (`"info,llmroller=info"`) | Structured JSON log level filter passed to `tracing_subscriber::EnvFilter` (`OBS-1`). |
 
 ## 6. Functional requirements
@@ -659,16 +665,17 @@ The routing engine pins existing conversations to their upstream key and distrib
 | RTE-1 | P0 | Inbound session IDs must be resolved by the eight-step precedence order in Section 11.1 (with canonical byte-sliced opening-message fingerprinting at Step 8 and the 21-slot exact `ConstantSessionDetector` for Steps 4 through 7) after checking Response-link session inheritance (Section 11.1.2), and hashed with HMAC-SHA256 (`session_hash`). |
 | RTE-2 | P0 | A session pin in `PinStore` binds `PinKey = (client_key_id, canonical_id, session_hash)` (persisted with `model_pk`) to one `upstream_key_id`, `pool_tier`, and `generation`. While the pinned route passes checks `C1` through `C8`, every turn in that session must route to that `upstream_key_id` unless a recovery repin (`repin_on_personal_recovery`) fires after the pin has been idle for at least `recovery_repin_min_idle_secs` (default 300 s, `pin_outcome = 'repin_recovery'`). |
 | RTE-3 | P0 | Every request must first pass ordered request gates `G1` through `G7` (Section 10.0), and a candidate route `R = (K, M)` is eligible only when all eight candidate checks `C1` through `C8` (Section 10.1) hold. |
-| RTE-4 | P0 | When no usable pin exists, the router must select a route from the first non-empty tier group under `routing_scope` using per-group smooth weighted round-robin (`WrrState` keyed by `(user_id, canonical_id, protocol, pool_tier)` under a mutex, evicting members absent for `>= 300 s` and preserving the zero-sum weight invariant without clamping). |
+| RTE-4 | P0 | When no usable pin exists, the router must select a route from the first non-empty tier group under `routing_scope` through the pluggable `RouteSelector` trait (`Section 10.3`), defaulting to per-group smooth weighted round-robin (`smooth_weighted_rr`, `WrrState` keyed by `(user_id, canonical_id, protocol, pool_tier)` under a mutex, evicting members absent for `>= 300 s` and preserving the zero-sum weight invariant without clamping). |
 | RTE-5 | P0 | A route's effective priority `W(U, r)` is resolved in three steps: (1) for `Own` and `Shared` routes only, `user_route_preferences.priority_override` (`1` to `1000`) if set, (2) `model_routes.priority_override` if set, and (3) `upstream_keys.priority`. Standard users cannot override weights on `Global` routes. |
-| RTE-6 | P0 | Each canonical model must support two distribution modes: `weighted` (default smooth WRR across all eligible routes in the active tier group) and `strict` (filters candidates in the active tier group to the lowest numeric `strict_tier` value, where `1` is highest priority and `10` is lowest, before running smooth WRR within that tier). |
+| RTE-6 | P0 | Each canonical model must support two distribution modes: `weighted` (applies the active `RoutingStrategy` across all eligible routes in the active tier group) and `strict` (filters candidates in the active tier group to the lowest numeric `strict_tier` value, where `1` is highest priority and `10` is lowest, before applying the active `RoutingStrategy` within that tier). |
 | RTE-7 | P0 | Concurrent requests for the same `PinKey` must synchronize through the per-entry `parking_lot::Mutex<PinEntry>` in `PinStore` (Section 10.4): the first request runs the selector (`< 5 us`) and inserts `Provisional { K, gen = 1, expires = now + 50_000 }`, while followers share `(K, gen)`. On pre-first-byte failure, the first task to report failure advances `gen` and reselects excluding `tried_this_generation`, while tasks with stale `ticket.generation < gen` adopt the new `(K, gen)` instead of scattering across keys. |
 | RTE-8 | P0 | A provisional pin is promoted to `Confirmed` under the entry mutex only after the upstream returns HTTP 200 and its first non-comment SSE `data:` frame (or JSON body) is verified free of an embedded error object. Provisional pins exist only in memory; every row persisted to the SQLite `pins` table is confirmed. |
 | RTE-9 | P0 | If an upstream try fails with a failover-eligible outcome (Section 10.5.2) before the first valid response frame, LLMRoller must retry on up to two other eligible routes while the cumulative `failover_wall_clock_budget_ms` (`60 s`) is not exhausted. Wait-timeout outcomes (`first_activity_timeout_ms = 60 s`) are failover-eligible only for streaming requests on providers with `timeout_failover = true`. After the first valid frame is flushed to the client, or after any non-streaming request is accepted, LLMRoller must never retry. |
 | RTE-10 | P0 | Confirmed pins in `PinStore` (capped at `max_active_pins = 250,000`; overflow routes unpinned with `pin_outcome = 'unpinned_capacity'`) must expire after `pin_ttl_secs` (default 24 hours, checked via the `Clock` seam so `FakeClock` tests run deterministically) and persist to SQLite via the non-dropping `durable_state` queue. |
 | RTE-11 | P0 | When a confirmed pin fails any check `C1` through `C8` (or is expired), `PinStore::acquire` reselects under the entry mutex so concurrent turns of the same session coalesce onto one new key, increments `repin_count`, and records `pin_outcome = 'repin'`. |
 | RTE-12 | P0 | For OpenAI Responses requests, LLMRoller must create a durable `response_links` row (Section 9.1) for every upstream response ID at the moment the ID is first observed (streaming `response.created` or non-streaming JSON body) via the `durable_state` queue. Follow-up calls carrying `previous_response_id`, and `GET`, `DELETE`, `/input_items`, and `/cancel` calls on `/v1/responses/{id}`, must inherit the link's `session_hash`, route only to the link's `upstream_key_id` (`RoutingConstraint::HardKey`) under the decision table in Section 10.4, and must never fail over to another key. |
-| RTE-13 | P1 | Headroom mode should optionally scale each route's effective WRR weight by `bps = clamp(min_w floor(10_000 * max(0, w.limit - w.used - w.reserved_in_flight) / w.limit), 500, 10_000)` across all key and route windows (`W_eff = max(1, W(U, r) * bps / 10_000)`). |
+| RTE-13 | P1 | Headroom mode should optionally scale each route's effective weight by `bps = clamp(min_w floor(10_000 * max(0, w.limit - w.used - w.reserved_in_flight) / w.limit), 500, 10_000)` across all key and route windows (`W_eff = max(1, W(U, r) * bps / 10_000)`) for all weighted strategies (`smooth_weighted_rr`, `weighted_rr`, `weighted_random`, `power_of_two_choices`). |
+| RTE-14 | P0 | The routing engine must support six configurable `RoutingStrategy` algorithms selectable globally (`settings.default_routing_strategy` and `LLMROLLER_DEFAULT_ROUTING_STRATEGY`, default `smooth_weighted_rr`) and overridable per canonical model (`models.routing_strategy`): `smooth_weighted_rr` (Nginx SWRR), `naive_rr` (lock-free `AtomicU64` cyclic `idx = (cursor.fetch_add(1) % N)` ignoring weights), `weighted_rr` (classical GCD block-weighted cycle), `uniform_random` (alias `random`, lock-free thread-local PRNG seeded from `EntropySource` ignoring weights), `weighted_random` (`O(log N)` cumulative-weight binary search over `SmallVec<[i64; 16]>`), and `power_of_two_choices` (alias `p2c`, sampling two distinct weighted candidates and picking minimal `((in_flight + 1) * ewma_ttfb_ms * 1000) / W_eff`). Switching strategies via API or settings must hot-reload within 1 s via `Reloader`, preserve stored weights when unweighted strategies are active, and keep existing confirmed pins intact. |
 
 ### 6.8 Transparent proxying (API)
 
@@ -775,10 +782,10 @@ Operational quality attributes keep the binary portable, auditable, observable, 
 
 | ID | Pri | Requirement specification | Verification method |
 | --- | --- | --- | --- |
-| POR-1 | P0 | LLMRoller must compile and pass unit tests in CI from Sub-phase 1.1 onward on Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`), and ship a container image under 50 MB. | CI build matrix and image size gate |
+| POR-1 | P0 | LLMRoller must compile and pass unit tests in CI from Sub-phase 1.1 onward on Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`), ship a multi-stage distroless production container image under 50 MB (`Section 22.1`) with a native `llmroller healthcheck` probe, and provide complete `docker-compose.yml` orchestration for both production (`caddy` + `llmroller-init` + `llmroller` + `prometheus`) and development (`mock-upstream` + `llmroller-dev`) profiles (`Section 22.2`). | CI build matrix, `docker compose` smoke gate, and image size gate |
 | MNT-1 | P0 | All workspace crates must declare `#![forbid(unsafe_code)]` and pass `cargo clippy --all-targets -- -D warnings`. | CI lint gate |
 | MNT-2 | P0 | Provider-specific endpoint paths, headers, error patterns, and `/usage` parsers must live inside `ProviderAdapter` implementations and preset TOML files; `crates/core` must contain zero provider-specific branches and zero I/O dependencies (`Clock` in `crates/core` is synchronous). | Architectural dependency check (`tests/workspace_boundaries.rs`) |
-| OBS-1 | P0 | Every request must receive a unique ULID in `x-llmroller-request-id`, emitted in structured JSON logs and recorded in `usage_events`. Prometheus metrics at `/metrics` must enforce a closed label allow-list (`provider_kind`, `provider_id`, `protocol`, `endpoint`, `status_class`, `outcome`, `job`, `reason`, and a bounded top-50 `model_bucket` with others grouped as `"other"`), strictly forbidding high-cardinality or tenant-identifying labels (`client_key_id`, `user_id`, `username`, key labels, `session_hash`, or unbounded model IDs). | Integration and metric-registry label allow-list tests |
+| OBS-1 | P0 | Every request must receive a unique ULID in `x-llmroller-request-id`, emitted in structured JSON logs and recorded in `usage_events`. Prometheus metrics at `/metrics` must enforce a closed label allow-list (`provider_kind`, `provider_id`, `protocol`, `endpoint`, `status_class`, `outcome`, `strategy`, `job`, `reason`, and a bounded top-50 `model_bucket` with others grouped as `"other"`), strictly forbidding high-cardinality or tenant-identifying labels (`client_key_id`, `user_id`, `username`, key labels, `session_hash`, or unbounded model IDs). | Integration and metric-registry label allow-list tests |
 | PRIV-1 | P0 | LLMRoller must emit zero telemetry, analytics, or crash reports to third parties. Outbound network connections may go only to configured provider hosts and, when explicitly enabled by an admin, the configured price-book catalog URL. | Network sandbox egress test |
 
 ## 8. Security and privacy
@@ -1068,6 +1075,7 @@ CREATE TABLE models (
   display_name TEXT,
   exposed INTEGER CHECK (exposed IN (0, 1)), -- NULL = automatic global exposure rule, 0 = forced off, 1 = forced on
   distribution TEXT NOT NULL DEFAULT 'weighted' CHECK (distribution IN ('weighted', 'strict')),
+  routing_strategy TEXT CHECK (routing_strategy IN ('smooth_weighted_rr', 'naive_rr', 'weighted_rr', 'uniform_random', 'weighted_random', 'power_of_two_choices')), -- NULL = inherit settings.default_routing_strategy
   merge_state TEXT NOT NULL DEFAULT 'confirmed' CHECK (merge_state IN ('confirmed', 'pending_review')),
   origin TEXT NOT NULL DEFAULT 'global' CHECK (origin IN ('global', 'preset', 'personal')),
   created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
@@ -1541,14 +1549,15 @@ Context-length pricing tiers (`tiers_json`) apply when `total_input_tokens >= mi
 
 #### 9.3.3 Closed runtime `settings` registry
 
-The `settings` table enforces a closed 13-key registry. Any unknown key or out-of-range value submitted to `PATCH /admin/api/settings` is rejected with HTTP 422.
+The `settings` table enforces a closed 14-key registry. Any unknown key or out-of-range value submitted to `PATCH /admin/api/settings` is rejected with HTTP 422.
 
 | `settings.key` | Type & validation range | Default `value_json` | Purpose and hot-reload target in `ConfigSnapshot` |
 | --- | --- | --- | --- |
 | `pin_ttl_secs` | Integer `300..=2_592_000` | `86400` | Sliding idle expiration window in seconds for confirmed session pins (`RTE-10`). |
 | `max_active_pins` | Integer `1_000..=1_000_000` | `250000` | Maximum entries in `PinStore` (`~72 MB` at 250k); overflow routes unpinned (`unpinned_capacity`, `RTE-10`). |
 | `usage_poll_interval_secs` | Integer `60..=3600` | `300` | Periodic polling interval in seconds for active upstream keys' `/usage` endpoints (`USG-4`). |
-| `headroom_scaling_enabled` | Boolean | `false` | Scales WRR route weights by remaining budget basis points `bps in 500..=10_000` (`RTE-13`). |
+| `default_routing_strategy` | Enum `"smooth_weighted_rr" \| "naive_rr" \| "weighted_rr" \| "uniform_random" \| "weighted_random" \| "power_of_two_choices"` (aliases `"random" -> "uniform_random"`, `"p2c" -> "power_of_two_choices"`) | `"smooth_weighted_rr"` | Instance-wide default routing algorithm used when `models.routing_strategy IS NULL` (`RTE-4`, `RTE-14`). |
+| `headroom_scaling_enabled` | Boolean | `false` | Scales weighted route weights by remaining budget basis points `bps in 500..=10_000` (`RTE-13`). |
 | `repin_on_personal_recovery` | Boolean | `true` | Enables recovery repin from a fallback tier back to a higher priority tier once idle (`RTE-2`). |
 | `recovery_repin_min_idle_secs` | Integer `0..=86400` | `300` | Minimum idle seconds since the pin's previous served turn before a recovery repin is permitted (`RTE-2`). |
 | `global_exposure_mode` | Enum `"union" \| "intersection"` | `"union"` | Controls automatic global exposure when `models.exposed IS NULL` (`MDL-3`). |
@@ -1561,7 +1570,7 @@ The `settings` table enforces a closed 13-key registry. Any unknown key or out-o
 
 ## 10. Routing design
 
-The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It evaluates request gates (`G1` through `G7`), resolves the session and routing constraint, and checks candidate eligibility (`C1` through `C8`). It then selects routes via per-group smooth WRR and manages single-flight pinning and pre-first-valid-frame failover.
+The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It evaluates request gates (`G1` through `G7`), resolves the session and routing constraint, and checks candidate eligibility (`C1` through `C8`). It then selects routes through the pluggable `RouteSelector` strategy engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`) and manages single-flight pinning and pre-first-valid-frame failover.
 
 ### 10.0 Ordered request gates (`G1` through `G7`)
 
@@ -1624,7 +1633,7 @@ Routes passing `C1` through `C8` are partitioned into `Tier_Own`, `Tier_Shared`,
 
 When all allowed tier groups are empty because of share or user monthly caps, the router returns HTTP `429 rate_limit_error` (`code = "monthly_cap_exhausted"`). Otherwise it returns HTTP `503 no_eligible_route` with `Retry-After` set to the earliest positive recovery delay.
 
-### 10.3 Effective priority, headroom scaling, and per-group smooth WRR
+### 10.3 Pluggable routing strategy engine, effective priority, and headroom scaling
 
 For each candidate route `r = (K, M)` in the active tier group `C`, the base integer weight `W(U, r)` in `1..=1000` is resolved in three steps:
 1. For `Own` or `Shared` routes, use `user_route_preferences(U, K, M).priority_override` when set.
@@ -1648,14 +1657,62 @@ if windows.is_empty() {
 W_eff(U, r) = max(1, (W(U, r) * bps) / 10_000);
 ```
 
-When `models.distribution == 'strict'` (`RTE-6`), `C` is filtered to candidates with the minimum `strict_tier` (`1` is highest, `10` is lowest) before running smooth WRR.
+When `models.distribution == 'strict'` (`RTE-6`), `C` is filtered to candidates with the minimum `strict_tier` (`1` is highest, `10` is lowest) before invoking the configured routing strategy. Candidate slices passed into the selector are always sorted in ascending `RouteId` (`(upstream_key_id, model_pk)`) order so index arithmetic and tie-breaking are deterministic across threads.
 
-To prevent cross-user weight interference and multi-atomic race conditions while keeping memory bounded, WRR state lives in `WrrState` keyed by `WrrGroupKey { user_id, canonical_id, protocol, pool_tier }`. Each group is protected by a short synchronous `parking_lot::Mutex<WrrGroup>` and maintains the exact invariant `sum(m.current for m in members) == 0` without clamping:
+#### 10.3.1 Common `RouteSelector` trait and `RoutingStrategy` enum (`RTE-4`, `RTE-14`)
+
+Target selection is decoupled from candidate filtering via the thread-safe `RouteSelector` trait in `crates/core::strategy`. Each selection group is keyed by `WrrGroupKey { user_id, model_pk, protocol, pool_tier }` so one user's route overrides or selection cursor never perturbs another user's distribution.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategy {
+    SmoothWeightedRr,      // "smooth_weighted_rr" (default)
+    NaiveRr,               // "naive_rr"
+    WeightedRr,            // "weighted_rr"
+    UniformRandom,         // "uniform_random" (deserializes alias "random")
+    WeightedRandom,        // "weighted_random"
+    PowerOfTwoChoices,     // "power_of_two_choices" (deserializes alias "p2c")
+}
+
+pub trait RouteSelector: Send + Sync {
+    fn strategy(&self) -> RoutingStrategy;
+    fn select_next(
+        &self,
+        group_key: &WrrGroupKey,
+        candidates: &[(RouteId, i64)],
+        now_ms: i64,
+        entropy: &dyn EntropySource,
+        load_tracker: &RouteLoadTracker,
+    ) -> Option<RouteId>;
+    fn on_weights_updated(&self, group_key: &WrrGroupKey);
+    fn reset_group(&self, group_key: &WrrGroupKey);
+    fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64);
+}
+```
+
+#### 10.3.2 Supported routing algorithms and mathematical invariants
+
+LLMRoller ships six built-in `RouteSelector` implementations dispatched by `RoutingStrategyEngine`. All six algorithms return `None` immediately when `candidates` is empty.
+
+| Strategy enum (`RoutingStrategy`) | Uses `W_eff` weights | State per `WrrGroupKey` | Concurrency primitive | Mathematical invariant and selection complexity |
+| --- | --- | --- | --- | --- |
+| `smooth_weighted_rr` (default) | Yes (`1..=1000`) | `WrrGroup` (`members: Vec<WrrMember>`, `last_used_ms`) | `parking_lot::Mutex<WrrGroup>` (`< 1 us`) | Nginx SWRR: `m.current += W_eff`, pick `argmax(m.current, r.id_bytes)`, `winner.current -= sum(W_eff)`. Preserves `sum(current) == 0` without clamping; evicts members absent `>= 300,000 ms`. Max consecutive run `<= ceil(max(W) / min(W))`. `O(N)`. |
+| `naive_rr` | No (treats each healthy candidate equally as weight `1`) | `NaiveRrGroup { cursor: AtomicU64, last_used_ms: AtomicI64 }` | Lock-free `AtomicU64::fetch_add(1, Ordering::Relaxed)` | Cyclic unweighted round-robin: `idx = (cursor.fetch_add(1, Relaxed) % (N as u64)) as usize`, returning `candidates[idx].0`. Unsigned `u64` wrap-around at `u64::MAX` is well-defined (`wrapping_add`). Over `K * N` picks with fixed `N`, each route receives exactly `K` picks. `O(1)`. |
+| `weighted_rr` | Yes (`1..=1000`, reduced by `gcd`) | `ClassicalWrrGroup { index: usize, current_weight: i64, last_used_ms: i64 }` | `parking_lot::Mutex<ClassicalWrrGroup>` (`< 1 us`) | Superset/LVS sequential block-weighted cycle: steps `index = (index + 1) % N`; whenever `index == 0`, sets `cw -= gcd(W_eff)` and wraps `cw = max(W_eff)` when `cw <= 0`, picking the first candidate with `W_eff >= cw`. Exact share `W_eff_i / sum(W_eff)` every `sum(W_eff) / gcd(W_eff)` picks. `O(N)`. |
+| `uniform_random` (alias `random`) | No (uniform `1 / N` across healthy candidates) | Stateless | Lock-free `thread_local!` `ChaCha12Rng` seeded from `EntropySource` | Pseudo-random uniform pick: draws unbiased `idx in 0..N` using Lemire's divisionless rejection method (zero global RNG mutex contention; deterministic in tests when driven by `DeterministicRng`). `P(route_i) = 1 / N`. `O(1)`. |
+| `weighted_random` | Yes (`1..=1000`) | Stateless | Lock-free `thread_local!` `ChaCha12Rng` seeded from `EntropySource` | Builds cumulative prefix weights `prefix: SmallVec<[i64; 16]>` (`prefix[i] = sum_{k=0..=i} W_eff_k`, `total_w = prefix[N - 1]`), draws unbiased `draw in 0..total_w`, and binary-searches `idx = prefix.partition_point(\|&c\| c <= draw)`. `P(route_i) = W_eff_i / total_w`. `O(N)` prefix build (`<= 16` inline on stack) + `O(log N)` binary search. |
+| `power_of_two_choices` (alias `p2c`) | Yes (`1..=1000` combined with live load) | Per-route `RouteLoadAtomics` in `RuntimeState` (`in_flight: AtomicU32`, `ewma_ttfb_ms: AtomicU64`) | Lock-free atomic loads + thread-local `ChaCha12Rng` | Samples two distinct candidates `(a, b)` without replacement via `weighted_random` (or returns `candidates[0]` when `N == 1`) and picks `argmin_{r in {a, b}} (load_score(r), r.id_bytes)` where `load_score(r) = ((in_flight(r) + 1) * ewma_ttfb_ms(r) * 1000) / W_eff(r)`. Mitigates herd effects on slow upstreams. `O(log N)`. |
+
+##### 10.3.2.1 Reference implementation of the pluggable algorithms
+
+The pseudocode below specifies the six selection algorithms in `crates/core::strategy`.
 
 ```text
 const WRR_MEMBER_EVICT_MS: i64 = 300_000; // 5 minutes
 
-fn select(group_key: WrrGroupKey, candidates: &[(RouteId, i64)], now_ms: i64) -> RouteId {
+// 1. Smooth Weighted Round Robin (smooth_weighted_rr)
+fn select_smooth_wrr(group_key: &WrrGroupKey, candidates: &[(RouteId, i64)], now_ms: i64) -> RouteId {
     let mut group = wrr_state.get_or_insert(group_key).lock();
     for (route, _) in candidates {
         if !group.members.iter().any(|m| m.route == *route) {
@@ -1685,11 +1742,66 @@ fn select(group_key: WrrGroupKey, candidates: &[(RouteId, i64)], now_ms: i64) ->
     group.last_used_ms = now_ms;
     winner.route
 }
+
+// 2. Naive Unweighted Round Robin (naive_rr)
+fn select_naive_rr(group_key: &WrrGroupKey, candidates: &[(RouteId, i64)], now_ms: i64) -> RouteId {
+    let entry = naive_rr_state.get_or_insert(group_key);
+    entry.last_used_ms.store(now_ms, Ordering::Relaxed);
+    let seq = entry.cursor.fetch_add(1, Ordering::Relaxed);
+    let idx = (seq % (candidates.len() as u64)) as usize;
+    candidates[idx].0
+}
+
+// 3. Uniform Random (uniform_random) and 4. Weighted Random (weighted_random)
+fn select_weighted_random(candidates: &[(RouteId, i64)], entropy: &dyn EntropySource) -> RouteId {
+    let mut prefix: SmallVec<[i64; 16]> = SmallVec::with_capacity(candidates.len());
+    let mut acc: i64 = 0;
+    for (_, w) in candidates {
+        acc += (*w).max(1);
+        prefix.push(acc);
+    }
+    let draw = entropy.next_u64_bounded(acc as u64) as i64;
+    let idx = prefix.partition_point(|&cum| cum <= draw);
+    candidates[idx].0
+}
+
+// 5. Power of Two Choices (power_of_two_choices / p2c)
+fn select_p2c(
+    candidates: &[(RouteId, i64)],
+    entropy: &dyn EntropySource,
+    load: &RouteLoadTracker,
+) -> RouteId {
+    if candidates.len() == 1 {
+        return candidates[0].0;
+    }
+    let first = select_weighted_random_index(candidates, entropy);
+    let second = select_weighted_random_index_excluding(candidates, first, entropy);
+    let score = |idx: usize| -> (u64, RouteId) {
+        let (route, w) = candidates[idx];
+        let in_flight = load.in_flight(route) as u64;
+        let ttfb_ms = load.ewma_ttfb_ms(route).max(1);
+        (((in_flight + 1) * ttfb_ms * 1000) / (w.max(1) as u64), route)
+    };
+    score(first).min(score(second)).1
+}
 ```
 
-The 60 s background sweeper deletes `WrrGroup` entries where `now_ms - last_used_ms >= 86_400_000` (24 h).
+The 60 s background sweeper evicts idle state entries (`WrrGroup`, `NaiveRrGroup`, `ClassicalWrrGroup`) where `now_ms - last_used_ms >= 86_400_000` (24 h).
 
-#### 10.3.1 Worked routing example
+#### 10.3.3 Strategy configuration schema, precedence, and weight validation rules
+
+The effective `RoutingStrategy` for a request to canonical model `M` is resolved in three steps:
+1. If `models[M].routing_strategy` is non-null, use `models[M].routing_strategy`.
+2. Else use `ConfigSnapshot.settings.default_routing_strategy` (persisted in `settings` under key `"default_routing_strategy"`).
+3. At startup, validate `LLMROLLER_DEFAULT_ROUTING_STRATEGY` against the six enum identifiers (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random` / `random`, `weighted_random`, `power_of_two_choices` / `p2c`). An invalid environment variable value aborts startup immediately with exit code `2`.
+
+Weight and fallback rules across strategies:
+1. Priority weights (`upstream_keys.priority`, `model_routes.priority_override`, `user_route_preferences.priority_override`) are always validated (`1..=1000`) and stored in SQLite even when an unweighted strategy (`naive_rr` or `uniform_random`) is currently selected.
+2. When `naive_rr` or `uniform_random` is active on model `M`, the UI and route APIs return `"effective_strategy"` and display each route share as `100% / N`. Stored priority weights stay intact so switching back to a weighted strategy restores them without re-entry.
+3. Updating `models.routing_strategy` or `settings.default_routing_strategy` increments `instance_meta.config_version` and emits `CacheInvalidationEvent::StrategyChanged`. It resets in-memory selector counters for the affected models while keeping confirmed pins in `PinStore` intact.
+4. Every route selection increments `llmroller_routing_selections_total{provider_kind,provider_id,protocol,outcome,strategy,model_bucket}` where `strategy` is one of the six canonical snake_case strategy names (`OBS-1`).
+
+#### 10.3.4 Worked routing example
 
 Consider three upstream keys with default priorities matching their general plan tiers: Open Design AMR (`100`), OpenCode Go (`60`), and Command Code GOAT (`30`). The table below uses illustrative per-model monthly allowances to show how per-model `priority_override` values adjust session shares.
 
@@ -2475,10 +2587,10 @@ Every `/admin/api/*` endpoint rejects non-admin callers with HTTP 403.
 | User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}`, `GET /admin/api/client-keys/{id}/sessions?since_ms=&after=&limit=50` (lists recently active sessions for any client key with logged request stats, trace counts, and live pinned provider and upstream key right now, `TRC-9`) |
 | Admin override on user resources | `GET /admin/api/users/{id}/providers`, `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `GET /admin/api/users/{id}/shares`, `DELETE /admin/api/shares/{id}`, `POST /admin/api/shares/{id}/approve` (approves `custom` provider share), `GET /admin/api/users/{id}/pins` (every action logs `target_type` and owner `user_id` in `audit_log`) |
 | Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/reset-health`, `GET /admin/api/upstream-keys/{id}/usage`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
-| Model catalog and price book | `GET /admin/api/models` (includes `merge_state` and `origin` filters), `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`), `POST /admin/api/models/{canonical_id}/confirm-merge`, `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases` (body `{alias, canonical_id}`), `DELETE /admin/api/model-aliases?alias=<urlencoded>`, `GET /admin/api/prices`, `PUT /admin/api/prices` (body carries `{provider_id, provider_kind, upstream_model_id, ...}`), `POST /admin/api/prices/sync` |
+| Model catalog and price book | `GET /admin/api/models` (includes `merge_state`, `origin`, and `routing_strategy` filters), `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`, `routing_strategy`), `POST /admin/api/models/{canonical_id}/confirm-merge`, `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases` (body `{alias, canonical_id}`), `DELETE /admin/api/model-aliases?alias=<urlencoded>`, `GET /admin/api/prices`, `PUT /admin/api/prices` (body carries `{provider_id, provider_kind, upstream_model_id, ...}`), `POST /admin/api/prices/sync` |
 | Global routing and pins | `GET /admin/api/routes`, `PATCH /admin/api/routes/{upstream_key_id}/{canonical_id}`, `GET /admin/api/pins`, `DELETE /admin/api/pins` (takes a filter or `confirm_all=true`), `POST /admin/api/pins/move` |
 | Content traceability & chat preview | `GET /admin/api/settings/traceability`, `PUT /admin/api/settings/traceability` (lowering `retention_days` returns 409 with row count unless `"confirm_purge": true`), `GET /admin/api/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (logs deduplicated `trace.viewed` audit row once per 30 m), `GET /admin/api/traces/{request_id}`, `DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces` |
-| Instance usage, settings, and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown`, `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` (validates against closed 13-key registry) |
+| Instance usage, settings, and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown`, `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` (validates against closed 14-key registry including `default_routing_strategy`) |
 
 ### 14.3 Web UI screens, CSP configuration, and metric definitions
 
@@ -2490,13 +2602,13 @@ The web interface is server-rendered with Askama templates and HTMX partial upda
 | Overview Dashboard | `user` (scoped) & `admin` (global + personal) | Range selector (24 h, 7 d, 30 d, custom); cards for total requests, tokens, micro-USD cost, cache hit rate, pin follow rate, and repin rate; projected disk usage meter (`A6`) and `"Unpriced models"` badge; stacked daily cost chart (`uPlot`); upstream key cards showing live health from `RuntimeState`, local window ring spend, and `UpstreamObservation` gauges (`5h`, `7d`, `1mo`) with reset countdowns. |
 | Personal Providers & Keys | `user` & `admin` | Add personal provider from preset or custom URL; add personal upstream keys; Test button; Refresh `/usage` button; modal showing decrypted raw source provider `/usage` JSON; configure budget windows and manual calibration. |
 | Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key (preventing overlapping provider/key shares), set allowed models and monthly USD cap, view per-grantee token and dollar consumption (including charged failed tries), revoke share. **Shared With Me tab:** inspect pending and accepted shares, view provider kind, `base_url` host, key label, and the explicit disclosure `"Requests you send through this share travel to the endpoint above and are visible to its operator"`, and click **Accept Share** (`POST /api/user/shares/{id}/accept`). |
-| Routing Matrix | `user` (`Own` + `Shared` + aggregated `"Global pool"` via `project_key`) & `admin` (full catalog) | Matrix of canonical models (rows) by upstream keys (columns). For standard users, all global keys are aggregated into a single `"Global pool"` column showing the combined projected share without leaking global key labels or priorities. Displays protocol chips (`chat`, `responses`, `messages`), inline editable per-model `priority_override` on `Own` and `Shared` routes, effective weight, and projected percentage share. |
+| Routing Matrix | `user` (`Own` + `Shared` + aggregated `"Global pool"` via `project_key`) & `admin` (full catalog) | Matrix of canonical models (rows) by upstream keys (columns). For standard users, all global keys are aggregated into a single `"Global pool"` column showing the combined projected share without leaking global key labels or priorities. Displays protocol chips (`chat`, `responses`, `messages`), active `routing_strategy` badge (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`, showing `100% / N` equal shares when an unweighted strategy is active), inline editable per-model `priority_override` on `Own` and `Shared` routes, effective weight, and projected percentage share. |
 | Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once in a confirmation modal), select `routing_scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), configure `constant_session_mode` (`flag` or `fingerprint_generic_ids`), restrict models, set RPM or monthly USD cap, rotate with configurable `grace_period_secs`, or revoke. Includes a **Recently Active Sessions** drawer per client key (`TRC-9`) showing each recent `session_hash`, which provider and upstream key (`project_key`-redacted) it is pinned to right now (or `"unpinned / expired"` with last-served route), logged request and traced-turn counts, **View Requests** filter link, and **Preview Chat** button. |
 | Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins in `PinStore` filterable by `client_key_id` (with a toggle to include recently active sessions from `usage_events` whose pins expired): session hash prefix, client key, model, pinned provider name/kind and upstream key (projected via `project_key`), tier badge (`Own`, `Shared`, `Global`, `Blended`), age, logged request count, `repin_count`, constant-session warning badge, **View Requests** link, and **Preview Chat** button. Supports Unpin and Move Pin. |
 | Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay paginated by `(ts, request_id)` cursor: header displays the originating `client_key_prefix`/`label` and live `current_pins` badges showing which provider and upstream key (`project_key`-redacted) the session is pinned to right now; timeline renders per-thread system instructions and tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs (auto-escaped in `<pre>`), assistant Markdown sanitized via `pulldown-cmark` (raw HTML off) + `ammonia`, context-compaction dividers, per-turn telemetry chips (with `project_key` redaction), and a raw JSON inspector drawer. |
 | Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, model, or `cost_source` (`provider`, `price_book`, `fallback_rate`, `estimated_incomplete`, `estimated_attempt`). Paged event table (`<= 5,000` rows per read tx) with `usage_attempts` breakdown and formula-sanitized CSV or JSON export. |
 | Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, review `pending_review` cross-vendor model merges, force-expose or disable models, merge or split models over `model_pk`, edit aliases and prices, and approve `custom` provider shares. |
-| Admin: Users, Settings & Audit | `admin` only | Create, disable, or delete user accounts (`?confirm=<username>`), inspect `deleted_users`, set per-user global pool access and monthly global caps, edit the 13 validated runtime settings, and inspect the hash-chained `audit_log`. |
+| Admin: Users, Settings & Audit | `admin` only | Create, disable, or delete user accounts (`?confirm=<username>`), inspect `deleted_users`, set per-user global pool access and monthly global caps, edit the 14 validated runtime settings (including `default_routing_strategy`), and inspect the hash-chained `audit_log`. |
 
 ## 15. Technology choices and workspace layout
 
@@ -2527,11 +2639,19 @@ The repository is a seven-member Cargo workspace (`crates/{core,proto,store,prox
 llmroller/
   Cargo.toml                  # Workspace manifest, shared lints (#![forbid(unsafe_code)])
   Cargo.lock                  # Committed lockfile for reproducible builds
+  Dockerfile                  # Multi-stage build (chef, builder, runtime-distroless, runtime-dev)
+  .dockerignore               # Deterministic build context exclusion rules
+  docker-compose.yml          # Production/staging and dev/test Compose orchestration
+  .env.example                # Documented bootstrap environment variable template
   deny.toml                   # cargo-deny license, ban, and advisory rules
   .cargo/mutants.toml         # cargo-mutants configuration and timeout tuning
+  deploy/
+    Caddyfile                 # Streaming-safe TLS reverse proxy config (flush_interval -1)
+    prometheus.yml            # Internal Prometheus scrape config for :9090/metrics
   docs/
     srdd/
-      0. SRDD - Introduction.md .. 21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md
+      0. SRDD - Introduction.md .. 22. SRDD - Deployment and Containers.md
+      deployment-and-containers.md # Alias copy of Section 22 container & deployment spec
       requirements.toml       # Authoritative requirement -> milestone & sub-phase registry
     bigbang/
       big-bang-phases-0.md .. big-bang-phases-7.md (including big-bang-phases-4b.md)
@@ -2555,7 +2675,8 @@ llmroller/
   crates/
     core/                     # Pure domain logic (ZERO network or database dependencies):
                               #   models (model_pk), ActorScope, RBAC rules, G1..G7 & C1..C8,
-                              #   per-group WrrState, PinStore state machine, OriginBreaker,
+                              #   pluggable RouteSelector (SWRR, NaiveRR, WeightedRR, Random,
+                              #   WeightedRandom, P2C), PinStore state machine, OriginBreaker,
                               #   pricing & binary-aware estimator, WindowState & UpstreamObservation,
                               #   UTC month accumulators, synchronous Clock seam
     proto/                    # Wire protocols and provider adapters:
@@ -2580,7 +2701,7 @@ llmroller/
                               #   30s WAL checkpointer and retention sweeper
 ```
 
-`crates/core` depends only on pure-Rust in-memory crates (`serde`, `serde_json`, `time`, `ulid`, `sha2`, `hmac`, `subtle`, `secrecy`, `zeroize`, `ipnet`, `arc-swap`, `dashmap`, `parking_lot`, `smallvec`). Its `Clock` seam (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) is strictly synchronous; `crates/proxy::AsyncClock: Clock` extends it with `async fn sleep(&self, d: Duration)` outside `crates/core`. It cannot import `tokio`, `reqwest`, `hyper`, `axum`, or `sqlx`. This boundary guarantees that every routing, sharing, eligibility, pinning, breaker, and budget rule can be unit-tested and mutation-tested in milliseconds without sockets or disk files.
+`crates/core` depends only on pure-Rust in-memory crates (`serde`, `serde_json`, `time`, `ulid`, `sha2`, `hmac`, `subtle`, `secrecy`, `zeroize`, `ipnet`, `arc-swap`, `dashmap`, `parking_lot`, `smallvec`, `rand`, `rand_chacha`). Its `Clock` seam (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) is strictly synchronous; `crates/proxy::AsyncClock: Clock` extends it with `async fn sleep(&self, d: Duration)` outside `crates/core`. It cannot import `tokio`, `reqwest`, `hyper`, `axum`, or `sqlx`. This boundary guarantees that every routing, sharing, eligibility, pinning, breaker, and budget rule can be unit-tested and mutation-tested in milliseconds without sockets or disk files.
 
 ## 16. Testing plan and TDD governance
 
@@ -2593,7 +2714,7 @@ A disciplined test suite tests the logic that the engineering team controls and 
 | Inside our testing boundary (MUST test thoroughly) | Outside our testing boundary (DO NOT over-test) |
 | --- | --- |
 | Request gates (`G1`..`G7`), candidate checks (`C1`..`C8`), `effective_share` precedence, and three-tier pool resolution (`Own`, `Shared`, `Global`, `Blended`) (`RTE-3`, `SHR-3`, `USR-3`) | Whether `tokio::spawn` schedules tasks onto OS threads or whether `dashmap` implements concurrent hash shards internally |
-| Per-group `WrrState` counter math, zero-sum weight invariant across subset churn, per-model priority overrides, strict tier fallback, and headroom `bps` scaling (`RTE-4`, `RTE-5`, `RTE-6`, `RTE-13`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
+| Pluggable `RouteSelector` strategies (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`), zero-sum SWRR weight invariant across subset churn, `u64::MAX` wrap-around in `naive_rr`, seeded PRNG determinism and chi-squared distribution bounds, `p2c` load scoring, per-model priority overrides, strict tier fallback, and headroom `bps` scaling (`RTE-4`, `RTE-5`, `RTE-6`, `RTE-13`, `RTE-14`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
 | Eight-step inbound session precedence, `response_links` session inheritance (`Section 11.1.2`), canonical byte-sliced Step 8 fingerprinting, 21-slot `ConstantSessionDetector`, and `Shared`/`Global` carrier stripping (`RTE-1`, `RTE-12`, `SEC-16`) | Whether `sha2`, `chacha20poly1305`, or `argon2` implements its underlying mathematical primitives correctly |
 | Duplicate-key rejection and surgical top-level JSON span editing (`model`, `prompt_cache_key`, `stream_options.include_usage`) without altering message byte order (`TRN-1`, `TRN-2`, `API-4`, `API-5`) | Whether `serde_json` parses valid RFC 8259 JSON strings in general |
 | Inline `SseUsageTap`, bounded `TraceTap`, `RequestLifecycle` drop finalization, unified cache-read and cache-write subtraction, content-addressed `trace_blocks` LCP reconstruction, and binary-aware token estimation (`USG-1`..`USG-3`, `TRC-2`..`TRC-5`) | Whether SQLite's `PRAGMA journal_mode = WAL` writes frames to the `-wal` file on the OS filesystem |
@@ -2643,7 +2764,7 @@ To test our controlled logic thoroughly without flakiness from wall-clock time, 
 | Seam trait | Production implementation | Test fake or mock implementation | Controlled logic verified by mocking this seam |
 | --- | --- | --- | --- |
 | `Clock` (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) and `AsyncClock: Clock` (`async fn sleep(&self, d: Duration)`) | `SystemClock` (`time::OffsetDateTime::now_utc`, `std::time::Instant`, `tokio::time::sleep`) | `FakeClock` (atomic millisecond counter advanced manually by tests) | `PinStore` provisional (50 s) and confirmed (`pin_ttl_secs`) expiry (`RTE-10`), `recovery_repin_min_idle_secs` (`300 s`), 360-bucket rolling rings and day-clamped calendar months (`LIM-1`), 30-minute `UpstreamObservation` decay, `prev_key_expires_at` rotation grace, and `Retry-After <= 2 s` same-key retry (`RTE-9`). |
-| `EntropySource` (`fn fill_bytes(&self, dest: &mut [u8])`) | `OsEntropy` (`rand::rngs::OsRng`) | `DeterministicRng` (seeded ChaCha20 RNG for reproducible test vectors) | Client key generation (`llr_...`, `SEC-3`), XChaCha20 24-byte nonces (`SEC-1`, `fixtures/crypto/aad_vectors.json`), and web session and CSRF token creation (`AUTH-7`, `SEC-5`). |
+| `EntropySource` (`fn fill_bytes(&self, dest: &mut [u8])`, `fn next_u64_bounded(&self, bound: u64) -> u64`) | `OsEntropy` (`rand::rngs::OsRng` + thread-local `ChaCha12Rng` for lock-free routing picks) | `DeterministicRng` (seeded ChaCha20/ChaCha12 RNG for reproducible test vectors and routing sequences) | Client key generation (`llr_...`, `SEC-3`), XChaCha20 24-byte nonces (`SEC-1`, `fixtures/crypto/aad_vectors.json`), web session and CSRF token creation (`AUTH-7`, `SEC-5`), and deterministic `uniform_random`, `weighted_random`, and `power_of_two_choices` route selection (`RTE-14`). |
 | `UpstreamTransport` (`async fn send_inference(&self, req: OutboundRequest) -> Result<UpstreamResponseStream, TransportError>`) | `ReqwestUpstreamTransport` (with `GuardedConnector` socket SSRF filter and `rustls`) | `MockUpstreamTransport` (programmable per-route response queue: SSE chunk streams, comment keep-alives, delays, mid-stream drops, 429/401/403/503 responses, and outbound request capture) | Pre-first-valid-frame failover and 64 KiB holding (`RTE-9`), `HardKey` no-failover (`RTE-12`), five-class error classification (`API-8`), request/response header policies (`API-2`, `API-3`, `API-6`), surgical body edits (`API-4`), and `RequestLifecycle` disconnect finalization (`API-7`). |
 | `UsageEndpointClient` (`async fn fetch_usage(&self, key: &UpstreamKey) -> Result<RawUsageResponse, UsagePollError>`) | `HttpUsageEndpointClient` | `StubUsageEndpointClient` (returns canned or sequence-scripted OpenCode Go, Command Code, OpenRouter, or 404/500 responses) | Single-flight polling, `local_at_observation` capture at `t0`, `UpstreamObservation` projection and 30-minute decay, key exhaustion transitions (`USG-4`..`USG-6`), and `/v1/usage` pass-through sanitization (`USG-7`, `USG-8`, `SEC-18`). |
 | `StorageRepository` (`UserRepo`, `ProviderRepo`, `ShareRepo`, `CatalogRepo`, `PinRepo`, `UsageRepo`, `AuditRepo`) | `SqliteRepository` (`sqlx::SqlitePool` via `connect_options(role)`) | `InMemoryRepository` (for fast handler unit tests) plus ephemeral temp-file SQLite WAL instances (for `crates/store` SQL integration tests) | Handler RBAC enforcement (`ActorScope`, `USR-1`..`USR-5`), share acceptance and `share_config_fingerprint` suspension (`SHR-3`, `SHR-5`), atomic `/setup` (`AUTH-1`), in-transaction `last_admin` guard (`AUTH-5`), and three-queue writer backpressure (`REL-3`). |
@@ -2660,7 +2781,7 @@ Unit and property tests verify pure domain and protocol rules in milliseconds wi
 | Test category | Invariants and behaviors verified |
 | --- | --- |
 | Table-driven unit tests | Eight-step session resolution plus `response_links` inheritance, canonical byte-sliced Step 8 fingerprinting (including multi-byte UTF-8 characters straddling offset 4096 and moving `cache_control` markers), 21-slot `ConstantSessionDetector` (skipping Steps 1..3 and `x-claude-code-agent-id`), digit-preserving model normalization and within-key `--` collision resolution, `ActorScope` RBAC checks, `G1`..`G7` and `C1`..`C8` across all five `routing_scope` modes, and five-class error classification. |
-| Smooth WRR `proptest` suite | (1) Fixed candidate set: for 1 to 50 routes with weights in `1..=1000`, over 100,000 picks, each route's share stays within `0.5%` of `W_eff_i / sum(W_eff)`, consecutive runs never exceed `ceil(max(W) / min(W))`, and `sum(current) == 0` holds after every pick. (2) Varying subsets: at each step drop a random subset of up to 50% of routes and assert the `G2` `1%` subset-relative bound and `sum(current) == 0`. (3) Two-user isolation: user B's `priority_override = 1000` on a shared key does not alter user C's selection shares. |
+| Pluggable routing strategy `proptest` and statistical suite (`RTE-4`, `RTE-14`) | (1) `smooth_weighted_rr` & `weighted_rr`: for 1 to 50 routes with weights in `1..=1000`, over 100,000 picks, each route's share stays within `0.5%` of `W_eff_i / sum(W_eff)`, SWRR consecutive runs never exceed `ceil(max(W) / min(W))`, and `sum(current) == 0` holds across subset churn (`1.0%` subset-relative bound). (2) `naive_rr`: exact cyclic sequence `0, 1, ..., N-1` over `K * N` picks regardless of configured route weights, plus `AtomicU64` wrap-around from `u64::MAX - 5` across 8 concurrent threads. (3) `uniform_random` & `weighted_random`: seeded determinism with `DeterministicRng(42)` produces identical pick sequences across runs, `weighted_random` binary search (`partition_point`) matches exact cumulative intervals, and over 100,000 picks empirical frequencies stay within `1.0%` of target probabilities and pass a Pearson chi-squared goodness-of-fit test (`p > 0.001`). (4) `power_of_two_choices`: routes with higher `in_flight` or `ewma_ttfb_ms` receive proportionally fewer selections than idle low-latency routes of equal weight. (5) Two-user isolation: user B's `priority_override = 1000` on a shared key never alters user C's selection shares. |
 | Surgical JSON span `proptest` suite | For any generated JSON payload, duplicate top-level keys always return 400; random `upstream_model_id` strings containing quotes and backslashes produce valid JSON whose parsed `model` equals the input; when `Own` tier and no edit applies, output `Bytes` pointer is identical to input (`TRN-1`); when edited, untouched spans keep exact byte equality (`TRN-2`). |
 | Micro-USD cost, estimator, and window `proptest` suite | Integer micro-USD cost math never overflows up to `10^9` tokens; `estimate_input_tokens` counts a 4 MB base64 image as `1,600` tokens plus text; generalized 360-bucket rolling rings, day-clamped calendar months (31 Jan -> 28/29 Feb -> 31 Mar), and 30-minute decaying `UpstreamObservation` projections match exact reference sums. |
 
@@ -2727,7 +2848,7 @@ Every requirement ID in this SRDD is registered in `docs/srdd/requirements.toml`
 | `SHR-1`..`SHR-6` | `M2` (`3.2`), `M3` (`4.3`) | `crates/core::shares`, `crates/store::shares`, `crates/admin::shares` | `core::shares::tests::eligibility_and_caps` | `tests/integration_personal_sharing.rs` (409 `share_overlap`, `share_config_fingerprint` acceptance & suspension, `custom` admin approval, monthly cap reservation) |
 | `CLK-1`..`CLK-5` | `M1` (`2.2`), `M2` (`3.0c`, `3.4`, `3.6b`) | `crates/core::client_key`, `crates/proxy::auth` | `core::client_key::tests::*` | `tests/integration_client_keys.rs` (`prev_key_hash` rotation grace, 5 `routing_scope` modes, <1 s revocation, G1..G7 gates) |
 | `MDL-1`..`MDL-7` | `M2` (`3.1`) | `crates/core::catalog`, `crates/proto::discovery`, `crates/store::models` | `core::catalog::tests::normalization_and_exposure` | `tests/integration_model_catalog.rs` (digit-dot preservation, `--` collision, `merge_state`, surrogate `model_pk` merge/split, `union`/`intersection`, 2,000 personal cap) |
-| `RTE-1`..`RTE-13` | `M2` (`3.3`, `3.4`, `3.5`, `3.6a`, `3.6b`, `3.7`) | `crates/core::router`, `crates/core::wrr`, `crates/core::pins`, `crates/core::session` | `core::wrr::proptests::*`, `core::session::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (`PinStore` 10-way 429 loser adoption, durable `response_links` session inheritance, `HardKey` no-failover, `OriginBreaker`) + `cargo-mutants` |
+| `RTE-1`..`RTE-14` | `M2` (`3.3`, `3.4`, `3.5`, `3.6a`, `3.6b`, `3.7`) | `crates/core::router`, `crates/core::strategy`, `crates/core::wrr`, `crates/core::pins`, `crates/core::session` | `core::strategy::proptests::*`, `core::wrr::proptests::*`, `core::session::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (all 6 `RoutingStrategy` variants, hot-reload strategy switching, `PinStore` 10-way 429 loser adoption, durable `response_links` session inheritance, `HardKey` no-failover, `OriginBreaker`) + `cargo-mutants` |
 | `API-1`..`API-8`, `TRN-1`..`TRN-3` | `M1` (`2.3`..`2.7`), `M2` (`3.6a`, `3.6b`), `M3` (`4.1`), `M4` (`4b.2`) | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (duplicate-key 400, response header `R1`..`R5`, 64 KiB frame filter, `RequestLifecycle` disconnect guard, 5-class error classifier) |
 | `USG-1`..`USG-8`, `LIM-1` | `M2` (`3.0a`, `3.0b`), `M3` (`4.1`, `4.2`, `4.3`, `4.6`), `M4` (`4b.1`, `4b.2`) | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (`usage_attempts`, `usage_rollups_5min` `< 2 s` rebuild, 30-min `UpstreamObservation` decay, single-flight polling, `raw_json_enc`) |
 | `TRC-1`..`TRC-9`, `PERF-5`, `SEC-19` | `M3b` (`5.1`..`5.4`), `M5` (`6.2`, `6.4`, `6.5`) | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (`trace_blocks` dedup, 2-thread `zstd::bulk::Compressor` pool, block-hash LCP, `(ts, request_id)` cursor pagination, per-client-key recently active sessions with live `PinStore` provider/key projection, `ammonia` + `<pre>` XSS tests) |
@@ -2745,14 +2866,14 @@ The table below defines the scope, deliverables, and exit criteria for each mile
 
 | Milestone (Big-Bang Epic) | Scope and deliverables | Exit criteria (must pass in `cargo xtask traceability --milestone <M>` before starting next milestone) |
 | --- | --- | --- |
-| `M0`: Foundation, Dual-Queue Writer, Reloader, RBAC, and Auth (`Epic 1`: `1.1`..`1.6`) | Six-crate + `xtask` workspace, `POR-1` multi-arch CI matrix, `connect_options(role)` + 31-table SQLite WAL migrations (`auto_vacuum = INCREMENTAL`), `instance_meta` & `instance_secrets`, canonical AAD `XChaCha20-Poly1305` sealer, offline resumable 500-row `rotate-master-key`, `ActorScope::{User, System}`, `Argon2id` + TOTP + `setup-token` file (`0600`) + `reset-admin` CLI + 3-tier login limiter, HMAC `audit_log` with `audit_anchor`, dual-queue writer (`Control` + `Data` `4 MiB` cap), closed 13-key settings registry, and single `Reloader` task (`config_version` + `RuntimeState`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `POR-1` (build matrix), `REL-4`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
+| `M0`: Foundation, Dual-Queue Writer, Reloader, RBAC, and Auth (`Epic 1`: `1.1`..`1.6`) | Six-crate + `xtask` workspace, foundational Docker scaffolding (`Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`), `POR-1` multi-arch CI matrix, `connect_options(role)` + 31-table SQLite WAL migrations (`auto_vacuum = INCREMENTAL`), `instance_meta` & `instance_secrets`, canonical AAD `XChaCha20-Poly1305` sealer, offline resumable 500-row `rotate-master-key`, `ActorScope::{User, System}`, `Argon2id` + TOTP + `setup-token` file (`0600`) + `reset-admin` CLI + 3-tier login limiter, HMAC `audit_log` with `audit_anchor`, dual-queue writer (`Control` + `Data` `4 MiB` cap), closed 14-key settings registry (including `default_routing_strategy`), and single `Reloader` task (`config_version` + `RuntimeState`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `POR-1` (build matrix + base container build), `REL-4`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
 | `M1`: Transparent Pass-Through Proxy & Orchestrator v1 (`Epic 2`: `2.0`..`2.7`) | Minimal control-plane JSON CRUD (`2.0`), `GuardedConnector` socket-level SSRF filter (`2.1`), client key issuance and `prev_key_hash` grace rotation + gates `G1`..`G6` + `auth_failure_counters` + `/healthz`, `/readyz`, `/metrics` with closed label allow-list (`2.2`), request & response header pipelines (`R1`..`R5`) (`2.3`), duplicate-rejecting surgical JSON span editor (`2.4`), 64 KiB pre-first-frame holding buffer + 64 KiB usage-chunk filter + `RequestLifecycle` drop guard (`2.5`), `ProviderAdapter` presets (`2.6`), and `/v1/*` orchestrator v1 + `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` admission queue + 8-step `SIGTERM` drain + parser fuzz targets + initial TTFF load benchmark (`2.7`). | `PRV-1`..`PRV-5`, `PRV-7`, `CLK-1`, `CLK-4`, `API-2`..`API-4`, `API-6`, `API-7`, `TRN-1`..`TRN-3`, `PERF-1`, `PERF-2`, `REL-1`, `OBS-1`, `SEC-3`, `SEC-6`..`SEC-9`, `SEC-12`, `SEC-15` tests pass. |
-| `M2`: Pure Pricing/Windows Core, Catalog, Consented Sharing, Smooth WRR, and Pinning (`Epic 3`: `3.0a`..`3.7`) | Pure `crates/core::pricing` + binary-aware estimator (`3.0a`), pure `WindowState` (360-bucket rings, day-clamped calendar months, decaying `UpstreamObservation`, cache-aware `try_reserve`) (`3.0b`), pure UTC monthly accumulators + gate `G7` (`3.0c`), `/models` discovery + digit-preserving normalization + surrogate `model_pk` merge/split (`3.1`), consented `provider_shares` (`effective_share`, `share_config_fingerprint`, `custom` approval) (`3.2`), 8-step session resolver + 21-slot detector + `Shared`/`Global` carrier stripping (`3.3`), `C1`..`C8` + 3-tier pool selector (`3.4`), per-group `WrrState` (`3.5`), pure health/5-class classifier/`OriginBreaker` (`3.6a`), `PinStore` mutex state machine + durable `response_links` inheritance + failover (`3.6b`), and orchestrator v2 (`3.7`). | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` tests pass; zero surviving mutants in `crates/core`. |
+| `M2`: Pure Pricing/Windows Core, Catalog, Consented Sharing, Pluggable Routing Engine, and Pinning (`Epic 3`: `3.0a`..`3.7`) | Pure `crates/core::pricing` + binary-aware estimator (`3.0a`), pure `WindowState` (360-bucket rings, day-clamped calendar months, decaying `UpstreamObservation`, cache-aware `try_reserve`) (`3.0b`), pure UTC monthly accumulators + gate `G7` (`3.0c`), `/models` discovery + digit-preserving normalization + surrogate `model_pk` merge/split (`3.1`), consented `provider_shares` (`effective_share`, `share_config_fingerprint`, `custom` approval) (`3.2`), 8-step session resolver + 21-slot detector + `Shared`/`Global` carrier stripping (`3.3`), `C1`..`C8` + 3-tier pool selector (`3.4`), pluggable `RouteSelector` engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`) (`3.5`), pure health/5-class classifier/`OriginBreaker` (`3.6a`), `PinStore` mutex state machine + durable `response_links` inheritance + failover (`3.6b`), and orchestrator v2 (`3.7`). | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-14`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` tests pass; zero surviving mutants in `crates/core`. |
 | `M3`: Usage Pipeline, 5-Min & Hourly Rollups, Orchestrator v3, and Retention (`Epic 4`: `4.1`..`4.3`, `4.6`, `4.7`) | Inline `SseUsageTap` and `JsonUsageExtractor` with unified `cache_read` and `cache_write` subtraction (`4.1`), `models.dev` price sync and body-based price APIs (`4.2`), three-queue writer (`durable_state`, `rollups`, `raw_events` `VecDeque` dropping oldest) + `usage_events` + `usage_attempts` + `usage_rollups_5min` + `usage_rollups_hourly` + `SIGKILL` recovery (`4.3`), orchestrator v3 wiring live usage and reservations (`4.6`), and general retention sweeper + 30 s/256 MiB WAL checkpointer + `SQLITE_FULL` handling (`4.7`). | `SHR-6`, `API-5`, `USG-1`..`USG-3`, `REL-2`, `REL-3`, `PRIV-1` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
 | `M4`: Window Persistence, `< 2 s` Startup Reconstruction, and Source Provider `/usage` Engine (`Epic 4b`: `4b.1`, `4b.2`) | Startup reconstruction (`< 2 s`) of all window rings and UTC monthly accumulators from `usage_rollups_5min`, window-instance-bound `budget_adjustments`, and `upstream_usage_snapshots` (`4b.1`), plus single-flight `/usage` poller (8-permit concurrency semaphore, `local_at_observation` at `t0`, `raw_json_enc` sealing, allow-list `sanitized_json`, decaying `UpstreamObservation` sync, and header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw`) (`4b.2`). | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `PERF-4`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
 | `M3b`: Opt-In Content Traceability and Session Chat Preview API (`Epic 5`: `5.1`..`5.4`) | Request-start `traceability_config` matcher + `"confirm_purge": true` guard (`5.1`), bounded `TraceTap` (`mpsc(256)` + `64 MiB` in-flight + `1 MiB` per-stream output cap + 2,000-stream memory soak) (`5.2`), content-addressed `trace_blocks` + 2-thread OS sealer pool (`crossbeam::bounded(64)` + `zstd::bulk::Compressor`) (`5.3`), and block-hash LCP reconstructor + `(ts, request_id)` cursor pagination + per-client-key recently active sessions with live `PinStore` provider/key lookup + 30-min deduplicated `trace.viewed` audit logging (`5.4`). | `TRC-1`..`TRC-5`, `TRC-7`..`TRC-9`, `PERF-5`, `SEC-19` tests pass. |
 | `M5`: Dual-Workspace HTMX Web UI and Session Chat Preview UI (`Epic 6`: `6.1`..`6.5`) | Embedded Askama + HTMX shell (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`) + CSRF middleware (`6.1`), Personal Workspace `/app/*` and `/api/user/*` with share-acceptance modal and `project_key` verification (`6.2`), Admin Console `/admin/*` and `/admin/api/*` with user-resource override routes and `model_pk` merge/split (`6.3`), Overview dashboard (`uPlot`, dual gauges, disk budget `A6`) + Active Sessions + paged Usage Explorer (`6.4`), and read-only Session Chat Preview UI (`6.5`). | `UI-1`..`UI-4`, `TRC-6`, `SEC-5` E2E browser and HTMX tests pass. |
-| `M6`: Extended Fuzzing, Full Soak Verification, Live Harnesses, and v1.0.0 Release (`Epic 7`: `7.1`..`7.5`) | Extended 24-hour fuzzing across all 6 fuzz targets + full-stack canary redaction test (`7.1`), full-workspace `cargo mutants --workspace` + `cargo xtask traceability --milestone M6` + `cargo xtask doc-consistency` (`7.2`), 500 req/s and 2,000-stream soak benchmark against 50M-row DB + `llmroller backup` `fsync` + exit codes `0..14` (`7.3`), headless CLI harness compatibility (`COM-1`) (`7.4`), and multi-arch static release + `< 50 MB` distroless container + SBOM + `cosign` + `llmroller --version` (`7.5`). | All `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `POR-1`, `COM-1`, `SEC-11` checks pass; `cargo xtask traceability --milestone M6` reports 100% coverage. |
+| `M6`: Extended Fuzzing, Full Soak Verification, Live Harnesses, Container Smoke Gate, and v1.0.0 Release (`Epic 7`: `7.1`..`7.5`) | Extended 24-hour fuzzing across all 6 fuzz targets + full-stack canary redaction test (`7.1`), full-workspace `cargo mutants --workspace` + `cargo xtask traceability --milestone M6` + `cargo xtask doc-consistency` (`7.2`), 500 req/s and 2,000-stream soak benchmark against 50M-row DB + `llmroller backup` `fsync` + exit codes `0..14` (`7.3`), headless CLI harness compatibility (`COM-1`) (`7.4`), and multi-arch static release + `< 50 MB` distroless container + `docker compose` smoke & routing-strategy integration gate + SBOM + `cosign` + `llmroller --version` (`7.5`). | All `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `POR-1`, `COM-1`, `SEC-11` checks pass; `cargo xtask traceability --milestone M6` reports 100% coverage. |
 
 ### 17.2 Post-1.0 roadmap (`P2` items)
 
@@ -2794,7 +2915,7 @@ This section records the architectural decisions resolved during specification r
 
 ### 19.1 Resolved architectural decisions (ADRs)
 
-Eleven core design decisions govern version 1.0 of LLMRoller.
+Twelve core design decisions govern version 1.0 of LLMRoller.
 
 | ADR ID | Topic | Decision for version 1.0 | Rationale |
 | --- | --- | --- | --- |
@@ -2802,13 +2923,15 @@ Eleven core design decisions govern version 1.0 of LLMRoller.
 | `ADR-2` | Standard non-admin user class (`user`) and `ActorScope` | Ship the standard `user` role in version 1.0 (`P0`) with full self-service UI and API (`/app/*`, `/api/user/*`), enforced by a closed `ActorScope::{User, System}` enum on every repository method and `project_key` redaction on every user response. | Eliminates admin bottlenecks, keeps background jobs from masquerading as admins, and guarantees SQL-level and wire-level tenant isolation. |
 | `ADR-3` | Three-tier pool ordering (`Own`, `Shared`, `Global`) | Partition routes into three ordered tiers (`Own`, `Shared`, `Global`) across five selectable `routing_scope` modes: `personal_first` (`[Own] -> [Shared] -> [Global]`), `blended`, `personal_only` (`[Own] -> [Shared]`), `own_only` (`[Own]`), and `global_only` (`[Global]`). | Guarantees that grantees spend their own personal subscription quota before consuming a teammate's shared quota under `personal_first`, and gates recovery repins on `recovery_repin_min_idle_secs` (`300 s`). |
 | `ADR-4` | Source provider `/usage` observations and pass-through | Poll source provider `/usage` endpoints with per-key single-flight deduplication and capture `local_at_observation` at poll start `t0` to update a time-bounded `UpstreamObservation` (expiring after 30 minutes or at `resets_at_ms`), and expose header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw` with allow-list PII sanitization. | Prevents permanent key lockouts when `/usage` polling fails and eliminates timing jitter between poll start and completion. |
-| `ADR-5` | Per-group smooth WRR vs. strict priority tiers | Maintain smooth WRR counters inside per-`(user_id, canonical_id, protocol, pool_tier)` `WrrGroup` mutexes without clamping (evicting members absent `>= 5 min` to preserve `sum(current) == 0`), plus `strict` tier filtering per model. | Prevents cross-tenant weight interference and multi-atomic selection races while converging within `0.5%` on fixed sets and `1%` across subset churn (`G2`). |
+| `ADR-5` | Pluggable `RouteSelector` strategy engine vs. hardcoded SWRR | Abstract target selection behind `RouteSelector` (`smooth_weighted_rr` default, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`) scoped per `(user_id, model_pk, protocol, pool_tier)` with `strict` tier pre-filtering and lock-free thread-local `ChaCha12Rng` seeded from `EntropySource`. | Preserves deterministic Nginx SWRR interleaving by default while letting operators select unweighted cyclic, randomized, or latency-aware P2C load balancing per model or instance-wide (`RTE-4`, `RTE-14`). |
 | `ADR-6` | Cross-protocol translation | Route requests in version 1.0 only to candidates that natively support the inbound protocol (`chat`, `responses`, or `messages`); defer opt-in cross-protocol translation to post-1.0 (`P2`). | Prevents silent loss of reasoning blocks ([open-design#8687](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fnexu-io%2Fopen-design%2Fissues%2F8687)) and tool-call schema mismatches. |
 | `ADR-7` | Digit-preserving model normalization and surrogate `model_pk` | Preserve every dot between two ASCII digits during normalization (`normalize_model_id`), resolve within-key collisions by keeping the vendor prefix with `--`, and identify canonical models by an immutable ULID `model_pk` (`ON DELETE RESTRICT` with `model_redirects`). | Prevents merging distinct model versions (`deepseek-v4-flash` != `deepseek-v4.1-flash`) and guarantees that admin merges and splits never cascade-delete pins, windows, preferences, or response links. |
 | `ADR-8` | Test governance, `xtask`, and mutation testing | Mandate Red-Green-Refactor TDD, pure-Rust `cargo xtask` (`traceability`, `doc-consistency`, `docs-bundle`) driven by `docs/srdd/requirements.toml`, and zero unannotated surviving mutants in `cargo-mutants` (`git diff --cached` locally, `origin/main...HEAD` per PR). | Guarantees that tests verify actual behavioral invariants and eliminates specification-to-phase drift. |
 | `ADR-9` | Content-addressed traceability and 2-thread sealer pool | Store opt-in traced prompts as per-user content-addressed blocks (`trace_blocks`) referenced by `StoredTurnTrace v2` (`trace_records`), ordered by `(ts, request_id)`, and compressed at turn end on a fixed 2-thread `zstd::bulk::Compressor` pool (`~7 MiB` total RAM). | Eliminates quadratic multi-turn storage growth, prevents broken delta chains when turns drop or expire, and avoids the `~7 GB` RAM cost of 2,000 per-stream zstd encoders. |
 | `ADR-10` | Pre-flight body budgeting and opt-in wait-timeout failover | Buffer request bodies once in shared `Bytes` under `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (`819 MiB` on a 2 GB host, `2,000 ms` queue wait), and fail over automatically on connection/write errors and explicit HTTP rejections while keeping wait-timeout failover opt-in (`timeout_failover = false`). | Sustains high concurrency for realistic megabyte-scale coding prompts and prevents duplicate billing on slow prefills or non-streaming calls. |
 | `ADR-11` | Separation of instance secrets from the rotatable master key | Store `session_hmac_secret` and `audit_hmac_key` as random 256-bit secrets sealed in `instance_secrets`, and run `llmroller rotate-master-key` as an offline resumable 500-row state machine tracked in `instance_meta`. | Guarantees that rotating `LLMROLLER_MASTER_KEY` never invalidates the `audit_log` HMAC chain or existing `session_hash` pins and recovers cleanly from mid-rotation crashes. |
+| `ADR-12` | Distroless production container with built-in `healthcheck` subcommand and split Compose networks | Ship a multi-stage `Dockerfile` targeting `gcr.io/distroless/static-debian12:nonroot` (UID `65532`, read-only rootfs, `< 50 MB`) with a native `llmroller healthcheck` subcommand and segmented `edge_net` / `internal_obs_net` networks in `docker-compose.yml` (`Section 22`). | Eliminates shell and package-manager attack surfaces in production containers while supporting native Docker healthchecks, `llmroller-init` volume ownership setup, and a `runtime-dev` profile for CI integration testing (`POR-1`, `SEC-11`). |
+| `ADR-12` | Distroless production container with built-in `healthcheck` subcommand and split Compose networks | Ship a multi-stage `Dockerfile` targeting `gcr.io/distroless/static-debian12:nonroot` (UID `65532`, read-only rootfs, `< 50 MB`) with a native `llmroller healthcheck` subcommand and segmented `edge_net` / `internal_obs_net` networks in `docker-compose.yml` (`Section 22`). | Eliminates shell and package-manager attack surfaces in production containers while supporting native Docker healthchecks, `llmroller-init` volume ownership setup, and a `runtime-dev` profile for CI integration testing (`POR-1`, `SEC-11`). |
 
 ### 19.2 Operational verification items for Milestone 1 (`M1`)
 
@@ -2956,16 +3079,19 @@ Session pins live in `crates/core::pins::PinStore` (`DashMap<PinKey, Arc<parking
 | Leaked provisional pins on client abort | If all holders of a provisional pin disconnect before any upstream responds, `expires_ms = created_ms + 50_000` expires after 50 s. Both `Acquire(req)` and the 60 s sweeper treat expired provisional entries as absent and increment `generation`. |
 | Capacity bound (`max_active_pins = 250,000`) | Confirmed pins are never evicted by TinyLFU capacity pressure. When `PinStore.len() >= max_active_pins`, new sessions bypass insertion, route via WRR with `pin_outcome = 'unpinned_capacity'`, and increment `llmroller_pin_capacity_overflow_total`. |
 
-### 21.3 Per-group smooth WRR atomicity and zero-sum invariant
+### 21.3 Concurrency invariants across pluggable `RouteSelector` strategies
 
-Smooth weighted round-robin state in `crates/core::wrr::WrrState` is partitioned into independent selection groups keyed by `WrrGroupKey = (user_id, model_pk, protocol, pool_tier)` (`RTE-4`, `RTE-5`, `G2`).
+Routing state in `crates/core::strategy` and `crates/core::wrr` is partitioned into independent selection groups keyed by `WrrGroupKey = (user_id, model_pk, protocol, pool_tier)` (`RTE-4`, `RTE-5`, `RTE-14`, `G2`).
 
 | Invariant | Enforcement rule |
 | --- | --- |
-| Tenant weight isolation | Keying by `user_id` and `pool_tier` guarantees that User B's `user_route_preferences.priority_override` on a shared route never inflates or deflates the `current` weight counters seen by User C. |
-| Single critical section per pick | Each `WrrGroup` is protected by one `parking_lot::Mutex<WrrGroup>` (never held across `.await`). Adding `W_eff(r)` to active candidates, picking `argmax(m.current, r.id_bytes)`, and subtracting `total = sum(W_eff)` run as one atomic critical section, preventing concurrent threads from reading the same maximum before subtraction. |
-| Unclamped zero-sum convergence | For every `WrrGroup`, `sum(m.current for m in group.members)` before selection equals `sum(m.current)` after selection (`0`). No artificial clamp is applied when the candidate subset shrinks during transient cooldowns. Members absent from the eligible candidate set for `>= WRR_MEMBER_EVICT_MS` (`300,000 ms`) are evicted from `group.members` (rebalancing the remaining members by subtracting their offset lazily) and re-enter at `current = 0` when healthy again. |
-| Bounded memory | The 60 s background sweeper removes any `WrrGroup` with `now_ms - last_used_ms >= 86_400_000` (24 h). |
+| Tenant weight and cursor isolation | Keying by `user_id` and `pool_tier` guarantees that User B's `user_route_preferences.priority_override` or selection cursor on a shared route never alters the weights or round-robin position seen by User C. |
+| Single critical section for `smooth_weighted_rr` and `weighted_rr` | Each `WrrGroup` and `ClassicalWrrGroup` is protected by one `parking_lot::Mutex` (never held across `.await`). Adding `W_eff(r)` to active candidates, picking `argmax(m.current, r.id_bytes)`, and subtracting `total = sum(W_eff)` run as one atomic critical section. |
+| Unclamped zero-sum convergence (`smooth_weighted_rr`) | For every `WrrGroup`, `sum(m.current for m in group.members)` before selection equals `sum(m.current)` after selection (`0`). No artificial clamp is applied when the candidate subset shrinks during transient cooldowns. Members absent for `>= WRR_MEMBER_EVICT_MS` (`300,000 ms`) are evicted and rebalanced lazily. |
+| Lock-free atomic wrap-around (`naive_rr`) | `NaiveRrGroup` increments `cursor: AtomicU64` via `fetch_add(1, Ordering::Relaxed)` and computes `(seq % (candidates.len() as u64)) as usize` over candidates sorted by `RouteId`, wrapping cleanly across `u64::MAX` with zero mutex contention. |
+| Contention-free thread-local PRNG (`uniform_random`, `weighted_random`, `p2c`) | Random strategies draw from a thread-local `ChaCha12Rng` seeded from `EntropySource` (or directly from `DeterministicRng` in unit tests), avoiding any global RNG mutex across Tokio worker threads. |
+| Lock-free load tracking (`power_of_two_choices`) | `RouteLoadTracker` maintains per-route `in_flight: AtomicU32` (RAII-decremented in `RequestLifecycle::drop`) and `ewma_ttfb_ms: AtomicU64` (updated via `compare_exchange_weak` on first valid frame). |
+| Bounded memory and hot-reload reset | The 60 s background sweeper removes any strategy group with `now_ms - last_used_ms >= 86_400_000` (24 h), and `CacheInvalidationEvent::StrategyChanged` clears group state immediately after `ArcSwap` publication. |
 
 ### 21.4 Ordered budget reservation (`Reservation`) and decaying observations
 
@@ -3075,3 +3201,519 @@ Upon receiving `SIGTERM` or `SIGINT`, the server drains in eight time-bounded st
 Stateless background jobs (`Discovery`, `UsagePoller`, `RetentionSweeper`, `WalCheckpointer`) run inside tasks wrapped with `FutureExt::catch_unwind`. On panic, the supervisor logs the panic payload (redacted per `SEC-6`) and restarts the job with exponential backoff (`1 s, 2 s, 4 s, ...` capped at `300 s`). Three panics within 10 minutes mark the job `failed`, set `llmroller_job_failed{job} = 1`, and leave the job stopped until operator intervention.
 
 The **SQLite writer actor is never restarted** after a panic because an interrupted batch could desynchronize in-memory queues. Instead, a writer panic sets `/readyz` to HTTP `503` and triggers controlled shutdown with exit code `12`.
+
+## 22. Deployment and containerization specification
+
+This section defines the containerization architecture, orchestration topologies, volume and network boundaries, and environment contracts for LLMRoller (`POR-1`, `SEC-9`, `SEC-11`, `REL-1`). Every port, path, timeout, and environment variable matches Sections 5, 7, 8, 9, 10, and 21 with zero drift.
+
+### 22.1 Multi-stage `Dockerfile` and `.dockerignore` architecture
+
+LLMRoller builds from a single multi-stage `Dockerfile` using BuildKit (`# syntax=docker/dockerfile:1.7`). The build pipeline uses four stages: `planner`, `builder`, `runtime-distroless` (production), and `runtime-dev` (development and CI).
+
+#### 22.1.1 Build stage responsibilities and security invariants
+
+The table below defines the four stages in the `Dockerfile` and the security controls enforced on the final image (`POR-1`, `SEC-10`, `SEC-11`).
+
+| Stage name | Base image (pinned tag & digest) | Purpose and key invariants |
+| --- | --- | --- |
+| `planner` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Installs `cargo-chef` (`0.1.71`) and computes `recipe.json` from `Cargo.toml` and `Cargo.lock` so source edits in `crates/*` never invalidate cached third-party crate compilations. |
+| `builder` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Compiles cached dependencies via `cargo chef cook --release --locked --target <musl_target>`, verifies `cargo xtask doc-consistency`, compiles the static `llmroller` binary (`--locked`, stripped of debug symbols), and prepares empty `/var/lib/llmroller` and `/etc/llmroller/presets` directories owned by `65532:65532`. |
+| `runtime-distroless` (default production target) | `gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0` | Copies only `/usr/local/bin/llmroller` and `/etc/llmroller/presets/*.toml`. Runs as non-root `65532:65532` (`nonroot`), contains zero shell (`/bin/sh` absent) and zero package manager, keeps total uncompressed image size `< 50 MB` (`POR-1`), and uses `llmroller healthcheck` for native container probes. |
+| `runtime-dev` (development & CI target) | `debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a` | Installs `tini`, `ca-certificates`, `curl`, and `sqlite3`, creates non-root user `llmroller` (`65532:65532`), and runs under `/usr/bin/tini -- /usr/local/bin/llmroller` for interactive debugging and Compose smoke testing. |
+
+#### 22.1.2 Complete `.dockerignore` reference manifest
+
+The `.dockerignore` file excludes build artifacts, local SQLite databases, git history, and secret files (`SEC-11`). This keeps the build context under 2 MiB and prevents credential leaks into layers.
+
+```dockerignore
+# Build outputs and caches
+target/
+**/target/
+*.profraw
+lcov.info
+
+# Local runtime state, SQLite WAL files, and secrets
+/var/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+setup-token
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control, IDE state, and test artifacts
+.git/
+.github/
+.vscode/
+.idea/
+artifacts/
+tmp/
+*.log
+```
+
+#### 22.1.3 Complete multi-stage `Dockerfile` reference manifest
+
+The `Dockerfile` below is the normative container build manifest for `x86_64` (`x86_64-unknown-linux-musl`) and `aarch64` (`aarch64-unknown-linux-musl`) builds.
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_IMAGE=rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0
+ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+
+# -----------------------------------------------------------------------------
+# Stage 1: planner - compute deterministic cargo-chef dependency recipe
+# -----------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS planner
+WORKDIR /src
+RUN cargo install cargo-chef --locked --version 0.1.71
+COPY Cargo.toml Cargo.lock deny.toml ./
+COPY xtask/Cargo.toml xtask/Cargo.toml
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/proto/Cargo.toml crates/proto/Cargo.toml
+COPY crates/store/Cargo.toml crates/store/Cargo.toml
+COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
+COPY crates/admin/Cargo.toml crates/admin/Cargo.toml
+COPY crates/server/Cargo.toml crates/server/Cargo.toml
+RUN mkdir -p xtask/src crates/core/src crates/proto/src crates/store/src              crates/proxy/src crates/admin/src crates/server/src     && touch xtask/src/main.rs crates/core/src/lib.rs crates/proto/src/lib.rs              crates/store/src/lib.rs crates/proxy/src/lib.rs              crates/admin/src/lib.rs crates/server/src/main.rs     && cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 2: builder - compile static musl release binary with embedded UI assets
+# -----------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS builder
+ARG TARGETARCH
+ARG GIT_SHA=unknown
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.71
+
+RUN case "${TARGETARCH:-amd64}" in       amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust_target ;;       arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;;       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;;     esac     && rustup target add "$(cat /tmp/rust_target)"
+
+COPY --from=planner /src/recipe.json recipe.json
+RUN TARGET_TRIPLE="$(cat /tmp/rust_target)"     && cargo chef cook --release --locked --target "${TARGET_TRIPLE}" --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock deny.toml ./
+COPY presets ./presets
+COPY docs ./docs
+COPY fixtures ./fixtures
+COPY xtask ./xtask
+COPY crates ./crates
+
+ENV LLMROLLER_BUILD_GIT_SHA=${GIT_SHA}
+RUN TARGET_TRIPLE="$(cat /tmp/rust_target)"     && cargo build --release --locked --target "${TARGET_TRIPLE}" --bin llmroller     && cp "target/${TARGET_TRIPLE}/release/llmroller" /usr/local/bin/llmroller     && strip --strip-debug /usr/local/bin/llmroller     && install -d -m 0750 -o 65532 -g 65532 /staging/var/lib/llmroller     && install -d -m 0755 -o 65532 -g 65532 /staging/etc/llmroller/presets     && install -m 0644 -o 65532 -g 65532 presets/*.toml /staging/etc/llmroller/presets/
+
+# -----------------------------------------------------------------------------
+# Stage 3: runtime-dev - instrumented image for local Compose & CI smoke tests
+# -----------------------------------------------------------------------------
+FROM ${DEBIAN_SLIM_IMAGE} AS runtime-dev
+RUN apt-get update && apt-get install -y --no-install-recommends         ca-certificates curl sqlite3 tini     && rm -rf /var/lib/apt/lists/*     && groupadd -g 65532 llmroller     && useradd -u 65532 -g 65532 -d /var/lib/llmroller -s /usr/sbin/nologin -M llmroller
+
+COPY --from=builder --chown=65532:65532 /staging/var/lib/llmroller /var/lib/llmroller
+COPY --from=builder --chown=65532:65532 /staging/etc/llmroller /etc/llmroller
+COPY --from=builder /usr/local/bin/llmroller /usr/local/bin/llmroller
+
+ENV LLMROLLER_DATA_DIR=/var/lib/llmroller     LLMROLLER_LISTEN=0.0.0.0:8080     LLMROLLER_ADMIN_LISTEN=0.0.0.0:8081     LLMROLLER_METRICS_LISTEN=0.0.0.0:9090     LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr     LLMROLLER_LOG=info,llmroller=info
+
+EXPOSE 8080 8081 9090
+USER 65532:65532
+WORKDIR /var/lib/llmroller
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3   CMD ["/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/llmroller"]
+CMD ["serve"]
+
+# -----------------------------------------------------------------------------
+# Stage 4: runtime-distroless - default hardened production image (< 50 MB)
+# -----------------------------------------------------------------------------
+FROM ${DISTROLESS_IMAGE} AS runtime-distroless
+
+COPY --from=builder --chown=65532:65532 /staging/var/lib/llmroller /var/lib/llmroller
+COPY --from=builder --chown=65532:65532 /staging/etc/llmroller /etc/llmroller
+COPY --from=builder /usr/local/bin/llmroller /usr/local/bin/llmroller
+
+ENV LLMROLLER_DATA_DIR=/var/lib/llmroller     LLMROLLER_LISTEN=0.0.0.0:8080     LLMROLLER_ADMIN_LISTEN=0.0.0.0:8081     LLMROLLER_METRICS_LISTEN=0.0.0.0:9090     LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr     LLMROLLER_LOG=info,llmroller=info
+
+EXPOSE 8080 8081 9090
+USER 65532:65532
+WORKDIR /var/lib/llmroller
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3   CMD ["/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+
+ENTRYPOINT ["/usr/local/bin/llmroller"]
+CMD ["serve"]
+```
+
+### 22.2 Orchestration and `docker-compose.yml` topology
+
+LLMRoller runs as a stateful service with a persistent SQLite WAL volume, a volume initializer (`llmroller-init`), and a `caddy` TLS proxy. Optional Compose profiles add Prometheus scraping (`--profile observability`) and a local development harness (`--profile dev`).
+
+#### 22.2.1 Network segmentation, volumes, and security constraints
+
+The Compose topology enforces four isolation boundaries:
+1. Network segmentation: `edge_net` (`172.28.1.0/24`) connects `caddy` (`172.28.1.10`) to `llmroller` (`172.28.1.20`) on ports `8080` (data plane) and `8081` (control plane), with `LLMROLLER_TRUSTED_PROXIES=172.28.1.10/32` satisfying `SEC-5` and `SEC-9`. `internal_obs_net` (`172.28.2.0/24`, `internal: true`) connects `prometheus` to `llmroller:9090` with zero external ingress or egress.
+2. Persistent volumes and `tmpfs`: `llmroller_data` mounts at `/var/lib/llmroller` and `llmroller_backups` mounts at `/var/backups/llmroller`. Because SQLite WAL uses `mmap` in `llmroller.db-shm`, `llmroller_data` must reside on a local POSIX filesystem (ext4, XFS, or ZFS). A `64 MiB` `tmpfs` (`noexec,nosuid,nodev`) mounts at `/tmp`.
+3. Non-root volume initialization (`llmroller-init`): Fresh Docker volumes default to `root:root` (`0755`), blocking UID `65532` from creating `llmroller.lock`. The one-shot `llmroller-init` container runs before `llmroller` to set `65532:65532` and `0750` on `/var/lib/llmroller` and `/var/backups/llmroller`.
+4. Hardened container runtime (`SEC-11`): `llmroller` sets `user: "65532:65532"`, `read_only: true`, `cap_drop: ["ALL"]`, `security_opt: ["no-new-privileges:true"]`, `pids_limit: 512`, and `mem_limit: 2048m`. It sets `stop_grace_period: 90s`, which covers the 85 s drain budget in Section 21.8.2.
+
+#### 22.2.2 Complete `docker-compose.yml` reference manifest
+
+The `docker-compose.yml` manifest below defines the production, observability, and local development topologies.
+
+```yaml
+name: llmroller
+
+services:
+  llmroller-init:
+    image: debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+    user: "0:0"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - llmroller_backups:/var/backups/llmroller
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        chown 65532:65532 /var/lib/llmroller /var/backups/llmroller
+        chmod 0750 /var/lib/llmroller /var/backups/llmroller
+        if [ -f /var/lib/llmroller/llmroller.db ]; then
+          chown 65532:65532 /var/lib/llmroller/llmroller.db*
+        fi
+    restart: "no"
+
+  llmroller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-distroless
+      args:
+        GIT_SHA: ${GIT_SHA:-v1.0.0}
+    image: llmroller:1.0.0-distroless
+    user: "65532:65532"
+    read_only: true
+    init: false
+    stop_signal: SIGTERM
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: 2.0
+    mem_limit: 2048m
+    mem_reservation: 512m
+    memswap_limit: 2048m
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      llmroller-init:
+        condition: service_completed_successfully
+    environment:
+      LLMROLLER_MASTER_KEY_FILE: /run/secrets/llmroller_master_key
+      LLMROLLER_MASTER_KEY_ID: ${LLMROLLER_MASTER_KEY_ID:-mk_2026_10}
+      LLMROLLER_DATA_DIR: /var/lib/llmroller
+      LLMROLLER_LISTEN: 0.0.0.0:8080
+      LLMROLLER_ADMIN_LISTEN: 0.0.0.0:8081
+      LLMROLLER_METRICS_LISTEN: 0.0.0.0:9090
+      LLMROLLER_TRUSTED_PROXIES: 172.28.1.10/32
+      LLMROLLER_REQUIRE_TLS: ${LLMROLLER_REQUIRE_TLS:-true}
+      LLMROLLER_SETUP_TOKEN_REQUIRED: ${LLMROLLER_SETUP_TOKEN_REQUIRED:-true}
+      LLMROLLER_MAX_BODY_MB: ${LLMROLLER_MAX_BODY_MB:-32}
+      LLMROLLER_PREFLIGHT_BODY_BUDGET_MB: ${LLMROLLER_PREFLIGHT_BODY_BUDGET_MB:-819}
+      LLMROLLER_MEMORY_LIMIT_MB: 2048
+      LLMROLLER_SQLITE_SYNCHRONOUS: ${LLMROLLER_SQLITE_SYNCHRONOUS:-NORMAL}
+      LLMROLLER_DEFAULT_ROUTING_STRATEGY: ${LLMROLLER_DEFAULT_ROUTING_STRATEGY:-smooth_weighted_rr}
+      LLMROLLER_LOG: ${LLMROLLER_LOG:-info,llmroller=info}
+    secrets:
+      - source: llmroller_master_key
+        target: /run/secrets/llmroller_master_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - llmroller_backups:/var/backups/llmroller
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 67108864
+          mode: 01777
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.20
+      internal_obs_net:
+        ipv4_address: 172.28.2.20
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.9.1-alpine@sha256:663c83823d28073681e2c5f9b86c718193d689b8d9a22325f206f4e4596f7b0b
+    depends_on:
+      llmroller:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    ports:
+      - "${LLMROLLER_PUBLIC_HTTPS_PORT:-443}:443"
+      - "${LLMROLLER_ADMIN_HTTPS_PORT:-8443}:8443"
+    environment:
+      LLMROLLER_DOMAIN: ${LLMROLLER_DOMAIN:-llmroller.internal.example.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.10
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+    restart: unless-stopped
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.1.0@sha256:36259373f5b247829e3a1e4736c81f53e7b6a15c26149b176c6371a79d1e04b7
+    user: "65534:65534"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      llmroller:
+        condition: service_healthy
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      internal_obs_net:
+        ipv4_address: 172.28.2.30
+    restart: unless-stopped
+
+  mock-upstream:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-dev
+    command: ["serve", "--listen", "0.0.0.0:18080"]
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.50
+
+  llmroller-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-dev
+    user: "65532:65532"
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    depends_on:
+      llmroller-init:
+        condition: service_completed_successfully
+    environment:
+      LLMROLLER_MASTER_KEY: ${LLMROLLER_DEV_MASTER_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      LLMROLLER_MASTER_KEY_ID: mk_dev
+      LLMROLLER_DATA_DIR: /var/lib/llmroller
+      LLMROLLER_LISTEN: 0.0.0.0:8080
+      LLMROLLER_ADMIN_LISTEN: 0.0.0.0:8081
+      LLMROLLER_METRICS_LISTEN: 0.0.0.0:9090
+      LLMROLLER_TRUSTED_PROXIES: 127.0.0.1/32,172.28.1.0/24
+      LLMROLLER_REQUIRE_TLS: "false"
+      LLMROLLER_SETUP_TOKEN_REQUIRED: "false"
+      LLMROLLER_DEFAULT_ROUTING_STRATEGY: ${LLMROLLER_DEFAULT_ROUTING_STRATEGY:-smooth_weighted_rr}
+      LLMROLLER_LOG: debug,llmroller=trace
+    command: ["serve", "--dev-insecure-cookies"]
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - type: tmpfs
+        target: /tmp
+    networks:
+      - edge_net
+      - internal_obs_net
+
+networks:
+  edge_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  internal_obs_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
+
+volumes:
+  llmroller_data:
+  llmroller_backups:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+
+secrets:
+  llmroller_master_key:
+    file: ${LLMROLLER_MASTER_KEY_SECRET_PATH:-./secrets/master.key}
+```
+
+#### 22.2.3 Companion reverse-proxy (`deploy/Caddyfile`) and Prometheus (`deploy/prometheus.yml`) manifests
+
+Upstream reverse proxies must disable response buffering (`flush_interval -1`) so SSE token chunks reach coding agents within `1 ms` (`PERF-2`).
+
+```caddyfile
+# deploy/Caddyfile
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:443 {
+    reverse_proxy 172.28.1.20:8080 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:8443 {
+    reverse_proxy 172.28.1.20:8081 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+```
+
+```yaml
+# deploy/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "llmroller"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["172.28.2.20:9090"]
+```
+
+### 22.3 Environment, secrets, and entrypoint contract
+
+LLMRoller validates all environment variables at startup before opening network listeners. Invalid values cause an immediate exit with code `2` (or code `3` for master-key errors).
+
+#### 22.3.1 Complete environment variable schema
+
+The table below lists all supported environment variables, their defaults, and their validation rules.
+
+| Variable name | Type | Default | Mandatory / optional | Description and validation rule |
+| --- | --- | --- | --- | --- |
+| `LLMROLLER_MASTER_KEY_FILE` | Path | `None` | Mandatory (unless `LLMROLLER_MASTER_KEY` is set) | Path to a `0400`/`0600` file containing the base64-encoded 32-byte master key (`/run/secrets/llmroller_master_key` in Docker). Group or world permission bits cause exit `3` (`SEC-2`). |
+| `LLMROLLER_MASTER_KEY` | Base64 string | `None` | Optional fallback | Raw base64 master key; must decode to **exactly** 32 bytes (exit `3` otherwise). Logs a one-time `/proc/<pid>/environ` warning at startup (`SEC-2`). |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string | `"mk_default"` | Optional | Key identifier `^[A-Za-z0-9_.-]{1,64}$` verified against `instance_meta.active_master_key_id` at startup (exit `3` on mismatch, `SEC-1`). |
+| `LLMROLLER_DATA_DIR` | Path | `"/var/lib/llmroller"` | Optional | Writable directory holding `llmroller.db`, `-wal`, `-shm`, `llmroller.lock`, and `setup-token`. |
+| `LLMROLLER_LISTEN` | SocketAddr | `"0.0.0.0:8080"` | Optional | Data-plane bind address serving `/v1/*`, `/healthz`, and `/readyz` (exit `5` on bind error). |
+| `LLMROLLER_ADMIN_LISTEN` | SocketAddr | `"127.0.0.1:8081"` | Optional | Control-plane bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES` exits with code `2` (`SEC-5`). |
+| `LLMROLLER_METRICS_LISTEN` | SocketAddr | `"127.0.0.1:9090"` | Optional | Prometheus `/metrics` listener bind address (`OBS-1`, `SEC-9`). |
+| `LLMROLLER_TRUSTED_PROXIES` | CIDR CSV | `""` | Optional | Comma-separated IPv4/IPv6 CIDRs trusted to supply `X-Forwarded-For` and `X-Forwarded-Proto` (`172.28.1.10/32` in Compose, `SEC-12`). |
+| `LLMROLLER_REQUIRE_TLS` | Bool | `false` (`true` in prod Compose) | Optional | When `true`, refuses non-loopback `LLMROLLER_LISTEN` without TLS or `LLMROLLER_TRUSTED_PROXIES` (exit `2`, `SEC-9`). |
+| `LLMROLLER_SETUP_TOKEN` | ASCII string | Auto-generated file | Optional | Explicit bootstrap setup token (`>= 16` chars); otherwise generated to `${LLMROLLER_DATA_DIR}/setup-token` (`0600`, `AUTH-2`). |
+| `LLMROLLER_SETUP_TOKEN_REQUIRED` | Bool | `true` | Optional | When `false`, skips setup-token verification on `POST /admin/api/setup` (`AUTH-2`). |
+| `LLMROLLER_MAX_BODY_MB` | Integer | `32` | Optional | Maximum inbound request body in MiB (`1..=128` and `<= LLMROLLER_PREFLIGHT_BODY_BUDGET_MB / 4`, exit `2` otherwise, `SEC-8`). |
+| `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` | Integer | `min(1024, floor(0.40 * mem_mb))` | Optional | Total MiB of buffered request bodies permitted concurrently before first valid frame (`819` on 2 GB host, `PERF-3`). |
+| `LLMROLLER_MEMORY_LIMIT_MB` | Integer | Auto (`cgroup v2` or `2048`) | Optional | Explicit container memory ceiling in MiB (`256..=65536`) used when calculating memory budgets (`PERF-3`, `PERF-5`). |
+| `LLMROLLER_SQLITE_SYNCHRONOUS` | Enum | `"NORMAL"` | Optional | `"NORMAL"` or `"FULL"` writer WAL sync mode (`REL-2`). |
+| `LLMROLLER_DEFAULT_ROUTING_STRATEGY` | Enum | `"smooth_weighted_rr"` | Optional | Initial/override default routing strategy: `smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random` (`random`), `weighted_random`, or `power_of_two_choices` (`p2c`); invalid values exit with code `2` (`RTE-14`). |
+| `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY` | Path | `None` | Optional | PEM certificate chain and private key for native `rustls` HTTPS listeners (`A4`). |
+| `LLMROLLER_LOG` | EnvFilter | `"info,llmroller=info"` | Optional | Structured JSON log filter string for `tracing_subscriber` (`OBS-1`). |
+
+#### 22.3.2 Complete `.env.example` reference manifest
+
+Operators copy `.env.example` to `.env` to configure ports, routing strategy defaults, and resource limits.
+
+```dotenv
+# LLMRoller Production & Development Environment Template (.env.example)
+# Copy to .env and generate ./secrets/master.key with:
+#   mkdir -p secrets && chmod 0700 secrets
+#   docker run --rm llmroller:1.0.0-distroless generate-master-key > secrets/master.key
+#   chmod 0400 secrets/master.key
+
+GIT_SHA=v1.0.0
+LLMROLLER_DOMAIN=llmroller.internal.example.com
+LLMROLLER_PUBLIC_HTTPS_PORT=443
+LLMROLLER_ADMIN_HTTPS_PORT=8443
+
+# Master Key Configuration (file secret preferred in production)
+LLMROLLER_MASTER_KEY_SECRET_PATH=./secrets/master.key
+LLMROLLER_MASTER_KEY_ID=mk_2026_10
+
+# Security & TLS Enforcement
+LLMROLLER_REQUIRE_TLS=true
+LLMROLLER_SETUP_TOKEN_REQUIRED=true
+
+# Memory, Body Budgets & SQLite Durability
+LLMROLLER_MEMORY_LIMIT_MB=2048
+LLMROLLER_PREFLIGHT_BODY_BUDGET_MB=819
+LLMROLLER_MAX_BODY_MB=32
+LLMROLLER_SQLITE_SYNCHRONOUS=NORMAL
+
+# Pluggable Routing Strategy Default
+# Allowed: smooth_weighted_rr | naive_rr | weighted_rr | uniform_random | weighted_random | power_of_two_choices
+LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr
+
+# Observability
+LLMROLLER_LOG=info,llmroller=info
+```
+
+#### 22.3.3 Entrypoint signal handling, migrations, and healthcheck contract
+
+In `runtime-distroless`, `/usr/local/bin/llmroller` runs directly as PID 1 using `ENTRYPOINT ["/usr/local/bin/llmroller"]`. Because `serve` spawns no child processes, `crates/server` handles `SIGTERM` and `SIGINT` natively via `tokio::signal::unix::signal`.
+
+Database migrations run automatically inside Startup Step 3 (`Section 5.5.2`) while holding the exclusive `flock` on `${LLMROLLER_DATA_DIR}/llmroller.lock`. During Startup Steps 1 through 9, `/healthz` returns HTTP `200` and `/readyz` returns HTTP `503`. Once Step 10 completes, `/readyz` flips to HTTP `200` and `llmroller healthcheck --url http://127.0.0.1:8080/readyz` exits `0`.
+
+### 22.4 Observability and logging in containers
+
+All logs write to `stdout` and `stderr` as single-line JSON objects (`ts`, `level`, `target`, `request_id`, `msg`, `fields`). Secrets are scrubbed per `SEC-6`, and `audit_anchor` lines emit per `AUD-1`. Container log rotation is bounded by Docker's `json-file` driver (`max-size: "50m"`, `max-file: "5"`).
+
+Prometheus scrapes `http://172.28.2.20:9090/metrics` over `internal_obs_net`. Every routing selection increments `llmroller_routing_selections_total{provider_kind,provider_id,protocol,outcome,strategy,model_bucket}` where `strategy` identifies the active `RoutingStrategy` (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`).

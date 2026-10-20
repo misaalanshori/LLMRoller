@@ -1,0 +1,14 @@
+# deploy/Caddyfile
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:443 {
+    reverse_proxy 172.28.1.20:8080 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:8443 {
+    reverse_proxy 172.28.1.20:8081 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

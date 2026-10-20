@@ -1,6 +1,6 @@
 # Epic 0: Engineering governance, TDD workflow, atomic commits, and adaptive playbook
 
-This guide defines how engineers and coding agents build LLMRoller from an empty repository (`git init`) to version 1.0.0. It pairs every phase and sub-phase with exact references to the Software Requirements and Design Document (SRDD Sections 0 through 21).
+This guide defines how engineers and coding agents build LLMRoller from an empty repository (`git init`) to version 1.0.0. It pairs every phase and sub-phase with exact references to the Software Requirements and Design Document (SRDD Sections 0 through 22).
 
 ## 0.1 How to use this guide as an adaptive playbook
 
@@ -81,7 +81,7 @@ The table below maps the eight implementation epics (`big-bang-phases-1.md` thro
 | --- | --- | --- | --- |
 | `big-bang-phases-1.md` | Foundation, storage engine, cryptography, RBAC, and snapshot reloader | `M0` | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-5`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17`, `REL-4`, `MNT-1`, `MNT-2` |
 | `big-bang-phases-2.md` | Transparent wire proxy, protocol normalizer, provider adapters, and orchestrator v1 | `M1` | `PRV-1`..`PRV-5`, `PRV-7`, `CLK-1`, `CLK-4`, `API-2`..`API-4`, `API-6`, `API-7`, `TRN-1`..`TRN-3`, `SEC-3`, `SEC-6`..`SEC-9`, `SEC-12`, `SEC-15`, `REL-1`, `OBS-1` |
-| `big-bang-phases-3.md` | Core pricing/windows/accumulators, model catalog, sharing, smooth WRR, pinning, and orchestrator v2 | `M2` | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-13`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` |
+| `big-bang-phases-3.md` | Core pricing/windows/accumulators, model catalog, sharing, pluggable routing strategies, pinning, and orchestrator v2 | `M2` | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-14`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` |
 | `big-bang-phases-4.md` | Usage taps, three-queue batching writer, 5-minute & hourly rollups, orchestrator v3, and retention | `M3` | `API-5`, `USG-1`..`USG-3`, `SHR-6`, `REL-2`, `REL-3` |
 | `big-bang-phases-4b.md` | Startup 5-minute rollup reconstruction and source provider `/usage` poller, observations, and pass-through | `M4` | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `SEC-18` |
 | `big-bang-phases-5.md` | Opt-in content traceability mode, content-addressed blocks, 2-thread sealer pool, and chat reconstructor | `M3b` | `TRC-1`..`TRC-5`, `TRC-7`..`TRC-9`, `PERF-5`, `SEC-19` |

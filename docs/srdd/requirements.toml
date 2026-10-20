@@ -340,7 +340,14 @@ tests = ["tests/integration_routing_and_failover.rs"]
 priority = "P1"
 milestone = "M2"
 delivering_subphase = "3.5"
-tests = ["crates/core/src/wrr/proptests.rs"]
+tests = ["crates/core/src/wrr/proptests.rs", "crates/core/src/strategy/proptests.rs"]
+
+[requirements.RTE-14]
+priority = "P0"
+milestone = "M2"
+delivering_subphase = "3.5"
+partial_subphases = ["1.3", "1.6", "3.7", "6.3", "7.5"]
+tests = ["crates/core/src/strategy/proptests.rs", "tests/integration_routing_and_failover.rs"]
 
 # --- 6.8 Transparent proxying (API) ---
 [requirements.API-1]

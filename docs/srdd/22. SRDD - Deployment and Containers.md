@@ -1,0 +1,515 @@
+# 22. SRDD: Deployment and containerization specification
+
+This section defines the containerization architecture, orchestration topologies, volume and network boundaries, and environment contracts for LLMRoller (`POR-1`, `SEC-9`, `SEC-11`, `REL-1`). Every port, path, timeout, and environment variable matches Sections 5, 7, 8, 9, 10, and 21 with zero drift.
+
+## 22.1 Multi-stage `Dockerfile` and `.dockerignore` architecture
+
+LLMRoller builds from a single multi-stage `Dockerfile` using BuildKit (`# syntax=docker/dockerfile:1.7`). The build pipeline uses four stages: `planner`, `builder`, `runtime-distroless` (production), and `runtime-dev` (development and CI).
+
+### 22.1.1 Build stage responsibilities and security invariants
+
+The table below defines the four stages in the `Dockerfile` and the security controls enforced on the final image (`POR-1`, `SEC-10`, `SEC-11`).
+
+| Stage name | Base image (pinned tag & digest) | Purpose and key invariants |
+| --- | --- | --- |
+| `planner` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Installs `cargo-chef` (`0.1.71`) and computes `recipe.json` from `Cargo.toml` and `Cargo.lock` so source edits in `crates/*` never invalidate cached third-party crate compilations. |
+| `builder` | `rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2` | Compiles cached dependencies via `cargo chef cook --release --locked --target <musl_target>`, verifies `cargo xtask doc-consistency`, compiles the static `llmroller` binary (`--locked`, stripped of debug symbols), and prepares empty `/var/lib/llmroller` and `/etc/llmroller/presets` directories owned by `65532:65532`. |
+| `runtime-distroless` (default production target) | `gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0` | Copies only `/usr/local/bin/llmroller` and `/etc/llmroller/presets/*.toml`. Runs as non-root `65532:65532` (`nonroot`), contains zero shell (`/bin/sh` absent) and zero package manager, keeps total uncompressed image size `< 50 MB` (`POR-1`), and uses `llmroller healthcheck` for native container probes. |
+| `runtime-dev` (development & CI target) | `debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a` | Installs `tini`, `ca-certificates`, `curl`, and `sqlite3`, creates non-root user `llmroller` (`65532:65532`), and runs under `/usr/bin/tini -- /usr/local/bin/llmroller` for interactive debugging and Compose smoke testing. |
+
+### 22.1.2 Complete `.dockerignore` reference manifest
+
+The `.dockerignore` file excludes build artifacts, local SQLite databases, git history, and secret files (`SEC-11`). This keeps the build context under 2 MiB and prevents credential leaks into layers.
+
+```dockerignore
+# Build outputs and caches
+target/
+**/target/
+*.profraw
+lcov.info
+
+# Local runtime state, SQLite WAL files, and secrets
+/var/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+setup-token
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control, IDE state, and test artifacts
+.git/
+.github/
+.vscode/
+.idea/
+artifacts/
+tmp/
+*.log
+```
+
+### 22.1.3 Complete multi-stage `Dockerfile` reference manifest
+
+The `Dockerfile` below is the normative container build manifest for `x86_64` (`x86_64-unknown-linux-musl`) and `aarch64` (`aarch64-unknown-linux-musl`) builds.
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_IMAGE=rust:1.85.0-bookworm@sha256:632f37c2d09c9b6447a9d35b17e64940f97a461b91e04b815b7556795f2e90b2
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:e8a4044e0b4ae4257efa45fc026c0bc30ad320d43bd4c1a7d5271bd241e386d0
+ARG DEBIAN_SLIM_IMAGE=debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+
+# -----------------------------------------------------------------------------
+# Stage 1: planner - compute deterministic cargo-chef dependency recipe
+# -----------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS planner
+WORKDIR /src
+RUN cargo install cargo-chef --locked --version 0.1.71
+COPY Cargo.toml Cargo.lock deny.toml ./
+COPY xtask/Cargo.toml xtask/Cargo.toml
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/proto/Cargo.toml crates/proto/Cargo.toml
+COPY crates/store/Cargo.toml crates/store/Cargo.toml
+COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
+COPY crates/admin/Cargo.toml crates/admin/Cargo.toml
+COPY crates/server/Cargo.toml crates/server/Cargo.toml
+RUN mkdir -p xtask/src crates/core/src crates/proto/src crates/store/src              crates/proxy/src crates/admin/src crates/server/src     && touch xtask/src/main.rs crates/core/src/lib.rs crates/proto/src/lib.rs              crates/store/src/lib.rs crates/proxy/src/lib.rs              crates/admin/src/lib.rs crates/server/src/main.rs     && cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 2: builder - compile static musl release binary with embedded UI assets
+# -----------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS builder
+ARG TARGETARCH
+ARG GIT_SHA=unknown
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends         musl-tools pkg-config clang llvm lld     && rm -rf /var/lib/apt/lists/*     && cargo install cargo-chef --locked --version 0.1.71
+
+RUN case "${TARGETARCH:-amd64}" in       amd64) echo "x86_64-unknown-linux-musl" > /tmp/rust_target ;;       arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust_target ;;       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;;     esac     && rustup target add "$(cat /tmp/rust_target)"
+
+COPY --from=planner /src/recipe.json recipe.json
+RUN TARGET_TRIPLE="$(cat /tmp/rust_target)"     && cargo chef cook --release --locked --target "${TARGET_TRIPLE}" --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock deny.toml ./
+COPY presets ./presets
+COPY docs ./docs
+COPY fixtures ./fixtures
+COPY xtask ./xtask
+COPY crates ./crates
+
+ENV LLMROLLER_BUILD_GIT_SHA=${GIT_SHA}
+RUN TARGET_TRIPLE="$(cat /tmp/rust_target)"     && cargo build --release --locked --target "${TARGET_TRIPLE}" --bin llmroller     && cp "target/${TARGET_TRIPLE}/release/llmroller" /usr/local/bin/llmroller     && strip --strip-debug /usr/local/bin/llmroller     && install -d -m 0750 -o 65532 -g 65532 /staging/var/lib/llmroller     && install -d -m 0755 -o 65532 -g 65532 /staging/etc/llmroller/presets     && install -m 0644 -o 65532 -g 65532 presets/*.toml /staging/etc/llmroller/presets/
+
+# -----------------------------------------------------------------------------
+# Stage 3: runtime-dev - instrumented image for local Compose & CI smoke tests
+# -----------------------------------------------------------------------------
+FROM ${DEBIAN_SLIM_IMAGE} AS runtime-dev
+RUN apt-get update && apt-get install -y --no-install-recommends         ca-certificates curl sqlite3 tini     && rm -rf /var/lib/apt/lists/*     && groupadd -g 65532 llmroller     && useradd -u 65532 -g 65532 -d /var/lib/llmroller -s /usr/sbin/nologin -M llmroller
+
+COPY --from=builder --chown=65532:65532 /staging/var/lib/llmroller /var/lib/llmroller
+COPY --from=builder --chown=65532:65532 /staging/etc/llmroller /etc/llmroller
+COPY --from=builder /usr/local/bin/llmroller /usr/local/bin/llmroller
+
+ENV LLMROLLER_DATA_DIR=/var/lib/llmroller     LLMROLLER_LISTEN=0.0.0.0:8080     LLMROLLER_ADMIN_LISTEN=0.0.0.0:8081     LLMROLLER_METRICS_LISTEN=0.0.0.0:9090     LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr     LLMROLLER_LOG=info,llmroller=info
+
+EXPOSE 8080 8081 9090
+USER 65532:65532
+WORKDIR /var/lib/llmroller
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3   CMD ["/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/llmroller"]
+CMD ["serve"]
+
+# -----------------------------------------------------------------------------
+# Stage 4: runtime-distroless - default hardened production image (< 50 MB)
+# -----------------------------------------------------------------------------
+FROM ${DISTROLESS_IMAGE} AS runtime-distroless
+
+COPY --from=builder --chown=65532:65532 /staging/var/lib/llmroller /var/lib/llmroller
+COPY --from=builder --chown=65532:65532 /staging/etc/llmroller /etc/llmroller
+COPY --from=builder /usr/local/bin/llmroller /usr/local/bin/llmroller
+
+ENV LLMROLLER_DATA_DIR=/var/lib/llmroller     LLMROLLER_LISTEN=0.0.0.0:8080     LLMROLLER_ADMIN_LISTEN=0.0.0.0:8081     LLMROLLER_METRICS_LISTEN=0.0.0.0:9090     LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr     LLMROLLER_LOG=info,llmroller=info
+
+EXPOSE 8080 8081 9090
+USER 65532:65532
+WORKDIR /var/lib/llmroller
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3   CMD ["/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+
+ENTRYPOINT ["/usr/local/bin/llmroller"]
+CMD ["serve"]
+```
+
+## 22.2 Orchestration and `docker-compose.yml` topology
+
+LLMRoller runs as a stateful service with a persistent SQLite WAL volume, a volume initializer (`llmroller-init`), and a `caddy` TLS proxy. Optional Compose profiles add Prometheus scraping (`--profile observability`) and a local development harness (`--profile dev`).
+
+### 22.2.1 Network segmentation, volumes, and security constraints
+
+The Compose topology enforces four isolation boundaries:
+1. Network segmentation: `edge_net` (`172.28.1.0/24`) connects `caddy` (`172.28.1.10`) to `llmroller` (`172.28.1.20`) on ports `8080` (data plane) and `8081` (control plane), with `LLMROLLER_TRUSTED_PROXIES=172.28.1.10/32` satisfying `SEC-5` and `SEC-9`. `internal_obs_net` (`172.28.2.0/24`, `internal: true`) connects `prometheus` to `llmroller:9090` with zero external ingress or egress.
+2. Persistent volumes and `tmpfs`: `llmroller_data` mounts at `/var/lib/llmroller` and `llmroller_backups` mounts at `/var/backups/llmroller`. Because SQLite WAL uses `mmap` in `llmroller.db-shm`, `llmroller_data` must reside on a local POSIX filesystem (ext4, XFS, or ZFS). A `64 MiB` `tmpfs` (`noexec,nosuid,nodev`) mounts at `/tmp`.
+3. Non-root volume initialization (`llmroller-init`): Fresh Docker volumes default to `root:root` (`0755`), blocking UID `65532` from creating `llmroller.lock`. The one-shot `llmroller-init` container runs before `llmroller` to set `65532:65532` and `0750` on `/var/lib/llmroller` and `/var/backups/llmroller`.
+4. Hardened container runtime (`SEC-11`): `llmroller` sets `user: "65532:65532"`, `read_only: true`, `cap_drop: ["ALL"]`, `security_opt: ["no-new-privileges:true"]`, `pids_limit: 512`, and `mem_limit: 2048m`. It sets `stop_grace_period: 90s`, which covers the 85 s drain budget in Section 21.8.2.
+
+### 22.2.2 Complete `docker-compose.yml` reference manifest
+
+The `docker-compose.yml` manifest below defines the production, observability, and local development topologies.
+
+```yaml
+name: llmroller
+
+services:
+  llmroller-init:
+    image: debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+    user: "0:0"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - llmroller_backups:/var/backups/llmroller
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        chown 65532:65532 /var/lib/llmroller /var/backups/llmroller
+        chmod 0750 /var/lib/llmroller /var/backups/llmroller
+        if [ -f /var/lib/llmroller/llmroller.db ]; then
+          chown 65532:65532 /var/lib/llmroller/llmroller.db*
+        fi
+    restart: "no"
+
+  llmroller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-distroless
+      args:
+        GIT_SHA: ${GIT_SHA:-v1.0.0}
+    image: llmroller:1.0.0-distroless
+    user: "65532:65532"
+    read_only: true
+    init: false
+    stop_signal: SIGTERM
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: 2.0
+    mem_limit: 2048m
+    mem_reservation: 512m
+    memswap_limit: 2048m
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      llmroller-init:
+        condition: service_completed_successfully
+    environment:
+      LLMROLLER_MASTER_KEY_FILE: /run/secrets/llmroller_master_key
+      LLMROLLER_MASTER_KEY_ID: ${LLMROLLER_MASTER_KEY_ID:-mk_2026_10}
+      LLMROLLER_DATA_DIR: /var/lib/llmroller
+      LLMROLLER_LISTEN: 0.0.0.0:8080
+      LLMROLLER_ADMIN_LISTEN: 0.0.0.0:8081
+      LLMROLLER_METRICS_LISTEN: 0.0.0.0:9090
+      LLMROLLER_TRUSTED_PROXIES: 172.28.1.10/32
+      LLMROLLER_REQUIRE_TLS: ${LLMROLLER_REQUIRE_TLS:-true}
+      LLMROLLER_SETUP_TOKEN_REQUIRED: ${LLMROLLER_SETUP_TOKEN_REQUIRED:-true}
+      LLMROLLER_MAX_BODY_MB: ${LLMROLLER_MAX_BODY_MB:-32}
+      LLMROLLER_PREFLIGHT_BODY_BUDGET_MB: ${LLMROLLER_PREFLIGHT_BODY_BUDGET_MB:-819}
+      LLMROLLER_MEMORY_LIMIT_MB: 2048
+      LLMROLLER_SQLITE_SYNCHRONOUS: ${LLMROLLER_SQLITE_SYNCHRONOUS:-NORMAL}
+      LLMROLLER_DEFAULT_ROUTING_STRATEGY: ${LLMROLLER_DEFAULT_ROUTING_STRATEGY:-smooth_weighted_rr}
+      LLMROLLER_LOG: ${LLMROLLER_LOG:-info,llmroller=info}
+    secrets:
+      - source: llmroller_master_key
+        target: /run/secrets/llmroller_master_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - llmroller_backups:/var/backups/llmroller
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 67108864
+          mode: 01777
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.20
+      internal_obs_net:
+        ipv4_address: 172.28.2.20
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.9.1-alpine@sha256:663c83823d28073681e2c5f9b86c718193d689b8d9a22325f206f4e4596f7b0b
+    depends_on:
+      llmroller:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    ports:
+      - "${LLMROLLER_PUBLIC_HTTPS_PORT:-443}:443"
+      - "${LLMROLLER_ADMIN_HTTPS_PORT:-8443}:8443"
+    environment:
+      LLMROLLER_DOMAIN: ${LLMROLLER_DOMAIN:-llmroller.internal.example.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.10
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "3"
+    restart: unless-stopped
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.1.0@sha256:36259373f5b247829e3a1e4736c81f53e7b6a15c26149b176c6371a79d1e04b7
+    user: "65534:65534"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      llmroller:
+        condition: service_healthy
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      internal_obs_net:
+        ipv4_address: 172.28.2.30
+    restart: unless-stopped
+
+  mock-upstream:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-dev
+    command: ["serve", "--listen", "0.0.0.0:18080"]
+    networks:
+      edge_net:
+        ipv4_address: 172.28.1.50
+
+  llmroller-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-dev
+    user: "65532:65532"
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    depends_on:
+      llmroller-init:
+        condition: service_completed_successfully
+    environment:
+      LLMROLLER_MASTER_KEY: ${LLMROLLER_DEV_MASTER_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      LLMROLLER_MASTER_KEY_ID: mk_dev
+      LLMROLLER_DATA_DIR: /var/lib/llmroller
+      LLMROLLER_LISTEN: 0.0.0.0:8080
+      LLMROLLER_ADMIN_LISTEN: 0.0.0.0:8081
+      LLMROLLER_METRICS_LISTEN: 0.0.0.0:9090
+      LLMROLLER_TRUSTED_PROXIES: 127.0.0.1/32,172.28.1.0/24
+      LLMROLLER_REQUIRE_TLS: "false"
+      LLMROLLER_SETUP_TOKEN_REQUIRED: "false"
+      LLMROLLER_DEFAULT_ROUTING_STRATEGY: ${LLMROLLER_DEFAULT_ROUTING_STRATEGY:-smooth_weighted_rr}
+      LLMROLLER_LOG: debug,llmroller=trace
+    command: ["serve", "--dev-insecure-cookies"]
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - llmroller_data:/var/lib/llmroller
+      - type: tmpfs
+        target: /tmp
+    networks:
+      - edge_net
+      - internal_obs_net
+
+networks:
+  edge_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  internal_obs_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
+
+volumes:
+  llmroller_data:
+  llmroller_backups:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+
+secrets:
+  llmroller_master_key:
+    file: ${LLMROLLER_MASTER_KEY_SECRET_PATH:-./secrets/master.key}
+```
+
+### 22.2.3 Companion reverse-proxy (`deploy/Caddyfile`) and Prometheus (`deploy/prometheus.yml`) manifests
+
+Upstream reverse proxies must disable response buffering (`flush_interval -1`) so SSE token chunks reach coding agents within `1 ms` (`PERF-2`).
+
+```caddyfile
+# deploy/Caddyfile
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:443 {
+    reverse_proxy 172.28.1.20:8080 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+{$LLMROLLER_DOMAIN:llmroller.internal.example.com}:8443 {
+    reverse_proxy 172.28.1.20:8081 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+```
+
+```yaml
+# deploy/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "llmroller"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["172.28.2.20:9090"]
+```
+
+## 22.3 Environment, secrets, and entrypoint contract
+
+LLMRoller validates all environment variables at startup before opening network listeners. Invalid values cause an immediate exit with code `2` (or code `3` for master-key errors).
+
+### 22.3.1 Complete environment variable schema
+
+The table below lists all supported environment variables, their defaults, and their validation rules.
+
+| Variable name | Type | Default | Mandatory / optional | Description and validation rule |
+| --- | --- | --- | --- | --- |
+| `LLMROLLER_MASTER_KEY_FILE` | Path | `None` | Mandatory (unless `LLMROLLER_MASTER_KEY` is set) | Path to a `0400`/`0600` file containing the base64-encoded 32-byte master key (`/run/secrets/llmroller_master_key` in Docker). Group or world permission bits cause exit `3` (`SEC-2`). |
+| `LLMROLLER_MASTER_KEY` | Base64 string | `None` | Optional fallback | Raw base64 master key; must decode to **exactly** 32 bytes (exit `3` otherwise). Logs a one-time `/proc/<pid>/environ` warning at startup (`SEC-2`). |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string | `"mk_default"` | Optional | Key identifier `^[A-Za-z0-9_.-]{1,64}$` verified against `instance_meta.active_master_key_id` at startup (exit `3` on mismatch, `SEC-1`). |
+| `LLMROLLER_DATA_DIR` | Path | `"/var/lib/llmroller"` | Optional | Writable directory holding `llmroller.db`, `-wal`, `-shm`, `llmroller.lock`, and `setup-token`. |
+| `LLMROLLER_LISTEN` | SocketAddr | `"0.0.0.0:8080"` | Optional | Data-plane bind address serving `/v1/*`, `/healthz`, and `/readyz` (exit `5` on bind error). |
+| `LLMROLLER_ADMIN_LISTEN` | SocketAddr | `"127.0.0.1:8081"` | Optional | Control-plane bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES` exits with code `2` (`SEC-5`). |
+| `LLMROLLER_METRICS_LISTEN` | SocketAddr | `"127.0.0.1:9090"` | Optional | Prometheus `/metrics` listener bind address (`OBS-1`, `SEC-9`). |
+| `LLMROLLER_TRUSTED_PROXIES` | CIDR CSV | `""` | Optional | Comma-separated IPv4/IPv6 CIDRs trusted to supply `X-Forwarded-For` and `X-Forwarded-Proto` (`172.28.1.10/32` in Compose, `SEC-12`). |
+| `LLMROLLER_REQUIRE_TLS` | Bool | `false` (`true` in prod Compose) | Optional | When `true`, refuses non-loopback `LLMROLLER_LISTEN` without TLS or `LLMROLLER_TRUSTED_PROXIES` (exit `2`, `SEC-9`). |
+| `LLMROLLER_SETUP_TOKEN` | ASCII string | Auto-generated file | Optional | Explicit bootstrap setup token (`>= 16` chars); otherwise generated to `${LLMROLLER_DATA_DIR}/setup-token` (`0600`, `AUTH-2`). |
+| `LLMROLLER_SETUP_TOKEN_REQUIRED` | Bool | `true` | Optional | When `false`, skips setup-token verification on `POST /admin/api/setup` (`AUTH-2`). |
+| `LLMROLLER_MAX_BODY_MB` | Integer | `32` | Optional | Maximum inbound request body in MiB (`1..=128` and `<= LLMROLLER_PREFLIGHT_BODY_BUDGET_MB / 4`, exit `2` otherwise, `SEC-8`). |
+| `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` | Integer | `min(1024, floor(0.40 * mem_mb))` | Optional | Total MiB of buffered request bodies permitted concurrently before first valid frame (`819` on 2 GB host, `PERF-3`). |
+| `LLMROLLER_MEMORY_LIMIT_MB` | Integer | Auto (`cgroup v2` or `2048`) | Optional | Explicit container memory ceiling in MiB (`256..=65536`) used when calculating memory budgets (`PERF-3`, `PERF-5`). |
+| `LLMROLLER_SQLITE_SYNCHRONOUS` | Enum | `"NORMAL"` | Optional | `"NORMAL"` or `"FULL"` writer WAL sync mode (`REL-2`). |
+| `LLMROLLER_DEFAULT_ROUTING_STRATEGY` | Enum | `"smooth_weighted_rr"` | Optional | Initial/override default routing strategy: `smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random` (`random`), `weighted_random`, or `power_of_two_choices` (`p2c`); invalid values exit with code `2` (`RTE-14`). |
+| `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY` | Path | `None` | Optional | PEM certificate chain and private key for native `rustls` HTTPS listeners (`A4`). |
+| `LLMROLLER_LOG` | EnvFilter | `"info,llmroller=info"` | Optional | Structured JSON log filter string for `tracing_subscriber` (`OBS-1`). |
+
+### 22.3.2 Complete `.env.example` reference manifest
+
+Operators copy `.env.example` to `.env` to configure ports, routing strategy defaults, and resource limits.
+
+```dotenv
+# LLMRoller Production & Development Environment Template (.env.example)
+# Copy to .env and generate ./secrets/master.key with:
+#   mkdir -p secrets && chmod 0700 secrets
+#   docker run --rm llmroller:1.0.0-distroless generate-master-key > secrets/master.key
+#   chmod 0400 secrets/master.key
+
+GIT_SHA=v1.0.0
+LLMROLLER_DOMAIN=llmroller.internal.example.com
+LLMROLLER_PUBLIC_HTTPS_PORT=443
+LLMROLLER_ADMIN_HTTPS_PORT=8443
+
+# Master Key Configuration (file secret preferred in production)
+LLMROLLER_MASTER_KEY_SECRET_PATH=./secrets/master.key
+LLMROLLER_MASTER_KEY_ID=mk_2026_10
+
+# Security & TLS Enforcement
+LLMROLLER_REQUIRE_TLS=true
+LLMROLLER_SETUP_TOKEN_REQUIRED=true
+
+# Memory, Body Budgets & SQLite Durability
+LLMROLLER_MEMORY_LIMIT_MB=2048
+LLMROLLER_PREFLIGHT_BODY_BUDGET_MB=819
+LLMROLLER_MAX_BODY_MB=32
+LLMROLLER_SQLITE_SYNCHRONOUS=NORMAL
+
+# Pluggable Routing Strategy Default
+# Allowed: smooth_weighted_rr | naive_rr | weighted_rr | uniform_random | weighted_random | power_of_two_choices
+LLMROLLER_DEFAULT_ROUTING_STRATEGY=smooth_weighted_rr
+
+# Observability
+LLMROLLER_LOG=info,llmroller=info
+```
+
+### 22.3.3 Entrypoint signal handling, migrations, and healthcheck contract
+
+In `runtime-distroless`, `/usr/local/bin/llmroller` runs directly as PID 1 using `ENTRYPOINT ["/usr/local/bin/llmroller"]`. Because `serve` spawns no child processes, `crates/server` handles `SIGTERM` and `SIGINT` natively via `tokio::signal::unix::signal`.
+
+Database migrations run automatically inside Startup Step 3 (`Section 5.5.2`) while holding the exclusive `flock` on `${LLMROLLER_DATA_DIR}/llmroller.lock`. During Startup Steps 1 through 9, `/healthz` returns HTTP `200` and `/readyz` returns HTTP `503`. Once Step 10 completes, `/readyz` flips to HTTP `200` and `llmroller healthcheck --url http://127.0.0.1:8080/readyz` exits `0`.
+
+## 22.4 Observability and logging in containers
+
+All logs write to `stdout` and `stderr` as single-line JSON objects (`ts`, `level`, `target`, `request_id`, `msg`, `fields`). Secrets are scrubbed per `SEC-6`, and `audit_anchor` lines emit per `AUD-1`. Container log rotation is bounded by Docker's `json-file` driver (`max-size: "50m"`, `max-file: "5"`).
+
+Prometheus scrapes `http://172.28.2.20:9090/metrics` over `internal_obs_net`. Every routing selection increments `llmroller_routing_selections_total{provider_kind,provider_id,protocol,outcome,strategy,model_bucket}` where `strategy` identifies the active `RoutingStrategy` (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`).

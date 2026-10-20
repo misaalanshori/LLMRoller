@@ -1,0 +1,28 @@
+# Build outputs and caches
+target/
+**/target/
+*.profraw
+lcov.info
+
+# Local runtime state, SQLite WAL files, and secrets
+/var/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+setup-token
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Version control, IDE state, and test artifacts
+.git/
+.github/
+.vscode/
+.idea/
+artifacts/
+tmp/
+*.log

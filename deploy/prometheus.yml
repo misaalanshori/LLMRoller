@@ -1,0 +1,10 @@
+# deploy/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "llmroller"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["172.28.2.20:9090"]
