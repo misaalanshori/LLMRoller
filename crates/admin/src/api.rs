@@ -778,6 +778,111 @@ async fn post_admin_prices_sync_handler(
     })))
 }
 
+async fn get_user_client_key_sessions_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ClientKeyId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let key = llmroller_store::client_keys::get_client_key(&state.auth.pool, &actor, id)
+        .await
+        .map_err(|_| map_price_error(StatusCode::NOT_FOUND, "client key not found"))?;
+    if Some(key.owner_user_id) != actor.user_id() {
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "client key not found",
+        ));
+    }
+
+    list_client_key_sessions_internal(&state, &id).await
+}
+
+async fn get_admin_client_key_sessions_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ClientKeyId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    list_client_key_sessions_internal(&state, &id).await
+}
+
+async fn list_client_key_sessions_internal(
+    state: &ApiAppState,
+    client_key_id: &ClientKeyId,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        r#"SELECT session_hash, MAX(ts) as last_active_at, COUNT(*) as traced_turn_count
+           FROM trace_records
+           WHERE client_key_id = ?
+           GROUP BY session_hash
+           ORDER BY last_active_at DESC
+           LIMIT 50"#,
+    )
+    .bind(client_key_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut sessions = Vec::new();
+    for r in rows {
+        let session_hash: String = r.try_get("session_hash").unwrap_or_default();
+        let last_active_at: i64 = r.try_get("last_active_at").unwrap_or(0);
+        let traced_turn_count: i64 = r.try_get("traced_turn_count").unwrap_or(0);
+        sessions.push(serde_json::json!({
+            "session_hash": session_hash,
+            "last_active_at": last_active_at,
+            "traced_turn_count": traced_turn_count,
+            "current_pins": []
+        }));
+    }
+
+    Ok(Json(serde_json::json!({ "data": sessions })))
+}
+
+async fn get_user_session_preview_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(session_hash): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let owner_id = actor.user_id().expect("user_id");
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM trace_records WHERE owner_user_id = ? AND session_hash = ? LIMIT 1",
+    )
+    .bind(owner_id.to_string())
+    .bind(&session_hash)
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if exists.is_none() {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "session not found"));
+    }
+
+    get_session_preview_internal(&state, &session_hash).await
+}
+
+async fn get_admin_session_preview_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(session_hash): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_session_preview_internal(&state, &session_hash).await
+}
+
+async fn get_session_preview_internal(
+    _state: &ApiAppState,
+    session_hash: &str,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(serde_json::json!({
+        "session_hash": session_hash,
+        "turns": []
+    })))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // User endpoints
@@ -810,6 +915,14 @@ pub fn router(state: ApiAppState) -> Router {
             patch(patch_user_client_key_handler).delete(delete_user_client_key_handler),
         )
         .route(
+            "/api/user/client-keys/{id}/sessions",
+            get(get_user_client_key_sessions_handler),
+        )
+        .route(
+            "/api/user/sessions/{session_hash}/preview",
+            get(get_user_session_preview_handler),
+        )
+        .route(
             "/api/user/providers/{id}/prices",
             put(put_user_provider_price_handler),
         )
@@ -833,6 +946,14 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/client-keys/{id}",
             delete(delete_user_client_key_handler),
+        )
+        .route(
+            "/admin/api/client-keys/{id}/sessions",
+            get(get_admin_client_key_sessions_handler),
+        )
+        .route(
+            "/admin/api/sessions/{session_hash}/preview",
+            get(get_admin_session_preview_handler),
         )
         .route(
             "/admin/api/settings",
