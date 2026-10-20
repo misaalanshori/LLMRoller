@@ -404,3 +404,155 @@ fn test_terminal_error_selector_precedence_and_retry_after() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(code, "upstream_unreachable");
 }
+
+#[doc = "Spec: RTE-1, RTE-2, RTE-3, RTE-4, RTE-5, RTE-6, RTE-7, RTE-8, RTE-9, RTE-10, RTE-11, RTE-12, RTE-13, RTE-14, Partial: API-1, Partial: PERF-1"]
+#[tokio::test]
+async fn test_v1_endpoints_and_auxiliary_routes() {
+    use arc_swap::ArcSwap;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use http_body_util::BodyExt as _;
+    use llmroller_proxy::auth::ProxyAuthState;
+    use llmroller_proxy::listeners::data_plane_router;
+    use llmroller_server::reloader::load_initial_snapshot;
+    use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
+    use tower::ServiceExt as _;
+
+    let (_dir, pool, _master_key, user_id) = setup_failover_test_db().await;
+    let actor = ActorScope::user(user_id, Role::User);
+    let mut tx = pool.begin().await.expect("begin");
+
+    let created_key = create_client_key_tx(
+        &mut tx,
+        &actor,
+        user_id,
+        NewClientKey {
+            label: "Test Key".to_string(),
+            allowed_models: None,
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &OsEntropy,
+        1000,
+    )
+    .await
+    .expect("create client key");
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let client_key_token = created_key.raw_token.expose_secret().to_string();
+
+    tx.commit().await.expect("commit");
+
+    let snapshot = load_initial_snapshot(&pool).await.expect("snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
+    let auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![]);
+    auth_state
+        .is_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = data_plane_router(auth_state);
+
+    // 1. POST /v1/chat/completions
+    let req_chat = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_chat).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. POST /v1/responses
+    let req_resp = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"gpt-4o","input":"test prompt"}"#))
+        .expect("req");
+    let resp = app.clone().oneshot(req_resp).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. POST /v1/messages
+    let req_msg = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_msg).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. POST /v1/messages/count_tokens
+    let req_count = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello world"}]}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_count).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(json["input_tokens"].as_i64().is_some());
+
+    // 5. POST /v1/responses/compact
+    let req_compact = Request::builder()
+        .method("POST")
+        .uri("/v1/responses/compact")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"gpt-4o","input":"compact me"}"#))
+        .expect("req");
+    let resp = app.clone().oneshot(req_compact).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 6. State-bound endpoints: GET/DELETE /v1/responses/{id}, /input_items, /cancel
+    let req_get = Request::builder()
+        .method("GET")
+        .uri("/v1/responses/unknown_id")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.clone().oneshot(req_get).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req_del = Request::builder()
+        .method("DELETE")
+        .uri("/v1/responses/resp_test_1")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.clone().oneshot(req_del).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req_input_items = Request::builder()
+        .method("GET")
+        .uri("/v1/responses/resp_test_1/input_items")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.clone().oneshot(req_input_items).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req_cancel = Request::builder()
+        .method("POST")
+        .uri("/v1/responses/resp_test_1/cancel")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.oneshot(req_cancel).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+}

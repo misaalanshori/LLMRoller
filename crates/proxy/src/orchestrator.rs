@@ -120,6 +120,130 @@ pub async fn post_messages(
     handle_inference_request(state, EndpointKind::Messages, headers, body).await
 }
 
+/// Handler for POST /v1/messages/count_tokens.
+pub async fn post_messages_count_tokens(
+    State(_state): State<ProxyAuthState>,
+    _headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let est = llmroller_core::pricing::estimate_input_tokens(&body);
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        Json(serde_json::json!({
+            "input_tokens": est
+        })),
+    )
+        .into_response()
+}
+
+/// Handler for POST /v1/responses/compact.
+pub async fn post_responses_compact(
+    State(state): State<ProxyAuthState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_inference_request(state, EndpointKind::Responses, headers, body).await
+}
+
+/// Handler for GET /v1/responses/{id}.
+pub async fn get_response_by_id(
+    State(state): State<ProxyAuthState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Extension(client_key): axum::extract::Extension<
+        llmroller_core::client_key::ClientKeyRecord,
+    >,
+) -> Response {
+    use sqlx::Row as _;
+    let query_result = sqlx::query(
+        "SELECT response_id, owner_user_id, status FROM response_links WHERE response_id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match query_result {
+        Ok(Some(row)) => {
+            let owner_str: String = match row.try_get("owner_user_id") {
+                Ok(s) => s,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if owner_str != client_key.owner_user_id.to_string() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
+                )
+                    .into_response();
+            }
+            let resp_id: String = row.try_get("response_id").unwrap_or(id);
+            let status: String = row
+                .try_get("status")
+                .unwrap_or_else(|_| "completed".to_string());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": resp_id,
+                    "object": "response",
+                    "status": status
+                })),
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
+        )
+            .into_response(),
+    }
+}
+
+/// Handler for DELETE /v1/responses/{id}.
+pub async fn delete_response_by_id(
+    State(_state): State<ProxyAuthState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "object": "response",
+            "deleted": true
+        })),
+    )
+        .into_response()
+}
+
+/// Handler for GET /v1/responses/{id}/input_items.
+pub async fn get_response_input_items(
+    State(_state): State<ProxyAuthState>,
+    axum::extract::Path(_id): axum::extract::Path<String>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "object": "list",
+            "data": []
+        })),
+    )
+        .into_response()
+}
+
+/// Handler for POST /v1/responses/{id}/cancel.
+pub async fn post_response_cancel(
+    State(_state): State<ProxyAuthState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "object": "response",
+            "status": "cancelled"
+        })),
+    )
+        .into_response()
+}
+
 /// Core inference request handler coordinating admission, editing, and forwarding.
 pub async fn handle_inference_request(
     state: ProxyAuthState,

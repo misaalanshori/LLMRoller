@@ -29,7 +29,28 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             post(crate::orchestrator::post_chat_completions),
         )
         .route("/v1/responses", post(crate::orchestrator::post_responses))
+        .route(
+            "/v1/responses/compact",
+            post(crate::orchestrator::post_responses_compact),
+        )
+        .route(
+            "/v1/responses/{id}",
+            get(crate::orchestrator::get_response_by_id)
+                .delete(crate::orchestrator::delete_response_by_id),
+        )
+        .route(
+            "/v1/responses/{id}/input_items",
+            get(crate::orchestrator::get_response_input_items),
+        )
+        .route(
+            "/v1/responses/{id}/cancel",
+            post(crate::orchestrator::post_response_cancel),
+        )
         .route("/v1/messages", post(crate::orchestrator::post_messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::orchestrator::post_messages_count_tokens),
+        )
         .layer(from_fn_with_state(
             state.clone(),
             client_key_auth_middleware,
