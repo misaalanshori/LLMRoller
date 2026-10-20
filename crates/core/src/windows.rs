@@ -2,7 +2,10 @@
 //!
 //! Spec: Section 6.9, Section 13.2, Section 13.2.1, Section 21.4, Requirements: LIM-1, Partial: USG-6, Partial: RTE-3.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Maximum age of an upstream /usage observation in milliseconds (30 minutes).
 pub const MAX_OBSERVATION_AGE_MS: i64 = 1_800_000;
@@ -330,6 +333,223 @@ impl AnchoredProvider {
         match &self.observation {
             None => local,
             Some(o) => o.project(local, now_ms),
+        }
+    }
+}
+
+/// Computes the cache-aware pre-flight reservation estimate in micro-USD.
+///
+/// Clamped to `[1_000, 2_000_000]` ($0.001 to $2.00) per SRDD Section 13.2.2.
+pub fn estimate_reservation_cost_micro_usd(
+    input_tokens_est: i64,
+    cache_ratio: f64,
+    rates: &crate::pricing::Rates,
+    max_tokens: Option<i64>,
+    model_max_output_tokens: Option<i64>,
+) -> i64 {
+    let cache_ratio = cache_ratio.clamp(0.0, 1.0);
+    let in_rate = (1.0 - cache_ratio) * (rates.input_per_mtok_micro_usd as f64)
+        + cache_ratio * (rates.cache_read_per_mtok_micro_usd as f64);
+    let in_cost = (input_tokens_est as f64) * in_rate;
+
+    let out_tokens_est = max_tokens
+        .or(model_max_output_tokens)
+        .unwrap_or(8192)
+        .min(8192);
+    let out_cost = (out_tokens_est as f64) * (rates.output_per_mtok_micro_usd as f64);
+
+    let total = in_cost + out_cost;
+    let est = (total / 1_000_000.0).ceil() as i64;
+    est.clamp(1_000, 2_000_000)
+}
+
+/// Budget counter abstraction for CAS-based reservation.
+pub trait BudgetCounter: Send + Sync {
+    fn counter_id(&self) -> u64;
+    fn effective_used(&self, now_ms: i64) -> i64;
+    fn limit_micro_usd(&self) -> i64;
+    fn reserve_percent(&self) -> i64;
+    fn max_allowed_spend(&self) -> i64 {
+        let pct = (100 - self.reserve_percent()).clamp(0, 100);
+        (self.limit_micro_usd() * pct) / 100
+    }
+    fn reserved_in_flight(&self) -> &AtomicI64;
+    fn record_actual(&self, now_ms: i64, amount_micro_usd: i64);
+}
+
+/// Thread-safe in-memory budget counter backed by a rolling ring and atomic reservation ledger.
+pub struct AtomicBudgetCounter {
+    pub id: u64,
+    pub limit_micro_usd: i64,
+    pub reserve_percent: i64,
+    pub ring: RwLock<RollingRing>,
+    pub reserved: AtomicI64,
+    pub observation: RwLock<Option<UpstreamObservation>>,
+}
+
+impl AtomicBudgetCounter {
+    pub fn new(id: u64, limit_micro_usd: i64, reserve_percent: i64, period_ms: i64) -> Self {
+        Self {
+            id,
+            limit_micro_usd,
+            reserve_percent,
+            ring: RwLock::new(RollingRing::new(period_ms)),
+            reserved: AtomicI64::new(0),
+            observation: RwLock::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for AtomicBudgetCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicBudgetCounter")
+            .field("id", &self.id)
+            .field("limit_micro_usd", &self.limit_micro_usd)
+            .field("reserve_percent", &self.reserve_percent)
+            .field(
+                "reserved",
+                &self.reserved.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl BudgetCounter for AtomicBudgetCounter {
+    fn counter_id(&self) -> u64 {
+        self.id
+    }
+
+    fn effective_used(&self, now_ms: i64) -> i64 {
+        let local = self.ring.read().sum_at(now_ms);
+        let obs = *self.observation.read();
+        match obs {
+            None => local,
+            Some(o) => o.project(local, now_ms),
+        }
+    }
+
+    fn limit_micro_usd(&self) -> i64 {
+        self.limit_micro_usd
+    }
+
+    fn reserve_percent(&self) -> i64 {
+        self.reserve_percent
+    }
+
+    fn reserved_in_flight(&self) -> &AtomicI64 {
+        &self.reserved
+    }
+
+    fn record_actual(&self, now_ms: i64, amount_micro_usd: i64) {
+        self.ring.write().record(now_ms, amount_micro_usd);
+    }
+}
+
+/// Error returned when reservation fails admission check on any counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationError {
+    LimitExceeded {
+        counter_id: u64,
+        effective_used: i64,
+        reserved: i64,
+        max_allowed: i64,
+        requested: i64,
+    },
+}
+
+/// RAII reservation guard that rolls back on abort/drop or posts actual spend on commit.
+pub struct Reservation {
+    counters: Vec<Arc<dyn BudgetCounter>>,
+    pub estimate_micro_usd: i64,
+    committed: bool,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("counter_count", &self.counters.len())
+            .field("estimate_micro_usd", &self.estimate_micro_usd)
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
+impl Reservation {
+    /// Attempts to acquire an atomic reservation across all counters in fixed ID order.
+    pub fn try_reserve(
+        mut counters: Vec<Arc<dyn BudgetCounter>>,
+        estimate_micro_usd: i64,
+        now_ms: i64,
+    ) -> Result<Self, ReservationError> {
+        // Sort in fixed ascending order to prevent deadlocks
+        counters.sort_by_key(|c| c.counter_id());
+
+        let mut acquired: Vec<&Arc<dyn BudgetCounter>> = Vec::new();
+        for counter in &counters {
+            let max_allowed = counter.max_allowed_spend();
+            loop {
+                let current_reserved = counter.reserved_in_flight().load(Ordering::Acquire);
+                let used = counter.effective_used(now_ms);
+                if used + current_reserved + estimate_micro_usd > max_allowed {
+                    // Roll back all previously acquired counters in reverse order
+                    for prev in acquired.iter().rev() {
+                        prev.reserved_in_flight()
+                            .fetch_sub(estimate_micro_usd, Ordering::AcqRel);
+                    }
+                    return Err(ReservationError::LimitExceeded {
+                        counter_id: counter.counter_id(),
+                        effective_used: used,
+                        reserved: current_reserved,
+                        max_allowed,
+                        requested: estimate_micro_usd,
+                    });
+                }
+
+                if counter
+                    .reserved_in_flight()
+                    .compare_exchange_weak(
+                        current_reserved,
+                        current_reserved + estimate_micro_usd,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    acquired.push(counter);
+                    break;
+                }
+            }
+        }
+
+        Ok(Self {
+            counters,
+            estimate_micro_usd,
+            committed: false,
+        })
+    }
+
+    /// Commits actual spend to counters and releases reservation.
+    pub fn commit(mut self, actual_micro_usd: i64, now_ms: i64) {
+        for counter in &self.counters {
+            // Post actual cost first
+            counter.record_actual(now_ms, actual_micro_usd);
+            // Then release in-flight reservation
+            counter
+                .reserved_in_flight()
+                .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            for counter in &self.counters {
+                counter
+                    .reserved_in_flight()
+                    .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+            }
         }
     }
 }

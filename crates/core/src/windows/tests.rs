@@ -125,3 +125,75 @@ fn test_decaying_upstream_observation_projection_and_expiry() {
     assert!(short_obs.is_expired(t0 + 15 * 60_000));
     assert_eq!(short_obs.project(1_200_000, t0 + 15 * 60_000), 1_200_000);
 }
+
+#[doc = "Spec: LIM-1, Partial: RTE-3"]
+#[test]
+fn test_50_concurrent_try_reserve_at_97_9_pct_caps_at_98_pct() {
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    let t0 = 1_000_000_000_000;
+    // $10.00 window with 2% reserve -> max allowed spend is $10.00 * 0.98 = $9.80 (9_800_000 micro-USD)
+    let limit_micro_usd = 10_000_000;
+    let reserve_pct = 2;
+    let period_ms = 18_000_000; // 5h
+
+    let counter = Arc::new(AtomicBudgetCounter::new(
+        1,
+        limit_micro_usd,
+        reserve_pct,
+        period_ms,
+    ));
+
+    // Seed at 97.9% = 9_790_000 micro-USD
+    counter.record_actual(t0, 9_790_000);
+    assert_eq!(counter.effective_used(t0), 9_790_000);
+    assert_eq!(counter.max_allowed_spend(), 9_800_000);
+
+    // Rate that calculates minimum clamped estimate: $0.001 (1,000 micro-USD)
+    let rates = crate::pricing::Rates {
+        input_per_mtok_micro_usd: 1_000,
+        output_per_mtok_micro_usd: 1_000,
+        cache_read_per_mtok_micro_usd: 100,
+        cache_write_per_mtok_micro_usd: 100,
+    };
+    let est = estimate_reservation_cost_micro_usd(100, 0.5, &rates, Some(10), Some(10));
+    assert_eq!(est, 1_000); // exactly $0.001 clamped minimum
+
+    // Headroom: 9_800_000 - 9_790_000 = 10_000 micro-USD.
+    // Each reservation takes 1,000 micro-USD, so exactly 10 can fit.
+    let admitted_count = Arc::new(AtomicUsize::new(0));
+    let rejected_count = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let c: Arc<dyn BudgetCounter> = Arc::clone(&counter) as Arc<dyn BudgetCounter>;
+        let admitted = Arc::clone(&admitted_count);
+        let rejected = Arc::clone(&rejected_count);
+
+        handles.push(thread::spawn(move || {
+            match Reservation::try_reserve(vec![c], est, t0) {
+                Ok(res) => {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                    // Simulate fast work and commit
+                    res.commit(est, t0 + 1000);
+                }
+                Err(_) => {
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread join must succeed");
+    }
+
+    assert_eq!(admitted_count.load(Ordering::SeqCst), 10);
+    assert_eq!(rejected_count.load(Ordering::SeqCst), 40);
+
+    // Final reserved should be back to 0
+    assert_eq!(counter.reserved_in_flight().load(Ordering::SeqCst), 0);
+    // Final effective used is exactly 9_790_000 + 10 * 1_000 = 9_800_000
+    assert_eq!(counter.effective_used(t0 + 1000), 9_800_000);
+}
