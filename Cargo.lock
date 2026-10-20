@@ -1500,11 +1500,13 @@ name = "llmroller-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hmac",
  "http",
  "llmroller-core",
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror",
 ]
 
