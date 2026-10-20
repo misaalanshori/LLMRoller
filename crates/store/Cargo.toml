@@ -13,6 +13,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+argon2.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
@@ -23,8 +24,10 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+totp-rs.workspace = true
 ulid.workspace = true
 zeroize.workspace = true
 

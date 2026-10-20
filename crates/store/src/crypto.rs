@@ -227,7 +227,7 @@ pub fn load_master_key_from_env() -> Result<MasterKey, MasterKeyError> {
     load_master_key(None, inline.as_deref())
 }
 
-/// Load the active master-key identifier from `LLMROLLER_MASTER_KEY_ID`.
+/// Compute lowercase SHA-256 over arbitrary bytes.\n#[must_use]\npub fn sha256_hex(input: &[u8]) -> String {\n    use sha2::Digest as _;\n\n    let digest = sha2::Sha256::digest(input);\n    let mut encoded = String::with_capacity(digest.len() * 2);\n    for byte in digest {\n        use std::fmt::Write as _;\n        write!(&mut encoded, \"{byte:02x}\").expect(\"writing to a String cannot fail\");\n    }\n    encoded\n}\n\n/// Load the active master-key identifier from `LLMROLLER_MASTER_KEY_ID`.
 ///
 /// # Errors
 ///
