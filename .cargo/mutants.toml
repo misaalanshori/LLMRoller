@@ -1,0 +1,11 @@
+# cargo-mutants configuration.
+# Spec: ./docs/srdd/16. SRDD - Testing Plan and TDD Governance.md#16.5.6
+exclude_globs = [
+    "crates/server/src/main.rs",
+    "xtask/src/main.rs",
+]
+exclude_re = [
+    "impl (std::fmt::)?Display for",
+]
+timeout_multiplier = 2.0
+minimum_test_timeout = "60s"

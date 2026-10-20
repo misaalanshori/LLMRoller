@@ -1,0 +1,1 @@
+# Required so the container build context always contains the presets directory.

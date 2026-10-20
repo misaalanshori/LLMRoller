@@ -1,0 +1,38 @@
+# Build outputs and caches
+/target/
+**/target/
+*.profraw
+*.profdata
+lcov.info
+coverage/
+cargo-timings/
+
+# Local runtime state, SQLite WAL files, and secrets
+/var/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.lock
+!Cargo.lock
+setup-token
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# IDE and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test / tooling artifacts
+artifacts/
+tmp/
+*.log
+mutants.out/
+mutants.out.old/

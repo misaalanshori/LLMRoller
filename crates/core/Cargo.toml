@@ -1,0 +1,15 @@
+[package]
+name = "llmroller-core"
+description = "Pure domain logic, identifiers, RBAC, and seam traits for LLMRoller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

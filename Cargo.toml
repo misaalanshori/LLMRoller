@@ -1,0 +1,113 @@
+# LLMRoller workspace manifest.
+# Spec: ./docs/srdd/15. SRDD - Technology Choices and Workspace Layout.md#15.2
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/proto",
+    "crates/store",
+    "crates/proxy",
+    "crates/admin",
+    "crates/server",
+    "xtask",
+]
+default-members = [
+    "crates/core",
+    "crates/proto",
+    "crates/store",
+    "crates/proxy",
+    "crates/admin",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+authors = ["LLMRoller contributors"]
+repository = "https://github.com/llmroller/llmroller"
+homepage = "https://github.com/llmroller/llmroller"
+
+[workspace.dependencies]
+# Domain and protocol
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+bytes = "1.12.1"
+toml = "1.1.8"
+time = { version = "0.3.55", features = ["serde"] }
+
+# Identifiers, secrets, and cryptography
+ulid = "3.0.0"
+secrecy = "0.10.3"
+zeroize = { version = "1.9.1", features = ["derive"] }
+chacha20poly1305 = "0.11.0"
+hkdf = "0.13.0"
+sha2 = "0.11.1"
+hmac = "0.13.0"
+subtle = "2.6.1"
+argon2 = "0.6.0"
+totp-rs = "6.0.0"
+base64 = "0.22.1"
+getrandom = "0.4.3"
+rand = "0.10.3"
+
+# Concurrency and in-memory state
+arc-swap = "1.9.3"
+dashmap = "6.1.0"
+parking_lot = "0.12.5"
+smallvec = "1.15.1"
+
+# Async runtime and HTTP stack
+tokio = { version = "1.54.0", features = ["full"] }
+tokio-util = "0.7.20"
+futures-util = "0.3.32"
+axum = "0.8.9"
+hyper = { version = "1.9.0", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+http = "1.4.0"
+http-body = "1.0.1"
+http-body-util = "0.1.5"
+tower = "0.5.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-tls", "stream", "http2", "json"] }
+
+# Persistence
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+
+# Observability
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+
+# CLI and errors
+clap = { version = "4.6.7", features = ["derive"] }
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+
+# Testing
+proptest = "1.10.0"
+tempfile = "3.25.0"
+tokio-test = "0.4.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev.package."*"]
+opt-level = 1
