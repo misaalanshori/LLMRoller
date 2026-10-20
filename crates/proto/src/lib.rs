@@ -7,4 +7,6 @@ pub mod adapters;
 pub mod affinity;
 pub mod body_edit;
 pub mod headers;
+pub mod json_usage;
 pub mod sse_frame;
+pub mod sse_tap;

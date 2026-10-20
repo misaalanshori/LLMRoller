@@ -13,8 +13,9 @@ use crate::body_edit::ChatStreamMode;
 use crate::headers::UaPolicy;
 
 /// Upstream endpoint kinds for inference, discovery, usage, and auxiliary capabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
+    #[default]
     Chat,
     Responses,
     Messages,
