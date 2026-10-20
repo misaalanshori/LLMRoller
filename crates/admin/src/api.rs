@@ -597,6 +597,77 @@ fn map_price_error(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateTraceabilityRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub match_filters: llmroller_core::settings::TraceabilityMatch,
+    pub retention_days: i64,
+    pub auto_disable_at: Option<i64>,
+    pub confirm_purge: Option<bool>,
+}
+
+async fn put_admin_traceability_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateTraceabilityRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let settings = llmroller_store::settings::load_settings(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let now_ms = state.auth.clock.now_ms();
+
+    // Confirm purge guard (Section 6.10, TRC-1)
+    if payload.retention_days < settings.traceability_config.retention_days
+        && payload.confirm_purge != Some(true)
+    {
+        let new_cutoff = now_ms - payload.retention_days * 86_400_000;
+        let affected_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM trace_records WHERE created_at < ?")
+                .bind(new_cutoff)
+                .fetch_one(&state.auth.pool)
+                .await
+                .unwrap_or(0);
+
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "purge_confirmation_required",
+                    "message": "Lowering retention days requires explicit purge confirmation",
+                    "affected_rows": affected_rows
+                }
+            })),
+        ));
+    }
+
+    let new_config = llmroller_core::settings::TraceabilityConfig {
+        enabled: payload.enabled,
+        match_filters: payload.match_filters,
+        retention_days: payload.retention_days,
+        auto_disable_at: payload.auto_disable_at,
+    };
+
+    let config_json_str = serde_json::to_string(&new_config)
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    llmroller_store::settings::update_setting(
+        &state.auth.pool,
+        "traceability_config",
+        &config_json_str,
+        now_ms,
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "traceability_config": new_config
+    })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpsertPricePayload {
     pub provider_id: Option<String>,
     pub provider_kind: String,
@@ -766,6 +837,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/settings",
             get(get_admin_settings_handler).patch(patch_admin_settings_handler),
+        )
+        .route(
+            "/admin/api/settings/traceability",
+            put(put_admin_traceability_handler),
         )
         .route("/admin/api/prices", put(put_admin_price_handler))
         .route(
