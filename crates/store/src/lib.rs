@@ -16,5 +16,6 @@ pub mod providers;
 pub mod rotation;
 pub mod settings;
 pub mod shares;
+pub mod usage_writer;
 pub mod users;
 pub mod writer;
