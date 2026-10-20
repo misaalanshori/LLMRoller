@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ids::UserId;
-use crate::rbac::Role;
+use crate::ids::{ProviderId, UpstreamKeyId, UserId};
+use crate::provider::ProviderKind;
+use crate::rbac::{OwnershipScope, Role};
 use crate::settings::RuntimeSettings;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,37 @@ pub struct UserRecord {
     pub global_budget_micro_usd_month: Option<i64>,
 }
 
+/// In-memory projection of a provider for hot-path routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    pub id: ProviderId,
+    pub ownership_scope: OwnershipScope,
+    pub owner_user_id: Option<UserId>,
+    pub kind: ProviderKind,
+    pub name: String,
+    pub base_url: String,
+    pub config_json: String,
+    pub share_config_fingerprint: String,
+    pub usage_url_cross_origin_ack: bool,
+    pub allow_private_network: bool,
+    pub enabled: bool,
+}
+
+/// In-memory projection of an upstream key for hot-path routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamKeyRecord {
+    pub id: UpstreamKeyId,
+    pub provider_id: ProviderId,
+    pub owner_user_id: Option<UserId>,
+    pub label: String,
+    pub secret_last4: String,
+    pub enabled: bool,
+    pub priority: i64,
+    pub strict_tier: i64,
+    pub health: String,
+    pub health_version: i64,
+}
+
 /// Cache invalidation events applied immediately after atomic snapshot publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheInvalidationEvent {
@@ -46,6 +78,8 @@ pub enum CacheInvalidationEvent {
     OwnerDisabled(UserId),
     SettingsChanged,
     StrategyChanged,
+    ProviderChanged(ProviderId),
+    UpstreamKeyChanged(UpstreamKeyId),
 }
 
 /// Immutable configuration snapshot loaded into [`arc_swap::ArcSwap`].
@@ -54,6 +88,8 @@ pub struct ConfigSnapshot {
     pub config_version: i64,
     pub users: Arc<HashMap<UserId, UserRecord>>,
     pub settings: Arc<RuntimeSettings>,
+    pub providers: Arc<HashMap<ProviderId, ProviderRecord>>,
+    pub upstream_keys: Arc<HashMap<UpstreamKeyId, UpstreamKeyRecord>>,
 }
 
 impl ConfigSnapshot {
@@ -68,6 +104,18 @@ impl ConfigSnapshot {
     pub fn settings(&self) -> &RuntimeSettings {
         &self.settings
     }
+
+    /// Lookup an in-memory provider record by identifier.
+    #[must_use]
+    pub fn get_provider(&self, provider_id: &ProviderId) -> Option<&ProviderRecord> {
+        self.providers.get(provider_id)
+    }
+
+    /// Lookup an in-memory upstream key record by identifier.
+    #[must_use]
+    pub fn get_upstream_key(&self, key_id: &UpstreamKeyId) -> Option<&UpstreamKeyRecord> {
+        self.upstream_keys.get(key_id)
+    }
 }
 
 impl Default for ConfigSnapshot {
@@ -76,6 +124,8 @@ impl Default for ConfigSnapshot {
             config_version: 0,
             users: Arc::new(HashMap::new()),
             settings: Arc::new(RuntimeSettings::default()),
+            providers: Arc::new(HashMap::new()),
+            upstream_keys: Arc::new(HashMap::new()),
         }
     }
 }

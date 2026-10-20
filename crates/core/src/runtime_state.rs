@@ -63,7 +63,9 @@ impl RuntimeState {
         for inv in invalidations {
             match inv {
                 CacheInvalidationEvent::StrategyChanged
-                | CacheInvalidationEvent::SettingsChanged => {
+                | CacheInvalidationEvent::SettingsChanged
+                | CacheInvalidationEvent::ProviderChanged(_)
+                | CacheInvalidationEvent::UpstreamKeyChanged(_) => {
                     self.health.bump_version();
                 }
                 CacheInvalidationEvent::UserChanged(_)

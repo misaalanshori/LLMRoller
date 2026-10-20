@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::snapshot::{ConfigDomain, ConfigSnapshot};
+use llmroller_store::providers::{
+    ProviderError, load_provider_records_tx, load_upstream_key_records_tx,
+};
 use llmroller_store::settings::{SettingsError, load_settings_tx};
 use llmroller_store::users::{UserError, load_user_records_tx};
 use llmroller_store::writer::ReloadNotification;
@@ -28,6 +31,8 @@ pub enum ReloaderError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     User(#[from] UserError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
     #[error("reloader version notification timed out")]
     Timeout,
     #[error("reloader channel closed")]
@@ -106,12 +111,16 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
 
     let users = load_user_records_tx(&mut tx).await?;
     let settings = load_settings_tx(&mut tx).await?;
+    let providers = load_provider_records_tx(&mut tx).await?;
+    let upstream_keys = load_upstream_key_records_tx(&mut tx).await?;
     tx.commit().await?;
 
     Ok(ConfigSnapshot {
         config_version: v,
         users: Arc::new(users),
         settings: Arc::new(settings),
+        providers: Arc::new(providers),
+        upstream_keys: Arc::new(upstream_keys),
     })
 }
 
@@ -203,6 +212,33 @@ pub fn start_reloader(
                         current.settings.clone()
                     };
 
+                let next_providers =
+                    if reload_all || changed_domains.contains(&ConfigDomain::Providers) {
+                        match load_provider_records_tx(&mut tx).await {
+                            Ok(providers) => Arc::new(providers),
+                            Err(err) => {
+                                tracing::error!("reloader failed to load providers slice: {err}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        current.providers.clone()
+                    };
+
+                let next_upstream_keys = if reload_all
+                    || changed_domains.contains(&ConfigDomain::UpstreamKeys)
+                {
+                    match load_upstream_key_records_tx(&mut tx).await {
+                        Ok(keys) => Arc::new(keys),
+                        Err(err) => {
+                            tracing::error!("reloader failed to load upstream_keys slice: {err}");
+                            continue;
+                        }
+                    }
+                } else {
+                    current.upstream_keys.clone()
+                };
+
                 if let Err(err) = tx.commit().await {
                     tracing::error!("reloader failed to commit read transaction: {err}");
                     continue;
@@ -212,6 +248,8 @@ pub fn start_reloader(
                     config_version: db_version,
                     users: next_users,
                     settings: next_settings,
+                    providers: next_providers,
+                    upstream_keys: next_upstream_keys,
                 };
 
                 // Store new snapshot atomically
