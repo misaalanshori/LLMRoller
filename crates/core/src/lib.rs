@@ -13,6 +13,7 @@ pub mod rbac;
 pub mod runtime_state;
 pub mod seams;
 pub mod settings;
+pub mod shares;
 pub mod snapshot;
 pub mod strategy;
 pub mod windows;
