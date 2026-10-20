@@ -378,7 +378,7 @@ fn cargo_xtask_alias_is_configured() {
 }
 
 #[test]
-#[doc = "Partial: POR-1"]
+#[doc = "Spec: SEC-10, Partial: POR-1"]
 fn lockfile_is_committed_despite_generic_lock_ignore() {
     let gitignore = read(".gitignore");
     assert!(
