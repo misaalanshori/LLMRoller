@@ -12,6 +12,7 @@ pub mod provider;
 pub mod rbac;
 pub mod runtime_state;
 pub mod seams;
+pub mod session;
 pub mod settings;
 pub mod shares;
 pub mod snapshot;
