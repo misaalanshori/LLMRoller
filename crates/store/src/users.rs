@@ -6,6 +6,7 @@
 //! Partial: AUTH-1, AUTH-4, AUTH-5, AUTH-6, AUTH-7, AUTH-8, AUTH-9
 //! Partial: SEC-4, SEC-12
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
@@ -36,7 +37,7 @@ const ARGON2_PARALLELISM: u32 = 1;
 const TOTP_SECRET_BYTES: usize = 20;
 
 /// Public account projection. Password and TOTP material never appear here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     /// ULID primary key.
     pub id: UserId,
@@ -121,7 +122,7 @@ impl std::fmt::Debug for UserLoginRecord {
 }
 
 /// A persisted web session row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebSession {
     /// SHA-256 of the opaque session cookie token.
     pub id_hash: String,
@@ -337,7 +338,8 @@ pub fn generate_temporary_password(entropy: &dyn EntropySource) -> SecretString 
     secret_string(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn validate_username(username: &str) -> Result<&str, UserError> {
+/// Validate username syntax and length bounds.
+pub fn validate_username(username: &str) -> Result<&str, UserError> {
     if username.is_empty() {
         return Err(UserError::InvalidUsername("must not be empty"));
     }
