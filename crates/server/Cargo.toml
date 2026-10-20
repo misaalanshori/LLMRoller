@@ -21,6 +21,7 @@ workspace = true
 clap.workspace = true
 llmroller-core = { path = "../core" }
 llmroller-store = { path = "../store" }
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

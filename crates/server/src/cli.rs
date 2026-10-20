@@ -41,6 +41,25 @@ pub(crate) enum Command {
     RotateMasterKey(RotateMasterKeyArgs),
     /// Restore an administrator account offline.
     ResetAdmin(ResetAdminArgs),
+    /// Verify the audit-log HMAC chain.
+    VerifyAuditLog(VerifyAuditLogArgs),
+}
+
+/// Arguments for `llmroller verify-audit-log`.
+#[derive(Debug, Args)]
+pub(crate) struct VerifyAuditLogArgs {
+    /// Expected anchor sequence number.
+    #[arg(long)]
+    pub(crate) anchor_seq: Option<i64>,
+    /// Expected anchor HMAC-SHA256 hex hash.
+    #[arg(long)]
+    pub(crate) anchor_hash: Option<String>,
+    /// Data directory containing `llmroller.db`.
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    /// Output summary in JSON format.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Arguments for `llmroller reset-admin`.
@@ -77,6 +96,7 @@ pub(crate) async fn main() -> ExitCode {
     match cli.command {
         Command::RotateMasterKey(args) => run_rotation(args).await,
         Command::ResetAdmin(args) => run_reset_admin(args).await,
+        Command::VerifyAuditLog(args) => run_verify_audit_log(args).await,
     }
 }
 
@@ -224,6 +244,70 @@ async fn reset_admin_command(args: ResetAdminArgs) -> Result<(), CliFailure> {
     Ok(())
 }
 
+async fn run_verify_audit_log(args: VerifyAuditLogArgs) -> ExitCode {
+    match verify_audit_log_command(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("error: {}", failure.message);
+            ExitCode::from(failure.code)
+        }
+    }
+}
+
+async fn verify_audit_log_command(args: VerifyAuditLogArgs) -> Result<(), CliFailure> {
+    let data_dir = resolve_data_dir(args.data_dir);
+    let master_key = load_master_key_from_env().map_err(|error| {
+        let code = u8::try_from(error.exit_code()).unwrap_or(3);
+        CliFailure::new(code, error.to_string())
+    })?;
+    let master_key_id = load_master_key_id_from_env().map_err(|error| {
+        let code = u8::try_from(error.exit_code()).unwrap_or(3);
+        CliFailure::new(code, error.to_string())
+    })?;
+
+    let database = data_dir.join("llmroller.db");
+    let pool = open_pool(&database, Role::cli_read_only())
+        .await
+        .map_err(|error| {
+            CliFailure::new(13, format!("cannot open {}: {error}", database.display()))
+        })?;
+
+    let clock = SystemClock::new();
+    let entropy = Arc::new(OsEntropy::new());
+    let instance_state =
+        load_or_initialize(&pool, &master_key_id, &master_key, entropy, clock.now_ms())
+            .await
+            .map_err(|error| {
+                let code = u8::try_from(error.exit_code()).unwrap_or(3);
+                CliFailure::new(code, error.to_string())
+            })?;
+
+    let report = llmroller_store::audit::verify_audit_log(
+        &pool,
+        instance_state.audit_hmac_key.expose_secret(),
+        args.anchor_seq,
+        args.anchor_hash.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        let code = u8::try_from(error.exit_code()).unwrap_or(13);
+        CliFailure::new(code, error.to_string())
+    })?;
+    pool.close().await;
+
+    if args.json {
+        let json_output =
+            serde_json::to_string(&report).map_err(|e| CliFailure::new(13, e.to_string()))?;
+        println!("{json_output}");
+    } else {
+        eprintln!(
+            "audit log verified: {} rows intact (tail seq {}, hash {})",
+            report.rows_verified, report.max_seq, report.tail_hash
+        );
+    }
+    Ok(())
+}
+
 fn resolve_data_dir(explicit: Option<PathBuf>) -> PathBuf {
     explicit
         .or_else(|| env::var_os(DATA_DIR_ENV).map(PathBuf::from))
@@ -345,6 +429,35 @@ mod tests {
                 );
             }
             _ => panic!("expected ResetAdmin"),
+        }
+    }
+
+    #[test]
+    #[doc = "Spec: AUD-1, Spec: SEC-13"]
+    fn verify_audit_log_parses_required_arguments() {
+        let cli = Cli::try_parse_from([
+            "llmroller",
+            "verify-audit-log",
+            "--anchor-seq",
+            "100",
+            "--anchor-hash",
+            "abcdef123456",
+            "--data-dir",
+            "/tmp/data",
+            "--json",
+        ])
+        .expect("valid verify-audit-log CLI");
+        match cli.command {
+            Command::VerifyAuditLog(args) => {
+                assert_eq!(args.anchor_seq, Some(100));
+                assert_eq!(args.anchor_hash.as_deref(), Some("abcdef123456"));
+                assert_eq!(
+                    args.data_dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/data"))
+                );
+                assert!(args.json);
+            }
+            _ => panic!("expected VerifyAuditLog"),
         }
     }
 }

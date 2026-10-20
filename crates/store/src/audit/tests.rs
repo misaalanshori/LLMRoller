@@ -6,7 +6,10 @@
 use sqlx::Connection;
 use tempfile::TempDir;
 
-use super::{AuditEntry, GENESIS_HASH, append, canonical_frame, entry_hash};
+use super::{
+    AuditEntry, AuditVerificationError, GENESIS_HASH, append, canonical_frame, entry_hash,
+    format_audit_anchor, verify_audit_log,
+};
 use crate::migrations::migrate;
 use crate::pool::{Role, open_pool};
 
@@ -55,48 +58,123 @@ fn nullable_audit_fields_are_unambiguous() {
 }
 
 #[tokio::test]
-#[doc = "Partial: AUD-1, Partial: SEC-13"]
-async fn appended_rows_chain_from_genesis_and_previous_hash() {
+#[doc = "Spec: AUD-1, Spec: SEC-13"]
+async fn hash_chain_verification() {
     let (_directory, pool) = migrated_database().await;
-    let key = [0x42_u8; 32];
-    let mut connection = pool.acquire().await.expect("connection");
+    let key = [0x77_u8; 32];
 
-    let mut first_tx = connection.begin().await.expect("transaction");
-    let (first_seq, first_hash) = append(&mut first_tx, &key, entry("first"))
+    // (1) Inserting 10 audit rows (including backward NTP wall-clock steps on ts) verifies cleanly
+    let timestamps = [
+        1_700_000_000_000,
+        1_700_000_001_000,
+        1_699_999_990_000, // backward NTP step
+        1_700_000_002_000,
+        1_699_999_980_000, // backward NTP step
+        1_700_000_003_000,
+        1_700_000_004_000,
+        1_700_000_005_000,
+        1_700_000_006_000,
+        1_700_000_007_000,
+    ];
+
+    let mut hashes = Vec::new();
+    for (i, &ts) in timestamps.iter().enumerate() {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let mut tx = conn.begin().await.expect("begin");
+        let action = format!("action_{i}");
+        let mut ent = entry(&action);
+        ent.ts = ts;
+        let (seq, hash) = append(&mut tx, &key, ent).await.expect("append");
+        tx.commit().await.expect("commit");
+        assert_eq!(seq, (i + 1) as i64);
+        hashes.push(hash);
+    }
+
+    let report = verify_audit_log(&pool, &key, None, None)
         .await
-        .expect("first audit row");
-    first_tx.commit().await.expect("commit first row");
+        .expect("verify clean chain");
+    assert_eq!(report.rows_verified, 10);
+    assert_eq!(report.max_seq, 10);
+    assert_eq!(report.tail_hash, hashes[9]);
 
-    let mut second_tx = connection.begin().await.expect("transaction");
-    let (second_seq, second_hash) = append(&mut second_tx, &key, entry("second"))
+    // (3) Anchor format test
+    let anchor_line = format_audit_anchor(10, &hashes[9], timestamps[9]);
+    assert!(anchor_line.starts_with("{\"event\":\"audit_anchor\",\"seq\":10,"));
+
+    // (4) Anchor verification with valid anchor succeeds
+    let anchor_report = verify_audit_log(&pool, &key, Some(10), Some(&hashes[9]))
         .await
-        .expect("second audit row");
-    second_tx.commit().await.expect("commit second row");
+        .expect("verify with anchor");
+    assert_eq!(anchor_report.max_seq, 10);
 
-    assert_eq!(first_seq, 1);
-    assert_eq!(second_seq, 2);
-    assert_eq!(first_hash.len(), 64);
-    assert_eq!(second_hash.len(), 64);
+    // (2a) Mutate one character in row 4: detects HashMismatch (exit code 8)
+    sqlx::query("UPDATE audit_log SET action = 'tampered' WHERE seq = 4")
+        .execute(&pool)
+        .await
+        .expect("tamper row 4");
+    let tamper_err = verify_audit_log(&pool, &key, None, None)
+        .await
+        .expect_err("tamper must fail");
+    assert!(matches!(
+        tamper_err,
+        AuditVerificationError::HashMismatch { seq: 4, .. }
+    ));
+    assert_eq!(tamper_err.exit_code(), 8);
 
-    drop(connection);
-    let first: (String, String) =
-        sqlx::query_as("SELECT prev_hash, hash FROM audit_log WHERE seq = 1")
-            .fetch_one(&pool)
-            .await
-            .expect("first row");
-    let second: (String, String) =
-        sqlx::query_as("SELECT prev_hash, hash FROM audit_log WHERE seq = 2")
-            .fetch_one(&pool)
-            .await
-            .expect("second row");
-    assert_eq!(first.0, GENESIS_HASH);
-    assert_eq!(first.1, first_hash);
-    assert_eq!(second.0, first_hash);
-    assert_eq!(second.1, second_hash);
-    assert_eq!(
-        entry_hash(&key, &entry("second"), 2, &first_hash),
-        second_hash
-    );
+    // Restore row 4 action and hash
+    let mut restored_ent = entry("action_3");
+    restored_ent.ts = timestamps[3];
+    let computed_h4 = entry_hash(&key, &restored_ent, 4, &hashes[2]);
+    sqlx::query("UPDATE audit_log SET action = 'action_3', hash = ? WHERE seq = 4")
+        .bind(computed_h4)
+        .execute(&pool)
+        .await
+        .expect("restore row 4");
 
-    pool.close().await;
+    // (2b) Delete row 5 leaving a seq gap: detects SequenceGap (exit code 8)
+    sqlx::query("DELETE FROM audit_log WHERE seq = 5")
+        .execute(&pool)
+        .await
+        .expect("delete row 5");
+    let gap_err = verify_audit_log(&pool, &key, None, None)
+        .await
+        .expect_err("gap must fail");
+    assert!(matches!(
+        gap_err,
+        AuditVerificationError::SequenceGap {
+            seq: 6,
+            expected_seq: 5,
+            ..
+        }
+    ));
+    assert_eq!(gap_err.exit_code(), 8);
+
+    // (4) Deleting the last 3 rows causes verify-audit-log --anchor-seq 10 --anchor-hash H to exit with code 9 (truncation detected)
+    let (_dir2, pool2) = migrated_database().await;
+    for (i, &ts) in timestamps.iter().enumerate() {
+        let mut conn = pool2.acquire().await.expect("acquire");
+        let mut tx = conn.begin().await.expect("begin");
+        let action = format!("action_{i}");
+        let mut ent = entry(&action);
+        ent.ts = ts;
+        append(&mut tx, &key, ent).await.expect("append");
+        tx.commit().await.expect("commit");
+    }
+    // Delete last 3 rows (seq 8, 9, 10)
+    sqlx::query("DELETE FROM audit_log WHERE seq >= 8")
+        .execute(&pool2)
+        .await
+        .expect("delete last 3 rows");
+    let trunc_err = verify_audit_log(&pool2, &key, Some(10), Some(&hashes[9]))
+        .await
+        .expect_err("truncation must be detected");
+    assert!(matches!(
+        trunc_err,
+        AuditVerificationError::TruncationDetected {
+            anchor_seq: 10,
+            max_seq: 7,
+            ..
+        }
+    ));
+    assert_eq!(trunc_err.exit_code(), 9);
 }
