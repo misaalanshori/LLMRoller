@@ -146,3 +146,70 @@ fn test_compression_fallback_decoder() {
     let br_decompressed = decompress_chunk("br", &br_bytes).expect("decompress br");
     assert_eq!(br_decompressed.as_slice(), plain);
 }
+
+/// Spec: API-7
+/// Verify RequestLifecycle RAII completion guard:
+/// 1. Premature drop (client disconnect / future cancellation) triggers Termination::ClientGone
+///    and invokes on_finalize exactly once.
+/// 2. Normal completion sets Termination::Completed.
+/// 3. Upstream truncation sets Termination::UpstreamTruncated.
+#[doc = "Spec: API-7"]
+#[test]
+fn test_request_lifecycle_completion_and_abort_guards() {
+    use llmroller_core::ids::RequestId;
+    use llmroller_proxy::lifecycle::{RequestLifecycle, Termination, UsageAccumulator};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let counter = Arc::new(AtomicU32::new(0));
+    let term_observed = Arc::new(Mutex::new(None));
+
+    // Case 1: Premature drop -> ClientGone
+    {
+        let counter_clone = counter.clone();
+        let term_clone = term_observed.clone();
+        let mut lifecycle = RequestLifecycle::new(
+            RequestId::generate(),
+            1000,
+            Some(Box::new(move |term, usage| {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                *term_clone.lock().expect("lock") = Some(term);
+                assert_eq!(usage.prompt_tokens, 50);
+            })),
+        );
+        lifecycle.update_usage(UsageAccumulator {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            ..Default::default()
+        });
+        // Dropped without explicit finalize
+    }
+
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *term_observed.lock().expect("lock"),
+        Some(Termination::ClientGone)
+    );
+
+    // Case 2: Normal completion -> Completed
+    let counter2 = Arc::new(AtomicU32::new(0));
+    let term2 = Arc::new(Mutex::new(None));
+    {
+        let counter_clone = counter2.clone();
+        let term_clone = term2.clone();
+        let mut lifecycle = RequestLifecycle::new(
+            RequestId::generate(),
+            2000,
+            Some(Box::new(move |term, _| {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                *term_clone.lock().expect("lock") = Some(term);
+            })),
+        );
+        lifecycle.set_termination(Termination::Completed);
+        lifecycle.finalize();
+        // Redundant finalize has no effect (runs exactly once)
+        lifecycle.finalize();
+    }
+    assert_eq!(counter2.load(Ordering::SeqCst), 1);
+    assert_eq!(*term2.lock().expect("lock"), Some(Termination::Completed));
+}

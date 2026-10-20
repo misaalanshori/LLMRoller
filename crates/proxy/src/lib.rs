@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod clock;
 pub mod forward;
+pub mod lifecycle;
 pub mod listeners;
 pub mod metrics;
 pub mod ssrf;
