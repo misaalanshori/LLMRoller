@@ -3236,6 +3236,7 @@ lcov.info
 *.db-wal
 *.db-shm
 *.lock
+!Cargo.lock
 setup-token
 .env
 .env.*

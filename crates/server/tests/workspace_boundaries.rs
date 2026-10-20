@@ -279,6 +279,12 @@ fn dockerignore_excludes_secrets_and_build_output() {
             .lines()
             .any(|line| line.trim() == "!.env.example")
     );
+    assert!(
+        dockerignore
+            .lines()
+            .any(|line| line.trim() == "!Cargo.lock"),
+        ".dockerignore must un-ignore Cargo.lock for --locked builds"
+    );
 }
 
 #[test]
