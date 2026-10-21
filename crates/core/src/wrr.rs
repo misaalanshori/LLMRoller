@@ -6,6 +6,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
+use crate::ids::ModelPk;
 use crate::seams::EntropySource;
 use crate::strategy::{RouteId, RouteLoadTracker, RouteSelector, RoutingStrategy, WrrGroupKey};
 
@@ -144,6 +145,11 @@ impl RouteSelector for SmoothWeightedRrSelector {
         lock.remove(group_key);
     }
 
+    fn reset_model(&self, model_pk: ModelPk) {
+        let mut lock = self.groups.lock();
+        lock.retain(|key, _| key.model_pk != model_pk);
+    }
+
     fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64) {
         let mut lock = self.groups.lock();
         lock.retain(|_, g| now_ms - g.last_used_ms < max_idle_ms);
@@ -253,6 +259,11 @@ impl RouteSelector for WeightedRrSelector {
     fn reset_group(&self, group_key: &WrrGroupKey) {
         let mut lock = self.groups.lock();
         lock.remove(group_key);
+    }
+
+    fn reset_model(&self, model_pk: ModelPk) {
+        let mut lock = self.groups.lock();
+        lock.retain(|key, _| key.model_pk != model_pk);
     }
 
     fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64) {

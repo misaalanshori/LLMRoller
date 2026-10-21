@@ -51,6 +51,8 @@ pub trait RouteSelector: Send + Sync {
     ) -> Option<RouteId>;
     fn on_weights_updated(&self, group_key: &WrrGroupKey);
     fn reset_group(&self, group_key: &WrrGroupKey);
+    /// Drop all per-group cursor state belonging to a model whose route set changed.
+    fn reset_model(&self, _model_pk: ModelPk) {}
     fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64);
 }
 
@@ -143,6 +145,11 @@ impl RouteSelector for NaiveRrSelector {
     fn reset_group(&self, group_key: &WrrGroupKey) {
         let mut lock = self.groups.lock();
         lock.remove(group_key);
+    }
+
+    fn reset_model(&self, model_pk: ModelPk) {
+        let mut lock = self.groups.lock();
+        lock.retain(|key, _| key.model_pk != model_pk);
     }
 
     fn evict_idle_groups(&self, now_ms: i64, max_idle_ms: i64) {

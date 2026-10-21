@@ -182,10 +182,7 @@ impl RouteSelectorSet {
             &self.weighted_random,
             &self.p2c,
         ] {
-            let _ = &model_pk;
-            // Group keys embed the model; evict via a synthetic sweep key is not possible,
-            // so groups are reset by callers that own the concrete key.
-            let _ = selector;
+            selector.reset_model(model_pk);
         }
     }
 }
@@ -444,9 +441,12 @@ impl RuntimeState {
                 | CacheInvalidationEvent::CapChanged => {
                     rebuild_windows = true;
                 }
+                CacheInvalidationEvent::ModelRoutesChanged(model_pk) => {
+                    self.selectors.reset_model(*model_pk);
+                    self.health.bump_version();
+                }
                 CacheInvalidationEvent::StrategyChanged
                 | CacheInvalidationEvent::SettingsChanged
-                | CacheInvalidationEvent::ModelRoutesChanged(_)
                 | CacheInvalidationEvent::ClientKeyChanged(_)
                 | CacheInvalidationEvent::ShareChanged(_) => {
                     self.health.bump_version();
@@ -501,4 +501,103 @@ fn stable_counter_id(id: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(id, &mut hasher);
     std::hash::Hasher::finish(&hasher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::UserId;
+    use crate::seams::EntropySource;
+
+    struct FixedEntropy(u64);
+
+    impl EntropySource for FixedEntropy {
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+
+        fn next_u64_bounded(&self, upper: u64) -> u64 {
+            if upper == 0 { 0 } else { self.0 % upper }
+        }
+    }
+
+    fn route_a() -> RouteId {
+        RouteId {
+            upstream_key_id: UpstreamKeyId::generate(),
+            model_pk: ModelPk::generate(),
+        }
+    }
+
+    fn route_b() -> RouteId {
+        RouteId {
+            upstream_key_id: UpstreamKeyId::generate(),
+            model_pk: ModelPk::generate(),
+        }
+    }
+
+    fn route_c() -> RouteId {
+        RouteId {
+            upstream_key_id: UpstreamKeyId::generate(),
+            model_pk: ModelPk::generate(),
+        }
+    }
+
+    /// Spec: RTE-4, RTE-5, F08; ModelRoutesChanged must drop stale cursor state.
+    #[test]
+    fn model_route_invalidation_resets_round_robin_cursors() {
+        let runtime = RuntimeState::new();
+        let model_pk = ModelPk::generate();
+        let candidates = [(route_a(), 1), (route_b(), 1), (route_c(), 1)];
+        let group = RuntimeState::group_key(UserId::generate(), model_pk, "chat", 0);
+        let entropy = FixedEntropy(0);
+        let selector = runtime.selectors.selector(RoutingStrategy::NaiveRr);
+
+        let first = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("first selection");
+        let second = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("second selection");
+        assert_ne!(first, second, "round robin must advance its cursor");
+
+        runtime.selectors.reset_model(model_pk);
+
+        let after_reset = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("selection after reset");
+        assert_eq!(
+            after_reset, first,
+            "reset_model must clear the per-model round-robin cursor"
+        );
+    }
+
+    /// Spec: RTE-4, F08; the reloader applies ModelRoutesChanged invalidations.
+    #[test]
+    fn apply_invalidations_resets_selectors_for_changed_model() {
+        let runtime = RuntimeState::new();
+        let snapshot = ConfigSnapshot::default();
+        let model_pk = ModelPk::generate();
+        let candidates = [(route_a(), 1), (route_b(), 1), (route_c(), 1)];
+        let group = RuntimeState::group_key(UserId::generate(), model_pk, "chat", 0);
+        let entropy = FixedEntropy(0);
+        let selector = runtime.selectors.selector(RoutingStrategy::NaiveRr);
+
+        let first = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("first selection");
+        let _ = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("second selection");
+
+        runtime.apply_invalidations(
+            &[CacheInvalidationEvent::ModelRoutesChanged(model_pk)],
+            &snapshot,
+            1,
+        );
+
+        let after_reload = selector
+            .select_next(&group, &candidates, 0, &entropy, None)
+            .expect("selection after reload");
+        assert_eq!(after_reload, first);
+    }
 }
