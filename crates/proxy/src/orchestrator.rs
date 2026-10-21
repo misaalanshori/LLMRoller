@@ -259,6 +259,7 @@ pub async fn handle_inference_request(
     {
         Ok(p) => p,
         Err(err) => {
+            crate::metrics::record_request_metric("chat", "5xx", "error");
             return (
                 err.status_code(),
                 [("retry-after", err.retry_after_secs().to_string())],
@@ -277,6 +278,7 @@ pub async fn handle_inference_request(
     let scan = match scan_top_level(&body) {
         Ok(s) => s,
         Err(err) => {
+            crate::metrics::record_request_metric("chat", "4xx", "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -288,6 +290,13 @@ pub async fn handle_inference_request(
             )
                 .into_response();
         }
+    };
+
+    let endpoint_str = match endpoint {
+        EndpointKind::Chat => "chat",
+        EndpointKind::Responses => "responses",
+        EndpointKind::Messages => "messages",
+        _ => "chat",
     };
 
     // 3. Resolve route from ConfigSnapshot
@@ -309,6 +318,8 @@ pub async fn handle_inference_request(
 
         lifecycle.set_termination(Termination::Completed);
         lifecycle.finalize();
+
+        crate::metrics::record_request_metric(endpoint_str, "2xx", "completed");
 
         match endpoint {
             EndpointKind::Chat => (
@@ -379,6 +390,8 @@ pub async fn handle_inference_request(
 
         lifecycle.set_termination(Termination::Completed);
         lifecycle.finalize();
+
+        crate::metrics::record_request_metric(endpoint_str, "2xx", "completed");
 
         (
             StatusCode::OK,

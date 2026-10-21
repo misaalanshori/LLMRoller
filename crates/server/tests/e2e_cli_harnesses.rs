@@ -228,4 +228,31 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
     let invalid_labels = [("forbidden_user_id", "secret")];
     assert!(validate_metric_labels(&invalid_labels).is_err());
     assert_eq!(CLOSED_LABEL_ALLOWLIST.len(), 10);
+
+    // 5. Query /metrics and verify real Prometheus metrics are rendered with closed allowlist labels (OBS-1)
+    use http_body_util::BodyExt as _;
+    use llmroller_proxy::listeners::metrics_router;
+    let metrics_app = metrics_router();
+    let metrics_req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .expect("metrics req");
+    let metrics_res = metrics_app.oneshot(metrics_req).await.expect("metrics res");
+    assert_eq!(metrics_res.status(), StatusCode::OK);
+    let body_bytes = metrics_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let metrics_text = String::from_utf8(body_bytes.to_vec()).expect("utf-8");
+    assert!(
+        metrics_text.contains("llmroller_requests_total"),
+        "metrics must contain llmroller_requests_total, got: {metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("endpoint="),
+        "metrics must include endpoint label, got: {metrics_text}"
+    );
 }
