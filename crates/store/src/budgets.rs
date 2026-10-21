@@ -35,7 +35,7 @@ pub async fn reconstruct_budgets_from_rollups(
     let cutoff_ms = now_ms - max_window_period_ms - 300_000;
 
     let rows = sqlx::query(
-        r#"SELECT bucket_ms, upstream_key_id, client_key_id, owner_user_id, share_id, cost_micro_usd
+        r#"SELECT bucket_ms, upstream_key_id, client_key_id, owner_user_id, provider_scope, share_id, cost_micro_usd
            FROM usage_rollups_5min
            WHERE bucket_ms >= ?"#,
     )
@@ -51,6 +51,7 @@ pub async fn reconstruct_budgets_from_rollups(
         let upstream_key_id_str: String = r.try_get("upstream_key_id")?;
         let client_key_id_str: String = r.try_get("client_key_id")?;
         let owner_user_id_str: String = r.try_get("owner_user_id")?;
+        let provider_scope: String = r.try_get("provider_scope")?;
         let share_id_str: String = r.try_get("share_id")?;
         let cost_micro_usd: i64 = r.try_get("cost_micro_usd")?;
 
@@ -72,7 +73,10 @@ pub async fn reconstruct_budgets_from_rollups(
                 .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Ok(user_id) = UserId::parse(&owner_user_id_str) {
+        // Only global provider spend counts toward user monthly budget (USR-5)
+        if provider_scope == "global"
+            && let Ok(user_id) = UserId::parse(&owner_user_id_str)
+        {
             let acc = monthly_accumulators.get_or_create(month, BudgetScopeId::User(user_id));
             acc.used_micro_usd
                 .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);

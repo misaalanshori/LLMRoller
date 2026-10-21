@@ -91,53 +91,78 @@ pub async fn upsert_discovered_models_tx(
             (final_id, prefix)
         };
 
-        // Check if canonical_id exists in models
-        let existing =
-            sqlx::query("SELECT model_pk, origin, merge_state FROM models WHERE canonical_id = ?")
+        // Consult confirmed model_aliases and model_redirects during discovery route attachment (MDL-6)
+        let resolved_alias: Option<String> = sqlx::query_scalar(
+            "SELECT model_pk FROM model_aliases WHERE alias = ? AND confirmed = 1",
+        )
+        .bind(&canonical_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let resolved_redirect: Option<String> = if resolved_alias.is_none() {
+            sqlx::query_scalar("SELECT model_pk FROM model_redirects WHERE old_canonical_id = ?")
                 .bind(&canonical_id)
                 .fetch_optional(&mut **tx)
-                .await?;
+                .await?
+        } else {
+            None
+        };
 
-        let model_pk = match existing {
-            Some(row) => {
-                let pk_str: String = row.try_get("model_pk")?;
-                let origin_str: String = row.try_get("origin")?;
-                let pk = ModelPk::parse(&pk_str).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-                // If global discovery finds an existing personal model, upgrade to global (MDL-5)
-                if is_global && origin_str == "personal" {
+        let target_model_pk = resolved_alias.or(resolved_redirect);
+
+        let model_pk = if let Some(ref pk_str) = target_model_pk {
+            ModelPk::parse(pk_str).map_err(|e| sqlx::Error::Decode(Box::new(e)))?
+        } else {
+            // Check if canonical_id exists in models
+            let existing = sqlx::query(
+                "SELECT model_pk, origin, merge_state FROM models WHERE canonical_id = ?",
+            )
+            .bind(&canonical_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+
+            match existing {
+                Some(row) => {
+                    let pk_str: String = row.try_get("model_pk")?;
+                    let origin_str: String = row.try_get("origin")?;
+                    let pk =
+                        ModelPk::parse(&pk_str).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                    // If global discovery finds an existing personal model, upgrade to global (MDL-5)
+                    if is_global && origin_str == "personal" {
+                        sqlx::query(
+                            "UPDATE models SET origin = 'global', created_by_user_id = NULL WHERE model_pk = ?",
+                        )
+                        .bind(&pk_str)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                    pk
+                }
+                None => {
+                    // If personal, enforce max 2,000 personal models per user (MDL-5)
+                    if !is_global && personal_models_count >= MAX_PERSONAL_MODELS_PER_USER {
+                        continue;
+                    }
+                    let pk = ModelPk::generate();
+                    let origin_str = if is_global { "global" } else { "personal" };
+                    let owner_str = owner_user_id.map(|u| u.to_string());
+                    let pk_str = pk.to_string();
+
                     sqlx::query(
-                        "UPDATE models SET origin = 'global', created_by_user_id = NULL WHERE model_pk = ?",
+                        "INSERT INTO models (model_pk, canonical_id, origin, created_by_user_id) VALUES (?, ?, ?, ?)",
                     )
                     .bind(&pk_str)
+                    .bind(&canonical_id)
+                    .bind(origin_str)
+                    .bind(owner_str)
                     .execute(&mut **tx)
                     .await?;
-                }
-                pk
-            }
-            None => {
-                // If personal, enforce max 2,000 personal models per user (MDL-5)
-                if !is_global && personal_models_count >= MAX_PERSONAL_MODELS_PER_USER {
-                    continue;
-                }
-                let pk = ModelPk::generate();
-                let origin_str = if is_global { "global" } else { "personal" };
-                let owner_str = owner_user_id.map(|u| u.to_string());
-                let pk_str = pk.to_string();
 
-                sqlx::query(
-                    "INSERT INTO models (model_pk, canonical_id, origin, created_by_user_id) VALUES (?, ?, ?, ?)",
-                )
-                .bind(&pk_str)
-                .bind(&canonical_id)
-                .bind(origin_str)
-                .bind(owner_str)
-                .execute(&mut **tx)
-                .await?;
-
-                if !is_global {
-                    personal_models_count += 1;
+                    if !is_global {
+                        personal_models_count += 1;
+                    }
+                    pk
                 }
-                pk
             }
         };
 

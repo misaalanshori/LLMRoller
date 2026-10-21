@@ -102,4 +102,70 @@ async fn test_startup_rebuild_under_two_seconds_across_500_keys() {
     };
     assert_eq!(offset.value_at(now_ms), 5_000);
     assert_eq!(ring.sum_at(now_ms) + offset.value_at(now_ms), 55_000);
+
+    // 3. User monthly accumulator only aggregates global provider spend (USR-5)
+    let global_user_id = UserId::generate();
+    let personal_user_id = UserId::generate();
+    let client_key_id = ClientKeyId::generate();
+    let key_id = UpstreamKeyId::generate();
+    let bucket_ms = now_ms - 300_000;
+
+    let mut tx2 = pool.begin().await.expect("begin tx2");
+    sqlx::query(
+        r#"INSERT INTO usage_rollups_5min (
+               bucket_ms, upstream_key_id, canonical_id, client_key_id,
+               owner_user_id, provider_scope, share_id, cost_micro_usd, requests
+           )
+           VALUES (?, ?, 'model-y', ?, ?, 'global', '', 20000, 1)"#,
+    )
+    .bind(bucket_ms)
+    .bind(key_id.to_string())
+    .bind(client_key_id.to_string())
+    .bind(global_user_id.to_string())
+    .execute(&mut *tx2)
+    .await
+    .expect("insert global rollup");
+
+    sqlx::query(
+        r#"INSERT INTO usage_rollups_5min (
+               bucket_ms, upstream_key_id, canonical_id, client_key_id,
+               owner_user_id, provider_scope, share_id, cost_micro_usd, requests
+           )
+           VALUES (?, ?, 'model-z', ?, ?, 'personal', '', 30000, 1)"#,
+    )
+    .bind(bucket_ms)
+    .bind(key_id.to_string())
+    .bind(client_key_id.to_string())
+    .bind(personal_user_id.to_string())
+    .execute(&mut *tx2)
+    .await
+    .expect("insert personal rollup");
+    tx2.commit().await.expect("commit tx2");
+
+    let rebuilt2 = reconstruct_budgets_from_rollups(&pool, now_ms, 7 * 86_400_000)
+        .await
+        .expect("reconstruct budgets 2");
+
+    let month = UtcYearMonth::from_epoch_millis(bucket_ms);
+    let global_acc = rebuilt2
+        .monthly_accumulators
+        .get_or_create(month, BudgetScopeId::User(global_user_id));
+    assert_eq!(
+        global_acc
+            .used_micro_usd
+            .load(std::sync::atomic::Ordering::Relaxed),
+        20000,
+        "global spend must be aggregated in User monthly accumulator"
+    );
+
+    let personal_acc = rebuilt2
+        .monthly_accumulators
+        .get_or_create(month, BudgetScopeId::User(personal_user_id));
+    assert_eq!(
+        personal_acc
+            .used_micro_usd
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "personal spend must NOT be aggregated in User monthly accumulator (USR-5)"
+    );
 }

@@ -358,6 +358,44 @@ async fn test_models_exposure_merge_and_killswitch() {
     .expect("redirect query");
     assert_eq!(redirect_target, pk_b.to_string());
 
+    // Confirmed alias applies during discovery route attachment (MDL-6)
+    add_model_alias_tx(&mut tx, "model-b-alias", &pk_b)
+        .await
+        .expect("add alias");
+
+    // Discovery sees "vendor/model-b-alias"
+    let alias_discovery = vec!["vendor/model-b-alias".to_string()];
+    let _res_alias = upsert_discovered_models_tx(
+        &mut tx,
+        &global_key.id,
+        true,
+        None,
+        1_000_000,
+        &alias_discovery,
+        100,
+    )
+    .await
+    .expect("discovery with alias");
+
+    // Route must attach to pk_b, not create a new model row
+    let attached_pk: String = sqlx::query_scalar(
+        "SELECT model_pk FROM model_routes WHERE upstream_key_id = ? AND upstream_model_id = 'vendor/model-b-alias'",
+    )
+    .bind(global_key.id.to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("fetch attached model_pk");
+    assert_eq!(attached_pk, pk_b.to_string());
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM models WHERE canonical_id = 'model-b-alias'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
+    assert_eq!(
+        count, 0,
+        "Discovered model matching confirmed alias must NOT create duplicate model row (MDL-6)"
+    );
+
     tx.commit().await.expect("commit");
 }
 
