@@ -9,6 +9,7 @@ pub mod assets;
 pub mod auth;
 pub mod projection;
 pub mod setup;
+pub mod ui;
 
 pub use api::ApiAppState;
 pub use auth::AuthAppState;

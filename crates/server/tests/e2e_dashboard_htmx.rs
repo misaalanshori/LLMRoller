@@ -17,7 +17,7 @@ use llmroller_admin::{ApiAppState, control_plane_router_full};
 use llmroller_core::chat_preview::{escape_html, sanitize_assistant_text};
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
-use llmroller_core::seams::OsEntropy;
+use llmroller_core::seams::{Clock, OsEntropy};
 use llmroller_proto::headers::sanitize_csv_cell;
 use llmroller_store::crypto::MasterKey;
 use llmroller_store::instance::load_or_initialize;
@@ -66,7 +66,7 @@ async fn setup_dashboard_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, Mast
 #[doc = "Spec: UI-1, UI-2, UI-4, TRC-6, AUTH-4, USR-5, MDL-3, MDL-4, AUD-1, SEC-6, TRC-5, TRC-8, TRC-9, SEC-19"]
 #[tokio::test]
 async fn test_htmx_dashboards_key_projection_and_chat_preview() {
-    let (dir, pool, master_key, _admin_id) = setup_dashboard_test_db().await;
+    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
@@ -124,7 +124,7 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
         .uri("/static/app.css")
         .body(Body::empty())
         .expect("req");
-    let resp_static = app.oneshot(req_static).await.expect("resp");
+    let resp_static = app.clone().oneshot(req_static).await.expect("resp");
     assert_eq!(resp_static.status(), StatusCode::OK);
     let body = resp_static
         .into_body()
@@ -134,4 +134,68 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
         .to_bytes();
     let css = std::str::from_utf8(&body).expect("utf-8");
     assert!(css.contains(".traceability-banner"));
+
+    // 7. Test real HTTP rendering of /app and /admin via Askama templates (UI-1, UI-2)
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let raw_session = "test_session_token_12345678901234567890";
+    let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
+    let csrf_hash = llmroller_store::crypto::sha256_hex(b"csrf_secret");
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: admin_id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("test-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert session");
+
+    // GET /app returns 200 OK with rendered Personal Workspace
+    let req_app = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header(
+            axum::http::header::COOKIE,
+            format!("llmroller_session={raw_session}"),
+        )
+        .body(Body::empty())
+        .expect("req");
+    let resp_app = app.clone().oneshot(req_app).await.expect("resp");
+    assert_eq!(resp_app.status(), StatusCode::OK);
+    let app_bytes = resp_app
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let app_html_rendered = std::str::from_utf8(&app_bytes).expect("utf-8");
+    assert!(app_html_rendered.contains("Personal Workspace"));
+    assert!(app_html_rendered.contains("Global pool"));
+
+    // GET /admin returns 200 OK with rendered Admin Console
+    let req_admin = Request::builder()
+        .method("GET")
+        .uri("/admin")
+        .header(
+            axum::http::header::COOKIE,
+            format!("llmroller_session={raw_session}"),
+        )
+        .body(Body::empty())
+        .expect("req");
+    let resp_admin = app.oneshot(req_admin).await.expect("resp");
+    assert_eq!(resp_admin.status(), StatusCode::OK);
+    let admin_bytes = resp_admin
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let admin_html_rendered = std::str::from_utf8(&admin_bytes).expect("utf-8");
+    assert!(admin_html_rendered.contains("Admin Console"));
+    assert!(admin_html_rendered.contains("Projected Disk Usage"));
 }

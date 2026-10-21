@@ -89,7 +89,7 @@ async fn authenticate_admin(
     Ok(actor)
 }
 
-fn map_auth_error(err: AuthError) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn map_auth_error(err: AuthError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match err {
         AuthError::Unauthorized | AuthError::AccountDisabled => StatusCode::UNAUTHORIZED,
         AuthError::Forbidden | AuthError::InvalidCsrf => StatusCode::FORBIDDEN,
@@ -586,7 +586,7 @@ async fn patch_admin_settings_handler(
 // ---------------------------------------------------------------------------
 
 /// Build the JSON control-plane router.
-fn map_price_error(
+pub(crate) fn map_price_error(
     status: StatusCode,
     msg: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -885,6 +885,9 @@ async fn get_session_preview_internal(
 
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
+        // Web UI screens
+        .route("/app", get(crate::ui::get_app_ui))
+        .route("/admin", get(crate::ui::get_admin_ui))
         // User endpoints
         .route(
             "/api/user/providers",

@@ -4,7 +4,9 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    "RUSTSEC-2026-0374", # basic-toml unmaintained notice transitive from askama
+]
 
 [licenses]
 version = 2
