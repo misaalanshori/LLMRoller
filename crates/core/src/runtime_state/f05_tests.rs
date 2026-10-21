@@ -1,6 +1,6 @@
 //! F05 focused tests for scope-aware C8 window admission.
 //!
-//! Spec: Section 10.1 (C8), Section 13.2, Requirements: LIM-1, LIM-2, RTE-3.
+//! Spec: Section 10.1 (C8), Section 13.2, Requirements: LIM-1, RTE-3.
 
 use super::*;
 use crate::ids::{ModelPk, UpstreamKeyId};
@@ -95,7 +95,7 @@ fn key_budget_admitted_reads_configured_window_ids() {
 }
 
 #[test]
-#[doc = "Spec: LIM-2 — F05 route windows gate only their configured model"]
+#[doc = "Spec: LIM-1 — F05 route windows gate only their configured model"]
 fn route_windows_gate_only_their_configured_model() {
     let runtime = RuntimeState::new();
     let key = UpstreamKeyId::generate();
@@ -226,7 +226,7 @@ fn utc_now_ms_for_tests() -> i64 {
 }
 
 #[test]
-#[doc = "Spec: LIM-2 — F05 reservations include key windows and only matching route windows"]
+#[doc = "Spec: LIM-1 — F05 reservations include key windows and only matching route windows"]
 fn reserve_key_windows_filters_route_windows_by_model() {
     let runtime = RuntimeState::new();
     let key = UpstreamKeyId::generate();
