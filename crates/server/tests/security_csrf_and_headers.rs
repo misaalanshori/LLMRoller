@@ -301,10 +301,46 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"enabled":false,"retention_days":14}"#))
         .expect("req");
-    let mutating_with_csrf_res = app.oneshot(mutating_with_csrf_req).await.expect("res");
+    let mutating_with_csrf_res = app
+        .clone()
+        .oneshot(mutating_with_csrf_req)
+        .await
+        .expect("res");
     assert_eq!(
         mutating_with_csrf_res.status(),
         StatusCode::OK,
         "Mutation with extracted x-csrf-token from /app should succeed"
+    );
+
+    // 7. UI-4: Global traceability status banner renders when enabled
+    let enable_trace_req = Request::builder()
+        .method("PUT")
+        .uri("/admin/api/settings/traceability")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", extracted_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"enabled":true,"retention_days":14}"#))
+        .expect("req");
+    let enable_trace_res = app.clone().oneshot(enable_trace_req).await.expect("res");
+    assert_eq!(enable_trace_res.status(), StatusCode::OK);
+
+    let app_get_banner_req = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header(header::COOKIE, &session_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let app_get_banner_res = app.clone().oneshot(app_get_banner_req).await.expect("res");
+    assert_eq!(app_get_banner_res.status(), StatusCode::OK);
+    let app_banner_bytes = app_get_banner_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let app_banner_html = std::str::from_utf8(&app_banner_bytes).expect("utf8");
+    assert!(
+        app_banner_html.contains("id=\"traceability-banner\""),
+        "Traceability banner must render on /app when enabled (UI-4)"
     );
 }

@@ -60,11 +60,23 @@ pub async fn get_app_ui(
             .unwrap_or("");
     let csrf_token = crate::auth::derive_session_csrf(session_token);
 
+    let now_ms = state.auth.clock.now_ms();
+    let traceability_enabled =
+        match llmroller_store::settings::load_settings(&state.auth.pool).await {
+            Ok(s) => {
+                s.traceability_config.enabled
+                    && s.traceability_config
+                        .auto_disable_at
+                        .is_none_or(|t| now_ms < t)
+            }
+            Err(_) => false,
+        };
+
     let app_content = AppTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Personal Workspace".to_string(),
         csrf_token,
-        traceability_enabled: false,
+        traceability_enabled,
         is_admin: session.user.role == Role::Admin,
         content: app_content,
     };
@@ -115,11 +127,23 @@ pub async fn get_admin_ui(
             .unwrap_or("");
     let csrf_token = crate::auth::derive_session_csrf(session_token);
 
+    let now_ms = state.auth.clock.now_ms();
+    let traceability_enabled =
+        match llmroller_store::settings::load_settings(&state.auth.pool).await {
+            Ok(s) => {
+                s.traceability_config.enabled
+                    && s.traceability_config
+                        .auto_disable_at
+                        .is_none_or(|t| now_ms < t)
+            }
+            Err(_) => false,
+        };
+
     let admin_content = AdminTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Admin Console".to_string(),
         csrf_token,
-        traceability_enabled: false,
+        traceability_enabled,
         is_admin: true,
         content: admin_content,
     };
