@@ -532,6 +532,18 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     .await
     .expect("insert model claude");
 
+    for model_pk in [model_pk1, model_pk2] {
+        sqlx::query(
+            "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+             VALUES (?, ?, 'gpt-4o', '[\"chat\",\"responses\",\"messages\"]', 'active', 1000)",
+        )
+        .bind(upstream_key.id.to_string())
+        .bind(model_pk.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model route");
+    }
+
     let created_key = create_client_key_tx(
         &mut tx,
         &actor,
@@ -577,7 +589,8 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
 
     let snapshot = load_initial_snapshot(&pool).await.expect("snapshot");
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
-    let auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![]);
+    let auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![])
+        .with_master_key(master_key.clone());
     auth_state
         .is_ready
         .store(true, std::sync::atomic::Ordering::SeqCst);

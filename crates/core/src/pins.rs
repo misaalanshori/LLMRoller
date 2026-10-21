@@ -38,6 +38,21 @@ pub enum PinOutcome {
     ResponseLink,
 }
 
+impl PinOutcome {
+    /// Stable snake_case label persisted on the usage event (`pin_outcome`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewPin => "new_pin",
+            Self::Followed => "followed",
+            Self::Repin => "repin",
+            Self::RepinRecovery => "repin_recovery",
+            Self::UnpinnedCapacity => "unpinned_capacity",
+            Self::ResponseLink => "response_link",
+        }
+    }
+}
+
 /// Entry in PinStore guarded by a Mutex.
 #[derive(Debug, Clone)]
 pub struct PinEntry {

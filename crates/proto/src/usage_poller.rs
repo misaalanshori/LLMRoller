@@ -214,13 +214,12 @@ pub fn parse_raw_usage_to_sanitized(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
             let mut windows = Vec::new();
-            if let Some(limits) = raw_json
+            if let Some(window) = raw_json
                 .get("rateLimits")
                 .and_then(serde_json::Value::as_object)
+                .and_then(|limits| limits.get("rolling5h"))
             {
-                if let Some(window) = limits.get("rolling5h") {
-                    windows.push(parse_window_obj("rolling_5h", window, now_ms));
-                }
+                windows.push(parse_window_obj("rolling_5h", window, now_ms));
             }
             if windows.is_empty()
                 && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())

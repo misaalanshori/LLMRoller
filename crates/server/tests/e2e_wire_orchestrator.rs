@@ -213,7 +213,7 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
     .await
     .expect("create provider");
 
-    let _key = create_upstream_key_tx(
+    let upstream_key = create_upstream_key_tx(
         &mut tx,
         &system_actor,
         &master_key,
@@ -239,6 +239,16 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .await
         .expect("insert model gpt-4o");
 
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+         VALUES (?, ?, 'gpt-4o', '[\"chat\",\"responses\",\"messages\"]', 'active', 1000)",
+    )
+    .bind(upstream_key.id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert gpt-4o route");
+
     let forbidden_model_pk = ModelPk::generate();
     sqlx::query(
         "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-3-5-sonnet', 1)",
@@ -256,7 +266,8 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
     let snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
 
-    let mut proxy_auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![]);
+    let mut proxy_auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![])
+        .with_master_key(master_key.clone());
     proxy_auth_state.is_ready.store(true, Ordering::SeqCst);
     proxy_auth_state.writer = Some(writer);
 

@@ -33,7 +33,13 @@ use llmroller_store::users::{NewUser, create_user};
 use tempfile::tempdir;
 use tower::ServiceExt as _;
 
-async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, UserId) {
+async fn setup_test_context() -> (
+    tempfile::TempDir,
+    sqlx::SqlitePool,
+    String,
+    UserId,
+    MasterKey,
+) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("llmroller.db");
 
@@ -145,7 +151,7 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
     .expect("insert model claude");
 
     // Create upstream key
-    create_upstream_key(
+    let upstream_key = create_upstream_key(
         &pool,
         &user_actor,
         &master_key,
@@ -163,6 +169,18 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
     )
     .await
     .expect("create upstream key");
+
+    for model in [model_pk, model_pk2] {
+        sqlx::query(
+            "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, enabled, discovered_at) \
+             VALUES (?, ?, 'gpt-4o', '[\"chat\",\"responses\",\"messages\"]', 'active', 1, 1)",
+        )
+        .bind(upstream_key.id.to_string())
+        .bind(model.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert model route");
+    }
 
     // Create client key
     let ck_res = create_client_key(
@@ -186,7 +204,7 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
     .expect("create client key");
 
     let raw_token = ck_res.raw_token.expose_secret().to_string();
-    (dir, pool, raw_token, user.id)
+    (dir, pool, raw_token, user.id, master_key)
 }
 
 /// Spec: REL-1, SEC-8, Partial: PERF-1, Partial: PERF-2, Partial: PERF-3
@@ -195,11 +213,12 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
 #[doc = "Spec: REL-1, SEC-8, Partial: PERF-1, Partial: PERF-2, Partial: PERF-3"]
 #[tokio::test]
 async fn test_orchestrator_passthrough_and_body_budget_admission() {
-    let (_dir, pool, client_token, _user_id) = setup_test_context().await;
+    let (_dir, pool, client_token, _user_id, master_key) = setup_test_context().await;
 
     let snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
     let shared_snapshot = Arc::new(ArcSwap::new(Arc::new(snapshot)));
-    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![]);
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![])
+        .with_master_key(master_key);
     auth_state
         .is_ready
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -291,7 +310,7 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     use llmroller_server::shutdown::{JobSupervisor, ShutdownSupervisor};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    let (_dir, pool, _client_token, _user_id) = setup_test_context().await;
+    let (_dir, pool, _client_token, _user_id, _master_key) = setup_test_context().await;
 
     let is_ready = Arc::new(AtomicBool::new(true));
     let open_streams = Arc::new(AtomicUsize::new(2));

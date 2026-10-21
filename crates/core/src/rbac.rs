@@ -133,6 +133,53 @@ impl RoutingScope {
             Self::GlobalOnly => &[&[PoolTier::Global]],
         }
     }
+
+    /// Whether a concrete pool tier is authorized by this routing scope.
+    #[must_use]
+    pub const fn allows_tier(self, tier: PoolTier) -> bool {
+        match tier {
+            PoolTier::Blended => matches!(self, Self::Blended),
+            PoolTier::Own => !matches!(self, Self::GlobalOnly),
+            PoolTier::Shared => matches!(
+                self,
+                Self::PersonalFirst | Self::Blended | Self::PersonalOnly
+            ),
+            PoolTier::Global => {
+                matches!(self, Self::PersonalFirst | Self::Blended | Self::GlobalOnly)
+            }
+        }
+    }
+}
+
+/// Error returned when parsing an unrecognized routing scope string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRoutingScopeError(pub String);
+
+impl fmt::Display for InvalidRoutingScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid routing scope {:?}; expected personal_first, blended, personal_only, own_only, or global_only",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidRoutingScopeError {}
+
+impl std::str::FromStr for RoutingScope {
+    type Err = InvalidRoutingScopeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "personal_first" => Ok(Self::PersonalFirst),
+            "blended" => Ok(Self::Blended),
+            "personal_only" => Ok(Self::PersonalOnly),
+            "own_only" => Ok(Self::OwnOnly),
+            "global_only" => Ok(Self::GlobalOnly),
+            other => Err(InvalidRoutingScopeError(other.to_owned())),
+        }
+    }
 }
 
 impl fmt::Display for RoutingScope {

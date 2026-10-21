@@ -377,6 +377,41 @@ impl RuntimeState {
             })
     }
 
+    /// Current health projection for one upstream key (C6).
+    #[must_use]
+    pub fn key_health_entry(&self, key_id: UpstreamKeyId) -> KeyHealthEntry {
+        self.key_health
+            .get(&key_id)
+            .map(|entry| entry.clone())
+            .unwrap_or_default()
+    }
+
+    /// Acquire an RAII reservation across every hard budget window configured for a key.
+    ///
+    /// Returns `Ok(None)` when the key has no configured windows. A `LimitExceeded`
+    /// error means the caller must try the next candidate (C8).
+    pub fn reserve_key_windows(
+        &self,
+        snapshot: &ConfigSnapshot,
+        key_id: UpstreamKeyId,
+        estimate_micro_usd: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::windows::Reservation>, crate::windows::ReservationError> {
+        let Some(windows) = snapshot.budget_windows.get(&key_id) else {
+            return Ok(None);
+        };
+        let mut counters: Vec<Arc<dyn crate::windows::BudgetCounter>> = Vec::new();
+        for window in windows {
+            if let Some(counter) = self.window_counter(&window.id) {
+                counters.push(counter);
+            }
+        }
+        if counters.is_empty() {
+            return Ok(None);
+        }
+        crate::windows::Reservation::try_reserve(counters, estimate_micro_usd, now_ms).map(Some)
+    }
+
     /// Apply cache invalidation events immediately following atomic snapshot publication.
     pub fn apply_invalidations(
         &self,

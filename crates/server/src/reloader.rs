@@ -254,6 +254,7 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_snapshot(
     version: i64,
     instance_id: [u8; 16],

@@ -193,6 +193,16 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         .await
         .expect("insert model");
 
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, enabled, discovered_at) \
+         VALUES (?, ?, 'claude-3-5-sonnet', '[\"chat\",\"responses\",\"messages\"]', 'active', 1, 1000)",
+    )
+    .bind(key.id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model route");
+
     let link = ResponseLinkRow {
         response_id: "resp_codex_prev_1".to_string(),
         owner_user_id: user_id,
@@ -214,7 +224,8 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
 
     let snapshot = load_initial_snapshot(&pool).await.expect("snapshot");
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
-    let auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![]);
+    let auth_state =
+        ProxyAuthState::new(shared_snapshot, pool.clone(), vec![]).with_master_key(master_key);
     auth_state
         .is_ready
         .store(true, std::sync::atomic::Ordering::SeqCst);

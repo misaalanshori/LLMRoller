@@ -38,6 +38,7 @@ pub struct ProxyAuthState {
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
     pub pin_store: Arc<llmroller_core::pins::PinStore>,
+    pub runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
     pub master_key: Option<llmroller_store::crypto::MasterKey>,
 }
@@ -66,6 +67,7 @@ impl ProxyAuthState {
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
             pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
+            runtime_state: Arc::new(llmroller_core::runtime_state::RuntimeState::new()),
             writer: None,
             master_key: None,
         }
@@ -74,6 +76,15 @@ impl ProxyAuthState {
     #[must_use]
     pub fn with_master_key(mut self, master_key: llmroller_store::crypto::MasterKey) -> Self {
         self.master_key = Some(master_key);
+        self
+    }
+
+    #[must_use]
+    pub fn with_runtime_state(
+        mut self,
+        runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
+    ) -> Self {
+        self.runtime_state = runtime_state;
         self
     }
 

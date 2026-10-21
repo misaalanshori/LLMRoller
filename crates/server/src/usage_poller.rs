@@ -33,6 +33,21 @@ pub struct UsagePollerDeps {
     pub instance_id: [u8; 16],
 }
 
+impl std::fmt::Debug for UsagePollerDeps {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UsagePollerDeps")
+            .field("pool", &self.pool)
+            .field("snapshot", &self.snapshot)
+            .field("runtime_state", &self.runtime_state)
+            .field("writer", &self.writer)
+            .field("master_key", &"<redacted>")
+            .field("master_key_id", &self.master_key_id)
+            .field("instance_id", &self.instance_id)
+            .finish()
+    }
+}
+
 /// Spawn the supervised usage polling loop. Returns the join handle.
 pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

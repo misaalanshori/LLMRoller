@@ -46,7 +46,7 @@ impl AttemptOutcome {
 
     /// Parse a persisted outcome string.
     #[must_use]
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn from_wire(value: &str) -> Option<Self> {
         Some(match value {
             "served" => Self::Served,
             "connect_error" => Self::ConnectError,
@@ -103,7 +103,7 @@ mod tests {
         ];
         for outcome in all {
             assert_eq!(
-                AttemptOutcome::from_str(outcome.as_str()),
+                AttemptOutcome::from_wire(outcome.as_str()),
                 Some(outcome),
                 "round trip for {outcome:?}"
             );
