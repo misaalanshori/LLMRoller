@@ -8,6 +8,7 @@ coverage/
 cargo-timings/
 
 # Local runtime state, SQLite WAL files, and secrets
+/data/
 /var/
 *.db
 *.db-wal
