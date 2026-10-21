@@ -509,11 +509,21 @@ pub async fn create_upstream_key_tx(
         secret_exposed.to_string()
     };
 
-    let sealer = XChaCha20Poly1305Sealer::new(master_key.clone(), [0u8; 16], entropy);
+    let instance_id_vec: Vec<u8> = sqlx::query_scalar(
+        "SELECT instance_id FROM instance_meta WHERE singleton = 1",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let instance_id: [u8; 16] = instance_id_vec
+        .try_into()
+        .map_err(|_| ProviderError::Validation("corrupt instance_id in instance_meta".into()))?;
+
+    let sealer = XChaCha20Poly1305Sealer::new(master_key.clone(), instance_id, entropy);
 
     let sealed_secret = sealer.try_seal(
         "upstream_key",
         &[
+            master_key_id.as_bytes(),
             key_id.to_string().as_bytes(),
             new_key.provider_id.to_string().as_bytes(),
         ],

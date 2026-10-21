@@ -27,6 +27,7 @@ pub struct StoredTurnTraceV2 {
 /// Job submitted to the 2-thread sealer pool.
 #[derive(Debug, Clone)]
 pub struct SealJob {
+    pub master_key_id: String,
     pub usage_event_id: String,
     pub request_id: RequestId,
     pub ts: i64,
@@ -45,6 +46,8 @@ pub struct SealJob {
 /// Output of a completed seal job.
 #[derive(Debug)]
 pub struct SealedTurnResult {
+    pub master_key_id: String,
+    pub protocol: String,
     pub usage_event_id: String,
     pub request_id: RequestId,
     pub ts: i64,
@@ -74,7 +77,11 @@ pub fn seal_turn_sync(
             .map_err(|e| format!("zstd block compression failed: {e}"))?;
         let payload_enc = sealer.seal(
             "trace_block",
-            &[owner_bytes.as_bytes(), hash.as_bytes()],
+            &[
+                job.master_key_id.as_bytes(),
+                owner_bytes.as_bytes(),
+                hash.as_bytes(),
+            ],
             &compressed,
         );
         sealed_blocks.push((hash.clone(), payload_enc, block_bytes.len()));
@@ -86,11 +93,18 @@ pub fn seal_turn_sync(
         .map_err(|e| format!("zstd trace compression failed: {e}"))?;
     let payload_enc = sealer.seal(
         "trace_record",
-        &[owner_bytes.as_bytes(), req_bytes.as_bytes()],
+        &[
+            job.master_key_id.as_bytes(),
+            req_bytes.as_bytes(),
+            owner_bytes.as_bytes(),
+            job.session_hash.as_bytes(),
+        ],
         &compressed_trace,
     );
 
     Ok(SealedTurnResult {
+        master_key_id: job.master_key_id.clone(),
+        protocol: job.protocol.clone(),
         usage_event_id: job.usage_event_id.clone(),
         request_id: job.request_id,
         ts: job.ts,
@@ -183,7 +197,7 @@ pub async fn insert_sealed_trace_tx(
                session_hash, thread_id, canonical_id, protocol, truncated_content,
                payload_enc, master_key_id, expires_at
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'chat', ?, ?, ?, ?)"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&res.usage_event_id)
     .bind(res.request_id.to_string())
@@ -193,6 +207,7 @@ pub async fn insert_sealed_trace_tx(
     .bind(&res.session_hash)
     .bind(&res.thread_id)
     .bind(&res.canonical_id)
+    .bind(&res.protocol)
     .bind(if res.truncated_content { 1 } else { 0 })
     .bind(&res.payload_enc)
     .bind(master_key_id)

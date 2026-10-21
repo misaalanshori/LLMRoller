@@ -30,8 +30,12 @@ pub async fn insert_usage_snapshot_tx(
     let snapshot_id = format!("snap-{}", ulid::Ulid::generate());
     let key_str = snapshot.key_id.to_string();
 
-    // Seal raw_json_enc under domain "usage_raw" with AAD [key_id] per SEC-18
-    let raw_json_enc = sealer.seal("usage_raw", &[key_str.as_bytes()], snapshot.raw_json_bytes);
+    // Seal raw_json_enc under domain "usage_raw" with AAD [master_key_id, id] per SEC-18 and Section 9.2.2
+    let raw_json_enc = sealer.seal(
+        "usage_raw",
+        &[snapshot.master_key_id.as_bytes(), snapshot_id.as_bytes()],
+        snapshot.raw_json_bytes,
+    );
 
     sqlx::query(
         r#"INSERT INTO upstream_usage_snapshots (

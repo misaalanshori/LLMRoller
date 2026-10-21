@@ -104,6 +104,7 @@ async fn test_content_addressed_deduplication_and_reference_aware_purge() {
     let b3_hash = "b3_hash_hex".to_string();
 
     let job_sess1 = SealJob {
+        master_key_id: "key-0".to_string(),
         usage_event_id: "event-1".to_string(),
         request_id: RequestId::generate(),
         ts: 1000,
@@ -136,6 +137,7 @@ async fn test_content_addressed_deduplication_and_reference_aware_purge() {
 
     // Session 2: uses blocks B2 (shared!) and B3
     let job_sess2 = SealJob {
+        master_key_id: "key-0".to_string(),
         usage_event_id: "event-2".to_string(),
         request_id: RequestId::generate(),
         ts: 2000,
@@ -226,6 +228,7 @@ fn test_sealer_pool_bounded_queue_and_drop_on_full() {
     let (pool, _rx) = SealerPool::new(sealer);
 
     let dummy_job = SealJob {
+        master_key_id: "key-0".to_string(),
         usage_event_id: "ev".to_string(),
         request_id: RequestId::generate(),
         ts: 1000,

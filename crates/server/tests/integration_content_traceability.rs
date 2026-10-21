@@ -379,6 +379,7 @@ async fn test_rbac_isolated_sessions_and_preview() {
     ));
 
     let bob_job = SealJob {
+        master_key_id: "key-0".to_string(),
         usage_event_id: "ev-bob-1".to_string(),
         request_id: RequestId::generate(),
         ts: 1000,
