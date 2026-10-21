@@ -314,6 +314,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.is_ready = is_ready.clone();
     proxy_auth_state.pin_store = pin_store.clone();
     proxy_auth_state.writer = Some(writer_handle.clone());
+    proxy_auth_state.master_key = Some(master_key.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
 
     let auth_config = llmroller_admin::auth::AuthConfig {

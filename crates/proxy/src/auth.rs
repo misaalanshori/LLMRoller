@@ -39,6 +39,7 @@ pub struct ProxyAuthState {
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
     pub pin_store: Arc<llmroller_core::pins::PinStore>,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
+    pub master_key: Option<llmroller_store::crypto::MasterKey>,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -66,7 +67,14 @@ impl ProxyAuthState {
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
             pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
             writer: None,
+            master_key: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_master_key(mut self, master_key: llmroller_store::crypto::MasterKey) -> Self {
+        self.master_key = Some(master_key);
+        self
     }
 
     /// Record an authentication failure for rate limiting and flush to auth_failure_counters table.

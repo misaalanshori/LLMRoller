@@ -6,8 +6,11 @@ use axum::Json;
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use llmroller_core::seams::ExposeSecret as _;
+use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::auth::ProxyAuthState;
 use llmroller_core::client_key::ClientKeyRecord;
@@ -106,7 +109,7 @@ pub async fn get_v1_usage_raw_handler(
 
     use sqlx::Row as _;
     let row = sqlx::query(
-        r#"SELECT s.sanitized_json
+        r#"SELECT s.id as snap_id, s.master_key_id, s.raw_json_enc, s.sanitized_json, p.ownership_scope, p.owner_user_id
            FROM upstream_usage_snapshots s
            JOIN upstream_keys k ON s.upstream_key_id = k.id
            JOIN providers p ON k.provider_id = p.id
@@ -119,6 +122,46 @@ pub async fn get_v1_usage_raw_handler(
 
     match row {
         Ok(Some(r)) => {
+            let ownership_scope: String = r.try_get("ownership_scope").unwrap_or_default();
+            let owner_user_id: Option<String> = r.try_get("owner_user_id").ok();
+
+            // On user's OWN personal key: return decrypted raw_json (USG-8)
+            if ownership_scope == "personal"
+                && owner_user_id == Some(client_key.owner_user_id.to_string())
+            {
+                let snap_id: String = r.try_get("snap_id").unwrap_or_default();
+                let master_key_id: String = r.try_get("master_key_id").unwrap_or_default();
+                let raw_json_enc: Vec<u8> = r.try_get("raw_json_enc").unwrap_or_default();
+
+                let instance_id_vec: Vec<u8> =
+                    sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap_or_else(|_| vec![0u8; 16]);
+                let instance_id: [u8; 16] = instance_id_vec.try_into().unwrap_or([0u8; 16]);
+
+                let master_key_opt = state
+                    .master_key
+                    .clone()
+                    .or_else(|| llmroller_store::crypto::load_master_key_from_env().ok());
+
+                if let Some(master_key) = master_key_opt {
+                    let sealer = XChaCha20Poly1305Sealer::new(
+                        master_key,
+                        instance_id,
+                        Arc::new(llmroller_core::seams::OsEntropy),
+                    );
+                    let aad_parts: [&[u8]; 2] = [master_key_id.as_bytes(), snap_id.as_bytes()];
+                    if let Ok(decrypted) = sealer.open("usage_raw", &aad_parts, &raw_json_enc)
+                        && let Ok(val) =
+                            serde_json::from_slice::<serde_json::Value>(decrypted.expose_secret())
+                    {
+                        return (StatusCode::OK, Json(val)).into_response();
+                    }
+                }
+            }
+
+            // Shared or Global key: return only allow-list sanitized_json (USG-8, SEC-18)
             let sanitized: String = r
                 .try_get("sanitized_json")
                 .unwrap_or_else(|_| "{}".to_string());

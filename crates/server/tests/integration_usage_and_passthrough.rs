@@ -23,7 +23,7 @@ use llmroller_proto::usage_poller::{KeyPollerState, UsagePoller, parse_raw_usage
 use llmroller_proxy::auth::ProxyAuthState;
 use llmroller_proxy::listeners::data_plane_router;
 use llmroller_server::reloader::load_initial_snapshot;
-use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
+use llmroller_store::client_keys::{NewClientKey, create_client_key, create_client_key_tx};
 use llmroller_store::crypto::{MasterKey, XChaCha20Poly1305Sealer};
 use llmroller_store::instance::load_or_initialize;
 use llmroller_store::migrations::migrate;
@@ -226,7 +226,7 @@ fn test_upstream_observation_reconciliation_and_resets_at_expiry() {
 #[doc = "Spec: PRV-6, API-1, USG-4, USG-5, USG-6, USG-7, USG-8, SEC-18"]
 #[tokio::test]
 async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
-    let (_dir, pool, sealer, _master_key, user_id) = setup_passthrough_test_db().await;
+    let (_dir, pool, sealer, master_key, user_id) = setup_passthrough_test_db().await;
     let mut tx = pool.begin().await.expect("begin");
 
     let actor = ActorScope::user(user_id, Role::User);
@@ -269,7 +269,7 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
         .await
         .expect("insert key");
 
-    // Insert a stored snapshot for /v1/usage/raw (USG-8)
+    // Insert a stored snapshot on Global key for /v1/usage/raw (USG-8)
     let sanitized_doc =
         r#"{"status":"ok","windows":[{"kind":"5h","status":"ok","used_percent":20.0}]}"#;
     insert_usage_snapshot_tx(
@@ -284,17 +284,54 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
             balance_micro_usd: None,
             master_key_id: "key-0",
             sanitized_json: sanitized_doc,
-            raw_json_bytes: b"{}",
+            raw_json_bytes: b"{\"raw_field\":\"global_hidden\"}",
         },
     )
     .await
     .expect("insert snapshot");
 
+    // Insert a stored snapshot on Own personal key for /v1/usage/raw (USG-8)
+    let p_personal_id = llmroller_core::ids::ProviderId::generate();
+    let up_key_personal = UpstreamKeyId::generate();
+    sqlx::query("INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, owner_user_id, share_config_fingerprint, created_at) VALUES (?, 'P_Personal', 'openrouter', 'https://api.com', '{}', 'personal', ?, 'fp', 1000)")
+        .bind(p_personal_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert personal provider");
+
+    sqlx::query("INSERT INTO upstream_keys (id, provider_id, label, secret_enc, secret_last4, priority, master_key_id, owner_user_id, created_at) VALUES (?, ?, 'K_Personal', X'00', 'test', 100, 'key-0', ?, 1000)")
+        .bind(up_key_personal.to_string())
+        .bind(p_personal_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert personal key");
+
+    insert_usage_snapshot_tx(
+        &mut tx,
+        &sealer,
+        NewUsageSnapshot {
+            key_id: &up_key_personal,
+            now_ms: 2000,
+            http_status: 200,
+            plan_name: Some("pro"),
+            windows_json: "[]",
+            balance_micro_usd: None,
+            master_key_id: "key-0",
+            sanitized_json: sanitized_doc,
+            raw_json_bytes: b"{\"raw_field\":\"personal_secret\"}",
+        },
+    )
+    .await
+    .expect("insert personal snapshot");
+
     tx.commit().await.expect("commit");
 
     let snapshot = load_initial_snapshot(&pool).await.expect("snapshot");
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
-    let auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![]);
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![])
+        .with_master_key(master_key);
     auth_state
         .is_ready
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -344,13 +381,13 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
     let json_key: serde_json::Value = serde_json::from_slice(&body_key).expect("json");
     assert_eq!(json_key["rate_limit_rpm"], 60);
 
-    // 4. GET /v1/usage/raw serves strictly from stored snapshots
+    // 4. GET /v1/usage/raw serves decrypted raw_json on own personal key (USG-8)
     let req_raw = Request::builder()
         .uri("/v1/usage/raw")
         .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
         .body(Body::empty())
         .expect("req");
-    let resp_raw = app.oneshot(req_raw).await.expect("resp");
+    let resp_raw = app.clone().oneshot(req_raw).await.expect("resp");
     assert_eq!(resp_raw.status(), StatusCode::OK);
     let body_raw = resp_raw
         .into_body()
@@ -359,5 +396,75 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
         .expect("body")
         .to_bytes();
     let json_raw: serde_json::Value = serde_json::from_slice(&body_raw).expect("json");
-    assert_eq!(json_raw["windows"][0]["used_percent"], 20.0);
+    assert_eq!(
+        json_raw["raw_field"], "personal_secret",
+        "Own personal key must decrypt and expose raw_json on /v1/usage/raw (USG-8)"
+    );
+
+    // 5. Client key of another user (bob) querying Global key receives allow-list sanitized_json only (USG-8, SEC-18)
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+    let bob_user = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "bob_usage_test",
+            password: "supersecretbobpass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &OsEntropy,
+        2000,
+    )
+    .await
+    .expect("create bob user");
+    let bob_id = bob_user.id;
+    let bob_actor = ActorScope::user(bob_id, Role::User);
+    let bob_key = create_client_key(
+        &pool,
+        &bob_actor,
+        bob_id,
+        NewClientKey {
+            label: "Bob Key".to_string(),
+            allowed_models: None,
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &OsEntropy,
+        2000,
+    )
+    .await
+    .expect("create bob key");
+    let bob_token = bob_key.raw_token.expose_secret().to_string();
+
+    let updated_snapshot = load_initial_snapshot(&pool)
+        .await
+        .expect("updated snapshot");
+    shared_snapshot.store(Arc::new(updated_snapshot));
+
+    let req_bob_raw = Request::builder()
+        .uri("/v1/usage/raw")
+        .header(header::AUTHORIZATION, format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp_bob_raw = app.oneshot(req_bob_raw).await.expect("resp");
+    assert_eq!(resp_bob_raw.status(), StatusCode::OK);
+    let body_bob_raw = resp_bob_raw
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json_bob_raw: serde_json::Value = serde_json::from_slice(&body_bob_raw).expect("json");
+    assert_eq!(
+        json_bob_raw["windows"][0]["used_percent"], 20.0,
+        "Non-owner must receive allow-list sanitized_json (USG-8, SEC-18)"
+    );
+    assert!(
+        json_bob_raw.get("raw_field").is_none(),
+        "Non-owner must NOT see raw_json fields on Global/Shared keys (USG-8, SEC-18)"
+    );
 }
