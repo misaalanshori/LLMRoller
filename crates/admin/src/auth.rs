@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::header::COOKIE;
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -495,29 +496,37 @@ async fn get_login_page(State(state): State<AuthAppState>) -> Response {
 #[doc = "Spec: AUTH-7, Spec: AUTH-8, Spec: SEC-4, Spec: SEC-5"]
 async fn post_login(
     State(state): State<AuthAppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, AuthError> {
     let now_ms = state.clock.now_ms();
-    // Default to loopback for peer address if running behind axum without connect info
+    let peer_addr = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(
+            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
+            |ci| ci.0,
+        );
     let client_ip = extract_client_ip(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
-        &headers,
+        peer_addr,
+        &parts.headers,
         &state.config.trusted_proxies,
     );
 
     // 1. Validate Login CSRF token per SEC-5
     let login_csrf_cookie_name = state.config.login_csrf_cookie_name();
-    let cookie_header = headers
+    let cookie_header = parts
+        .headers
         .get(COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let expected_csrf = parse_cookie_value(cookie_header, login_csrf_cookie_name);
 
-    let header_csrf = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-    if let (Some(expected), Some(header_token)) = (expected_csrf, header_csrf)
-        && !bool::from(expected.as_bytes().ct_eq(header_token.as_bytes()))
-    {
+    let header_csrf = parts.headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
+    let (Some(expected), Some(header_token)) = (expected_csrf, header_csrf) else {
+        return Err(AuthError::InvalidCsrf);
+    };
+    if expected.is_empty() || !bool::from(expected.as_bytes().ct_eq(header_token.as_bytes())) {
         return Err(AuthError::InvalidCsrf);
     }
 
@@ -568,9 +577,7 @@ async fn post_login(
     let session_token = URL_SAFE_NO_PAD.encode(raw_session);
     let session_id_hash = sha256_hex(session_token.as_bytes());
 
-    let mut raw_csrf = [0_u8; 32];
-    state.entropy.fill_bytes(&mut raw_csrf);
-    let csrf_token = URL_SAFE_NO_PAD.encode(raw_csrf);
+    let csrf_token = derive_session_csrf(&session_token);
     let csrf_hash = sha256_hex(csrf_token.as_bytes());
 
     let expires_at = now_ms + SESSION_ABSOLUTE_TIMEOUT_MS;
@@ -581,7 +588,7 @@ async fn post_login(
             user_id: record.user.id,
             csrf_hash: &csrf_hash,
             ip_addr: Some(&client_ip.to_string()),
-            user_agent: headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            user_agent: parts.headers.get("user-agent").and_then(|v| v.to_str().ok()),
             created_at: now_ms,
             expires_at,
         },
@@ -736,7 +743,13 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     response
 }
 
-fn parse_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+/// Derives the verifiable per-session CSRF token from the session token.
+#[must_use]
+pub fn derive_session_csrf(session_token: &str) -> String {
+    sha256_hex(format!("llmroller.csrf.v1:{session_token}").as_bytes())
+}
+
+pub fn parse_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     for pair in cookie_header.split(';') {
         let mut parts = pair.trim().splitn(2, '=');
         let key = parts.next()?.trim();

@@ -6,6 +6,7 @@
 use askama::Template;
 use axum::Json;
 use axum::extract::State;
+use axum::http::header::COOKIE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
@@ -40,10 +41,14 @@ pub async fn get_app_ui(
         .await
         .map_err(map_auth_error)?;
 
+    let cookie_header = headers.get(COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let session_token = crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name()).unwrap_or("");
+    let csrf_token = crate::auth::derive_session_csrf(session_token);
+
     let app_content = AppTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Personal Workspace".to_string(),
-        csrf_token: session.session.csrf_hash,
+        csrf_token,
         traceability_enabled: false,
         is_admin: session.user.role == Role::Admin,
         content: app_content,
@@ -69,10 +74,14 @@ pub async fn get_admin_ui(
         return Err(map_auth_error(crate::auth::AuthError::Forbidden));
     }
 
+    let cookie_header = headers.get(COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let session_token = crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name()).unwrap_or("");
+    let csrf_token = crate::auth::derive_session_csrf(session_token);
+
     let admin_content = AdminTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Admin Console".to_string(),
-        csrf_token: session.session.csrf_hash,
+        csrf_token,
         traceability_enabled: false,
         is_admin: true,
         content: admin_content,

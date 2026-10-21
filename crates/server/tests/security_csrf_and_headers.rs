@@ -243,6 +243,71 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         // Missing x-csrf-token!
         .body(Body::from(r#"{"enabled":false,"retention_days":14}"#))
         .expect("req");
-    let mutating_res = app.oneshot(mutating_req).await.expect("res");
+    let mutating_res = app.clone().oneshot(mutating_req).await.expect("res");
     assert_eq!(mutating_res.status(), StatusCode::FORBIDDEN);
+
+    // 5. POST /api/auth/login without Cookie or X-CSRF-Token returns HTTP 403 Forbidden (SEC-5 login CSRF)
+    let bad_login_req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "username": "csrf_admin",
+                "password": "supersecretadminpass123",
+            })
+            .to_string(),
+        ))
+        .expect("req");
+    let bad_login_res = app.clone().oneshot(bad_login_req).await.expect("res");
+    assert_eq!(
+        bad_login_res.status(),
+        StatusCode::FORBIDDEN,
+        "Login without CSRF cookie/header must be rejected with 403"
+    );
+
+    // 6. GET /app exposes verifiable x-csrf-token in hx-headers, allowing mutations (SEC-5, UI-1)
+    let app_get_req = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header(header::COOKIE, &session_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let app_get_res = app.clone().oneshot(app_get_req).await.expect("res");
+    assert_eq!(app_get_res.status(), StatusCode::OK);
+    let app_body_bytes = app_get_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let app_html = std::str::from_utf8(&app_body_bytes).expect("utf8");
+
+    // Extract x-csrf-token from <body hx-headers='{"x-csrf-token": "..."}'>
+    let token_marker = r#"{"x-csrf-token": ""#;
+    let token_start = app_html
+        .find(token_marker)
+        .expect("hx-headers x-csrf-token")
+        + token_marker.len();
+    let token_end = app_html[token_start..]
+        .find('"')
+        .expect("token end quote")
+        + token_start;
+    let extracted_csrf = &app_html[token_start..token_end];
+
+    // Mutating request using extracted CSRF token succeeds
+    let mutating_with_csrf_req = Request::builder()
+        .method("PUT")
+        .uri("/admin/api/settings/traceability")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", extracted_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"enabled":false,"retention_days":14}"#))
+        .expect("req");
+    let mutating_with_csrf_res = app.oneshot(mutating_with_csrf_req).await.expect("res");
+    assert_eq!(
+        mutating_with_csrf_res.status(),
+        StatusCode::OK,
+        "Mutation with extracted x-csrf-token from /app should succeed"
+    );
 }

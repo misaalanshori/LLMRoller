@@ -19,7 +19,7 @@ use llmroller_store::client_keys::{
     ClientKey, ClientKeyError, ClientKeyPatch, NewClientKey, create_client_key, delete_client_key,
     list_client_keys, patch_client_key,
 };
-use llmroller_store::crypto::{MasterKey, sha256_hex};
+use llmroller_store::crypto::MasterKey;
 use llmroller_store::providers::{
     NewProvider, NewUpstreamKey, Provider, ProviderError, ProviderPatch, UpstreamKey,
     UpstreamKeyPatch, create_provider, create_upstream_key, delete_provider, delete_upstream_key,
@@ -64,14 +64,9 @@ async fn authenticate_actor(
         .map_err(map_auth_error)?;
 
     if is_mutation {
-        let token = headers
-            .get("x-csrf-token")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| map_auth_error(AuthError::InvalidCsrf))?;
-        let hash = sha256_hex(token.as_bytes());
-        if hash != session.session.csrf_hash {
-            return Err(map_auth_error(AuthError::InvalidCsrf));
-        }
+        crate::auth::validate_session_csrf(&session, headers)
+            .await
+            .map_err(map_auth_error)?;
     }
 
     Ok(ActorScope::user(session.user.id, session.user.role))

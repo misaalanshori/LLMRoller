@@ -127,17 +127,41 @@ pub fn extract_client_ip(
     trusted_proxies: &[String],
 ) -> IpAddr {
     let peer_ip = peer_addr.ip();
+    if trusted_proxies.is_empty() {
+        return peer_ip;
+    }
+
+    let peer_str = peer_ip.to_string();
     let is_trusted = trusted_proxies.iter().any(|cidr| {
-        cidr.parse::<IpNet>()
-            .is_ok_and(|net| net.contains(&peer_ip))
+        cidr.trim() == peer_str
+            || cidr
+                .trim()
+                .parse::<IpNet>()
+                .is_ok_and(|net| net.contains(&peer_ip))
     });
 
-    if is_trusted
-        && let Some(forwarded_for) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(first) = forwarded_for.split(',').next()
-        && let Ok(ip) = first.trim().parse::<IpAddr>()
-    {
-        return ip;
+    if !is_trusted {
+        return peer_ip;
+    }
+
+    let Some(forwarded_for) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+        return peer_ip;
+    };
+
+    let entries: Vec<&str> = forwarded_for.split(',').map(str::trim).collect();
+    for entry in entries.into_iter().rev() {
+        if let Ok(ip) = entry.parse::<IpAddr>() {
+            let is_proxy = trusted_proxies.iter().any(|cidr| {
+                cidr.trim() == entry
+                    || cidr
+                        .trim()
+                        .parse::<IpNet>()
+                        .is_ok_and(|net| net.contains(&ip))
+            });
+            if !is_proxy {
+                return ip;
+            }
+        }
     }
 
     peer_ip
@@ -154,8 +178,16 @@ pub async fn client_key_auth_middleware(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
 
+    let peer_addr = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(
+            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            |ci| ci.0,
+        );
+
     let client_ip = extract_client_ip(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+        peer_addr,
         &headers,
         &state.trusted_proxies,
     );
@@ -302,5 +334,57 @@ pub async fn client_key_auth_middleware(
             )
                 .into_response(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: AUTH-8, Spec: SEC-12, Spec: CLK-4"]
+    fn test_extract_client_ip_right_to_left_traversal() {
+        let peer_addr: SocketAddr = "10.0.0.1:12345".parse().expect("parse socket addr");
+        let trusted_proxies = vec!["10.0.0.0/8".to_string(), "172.16.0.1".to_string()];
+
+        // 1. Untrusted peer -> returns peer IP, ignores XFF
+        let untrusted_peer: SocketAddr = "192.168.1.1:12345".parse().expect("parse socket addr");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "1.2.3.4, 5.6.7.8".parse().expect("parse header"),
+        );
+        assert_eq!(
+            extract_client_ip(untrusted_peer, &headers, &trusted_proxies),
+            "192.168.1.1".parse::<IpAddr>().expect("parse ip")
+        );
+
+        // 2. Trusted peer with multiple XFF -> traverses right-to-left
+        headers.insert(
+            "x-forwarded-for",
+            "1.1.1.1, 203.0.113.195, 172.16.0.1"
+                .parse()
+                .expect("parse header"),
+        );
+        assert_eq!(
+            extract_client_ip(peer_addr, &headers, &trusted_proxies),
+            "203.0.113.195".parse::<IpAddr>().expect("parse ip")
+        );
+
+        // 3. Trusted peer with single external IP
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.42".parse().expect("parse header"),
+        );
+        assert_eq!(
+            extract_client_ip(peer_addr, &headers, &trusted_proxies),
+            "198.51.100.42".parse::<IpAddr>().expect("parse ip")
+        );
+
+        // 4. Empty trusted proxies -> returns peer IP even if XFF present
+        assert_eq!(
+            extract_client_ip(peer_addr, &headers, &[]),
+            "10.0.0.1".parse::<IpAddr>().expect("parse ip")
+        );
     }
 }

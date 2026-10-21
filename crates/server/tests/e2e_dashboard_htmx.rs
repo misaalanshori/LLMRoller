@@ -139,7 +139,8 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
     let raw_session = "test_session_token_12345678901234567890";
     let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
-    let csrf_hash = llmroller_store::crypto::sha256_hex(b"csrf_secret");
+    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
         llmroller_store::users::NewWebSession {
