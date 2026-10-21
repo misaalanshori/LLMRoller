@@ -14,7 +14,7 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
@@ -28,7 +28,7 @@ use llmroller_core::eligibility::{
 use llmroller_core::ids::{
     ClientKeyId, ModelPk, ProviderId, RequestId, ShareId, UpstreamKeyId, UserId,
 };
-use llmroller_core::pins::{PinKey, PinTicket};
+use llmroller_core::pins::{PinKey, PinOutcome, PinTicket};
 use llmroller_core::pricing::{
     CostSource, PriceEntry, Rates, compute_request_cost, estimate_input_tokens,
 };
@@ -46,7 +46,9 @@ use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
 use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
+use llmroller_store::pins::ResponseLinkRow;
 use llmroller_store::usage_writer::{UsageAttemptRecord, UsageEventRecord};
+use llmroller_store::writer::{DurableKey, DurableOp};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -180,21 +182,614 @@ pub async fn post_messages(
     .await
 }
 
-/// Handler for POST /v1/messages/count_tokens.
-pub async fn post_messages_count_tokens(
-    State(_state): State<ProxyAuthState>,
-    _headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let est = llmroller_core::pricing::estimate_input_tokens(&body);
+fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        Json(serde_json::json!({
-            "input_tokens": est
-        })),
+        status,
+        Json(serde_json::json!({ "error": { "code": code, "message": message.into() } })),
     )
         .into_response()
+}
+
+fn response_not_found(response_id: &str) -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "response_not_found",
+        format!("response '{response_id}' not found"),
+    )
+}
+
+fn permission_error(message: impl Into<String>) -> Response {
+    json_error(StatusCode::FORBIDDEN, "permission_error", message)
+}
+
+fn rate_limit_error(retry_after_secs: u64) -> Response {
+    let mut response = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_error",
+        "the upstream key that holds this response is temporarily unavailable",
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
+}
+
+/// Load one durable response link for a routed Responses operation.
+async fn load_response_link(
+    state: &ProxyAuthState,
+    response_id: &str,
+) -> Result<Option<ResponseLinkRow>, sqlx::Error> {
+    let mut tx = state.pool.begin().await?;
+    let link = llmroller_store::pins::get_response_link_tx(&mut tx, response_id).await?;
+    tx.commit().await?;
+    Ok(link)
+}
+
+/// Project the C1-C8 hard-route checks for a linked upstream key (RTE-12).
+fn hard_route_checks(
+    snapshot: &ConfigSnapshot,
+    runtime: &RuntimeState,
+    link: &ResponseLinkRow,
+    caller: &ClientKeyRecord,
+    protocol: &str,
+    now: i64,
+) -> (crate::failover::HardRouteChecks, u64) {
+    use crate::failover::HardRouteChecks;
+
+    let route = snapshot
+        .routes_by_model
+        .get(&link.model_pk)
+        .and_then(|routes| {
+            routes
+                .iter()
+                .find(|route| route.upstream_key_id == link.upstream_key_id)
+        });
+    let key = snapshot.upstream_keys.get(&link.upstream_key_id);
+    let provider = key.and_then(|key| snapshot.providers.get(&key.provider_id));
+    let model = snapshot.models.get(&link.model_pk);
+    let scope = parse_scope(&caller.routing_scope);
+
+    let c1 = key.is_some_and(|key| key.enabled)
+        && provider.is_some_and(|provider| provider.enabled)
+        && route.is_some_and(|route| {
+            route.enabled && route.status == llmroller_core::catalog::RouteStatus::Active
+        });
+
+    let c2 = match (provider, key) {
+        (Some(provider), Some(key)) => match provider.ownership_scope {
+            llmroller_core::rbac::OwnershipScope::Global => {
+                snapshot
+                    .users
+                    .get(&caller.owner_user_id)
+                    .is_some_and(|user| user.can_use_global_providers)
+                    && scope.allows_tier(PoolTier::Global)
+            }
+            llmroller_core::rbac::OwnershipScope::Personal => {
+                if provider.owner_user_id == Some(caller.owner_user_id) {
+                    scope.allows_tier(PoolTier::Own)
+                } else {
+                    let shared = snapshot
+                        .effective_share(caller.owner_user_id, provider.id, key.id)
+                        .is_some_and(|share| {
+                            share.allowed_models.as_ref().is_none_or(|allowed| {
+                                model.is_some_and(|model| allowed.contains(&model.canonical_id))
+                            })
+                        });
+                    shared && scope.allows_tier(PoolTier::Shared)
+                }
+            }
+        },
+        _ => false,
+    };
+
+    let c3 = provider.is_none_or(|provider| {
+        provider.ownership_scope != llmroller_core::rbac::OwnershipScope::Personal
+            || provider.owner_user_id.is_none_or(|owner| {
+                snapshot
+                    .users
+                    .get(&owner)
+                    .is_some_and(|user| !user.disabled)
+            })
+    });
+
+    let c4 = model.is_some_and(|model| {
+        model.exposed != Some(false)
+            && (provider.is_some_and(|provider| {
+                provider.ownership_scope == llmroller_core::rbac::OwnershipScope::Global
+            }) || snapshot
+                .user_route_prefs
+                .get(&(caller.owner_user_id, model.id))
+                .is_none_or(|pref| pref.enabled))
+    });
+
+    let c5 = route.is_some_and(|route| {
+        route.protocols.iter().any(|value| value == protocol) && route_healthy(route, now)
+    });
+
+    let c6 = key.is_some_and(|key| runtime.is_key_routable(key.id, now))
+        && route.is_some_and(|route| route_healthy(route, now));
+    let c7 = provider.is_some_and(|provider| runtime.is_origin_admitted(provider.id, now));
+    let c8 = key.is_some_and(|key| runtime.key_budget_admitted(key.id, now));
+
+    let retry_after = {
+        let mut until = now.saturating_add(60_000);
+        if let Some(key) = key {
+            let health = runtime.key_health_entry(key.id);
+            for candidate in [health.cooldown_until_ms, health.exhausted_until_ms]
+                .into_iter()
+                .flatten()
+            {
+                if candidate > now {
+                    until = until.min(candidate);
+                }
+            }
+        }
+        if let Some(until_route) = route.and_then(|route| route.route_health_until)
+            && until_route > now
+        {
+            until = until.min(until_route);
+        }
+        u64::try_from((until - now) / 1000).unwrap_or(60).max(1)
+    };
+
+    (
+        HardRouteChecks {
+            c1_c5_passed: c1 && c2 && c3 && c4 && c5,
+            c6_c8_passed: c6 && c7 && c8,
+            c6_failed: !c6,
+            c7_failed: !c7,
+            c8_failed: !c8,
+            c2_or_c3_failed: !c2 || !c3,
+            c4_or_c5_failed: !c4 || !c5,
+        },
+        retry_after,
+    )
+}
+
+/// Classify a provider/key pair into the caller-visible candidate pool tier.
+fn candidate_tier(
+    snapshot: &ConfigSnapshot,
+    provider: &ProviderRecord,
+    key: &UpstreamKeyRecord,
+    caller_user_id: UserId,
+) -> Option<(CandidatePoolTier, Option<ShareId>)> {
+    match provider.ownership_scope {
+        llmroller_core::rbac::OwnershipScope::Global => Some((CandidatePoolTier::Global, None)),
+        llmroller_core::rbac::OwnershipScope::Personal => {
+            if provider.owner_user_id == Some(caller_user_id) {
+                Some((CandidatePoolTier::Own, None))
+            } else {
+                // A foreign personal key without a share grant is invisible (SEC-17).
+                snapshot
+                    .effective_share(caller_user_id, provider.id, key.id)
+                    .map(|share| (CandidatePoolTier::Shared, Some(share.share_id)))
+            }
+        }
+    }
+}
+
+/// Build the single hard-route candidate for a durable response link (RTE-12).
+fn linked_candidate(
+    snapshot: &ConfigSnapshot,
+    link: &ResponseLinkRow,
+    caller: &ClientKeyRecord,
+) -> Option<RouteCandidate> {
+    let route = snapshot
+        .routes_by_model
+        .get(&link.model_pk)?
+        .iter()
+        .find(|route| route.upstream_key_id == link.upstream_key_id)?;
+    let key = snapshot.upstream_keys.get(&link.upstream_key_id)?;
+    let provider = snapshot.providers.get(&key.provider_id)?;
+    let (pool_tier, share_id) = candidate_tier(snapshot, provider, key, caller.owner_user_id)?;
+
+    Some(RouteCandidate {
+        upstream_key_id: key.id,
+        provider_id: provider.id,
+        model_pk: link.model_pk,
+        upstream_model_id: route.upstream_model_id.clone(),
+        base_url: provider.base_url.clone(),
+        allow_private_network: provider.allow_private_network,
+        pool_tier,
+        ownership_scope: provider.ownership_scope,
+        priority: route
+            .priority_override
+            .unwrap_or(key.priority)
+            .clamp(1, 1000),
+        provider_kind: provider.kind,
+        share_id,
+    })
+}
+
+/// Whether the Responses body opted into upstream storage (`store` defaults to true).
+fn response_store_flag(scan: &llmroller_proto::body_edit::TopLevelScan, body: &[u8]) -> bool {
+    scan.fields
+        .iter()
+        .find(|field| field.key == "store")
+        .and_then(|field| body.get(field.val_start..field.val_end))
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .is_none_or(|raw| raw.trim() != "false")
+}
+
+/// Durable `response_links` TTL: 30 days when stored, 1 hour otherwise.
+fn response_link_ttl_ms(store_flag: bool) -> i64 {
+    if store_flag {
+        30 * 24 * 60 * 60 * 1_000
+    } else {
+        60 * 60 * 1_000
+    }
+}
+
+/// Coalesced durable response-link write (RTE-12).
+#[allow(clippy::too_many_arguments)]
+fn enqueue_response_link(
+    state: &ProxyAuthState,
+    owner_user_id: UserId,
+    client_key_id: ClientKeyId,
+    model_pk: ModelPk,
+    upstream_key_id: UpstreamKeyId,
+    session_hash: &str,
+    response_id: &str,
+    status: &str,
+    store_flag: bool,
+    created_at: i64,
+) {
+    let Some(writer) = &state.writer else {
+        return;
+    };
+    let link = ResponseLinkRow {
+        response_id: response_id.to_string(),
+        owner_user_id,
+        client_key_id,
+        upstream_key_id,
+        model_pk,
+        session_hash: session_hash.to_string(),
+        status: status.to_string(),
+        store_flag,
+        created_at,
+        updated_at: created_at,
+        expires_at: created_at.saturating_add(response_link_ttl_ms(store_flag)),
+    };
+    writer.queues.durable_state.lock().insert(
+        DurableKey::ResponseLink(response_id.to_string()),
+        DurableOp::ResponseLinkUpsert(link),
+    );
+}
+
+/// Extract the upstream response id from a non-streaming `responses` payload.
+fn json_response_id(value: &serde_json::Value) -> Option<&str> {
+    value.get("id").and_then(|id| id.as_str())
+}
+
+/// Extract `response.created` (or any response object) id from the first SSE frame.
+fn sse_response_id(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let candidate = value
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(|id| id.as_str())
+            .or_else(|| value.get("id").and_then(|id| id.as_str()));
+        if let Some(id) = candidate {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// Forward one state-bound Responses operation to the exact linked upstream key.
+async fn forward_state_bound_response_op(
+    state: &ProxyAuthState,
+    caller: &ClientKeyRecord,
+    response_id: &str,
+    method: Method,
+    subpath: &str,
+) -> Response {
+    use crate::failover::{HardRouteDecision, evaluate_hard_route_decision};
+
+    let now = now_ms();
+    let link = match load_response_link(state, response_id).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return response_not_found(response_id),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if link.owner_user_id != caller.owner_user_id || now > link.expires_at {
+        return response_not_found(response_id);
+    }
+
+    let snapshot = state.snapshot.load();
+    let Some(key) = snapshot.upstream_keys.get(&link.upstream_key_id).cloned() else {
+        return permission_error(
+            "the upstream key that holds this response is no longer available",
+        );
+    };
+    let Some(provider) = snapshot.providers.get(&key.provider_id).cloned() else {
+        return permission_error(
+            "the upstream key that holds this response is no longer available",
+        );
+    };
+
+    let (checks, retry_after) = hard_route_checks(
+        &snapshot,
+        &state.runtime_state,
+        &link,
+        caller,
+        "responses",
+        now,
+    );
+    match evaluate_hard_route_decision(&checks, link.upstream_key_id, retry_after) {
+        HardRouteDecision::RouteWithoutFailover(_) => {}
+        HardRouteDecision::RateLimit429 { retry_after_secs } => {
+            return rate_limit_error(retry_after_secs);
+        }
+        HardRouteDecision::Forbidden403KeyUnavailable => {
+            return permission_error(
+                "the upstream key that holds this response is no longer available",
+            );
+        }
+        HardRouteDecision::Forbidden403ModelOrProtocolBlocked => {
+            return permission_error(
+                "the model or protocol that holds this response is no longer available",
+            );
+        }
+    }
+
+    let secret = match unseal_upstream_key(state, &snapshot, &key) {
+        Ok(secret) => secret,
+        Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let url = format!(
+        "{}/responses/{}{subpath}",
+        provider.base_url.trim_end_matches('/'),
+        response_id
+    );
+    if crate::ssrf::validate_url(&url, provider.allow_private_network).is_err() {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unreachable",
+            "the linked upstream origin is not permitted",
+        );
+    }
+    let client = match crate::ssrf::create_guarded_client(provider.allow_private_network) {
+        Ok(client) => client,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let request_id = RequestId::generate().to_string();
+    let upstream = match client
+        .request(method.clone(), &url)
+        .header(header::AUTHORIZATION.as_str(), format!("Bearer {secret}"))
+        .header("x-request-id", &request_id)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unreachable",
+                "the linked upstream key could not be reached",
+            );
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
+    let body = match upstream.bytes().await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    if status.is_success() {
+        if method == Method::DELETE && subpath.is_empty() {
+            if sqlx::query("DELETE FROM response_links WHERE response_id = ?")
+                .bind(response_id)
+                .execute(&state.pool)
+                .await
+                .is_err()
+            {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        } else if subpath == "/cancel"
+            && sqlx::query("UPDATE response_links SET status = 'incomplete' WHERE response_id = ?")
+                .bind(response_id)
+                .execute(&state.pool)
+                .await
+                .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Handler for POST /v1/messages/count_tokens.
+pub async fn post_messages_count_tokens(
+    State(state): State<ProxyAuthState>,
+    headers: HeaderMap,
+    Extension(caller): Extension<ClientKeyRecord>,
+    body: Bytes,
+) -> Response {
+    let now = now_ms();
+    let scan = match scan_top_level(&body) {
+        Ok(scan) => scan,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
+    };
+    let Some((ref model_str, _)) = scan.model else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "model is required in request body",
+        );
+    };
+    let snapshot = state.snapshot.load();
+    let model = match snapshot.resolve_model(model_str) {
+        Ok(model) => model.clone(),
+        Err(llmroller_core::snapshot::SnapshotResolveError::KillSwitched) => {
+            return permission_error(format!("model {model_str} is disabled"));
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("model {model_str} not found in catalog"),
+            );
+        }
+    };
+    if let Some(ref allowed) = caller.allowed_models
+        && !allowed
+            .iter()
+            .any(|entry| entry == &model.canonical_id || entry == model_str)
+    {
+        return permission_error(format!(
+            "model {} not permitted on this key",
+            model.canonical_id
+        ));
+    }
+
+    let scope = parse_scope(&caller.routing_scope);
+    let mut candidates: Vec<RouteCandidate> =
+        collect_candidates(&snapshot, &model, &caller, scope, now)
+            .into_iter()
+            .filter(|candidate| {
+                snapshot
+                    .routes_by_model
+                    .get(&model.id)
+                    .and_then(|routes| {
+                        routes.iter().find(|route| {
+                            route.upstream_key_id == candidate.upstream_key_id
+                                && route.protocols.iter().any(|value| value == "messages")
+                        })
+                    })
+                    .is_some()
+            })
+            .collect();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+
+    if candidates.is_empty() {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "no eligible upstream supports native Anthropic token counting",
+        );
+    }
+
+    for candidate in candidates {
+        let Some(key) = snapshot
+            .upstream_keys
+            .get(&candidate.upstream_key_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let secret = match unseal_upstream_key(&state, &snapshot, &key) {
+            Ok(secret) => secret,
+            Err(()) => continue,
+        };
+        let url = format!(
+            "{}/messages/count_tokens",
+            candidate.base_url.trim_end_matches('/')
+        );
+        if crate::ssrf::validate_url(&url, candidate.allow_private_network).is_err() {
+            continue;
+        }
+        let client = match crate::ssrf::create_guarded_client(candidate.allow_private_network) {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
+        let edited = match edit_body(
+            body.clone(),
+            candidate.pool_tier(),
+            Some(&candidate.upstream_model_id),
+            ChatStreamMode::Native,
+            None,
+        ) {
+            Ok((body, _)) => body,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let mut outbound = match llmroller_proto::headers::apply_request_header_pipeline(
+            &headers,
+            candidate.pool_tier(),
+            Some(("x-api-key", &secret)),
+            &[],
+            &[],
+        ) {
+            Ok(headers) => headers,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {secret}")) {
+            outbound.insert(header::AUTHORIZATION, value);
+        }
+        outbound
+            .entry("anthropic-version")
+            .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
+
+        let response = match client
+            .post(&url)
+            .body(edited)
+            .headers(outbound)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unreachable",
+                    "the upstream provider could not be reached",
+                );
+            }
+        };
+        let status =
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            continue;
+        }
+        let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+        let mut builder = Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(CONTENT_TYPE, content_type);
+        }
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    json_error(
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        "no eligible upstream supports native Anthropic token counting",
+    )
 }
 
 /// Handler for POST /v1/responses/compact.
@@ -220,47 +815,7 @@ pub async fn get_response_by_id(
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    use sqlx::Row as _;
-    let query_result = sqlx::query(
-        "SELECT response_id, owner_user_id, status FROM response_links WHERE response_id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await;
-
-    match query_result {
-        Ok(Some(row)) => {
-            let owner_str: String = match row.try_get("owner_user_id") {
-                Ok(s) => s,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            if owner_str != client_key.owner_user_id.to_string() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-                )
-                    .into_response();
-            }
-            let resp_id: String = row.try_get("response_id").unwrap_or(id);
-            let status: String = row
-                .try_get("status")
-                .unwrap_or_else(|_| "completed".to_string());
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "id": resp_id,
-                    "object": "response",
-                    "status": status
-                })),
-            )
-                .into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-        )
-            .into_response(),
-    }
+    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "").await
 }
 
 /// Handler for DELETE /v1/responses/{id}.
@@ -269,42 +824,7 @@ pub async fn delete_response_by_id(
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    use sqlx::Row as _;
-    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await;
-
-    match row {
-        Ok(Some(r)) => {
-            let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
-            if owner_str != client_key.owner_user_id.to_string() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-                )
-                    .into_response();
-            }
-            let _ = sqlx::query("DELETE FROM response_links WHERE response_id = ?")
-                .bind(&id)
-                .execute(&state.pool)
-                .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "id": id,
-                    "object": "response",
-                    "deleted": true
-                })),
-            )
-                .into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-        )
-            .into_response(),
-    }
+    forward_state_bound_response_op(&state, &client_key, &id, Method::DELETE, "").await
 }
 
 /// Handler for GET /v1/responses/{id}/input_items.
@@ -313,37 +833,7 @@ pub async fn get_response_input_items(
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    use sqlx::Row as _;
-    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await;
-
-    match row {
-        Ok(Some(r)) => {
-            let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
-            if owner_str != client_key.owner_user_id.to_string() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-                )
-                    .into_response();
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "object": "list",
-                    "data": []
-                })),
-            )
-                .into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-        )
-            .into_response(),
-    }
+    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "/input_items").await
 }
 
 /// Handler for POST /v1/responses/{id}/cancel.
@@ -352,43 +842,7 @@ pub async fn post_response_cancel(
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    use sqlx::Row as _;
-    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await;
-
-    match row {
-        Ok(Some(r)) => {
-            let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
-            if owner_str != client_key.owner_user_id.to_string() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-                )
-                    .into_response();
-            }
-            let _ =
-                sqlx::query("UPDATE response_links SET status = 'cancelled' WHERE response_id = ?")
-                    .bind(&id)
-                    .execute(&state.pool)
-                    .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "id": id,
-                    "object": "response",
-                    "status": "cancelled"
-                })),
-            )
-                .into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": { "code": "response_not_found" } })),
-        )
-            .into_response(),
-    }
+    forward_state_bound_response_op(&state, &client_key, &id, Method::POST, "/cancel").await
 }
 
 /// One fully-resolved routing candidate built exclusively from the immutable snapshot.
@@ -474,20 +928,10 @@ fn collect_candidates(
             continue;
         }
 
-        let (tier, share_id) = match provider.ownership_scope {
-            llmroller_core::rbac::OwnershipScope::Global => (CandidatePoolTier::Global, None),
-            llmroller_core::rbac::OwnershipScope::Personal => {
-                if provider.owner_user_id == Some(caller.owner_user_id) {
-                    (CandidatePoolTier::Own, None)
-                } else if let Some(share) =
-                    snapshot.effective_share(caller.owner_user_id, provider.id, key.id)
-                {
-                    (CandidatePoolTier::Shared, Some(share.share_id))
-                } else {
-                    // A foreign personal key without a share grant is invisible (SEC-17).
-                    continue;
-                }
-            }
+        let (tier, share_id) = match candidate_tier(snapshot, provider, key, caller.owner_user_id) {
+            Some(tier) => tier,
+            // A foreign personal key without a share grant is invisible (SEC-17).
+            None => continue,
         };
 
         if !scope.allows_tier(candidate_tier_as_pool(tier)) {
@@ -977,6 +1421,18 @@ fn attempt_record(
 }
 
 /// Owns all post-stream accounting and finalizes exactly once on EOF or client drop.
+/// Deferred status write for a response link created on a streamed `response.created` frame.
+struct ResponseLinkFinalizer {
+    response_id: String,
+    owner_user_id: UserId,
+    client_key_id: ClientKeyId,
+    upstream_key_id: UpstreamKeyId,
+    model_pk: ModelPk,
+    session_hash: String,
+    store_flag: bool,
+    created_at: i64,
+}
+
 struct StreamFinalizer {
     state: ProxyAuthState,
     usage: UsageContext,
@@ -989,6 +1445,7 @@ struct StreamFinalizer {
     price_entry: Option<PriceEntry>,
     fallback_rates: Rates,
     attempts: Vec<UsageAttemptRecord>,
+    response_link: Option<ResponseLinkFinalizer>,
     started_ms: i64,
     ttfb_ms: Option<i64>,
     finalized: bool,
@@ -1052,6 +1509,26 @@ impl StreamFinalizer {
                 .queues
                 .usage_writer
                 .enqueue(event, std::mem::take(&mut self.attempts));
+        }
+
+        if let Some(link) = &self.response_link {
+            let status = if termination.is_incomplete() {
+                "incomplete"
+            } else {
+                "completed"
+            };
+            enqueue_response_link(
+                &self.state,
+                link.owner_user_id,
+                link.client_key_id,
+                link.model_pk,
+                link.upstream_key_id,
+                &link.session_hash,
+                &link.response_id,
+                status,
+                link.store_flag,
+                link.created_at,
+            );
         }
     }
 }
@@ -1144,6 +1621,7 @@ pub async fn handle_inference_request(
     };
 
     let is_streaming = scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
+    let store_flag = response_store_flag(&scan, &body);
     let now = now_ms();
     let request_id = RequestId::generate();
 
@@ -1229,72 +1707,63 @@ pub async fn handle_inference_request(
     }
 
     let scope = parse_scope(&caller.routing_scope);
-    let candidates = collect_candidates(&snapshot, &model, &caller, scope, now);
-    if candidates.is_empty() {
-        crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "no_healthy_key",
-                    "message": "no eligible upstream route available for this caller"
+    // 5. Response-link session inheritance and HardKey affinity (RTE-12, Section 11.1.2).
+    let hard_link: Option<ResponseLinkRow> = if matches!(endpoint, EndpointKind::Responses) {
+        match scan.previous_response_id.as_ref() {
+            Some((previous_id, _)) => match load_response_link(&state, previous_id).await {
+                Ok(Some(link)) if link.owner_user_id != caller.owner_user_id => {
+                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    return response_not_found(previous_id);
                 }
-            })),
-        )
-            .into_response();
-    }
-
-    let eligibility: Vec<EligibilityRoute> = candidates
-        .iter()
-        .map(|candidate| {
-            eligibility_route(
-                &snapshot,
-                &state.runtime_state,
-                candidate,
-                &model,
-                &caller,
-                now,
-            )
-        })
-        .collect();
-    let shares = snapshot
-        .shares_by_grantee
-        .get(&caller.owner_user_id)
-        .map_or(&[][..], Vec::as_slice);
-    let owner_disabled = snapshot
-        .users
-        .get(&caller.owner_user_id)
-        .is_none_or(|user| user.disabled);
-    let can_use_global = snapshot
-        .users
-        .get(&caller.owner_user_id)
-        .is_some_and(|user| user.can_use_global_providers);
-    let context = CallerContext {
-        caller_user_id: &caller.owner_user_id,
-        can_use_global,
-        owner_disabled,
-        model_exposed: model.exposed,
-        merge_state: model.merge_state,
-        inbound_protocol: protocol,
-        model_canonical_id: &model.canonical_id,
+                Ok(Some(link)) if now <= link.expires_at => Some(link),
+                Ok(_) => None,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            },
+            None => None,
+        }
+    } else {
+        None
     };
 
-    let (selected_tier, eligible_pool) = match select_pool(&eligibility, &context, shares, scope) {
-        Ok(selection) => selection,
-        Err(PoolSelectionError::MonthlyCapExhausted) => {
-            crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "no_eligible_route",
-                        "message": "monthly budget capacity exhausted"
-                    }
-                })),
-            )
-                .into_response();
+    let (selected_tier, tier_candidates) = if let Some(link) = &hard_link {
+        use crate::failover::{HardRouteDecision, evaluate_hard_route_decision};
+
+        let (checks, retry_after) = hard_route_checks(
+            &snapshot,
+            &state.runtime_state,
+            link,
+            &caller,
+            protocol,
+            now,
+        );
+        match evaluate_hard_route_decision(&checks, link.upstream_key_id, retry_after) {
+            HardRouteDecision::RouteWithoutFailover(_) => {
+                let Some(candidate) = linked_candidate(&snapshot, link, &caller) else {
+                    return permission_error(
+                        "the upstream key that holds previous_response_id is no longer available to this client key",
+                    );
+                };
+                let tier = candidate.pool_tier;
+                (tier, vec![candidate])
+            }
+            HardRouteDecision::RateLimit429 { retry_after_secs } => {
+                crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                return rate_limit_error(retry_after_secs);
+            }
+            HardRouteDecision::Forbidden403KeyUnavailable => {
+                return permission_error(
+                    "the upstream key that holds previous_response_id is no longer available to this client key",
+                );
+            }
+            HardRouteDecision::Forbidden403ModelOrProtocolBlocked => {
+                return permission_error(
+                    "the model or protocol that holds previous_response_id is no longer available",
+                );
+            }
         }
-        Err(PoolSelectionError::NoEligibleRoute) => {
+    } else {
+        let candidates = collect_candidates(&snapshot, &model, &caller, scope, now);
+        if candidates.is_empty() {
             crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1307,21 +1776,85 @@ pub async fn handle_inference_request(
             )
                 .into_response();
         }
+
+        let eligibility: Vec<EligibilityRoute> = candidates
+            .iter()
+            .map(|candidate| {
+                eligibility_route(
+                    &snapshot,
+                    &state.runtime_state,
+                    candidate,
+                    &model,
+                    &caller,
+                    now,
+                )
+            })
+            .collect();
+        let shares = snapshot
+            .shares_by_grantee
+            .get(&caller.owner_user_id)
+            .map_or(&[][..], Vec::as_slice);
+        let owner_disabled = snapshot
+            .users
+            .get(&caller.owner_user_id)
+            .is_none_or(|user| user.disabled);
+        let can_use_global = snapshot
+            .users
+            .get(&caller.owner_user_id)
+            .is_some_and(|user| user.can_use_global_providers);
+        let context = CallerContext {
+            caller_user_id: &caller.owner_user_id,
+            can_use_global,
+            owner_disabled,
+            model_exposed: model.exposed,
+            merge_state: model.merge_state,
+            inbound_protocol: protocol,
+            model_canonical_id: &model.canonical_id,
+        };
+
+        let (selected_tier, eligible_pool) =
+            match select_pool(&eligibility, &context, shares, scope) {
+                Ok(selection) => selection,
+                Err(PoolSelectionError::MonthlyCapExhausted) => {
+                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "no_eligible_route",
+                                "message": "monthly budget capacity exhausted"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(PoolSelectionError::NoEligibleRoute) => {
+                    crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "no_healthy_key",
+                                "message": "no eligible upstream route available for this caller"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+
+        let tier_candidates: Vec<RouteCandidate> = eligible_pool
+            .iter()
+            .filter_map(|eligible| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.upstream_key_id == eligible.upstream_key_id)
+                    .cloned()
+            })
+            .collect();
+        (selected_tier, tier_candidates)
     };
 
-    let eligible_keys: HashSet<UpstreamKeyId> = eligible_pool
-        .iter()
-        .map(|candidate| candidate.upstream_key_id)
-        .collect();
-    let tier_candidates: Vec<RouteCandidate> = eligible_pool
-        .iter()
-        .filter_map(|eligible| {
-            candidates
-                .iter()
-                .find(|candidate| candidate.upstream_key_id == eligible.upstream_key_id)
-                .cloned()
-        })
-        .collect();
     if tier_candidates.is_empty() {
         crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
         return (
@@ -1335,6 +1868,11 @@ pub async fn handle_inference_request(
         )
             .into_response();
     }
+
+    let eligible_keys: HashSet<UpstreamKeyId> = tier_candidates
+        .iter()
+        .map(|candidate| candidate.upstream_key_id)
+        .collect();
 
     // Stage 1: Gate G7 monthly caps are reserved before any upstream connection.
     let estimate = estimate_cost_micro_usd(&snapshot, &tier_candidates[0], 0).max(
@@ -1381,13 +1919,42 @@ pub async fn handle_inference_request(
     let strategy = model
         .routing_strategy
         .unwrap_or(snapshot.settings.default_routing_strategy);
-    let pin_key = session_pin_key(&headers, &caller, &model.canonical_id);
+    let mut pin_key = session_pin_key(&headers, &caller, &model.canonical_id);
     let pin_ttl_ms = snapshot.settings.pin_ttl_secs.saturating_mul(1000);
     let clock = SystemClock::new();
     let mut pin_ticket: Option<PinTicket> = None;
     let mut ordered: Vec<RouteCandidate> = Vec::new();
 
-    if let Some(pin_key) = &pin_key {
+    if let Some(link) = &hard_link {
+        // HardKey affinity inherits the parent session_hash and disables repinning (RTE-12).
+        pin_key = if link.session_hash.is_empty() {
+            None
+        } else {
+            Some(PinKey {
+                client_key_id: caller.id,
+                canonical_id: model.canonical_id.clone(),
+                session_hash: link.session_hash.clone(),
+            })
+        };
+        if let (Some(pin_key), Some(candidate)) = (pin_key.as_ref(), tier_candidates.first()) {
+            let ticket = state.pin_store.acquire(
+                pin_key,
+                &clock,
+                pin_ttl_ms,
+                false,
+                snapshot.settings.recovery_repin_min_idle_secs,
+                scope,
+                Some(selected_tier),
+                |key_id| key_id == candidate.upstream_key_id,
+                |_tried| Some((candidate.upstream_key_id, candidate.pool_tier)),
+            );
+            if let Some(mut ticket) = ticket {
+                ticket.outcome = PinOutcome::ResponseLink;
+                ordered.push(candidate.clone());
+                pin_ticket = Some(ticket);
+            }
+        }
+    } else if let Some(pin_key) = &pin_key {
         let ticket = state.pin_store.acquire(
             pin_key,
             &clock,
@@ -1780,6 +2347,41 @@ pub async fn handle_inference_request(
                 }
                 drop(permit.take());
 
+                let response_link = if matches!(endpoint, EndpointKind::Responses) {
+                    first_chunk
+                        .as_ref()
+                        .and_then(|bytes| sse_response_id(bytes))
+                        .map(|response_id| {
+                            let session_hash = pin_key
+                                .as_ref()
+                                .map_or_else(String::new, |key| key.session_hash.clone());
+                            enqueue_response_link(
+                                &state,
+                                caller.owner_user_id,
+                                caller.id,
+                                model.id,
+                                candidate.upstream_key_id,
+                                &session_hash,
+                                &response_id,
+                                "in_progress",
+                                store_flag,
+                                now,
+                            );
+                            ResponseLinkFinalizer {
+                                response_id,
+                                owner_user_id: caller.owner_user_id,
+                                client_key_id: caller.id,
+                                upstream_key_id: candidate.upstream_key_id,
+                                model_pk: model.id,
+                                session_hash,
+                                store_flag,
+                                created_at: now,
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let usage = UsageContext {
                     request_id,
                     client_key_id: caller.id,
@@ -1816,6 +2418,7 @@ pub async fn handle_inference_request(
                         .cloned(),
                     fallback_rates: Rates::from(&snapshot.settings.unpriced_fallback_rates),
                     attempts: std::mem::take(&mut attempts),
+                    response_link,
                     started_ms: attempt_started,
                     ttfb_ms: Some(ttfb_ms),
                     finalized: false,
@@ -1972,6 +2575,22 @@ pub async fn handle_inference_request(
 
         let json_value =
             serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+        if matches!(endpoint, EndpointKind::Responses)
+            && let Some(response_id) = json_response_id(&json_value)
+        {
+            enqueue_response_link(
+                &state,
+                caller.owner_user_id,
+                caller.id,
+                model.id,
+                candidate.upstream_key_id,
+                pin_key.as_ref().map_or("", |key| key.session_hash.as_str()),
+                response_id,
+                "completed",
+                store_flag,
+                now,
+            );
+        }
         let extracted = extract_json_usage(endpoint, &json_value).unwrap_or_default();
         let price_entry = snapshot
             .price_for(

@@ -446,6 +446,36 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
             }),
         )
         .route(
+            "/responses/{id}",
+            axum::routing::delete(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp_test_1","deleted":true}"#,
+                )
+            }),
+        )
+        .route(
+            "/responses/{id}/input_items",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"object":"list","data":[]}"#,
+                )
+            }),
+        )
+        .route(
+            "/responses/{id}/cancel",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp_test_1","status":"cancelled"}"#,
+                )
+            }),
+        )
+        .route(
             "/messages",
             axum::routing::post(|| async {
                 (
@@ -576,7 +606,8 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         store_flag: true,
         created_at: 1000,
         updated_at: 1000,
-        expires_at: 1000 + 86400,
+        // Far-future expiry: state-bound forwarding must not depend on wall-clock 1970 fixtures.
+        expires_at: 4_102_444_800_000,
     };
     insert_response_link_tx(&mut tx, &link)
         .await
