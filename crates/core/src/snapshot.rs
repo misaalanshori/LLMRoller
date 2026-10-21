@@ -11,7 +11,7 @@ use crate::catalog::{MergeState, ModelOrigin, RouteStatus};
 use crate::client_key::{ClientKeyRecord, HashRole};
 use crate::ids::{ClientKeyId, ModelPk, ProviderId, UpstreamKeyId, UserId};
 use crate::pricing::PriceEntry;
-use crate::provider::ProviderKind;
+use crate::provider::{ProviderConfig, ProviderKind};
 use crate::rbac::{OwnershipScope, Role};
 use crate::settings::RuntimeSettings;
 use crate::shares::ShareConfig;
@@ -55,6 +55,8 @@ pub struct ProviderRecord {
     pub name: String,
     pub base_url: String,
     pub config_json: String,
+    /// Parsed projection of `config_json` for hot-path protocol behavior (`PRV-3`).
+    pub config: ProviderConfig,
     pub share_config_fingerprint: String,
     pub usage_url_cross_origin_ack: bool,
     pub allow_private_network: bool,

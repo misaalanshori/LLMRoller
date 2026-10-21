@@ -40,6 +40,16 @@ pub enum ChatStreamMode {
     None,
 }
 
+impl From<llmroller_core::provider::ChatStreamSetting> for ChatStreamMode {
+    fn from(value: llmroller_core::provider::ChatStreamSetting) -> Self {
+        match value {
+            llmroller_core::provider::ChatStreamSetting::Inject => Self::Inject,
+            llmroller_core::provider::ChatStreamSetting::Native => Self::Native,
+            llmroller_core::provider::ChatStreamSetting::None => Self::None,
+        }
+    }
+}
+
 /// Representation of top-level `stream_options` found in request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamOptionsState {

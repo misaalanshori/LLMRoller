@@ -14,7 +14,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
-use axum::http::header::{CONTENT_TYPE, HeaderValue};
+use axum::http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -35,7 +35,7 @@ use llmroller_core::pins::{PinKey, PinOutcome, PinTicket};
 use llmroller_core::pricing::{
     CostSource, PriceEntry, Rates, compute_request_cost, estimate_input_tokens,
 };
-use llmroller_core::provider::ProviderKind;
+use llmroller_core::provider::{ProviderAuthScheme, ProviderEndpoint, ProviderKind};
 use llmroller_core::rbac::{PoolTier, RoutingScope};
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::seams::{Clock as _, OsEntropy, SystemClock};
@@ -44,7 +44,7 @@ use llmroller_core::snapshot::{
 };
 use llmroller_core::strategy::{RouteId, RoutingStrategy, WrrGroupKey};
 use llmroller_core::windows::{Reservation, estimate_reservation_cost_micro_usd};
-use llmroller_proto::adapters::EndpointKind;
+use llmroller_proto::adapters::{EndpointKind, get_adapter};
 use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
@@ -403,6 +403,7 @@ fn linked_candidate(
         upstream_model_id: route.upstream_model_id.clone(),
         base_url: provider.base_url.clone(),
         allow_private_network: provider.allow_private_network,
+        config: provider.config.clone(),
         pool_tier,
         ownership_scope: provider.ownership_scope,
         priority: route
@@ -719,10 +720,8 @@ pub async fn post_messages_count_tokens(
             Ok(secret) => secret,
             Err(()) => continue,
         };
-        let url = format!(
-            "{}/messages/count_tokens",
-            candidate.base_url.trim_end_matches('/')
-        );
+        let url = get_adapter(candidate.provider_kind)
+            .build_endpoint_url(&candidate.base_url, EndpointKind::CountTokens);
         if crate::ssrf::validate_url(&url, candidate.allow_private_network).is_err() {
             continue;
         }
@@ -737,22 +736,15 @@ pub async fn post_messages_count_tokens(
             Ok((body, _)) => body,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let mut outbound = match llmroller_proto::headers::apply_request_header_pipeline(
+        let outbound = match build_upstream_headers(
             &headers,
-            candidate.pool_tier(),
-            Some(("x-api-key", &secret)),
-            &[],
-            &[],
+            &candidate,
+            &secret,
+            EndpointKind::CountTokens,
         ) {
             Ok(headers) => headers,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(response) => return *response,
         };
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {secret}")) {
-            outbound.insert(header::AUTHORIZATION, value);
-        }
-        outbound
-            .entry("anthropic-version")
-            .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
 
         let response = match client
             .post(&url)
@@ -861,6 +853,8 @@ pub(crate) struct RouteCandidate {
     upstream_model_id: String,
     base_url: String,
     allow_private_network: bool,
+    /// Parsed provider configuration for endpoint paths, auth, and header profiles.
+    config: llmroller_core::provider::ProviderConfig,
     pool_tier: CandidatePoolTier,
     ownership_scope: llmroller_core::rbac::OwnershipScope,
     priority: i64,
@@ -1030,6 +1024,7 @@ fn collect_routes(
             upstream_model_id: route.upstream_model_id.clone(),
             base_url: provider.base_url.clone(),
             allow_private_network: provider.allow_private_network,
+            config: provider.config.clone(),
             pool_tier: tier,
             ownership_scope: provider.ownership_scope,
             priority: route
@@ -1066,6 +1061,147 @@ const fn provider_scope_label(candidate: &RouteCandidate) -> &'static str {
         (llmroller_core::rbac::OwnershipScope::Personal, true) => "shared",
         (llmroller_core::rbac::OwnershipScope::Personal, false) => "personal",
     }
+}
+
+/// Map a wire endpoint to its independently configurable provider profile section.
+const fn provider_endpoint(endpoint: EndpointKind) -> Option<ProviderEndpoint> {
+    match endpoint {
+        EndpointKind::Chat => Some(ProviderEndpoint::Chat),
+        EndpointKind::Responses | EndpointKind::ResponsesCompact => {
+            Some(ProviderEndpoint::Responses)
+        }
+        EndpointKind::Messages | EndpointKind::CountTokens => Some(ProviderEndpoint::Messages),
+        EndpointKind::Models => Some(ProviderEndpoint::Models),
+        EndpointKind::Usage => Some(ProviderEndpoint::Usage),
+    }
+}
+
+/// Build an upstream URL from the provider's configured path, falling back to the adapter preset.
+fn endpoint_url(candidate: &RouteCandidate, endpoint: EndpointKind) -> String {
+    if let Some(configured) = provider_endpoint(endpoint)
+        && let Some(path) = candidate.config.paths.for_endpoint(configured)
+        && !path.trim().is_empty()
+    {
+        let path = path.trim();
+        if path.starts_with("https://") || path.starts_with("http://") {
+            return path.to_string();
+        }
+        let separated = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        return format!("{}{separated}", candidate.base_url.trim_end_matches('/'));
+    }
+    get_adapter(candidate.provider_kind).build_endpoint_url(&candidate.base_url, endpoint)
+}
+
+/// Resolve the configured credential header for an endpoint.
+fn auth_scheme_for(
+    candidate: &RouteCandidate,
+    endpoint: EndpointKind,
+) -> Option<&ProviderAuthScheme> {
+    candidate
+        .config
+        .auth
+        .for_endpoint(provider_endpoint(endpoint)?)
+}
+
+/// Build the complete outbound request header map for one provider attempt.
+///
+/// Applies the inbound sanitization pipeline, provider strip/token filters, the
+/// configured credential scheme, User-Agent policy, `add_headers`, and the native
+/// Anthropic protocol default (`API-2`, `API-3`, `PRV-3`).
+fn build_upstream_headers(
+    inbound: &HeaderMap,
+    candidate: &RouteCandidate,
+    secret: &str,
+    endpoint: EndpointKind,
+) -> Result<HeaderMap, Box<Response>> {
+    use llmroller_proto::headers::{
+        HeaderPipelineError, UaPolicy, apply_request_header_pipeline, resolve_user_agent,
+    };
+
+    // Native Anthropic endpoints default to `x-api-key`; all other protocols use
+    // an OpenAI-compatible Bearer token until the provider overrides `auth`.
+    let default_scheme = if matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens) {
+        ("x-api-key", "")
+    } else {
+        ("authorization", "Bearer ")
+    };
+    let (auth_header, auth_prefix) = auth_scheme_for(candidate, endpoint)
+        .map_or(default_scheme, |scheme| {
+            (scheme.header.as_str(), scheme.prefix.as_str())
+        });
+    let auth_value = format!("{auth_prefix}{secret}");
+    let mut outbound = apply_request_header_pipeline(
+        inbound,
+        candidate.pool_tier(),
+        Some((auth_header, &auth_value)),
+        &candidate.config.strip_headers,
+        &candidate.config.strip_header_tokens,
+    )
+    .map_err(|error| {
+        Box::new(match error {
+            HeaderPipelineError::Smuggling(reason) => json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                reason.to_string(),
+            ),
+            HeaderPipelineError::InvalidHeaderValue(reason) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_provider_config",
+                reason,
+            ),
+        })
+    })?;
+
+    let policy = candidate
+        .config
+        .ua_policy
+        .map(UaPolicy::from)
+        .unwrap_or_else(|| get_adapter(candidate.provider_kind).default_ua_policy());
+    let incoming_ua = inbound
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let resolved_ua = resolve_user_agent(policy, incoming_ua).map_err(|reason| {
+        Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            reason.to_string(),
+        ))
+    })?;
+    if let Ok(value) = HeaderValue::from_str(&resolved_ua) {
+        outbound.insert(header::USER_AGENT, value);
+    }
+
+    for (name, value) in &candidate.config.add_headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "host"
+            || lower == "content-length"
+            || lower == "authorization"
+            || lower == auth_header
+        {
+            continue;
+        }
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::warn!(header = %name, "ignoring invalid provider add_headers name");
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            tracing::warn!(header = %name, "ignoring invalid provider add_headers value");
+            continue;
+        };
+        outbound.insert(name, value);
+    }
+
+    if matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens) {
+        outbound
+            .entry(HeaderName::from_static("anthropic-version"))
+            .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
+    }
+
+    Ok(outbound)
 }
 
 /// Estimated input charge recorded on post-write failures (USG-1).
@@ -1181,6 +1317,7 @@ fn eligibility_route(
             name: String::new(),
             base_url: candidate.base_url.clone(),
             config_json: String::new(),
+            config: candidate.config.clone(),
             share_config_fingerprint: String::new(),
             usage_url_cross_origin_ack: false,
             allow_private_network: candidate.allow_private_network,
@@ -2447,13 +2584,7 @@ pub async fn handle_inference_request(
             }
         };
 
-        let path = match endpoint {
-            EndpointKind::Chat => "/chat/completions",
-            EndpointKind::Responses => "/responses",
-            EndpointKind::Messages => "/messages",
-            _ => "/chat/completions",
-        };
-        let target_url = format!("{}{path}", candidate.base_url.trim_end_matches('/'));
+        let target_url = endpoint_url(&candidate, endpoint);
         if crate::ssrf::validate_url(&target_url, candidate.allow_private_network).is_err() {
             attempts.push(attempt_record(
                 request_id,
@@ -2478,30 +2609,31 @@ pub async fn handle_inference_request(
             continue;
         };
 
+        // Only Chat Completions understands `stream_options`; native Messages and
+        // Responses streams must pass through byte-identically (`API-4`, `TRN-2`).
+        let chat_stream_mode = if is_streaming && endpoint == EndpointKind::Chat {
+            candidate.config.usage_reporting.chat_stream.map_or_else(
+                || get_adapter(candidate.provider_kind).default_chat_stream_mode(),
+                ChatStreamMode::from,
+            )
+        } else {
+            ChatStreamMode::Native
+        };
         let (edited_body, strip_injected_usage) = match edit_body(
             body.clone(),
             candidate.pool_tier(),
             Some(&candidate.upstream_model_id),
-            if is_streaming {
-                ChatStreamMode::Inject
-            } else {
-                ChatStreamMode::Native
-            },
+            chat_stream_mode,
             None,
         ) {
             Ok(edited) => edited,
             Err(_) => (body.clone(), false),
         };
 
-        let outbound_headers = match llmroller_proto::headers::apply_request_header_pipeline(
-            &headers,
-            candidate.pool_tier(),
-            Some(("authorization", &format!("Bearer {secret}"))),
-            &[],
-            &[],
-        ) {
+        let outbound_headers = match build_upstream_headers(&headers, &candidate, &secret, endpoint)
+        {
             Ok(headers) => headers,
-            Err(_) => headers.clone(),
+            Err(response) => return *response,
         };
 
         let mut request_builder = client.post(&target_url).body(edited_body.clone());
@@ -2856,7 +2988,7 @@ pub async fn handle_inference_request(
                     candidate.pool_tier(),
                     true,
                     &request_id.to_string(),
-                    &[],
+                    &candidate.config.response_header_allow,
                 );
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -2877,7 +3009,7 @@ pub async fn handle_inference_request(
                 candidate.pool_tier(),
                 false,
                 &request_id.to_string(),
-                &[],
+                &candidate.config.response_header_allow,
             );
             let bytes = response.bytes().await.unwrap_or_default();
             drop(reservation);
@@ -2899,7 +3031,7 @@ pub async fn handle_inference_request(
             candidate.pool_tier(),
             false,
             &request_id.to_string(),
-            &[],
+            &candidate.config.response_header_allow,
         );
         let status_value = response.status();
         let content_type = response.headers().get(CONTENT_TYPE).cloned();
@@ -3184,6 +3316,7 @@ mod tests {
             upstream_model_id: "model".to_string(),
             base_url: "https://example.test".to_string(),
             allow_private_network: false,
+            config: llmroller_core::provider::ProviderConfig::default(),
             pool_tier: tier,
             ownership_scope: llmroller_core::rbac::OwnershipScope::Global,
             priority: 1,

@@ -797,6 +797,7 @@ pub async fn load_provider_records_tx(
                 kind: p.kind,
                 name: p.name,
                 base_url: p.base_url,
+                config: llmroller_core::provider::ProviderConfig::from_json(&p.config_json),
                 config_json: p.config_json,
                 share_config_fingerprint: p.share_config_fingerprint,
                 usage_url_cross_origin_ack: p.usage_url_cross_origin_ack,

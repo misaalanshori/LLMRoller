@@ -161,13 +161,10 @@ pub fn apply_request_header_pipeline(
         }
 
         // Rule 2: Strip provider deny-list and token filters
-        if strip_headers.iter().any(|pattern| {
-            if pattern.ends_with('*') {
-                name_lower.starts_with(&pattern[..pattern.len() - 1])
-            } else {
-                name_lower == *pattern
-            }
-        }) {
+        if strip_headers
+            .iter()
+            .any(|pattern| header_matches_glob(&name_lower, pattern))
+        {
             continue;
         }
 
@@ -220,6 +217,21 @@ pub fn apply_request_header_pipeline(
     }
 
     Ok(out)
+}
+
+/// Case-insensitive provider deny-list glob match (`strip_headers`).
+///
+/// Supports an optional single `*` anywhere in the pattern, e.g. `x-debug-*`.
+fn header_matches_glob(name: &str, pattern: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+        None => name == pattern,
+    }
 }
 
 /// Apply the 5-step response header pipeline R1 through R5 per Section 12.1.1.
@@ -325,6 +337,16 @@ pub enum UaPolicy {
     Label,
     /// Return HTTP 400 if the client sends an empty or generic library User-Agent.
     Reject,
+}
+
+impl From<llmroller_core::provider::UaPolicySetting> for UaPolicy {
+    fn from(value: llmroller_core::provider::UaPolicySetting) -> Self {
+        match value {
+            llmroller_core::provider::UaPolicySetting::Pass => Self::Pass,
+            llmroller_core::provider::UaPolicySetting::Label => Self::Label,
+            llmroller_core::provider::UaPolicySetting::Reject => Self::Reject,
+        }
+    }
 }
 
 /// Error returned when a User-Agent is rejected by policy.
