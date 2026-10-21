@@ -520,12 +520,20 @@ async fn test_naive_round_robin_distributes_across_healthy_keys() {
     let token = create_client_key(&harness, user, "frank-key", None, None).await;
     let (app, _runtime) = build_app(&harness, harness.master_key.clone()).await;
 
-    for _ in 0..4 {
-        let response = app
-            .clone()
-            .oneshot(chat_request(&token, "gpt-4o"))
-            .await
-            .expect("response");
+    for turn in 0..4 {
+        // Distinct sessions must be distributed by naive RR; identical openings
+        // would share a Step 8 fingerprint and legitimately stick to one key.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-llmroller-session-id", format!("rr-session-{turn}"))
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 

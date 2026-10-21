@@ -21,7 +21,7 @@ use tower::ServiceExt as _;
 use llmroller_core::ids::{ModelPk, UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope, SystemSeal, SystemTask};
-use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_string};
+use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_bytes, secret_string};
 use llmroller_proxy::auth::ProxyAuthState;
 use llmroller_proxy::listeners::data_plane_router;
 use llmroller_server::reloader::load_initial_snapshot;
@@ -605,6 +605,7 @@ async fn build_wire_app(pool: &sqlx::SqlitePool, master_key: &MasterKey) -> Rout
         .with_master_key(master_key.clone());
     proxy_auth_state.is_ready.store(true, Ordering::SeqCst);
     proxy_auth_state.writer = Some(writer);
+    proxy_auth_state.session_hmac_secret = Some(secret_bytes(vec![0x5A; 32]));
     data_plane_router(proxy_auth_state)
 }
 
@@ -1224,8 +1225,180 @@ async fn test_mixed_quota_and_server_failure_returns_terminal_502() {
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
 }
 
+fn chat_request_with_body(token: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+fn recorded_authorizations(state: &MockUpstreamState) -> Vec<String> {
+    state
+        .recorded
+        .lock()
+        .expect("recorded requests")
+        .iter()
+        .filter_map(|request| {
+            request
+                .headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 #[tokio::test]
-#[doc = "Spec: API-8 — F03 all-quota failures select 429 with Retry-After"]
+#[doc = "Spec: RTE-1 - F06 Step 7 body session fields pin the same upstream key"]
+async fn test_body_session_fields_pin_across_distinct_openings() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f06_body_fields.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF1; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-session-a", 100), ("sk-session-b", 100)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let prompt_cache_key_bodies = [
+        r#"{"model":"gpt-4o","prompt_cache_key":"cache-key-1","messages":[{"role":"system","content":"system one"},{"role":"user","content":"question one"}]}"#,
+        r#"{"model":"gpt-4o","prompt_cache_key":"cache-key-1","messages":[{"role":"system","content":"system two"},{"role":"user","content":"question two"}]}"#,
+    ];
+    for body in prompt_cache_key_bodies {
+        let response = app
+            .clone()
+            .oneshot(chat_request_with_body(&token, body))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let metadata_session_bodies = [
+        r#"{"model":"gpt-4o","metadata":{"session_id":"meta-session-1"},"messages":[{"role":"system","content":"meta system one"},{"role":"user","content":"meta question one"}]}"#,
+        r#"{"model":"gpt-4o","metadata":{"session_id":"meta-session-1"},"messages":[{"role":"system","content":"meta system two"},{"role":"user","content":"meta question two"}]}"#,
+    ];
+    for body in metadata_session_bodies {
+        let response = app
+            .clone()
+            .oneshot(chat_request_with_body(&token, body))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let authorizations = recorded_authorizations(&mock_state);
+    assert_eq!(authorizations.len(), 4);
+    assert_eq!(
+        authorizations[0], authorizations[1],
+        "prompt_cache_key must pin distinct openings to one upstream key"
+    );
+    assert_eq!(
+        authorizations[2], authorizations[3],
+        "metadata.session_id must pin distinct openings to one upstream key"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: RTE-1 - F06 Step 8 fingerprint pins matching opening prompts"]
+async fn test_step8_fingerprint_pins_matching_openings() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f06_step8.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF2; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-step8-a", 100), ("sk-step8-b", 100)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let first_turn = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"stable system prompt"},{"role":"user","content":"first question"}]}"#;
+    let second_turn = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"stable system prompt"},{"role":"user","content":"first question"},{"role":"assistant","content":"answer"},{"role":"user","content":"follow-up question"}]}"#;
+
+    for body in [first_turn, second_turn] {
+        let response = app
+            .clone()
+            .oneshot(chat_request_with_body(&token, body))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let authorizations = recorded_authorizations(&mock_state);
+    assert_eq!(authorizations.len(), 2);
+    assert_eq!(
+        authorizations[0], authorizations[1],
+        "matching SYS and USER1 must produce one Step 8 pin"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: RTE-1 - F06 fingerprint_generic_ids replaces generic IDs with Step 8"]
+async fn test_constant_session_mode_fingerprint_generic_ids_uses_step8() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f06_constant_mode.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF3; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-mode-a", 100), ("sk-mode-b", 100)],
+        "{}",
+    )
+    .await;
+    sqlx::query("UPDATE client_keys SET constant_session_mode = 'fingerprint_generic_ids'")
+        .execute(&pool)
+        .await
+        .expect("set constant session mode");
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let first_opening = r#"{"model":"gpt-4o","session_id":"static-generic-id","messages":[{"role":"system","content":"opening one"},{"role":"user","content":"question one"}]}"#;
+    let second_opening = r#"{"model":"gpt-4o","session_id":"static-generic-id","messages":[{"role":"system","content":"opening two"},{"role":"user","content":"question two"}]}"#;
+
+    for body in [first_opening, second_opening, first_opening] {
+        let response = app
+            .clone()
+            .oneshot(chat_request_with_body(&token, body))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let authorizations = recorded_authorizations(&mock_state);
+    assert_eq!(authorizations.len(), 3);
+    assert_ne!(
+        authorizations[0], authorizations[1],
+        "fingerprint_generic_ids must ignore the static body session ID"
+    );
+    assert_eq!(
+        authorizations[0], authorizations[2],
+        "the same opening must return to its Step 8 pin"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 - F03 all-quota failures select 429 with Retry-After"]
 async fn test_all_quota_failures_return_429_with_retry_after() {
     let (mock_addr, _mock_state) = spawn_mock_upstream().await;
     let dir = tempdir().expect("temp dir");

@@ -41,6 +41,8 @@ pub struct ProxyAuthState {
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
     pub pin_store: Arc<llmroller_core::pins::PinStore>,
     pub runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
+    /// Persistent tenant salt for HMAC-SHA256 `session_hash` derivation (`RTE-1`).
+    pub session_hmac_secret: Option<llmroller_core::seams::SecretBytes>,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
     pub master_key: Option<llmroller_store::crypto::MasterKey>,
     pub master_key_id: Option<String>,
@@ -76,6 +78,7 @@ impl ProxyAuthState {
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
             pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
             runtime_state: Arc::new(llmroller_core::runtime_state::RuntimeState::new()),
+            session_hmac_secret: None,
             writer: None,
             master_key: None,
             master_key_id: None,

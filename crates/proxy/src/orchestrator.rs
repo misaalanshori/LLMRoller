@@ -38,7 +38,7 @@ use llmroller_core::pricing::{
 use llmroller_core::provider::{ProviderAuthScheme, ProviderEndpoint, ProviderKind};
 use llmroller_core::rbac::{PoolTier, RoutingScope};
 use llmroller_core::runtime_state::RuntimeState;
-use llmroller_core::seams::{Clock as _, OsEntropy, SystemClock};
+use llmroller_core::seams::{Clock as _, ExposeSecret as _, OsEntropy, SystemClock};
 use llmroller_core::snapshot::{
     ConfigSnapshot, ProviderRecord, SnapshotModel, SnapshotModelRoute, UpstreamKeyRecord,
 };
@@ -1553,14 +1553,11 @@ fn unseal_upstream_key(
         &[master_key_id, key_id.as_bytes(), provider_id.as_bytes()],
         &key.secret_enc,
     ) {
-        Ok(plaintext) => {
-            use llmroller_core::seams::ExposeSecret as _;
-            String::from_utf8(plaintext.expose_secret().to_vec()).map_err(|_| {
-                state
-                    .runtime_state
-                    .quarantine_key(key.id, "invalid_utf8_secret");
-            })
-        }
+        Ok(plaintext) => String::from_utf8(plaintext.expose_secret().to_vec()).map_err(|_| {
+            state
+                .runtime_state
+                .quarantine_key(key.id, "invalid_utf8_secret");
+        }),
         Err(_) => {
             state
                 .runtime_state
@@ -1570,12 +1567,76 @@ fn unseal_upstream_key(
     }
 }
 
+/// Deterministic fallback pin hash used when no instance session secret is configured.
+fn fallback_session_hash(client_key_id: ClientKeyId, raw_session: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"llmroller.pin.v1\0");
+    hasher.update(client_key_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw_session.as_bytes());
+    llmroller_core::session::hex_lower(&hasher.finalize())
+}
+
+/// Tenant-scoped session hash (`RTE-1`): HMAC-SHA256 with the instance secret.
+fn session_hash(
+    session_hmac_secret: Option<&[u8]>,
+    owner_user_id: &UserId,
+    client_key_id: ClientKeyId,
+    raw_session: &str,
+) -> String {
+    session_hmac_secret.map_or_else(
+        || fallback_session_hash(client_key_id, raw_session),
+        |secret| llmroller_core::session::compute_session_hash(secret, owner_user_id, raw_session),
+    )
+}
+
+/// Collect Step 7 body session fields from the parsed request body.
+fn session_body_fields(body: &serde_json::Value) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    for name in ["session_id", "prompt_cache_key", "promptCacheKey"] {
+        if let Some(value) = body.get(name).and_then(serde_json::Value::as_str) {
+            fields.insert(name.to_string(), value.to_string());
+        }
+    }
+    if let Some(value) = body
+        .get("metadata")
+        .and_then(|metadata| metadata.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        fields.insert("metadata.session_id".to_string(), value.to_string());
+    }
+    fields
+}
+
+/// Inputs shared by session pin resolution.
+struct SessionPinContext<'a> {
+    client_key: &'a ClientKeyRecord,
+    canonical_id: &'a str,
+    protocol: &'a str,
+    session_hmac_secret: Option<&'a [u8]>,
+    runtime_state: &'a RuntimeState,
+    now_ms: i64,
+}
+
 /// Deterministic in-memory pin key; the raw session string never leaves the process.
+///
+/// Implements the eight-step inbound session precedence (`RTE-1`), the Step 8
+/// canonical opening-message fingerprint fallback, and the 21-slot constant
+/// session detector for generic session sources (`RTE-1`, `RTE-2`).
 fn session_pin_key(
     headers: &HeaderMap,
-    client_key: &ClientKeyRecord,
-    canonical_id: &str,
+    body: &[u8],
+    context: &SessionPinContext<'_>,
 ) -> Option<PinKey> {
+    let SessionPinContext {
+        client_key,
+        canonical_id,
+        protocol,
+        session_hmac_secret,
+        runtime_state,
+        now_ms,
+    } = *context;
     let header_vec: Vec<(String, String)> = headers
         .iter()
         .map(|(name, value)| {
@@ -1585,19 +1646,61 @@ fn session_pin_key(
             )
         })
         .collect();
-    let (raw_session, _) =
-        llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
-    if raw_session.is_empty() {
-        return None;
+
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let body_fields = session_body_fields(&parsed);
+    let (raw_session, step) =
+        llmroller_core::session::extract_session_precedence(&header_vec, &body_fields);
+
+    let canonical = if raw_session.is_empty() || step.is_generic() {
+        Some(llmroller_core::session::extract_canonical_sys_and_user1(
+            protocol, &parsed,
+        ))
+    } else {
+        None
+    };
+
+    let raw_hash = if raw_session.is_empty() {
+        None
+    } else {
+        Some(session_hash(
+            session_hmac_secret,
+            &client_key.owner_user_id,
+            client_key.id,
+            &raw_session,
+        ))
+    };
+
+    if let (Some(session_hash), true, Some((sys, usr))) =
+        (raw_hash.as_ref(), step.is_generic(), canonical.as_ref())
+    {
+        runtime_state.constant_session_detector.record_and_evaluate(
+            client_key.id,
+            session_hash.clone(),
+            &llmroller_core::session::PromptContext {
+                sys,
+                usr,
+                has_claude_code_agent_id: headers.contains_key("x-claude-code-agent-id"),
+                step,
+            },
+            now_ms,
+        );
     }
 
-    use sha2::{Digest as _, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"llmroller.pin.v1\0");
-    hasher.update(client_key.id.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(raw_session.as_bytes());
-    let session_hash = llmroller_core::session::hex_lower(&hasher.finalize());
+    let use_step8 = raw_session.is_empty()
+        || (step.is_generic() && client_key.constant_session_mode == "fingerprint_generic_ids");
+    let session_hash = if use_step8 {
+        let (sys, usr) = canonical.as_ref()?;
+        llmroller_core::session::compute_step8_fingerprint(
+            &client_key.id,
+            canonical_id,
+            llmroller_core::session::protocol_code(protocol),
+            sys,
+            usr,
+        )
+    } else {
+        raw_hash?
+    };
 
     Some(PinKey {
         client_key_id: client_key.id,
@@ -2449,7 +2552,22 @@ pub async fn handle_inference_request(
     let strategy = model
         .routing_strategy
         .unwrap_or(snapshot.settings.default_routing_strategy);
-    let mut pin_key = session_pin_key(&headers, &caller, &model.canonical_id);
+    let session_hmac_secret = state
+        .session_hmac_secret
+        .as_ref()
+        .map(|secret| secret.expose_secret());
+    let mut pin_key = session_pin_key(
+        &headers,
+        &body,
+        &SessionPinContext {
+            client_key: &caller,
+            canonical_id: &model.canonical_id,
+            protocol,
+            session_hmac_secret,
+            runtime_state: &state.runtime_state,
+            now_ms: now,
+        },
+    );
     let pin_ttl_ms = snapshot.settings.pin_ttl_secs.saturating_mul(1000);
     let clock = SystemClock::new();
     let mut pin_ticket: Option<PinTicket> = None;
@@ -3673,6 +3791,160 @@ mod tests {
         assert!(
             registry.usage_for(&BudgetScopeId::ProviderShare(share_id), 1_000) == 0,
             "a dropped share reservation must not commit spend"
+        );
+    }
+
+    fn session_test_key(mode: &str) -> ClientKeyRecord {
+        ClientKeyRecord {
+            id: ClientKeyId::generate(),
+            owner_user_id: UserId::generate(),
+            label: "session-test".to_string(),
+            prefix: "llr_test".to_string(),
+            key_hash: [0; 32],
+            prev_key_hash: None,
+            prev_key_expires_at: None,
+            routing_scope: "inherit".to_string(),
+            allowed_models: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: mode.to_string(),
+            disabled: false,
+            revoked_at: None,
+            expires_at: None,
+        }
+    }
+
+    fn session_body(prompt_cache_key: Option<&str>, opening: &str) -> Vec<u8> {
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "stable system prompt"},
+                {"role": "user", "content": opening}
+            ]
+        });
+        if let Some(key) = prompt_cache_key {
+            body["prompt_cache_key"] = serde_json::Value::String(key.to_string());
+        }
+        serde_json::to_vec(&body).expect("serialize body")
+    }
+
+    fn test_session_pin(
+        key: &ClientKeyRecord,
+        body: &[u8],
+        session_hmac_secret: Option<&[u8]>,
+        runtime: &RuntimeState,
+        now_ms: i64,
+    ) -> Option<PinKey> {
+        session_pin_key(
+            &HeaderMap::new(),
+            body,
+            &SessionPinContext {
+                client_key: key,
+                canonical_id: "gpt-4o",
+                protocol: "chat",
+                session_hmac_secret,
+                runtime_state: runtime,
+                now_ms,
+            },
+        )
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-1 - F06 body fields and Step 8 fingerprint drive session pins"]
+    fn session_pin_key_uses_body_fields_and_step8_fingerprint() {
+        let runtime = RuntimeState::new();
+        let key = session_test_key("flag");
+
+        let first = test_session_pin(
+            &key,
+            &session_body(Some("cache-key"), "opening one"),
+            None,
+            &runtime,
+            1_000,
+        )
+        .expect("body prompt_cache_key must produce a pin");
+        let second = test_session_pin(
+            &key,
+            &session_body(Some("cache-key"), "opening two"),
+            None,
+            &runtime,
+            2_000,
+        )
+        .expect("body prompt_cache_key must produce a pin");
+        assert_eq!(first.session_hash, second.session_hash);
+        assert_eq!(
+            first.session_hash,
+            fallback_session_hash(key.id, "cache-key"),
+            "Step 7 keeps the tenant-scoped raw session hash"
+        );
+
+        let step8_first = test_session_pin(
+            &key,
+            &session_body(None, "same first question"),
+            None,
+            &runtime,
+            3_000,
+        )
+        .expect("Step 8 must produce a fingerprint pin");
+        let step8_second = test_session_pin(
+            &key,
+            &session_body(None, "same first question"),
+            None,
+            &runtime,
+            4_000,
+        )
+        .expect("Step 8 must produce a fingerprint pin");
+        assert!(step8_first.session_hash.starts_with("fp:"));
+        assert_eq!(step8_first.session_hash, step8_second.session_hash);
+        assert_ne!(step8_first.session_hash, first.session_hash);
+
+        let hmac_pin = test_session_pin(
+            &key,
+            &session_body(Some("cache-key"), "opening one"),
+            Some(b"instance-session-secret-32-bytes"),
+            &runtime,
+            5_000,
+        )
+        .expect("HMAC session hash must produce a pin");
+        assert_eq!(hmac_pin.session_hash.len(), 32);
+        assert_ne!(hmac_pin.session_hash, first.session_hash);
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-1 - F06 constant detector observes generic session sources"]
+    fn session_pin_key_records_constant_session_anomaly() {
+        let runtime = RuntimeState::new();
+        let key = session_test_key("flag");
+
+        for minute in 0..21 {
+            let body = serde_json::json!({
+                "model": "gpt-4o",
+                "session_id": "static-session",
+                "messages": [
+                    {"role": "system", "content": format!("opening system {minute}")},
+                    {"role": "user", "content": format!("opening user {minute}")}
+                ]
+            });
+            let pin = test_session_pin(
+                &key,
+                &serde_json::to_vec(&body).expect("serialize body"),
+                None,
+                &runtime,
+                1_000_000 + minute * 60_000,
+            )
+            .expect("generic session ID must produce a pin");
+            assert_eq!(
+                pin.session_hash,
+                fallback_session_hash(key.id, "static-session")
+            );
+        }
+
+        assert!(
+            runtime
+                .constant_session_detector
+                .is_flagged(key.id, &fallback_session_hash(key.id, "static-session")),
+            "21 distinct openings within an hour must flag the static session ID"
         );
     }
 }

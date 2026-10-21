@@ -129,6 +129,16 @@ pub fn compute_session_hash(
     hex_lower(&result[..16])
 }
 
+/// Maps an inbound protocol name to the canonical Step 8 protocol code.
+#[must_use]
+pub fn protocol_code(protocol: &str) -> u8 {
+    match protocol {
+        "responses" => 2,
+        "messages" => 3,
+        _ => 1,
+    }
+}
+
 /// Computes Step 8 derived fallback fingerprint over byte-sliced SYS and USER1 (Section 11.1.3).
 pub fn compute_step8_fingerprint(
     client_key_id: &ClientKeyId,
