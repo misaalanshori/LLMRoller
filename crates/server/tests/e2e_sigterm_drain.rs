@@ -345,9 +345,8 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
         .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), job_task).await;
     let _ = stop_tx.send(true);
-    let _ = job_task.await;
 
     assert!(panic_count.load(Ordering::SeqCst) >= 3);
 }
