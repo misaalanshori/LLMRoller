@@ -911,7 +911,7 @@ async fn post_admin_prices_sync_handler(
     llmroller_core::ssrf::validate_url(url, false)
         .map_err(|_| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid catalog URL"))?;
 
-    let client = llmroller_core::ssrf::create_guarded_client(false)
+    let client = llmroller_proxy::ssrf::create_guarded_client(false)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let catalog: serde_json::Value = client
         .get(url)
@@ -2737,7 +2737,7 @@ async fn post_test_upstream_key_handler(
             "provider URL is not allowed",
         ));
     }
-    let client = llmroller_core::ssrf::create_guarded_client(allow_private)
+    let client = llmroller_proxy::ssrf::create_guarded_client(allow_private)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let started = std::time::Instant::now();
     let response = client

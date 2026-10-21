@@ -4,13 +4,9 @@
 //! Spec: ./docs/srdd/6. SRDD - Functional Requirements.md#63-provider-and-upstream-key-management-prv
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
 
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use thiserror::Error;
 use url::Url;
 
@@ -31,8 +27,6 @@ pub enum SsrfError {
     Url(#[from] url::ParseError),
     #[error("validation error: {0}")]
     Validation(String),
-    #[error("HTTP client error: {0}")]
-    Reqwest(#[from] reqwest::Error),
 }
 
 /// Check whether an IPv4 address belongs to any special-purpose or blocked range per SEC-7.
@@ -280,93 +274,4 @@ pub fn extract_raw_host(url_str: &str) -> Option<&str> {
         return Some(&host[..=end_bracket]);
     }
     Some(host.split(':').next().unwrap_or(host))
-}
-
-/// DNS resolver that rejects any hostname resolving to a blocked address (SEC-7).
-#[derive(Debug, Clone)]
-pub struct GuardedDnsResolver {
-    allow_private_network: bool,
-}
-
-impl GuardedDnsResolver {
-    #[must_use]
-    pub const fn new(allow_private_network: bool) -> Self {
-        Self {
-            allow_private_network,
-        }
-    }
-}
-
-impl Resolve for GuardedDnsResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let allow_private_network = self.allow_private_network;
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
-                .collect();
-
-            if addrs.is_empty() {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no DNS records found for host '{host}'"),
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
-            }
-
-            for addr in &addrs {
-                if is_ip_blocked(addr.ip(), allow_private_network) {
-                    return Err(Box::new(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "SSRF guard blocked host '{host}' resolving to {}",
-                            addr.ip()
-                        ),
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-            }
-
-            let addrs: Addrs = Box::new(addrs.into_iter());
-            Ok(addrs)
-        })
-    }
-}
-
-/// Create a hardened outbound `reqwest::Client` disabling proxies and redirects,
-/// resolving every hostname through [`GuardedDnsResolver`], and enforcing TLS 1.2+
-/// per SEC-7.
-pub fn create_guarded_client(allow_private_network: bool) -> Result<reqwest::Client, SsrfError> {
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(Arc::new(GuardedDnsResolver::new(allow_private_network)))
-        .pool_max_idle_per_host(32)
-        .connect_timeout(Duration::from_secs(10));
-
-    if !allow_private_network {
-        builder = builder.min_tls_version(reqwest::tls::Version::TLS_1_2);
-    }
-
-    builder.build().map_err(SsrfError::Reqwest)
-}
-
-#[cfg(test)]
-mod guarded_client_tests {
-    /// Spec: SEC-7, F07; DNS must be re-checked at connect time, not just at save time.
-    #[tokio::test]
-    async fn guarded_client_rejects_hostname_resolving_to_loopback() {
-        let client = super::create_guarded_client(false).expect("guarded client");
-        let error = client
-            .get("https://localhost:9/v1/models")
-            .send()
-            .await
-            .expect_err("localhost must be rejected by the DNS guard");
-        let rendered = format!("{error:?}");
-        assert!(
-            rendered.contains("SSRF guard blocked"),
-            "unexpected error: {rendered}"
-        );
-    }
 }

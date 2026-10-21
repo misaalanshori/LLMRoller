@@ -31,8 +31,6 @@ url.workspace = true
 zeroize.workspace = true
 ammonia.workspace = true
 pulldown-cmark.workspace = true
-reqwest.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
