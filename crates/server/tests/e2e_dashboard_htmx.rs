@@ -201,3 +201,161 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     assert!(admin_html_rendered.contains("Admin Console"));
     assert!(admin_html_rendered.contains("Projected Disk Usage"));
 }
+
+#[doc = "Spec: SHR-3, MDL-3, MDL-4, UI-2, Section 3.3 (A6)"]
+#[tokio::test]
+async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
+    use axum::http::header;
+    use llmroller_core::provider::ProviderKind;
+    use llmroller_core::rbac::OwnershipScope;
+    use llmroller_core::seams::Clock as _;
+    use llmroller_store::providers::{NewProvider, create_provider};
+    use llmroller_store::shares::{NewShare, create_provider_share_tx};
+
+    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
+
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let entropy = OsEntropy;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+
+    // Create user Alice and Bob
+    let alice = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "alice_custom",
+            password: "supersecretalicepass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("alice");
+
+    let bob = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "bob_grantee",
+            password: "supersecretbobpass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("bob");
+
+    let alice_actor = ActorScope::user(alice.id, Role::User);
+
+    // Create custom provider for Alice
+    let custom_prov = create_provider(
+        &pool,
+        &alice_actor,
+        NewProvider {
+            name: "alice_custom_llm".to_string(),
+            kind: ProviderKind::Custom,
+            base_url: "https://custom.endpoint.internal".to_string(),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Personal,
+            owner_user_id: Some(alice.id),
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+        },
+        now_ms,
+    )
+    .await
+    .expect("custom prov");
+
+    // Alice shares custom provider with Bob
+    let mut tx = pool.begin().await.expect("tx");
+    let share = create_provider_share_tx(
+        &mut tx,
+        &alice.id,
+        NewShare {
+            provider_id: custom_prov.id,
+            upstream_key_id: None,
+            grantee_user_id: bob.id,
+            allowed_models: None,
+            max_monthly_micro_usd: None,
+        },
+        now_ms,
+    )
+    .await
+    .expect("create share");
+    tx.commit().await.expect("commit share");
+
+    // Authenticate Admin session
+    let raw_session = "admin_approval_session_token_123456789";
+    let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
+    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: admin_id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert admin session");
+
+    let admin_cookie = format!("llmroller_session={raw_session}");
+
+    // 1. POST /admin/api/shares/{id}/approve: Admin approves custom provider share (SHR-3)
+    let approve_req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/api/shares/{}/approve", share.share_id))
+        .header(header::COOKIE, &admin_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .expect("req");
+    let approve_res = app.clone().oneshot(approve_req).await.expect("res");
+    assert_eq!(approve_res.status(), StatusCode::OK);
+
+    // 2. Telemetry: GET /admin/api/overview returns dynamic A6 disk usage calculation (UI-2, Section 3.3 A6)
+    let overview_req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/overview")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let overview_res = app.oneshot(overview_req).await.expect("res");
+    assert_eq!(overview_res.status(), StatusCode::OK);
+    let overview_bytes = overview_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let overview_json: serde_json::Value =
+        serde_json::from_slice(&overview_bytes).expect("parse json");
+    assert!(overview_json["projected_disk_mb"].is_number());
+    assert!(overview_json["unpriced_models_count"].is_number());
+}

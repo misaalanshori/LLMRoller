@@ -753,6 +753,42 @@ async function loadRoutingMatrix() {
     }
 }
 
+async function loadAdminOverview() {
+    const diskMeter = document.getElementById('disk-meter');
+    if (!diskMeter) return;
+    try {
+        const res = await fetch('/admin/api/overview');
+        const data = await res.json();
+        let unpricedBadge = '';
+        if (data.unpriced_models_count > 0) {
+            unpricedBadge = `<span class="badge badge-warning" style="margin-top: 0.25rem;">${data.unpriced_models_count} unpriced models</span>`;
+        }
+        diskMeter.innerHTML = `
+            <p class="stat-val" style="font-size: 1.5rem;">Projected Disk Usage: ${data.projected_disk_mb} MB</p>
+            ${unpricedBadge}
+            <div class="stat-desc" style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">
+                ${data.usage_events_count.toLocaleString()} / ${data.max_usage_events_rows.toLocaleString()} events (${data.retention_days}d retention)
+            </div>
+        `;
+    } catch (e) {
+        console.error('Failed to load admin overview:', e);
+    }
+}
+
+async function approveShare(shareId) {
+    try {
+        await fetch(`/admin/api/shares/${shareId}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: '{}'
+        });
+        alert('Custom provider share approved!');
+        if (typeof loadAdminProviders === 'function') loadAdminProviders();
+    } catch (e) {
+        alert('Failed to approve share: ' + e);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Document Ready Dispatcher
 // ---------------------------------------------------------------------------
@@ -767,6 +803,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     // Check if on Admin Console
     if (document.getElementById('adm-users-body')) {
+        loadAdminOverview();
         loadAdminUsers();
         loadAdminProviders();
         loadAdminModels();

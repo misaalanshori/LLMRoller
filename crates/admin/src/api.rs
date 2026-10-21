@@ -1348,6 +1348,132 @@ async fn patch_admin_model_handler(
     Ok(StatusCode::OK)
 }
 
+async fn post_admin_model_confirm_merge_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ModelPk>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let res = sqlx::query("UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?")
+        .bind(id.to_string())
+        .execute(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if res.rows_affected() == 0 {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
+    }
+    Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteAliasParams {
+    pub alias: Option<String>,
+}
+
+async fn delete_admin_model_alias_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<DeleteAliasParams>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let Some(alias) = params.alias else {
+        return Err(map_price_error(
+            StatusCode::BAD_REQUEST,
+            "missing alias parameter",
+        ));
+    };
+    sqlx::query("DELETE FROM model_aliases WHERE alias = ?")
+        .bind(alias)
+        .execute(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_admin_share_approve_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ShareId>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let _admin_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    llmroller_store::shares::approve_provider_share_tx(&mut tx, &id, now_ms)
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn get_admin_overview_telemetry_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let settings = llmroller_store::settings::load_settings(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let retention_days = settings.traceability_config.retention_days;
+
+    let daily_requests: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE created_at >= ?")
+            .bind(now_ms - 86400 * 1000)
+            .fetch_one(&state.auth.pool)
+            .await
+            .unwrap_or(0)
+            .max(1000);
+
+    let trace_bytes: i64 =
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(byte_len), 0) FROM trace_blocks")
+            .fetch_one(&state.auth.pool)
+            .await
+            .unwrap_or(0);
+
+    let projected_bytes =
+        ((daily_requests as f64) * (retention_days as f64) * 600.0 * 1.3) + (trace_bytes as f64);
+    let projected_disk_mb = (projected_bytes / (1024.0 * 1024.0) * 10.0).round() / 10.0;
+
+    let unpriced_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT r.model_pk) FROM model_routes r
+         WHERE r.enabled = 1 AND NOT EXISTS (
+            SELECT 1 FROM prices p WHERE p.upstream_model_id = r.upstream_model_id
+         )",
+    )
+    .fetch_one(&state.auth.pool)
+    .await
+    .unwrap_or(0);
+
+    let usage_events_count: i64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(&state.auth.pool)
+        .await
+        .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "projected_disk_mb": projected_disk_mb,
+        "unpriced_models_count": unpriced_count,
+        "usage_events_count": usage_events_count,
+        "max_usage_events_rows": 50_000_000i64,
+        "retention_days": retention_days,
+        "daily_requests": daily_requests
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Audit Log Viewer (/admin/api/audit-log)
 // ---------------------------------------------------------------------------
@@ -1997,6 +2123,22 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/models/{id}/aliases",
             post(post_admin_model_alias_handler),
+        )
+        .route(
+            "/admin/api/models/{id}/confirm-merge",
+            post(post_admin_model_confirm_merge_handler),
+        )
+        .route(
+            "/admin/api/model-aliases",
+            delete(delete_admin_model_alias_handler),
+        )
+        .route(
+            "/admin/api/shares/{id}/approve",
+            post(post_admin_share_approve_handler),
+        )
+        .route(
+            "/admin/api/overview",
+            get(get_admin_overview_telemetry_handler),
         )
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))
