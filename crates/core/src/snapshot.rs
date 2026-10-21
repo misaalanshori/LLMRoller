@@ -125,6 +125,11 @@ pub struct SnapshotBudgetWindow {
     pub model_pk: Option<ModelPk>,
     pub window_kind: String,
     pub period_ms: Option<i64>,
+    /// Billing anchor timestamp for anchored window kinds (Section 13.2).
+    pub anchor_at: Option<i64>,
+    /// Canonical provider window label (`5h`, `7d`, `1mo`) used by `/usage`
+    /// reconciliation, when configured.
+    pub upstream_window_kind: Option<String>,
     pub limit_micro_usd: i64,
     pub reserve_pct: i64,
 }

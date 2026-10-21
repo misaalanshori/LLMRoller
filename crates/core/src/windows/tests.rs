@@ -126,6 +126,107 @@ fn test_decaying_upstream_observation_projection_and_expiry() {
     assert_eq!(short_obs.project(1_200_000, t0 + 15 * 60_000), 1_200_000);
 }
 
+#[doc = "Spec: LIM-1, Partial: USG-6"]
+#[test]
+fn test_anchored_fixed_aligns_backwards_for_future_anchor() {
+    // Anchor in the future still identifies the instance containing `now`.
+    let anchor = utc_to_epoch_millis(2026, 1, 31, 0);
+    let now = utc_to_epoch_millis(2026, 1, 15, 0);
+    let mut window = AnchoredFixed::new(18_000_000, anchor, now);
+    assert!(
+        window.window_start_ms <= now && now < window.resets_at_ms,
+        "future anchors must align backwards to the instance containing now"
+    );
+    assert!(window.window_start_ms < anchor);
+    assert_eq!(window.resets_at_ms - window.window_start_ms, 18_000_000);
+    assert_eq!(window.used_at(now), 0);
+}
+
+#[doc = "Spec: LIM-1"]
+#[test]
+fn test_anchored_calendar_month_aligns_backwards_for_future_anchor() {
+    // 31 January anchor evaluated on 15 January must resolve to the
+    // 31 December 2025 instance rather than a future window.
+    let now = utc_to_epoch_millis(2026, 1, 15, 870);
+    let mut calendar = AnchoredCalendarMonth::new(31, 870, 2026, 1);
+    calendar.align_to(now);
+    assert_eq!(
+        calendar.window_start_ms,
+        utc_to_epoch_millis(2025, 12, 31, 870)
+    );
+    assert_eq!(calendar.resets_at_ms, utc_to_epoch_millis(2026, 1, 31, 870));
+    assert!(calendar.current_year == 2025 && calendar.current_month == 12);
+}
+
+#[doc = "Spec: LIM-1"]
+#[test]
+fn test_epoch_millis_round_trips_utc_components() {
+    let expected = (2026, 3, 1, 870);
+    let ms = utc_to_epoch_millis(expected.0, expected.1, expected.2, expected.3);
+    assert_eq!(epoch_millis_to_utc(ms), expected);
+    assert_eq!(epoch_millis_to_utc(0), (1970, 1, 1, 0));
+}
+
+#[doc = "Spec: LIM-1 — F05 anchored_fixed counters enforce and reset on the anchor grid"]
+#[test]
+fn test_anchored_fixed_counter_enforces_and_resets() {
+    let anchor = 1_000_000_000_000;
+    let period = 18_000_000;
+    let counter = AtomicBudgetCounter::for_window(
+        7,
+        10_000_000,
+        0,
+        WindowKind::AnchoredFixed,
+        Some(period),
+        Some(anchor),
+        None,
+        anchor + 1_000,
+    );
+    counter.record_actual(anchor + 1_000, 9_000_000);
+    assert_eq!(counter.effective_used(anchor + 1_000), 9_000_000);
+    assert!(counter.effective_used(anchor + 1_000) < counter.max_allowed_spend());
+
+    // Spend reaches the cap inside the instance...
+    counter.record_actual(anchor + 2_000, 1_000_000);
+    assert_eq!(counter.effective_used(anchor + 2_000), 10_000_000);
+    assert!(
+        counter.effective_used(anchor + 2_000) >= counter.max_allowed_spend(),
+        "spend at the cap must no longer be admitted"
+    );
+
+    // ...and the anchored grid resets the instance at `resets_at_ms`.
+    assert_eq!(counter.effective_used(anchor + period), 0);
+}
+
+#[doc = "Spec: LIM-1, Partial: USG-6"]
+#[test]
+fn test_provider_counter_observation_moves_window_start() {
+    let t0 = 1_000_000_000_000;
+    let counter = AtomicBudgetCounter::for_window(
+        9,
+        10_000_000,
+        0,
+        WindowKind::AnchoredProvider,
+        Some(18_000_000),
+        None,
+        Some("5h"),
+        t0,
+    );
+    counter.record_actual(t0, 1_000);
+    counter.record_actual(t0 + 10_000_000, 2_000);
+    assert_eq!(counter.effective_used(t0 + 10_000_000), 3_000);
+
+    // Provider reports a window starting at t0 + 10M: earlier local spend is
+    // outside the reported instance.
+    counter.observe(UpstreamObservation {
+        used_micro_usd: 5_000_000,
+        observed_at_ms: t0 + 10_000_000,
+        local_at_observation: 2_000,
+        resets_at_ms: Some(t0 + 28_000_000),
+    });
+    assert_eq!(counter.effective_used(t0 + 10_000_000), 5_000_000);
+}
+
 #[doc = "Spec: LIM-1, Partial: RTE-3"]
 #[test]
 fn test_50_concurrent_try_reserve_at_97_9_pct_caps_at_98_pct() {

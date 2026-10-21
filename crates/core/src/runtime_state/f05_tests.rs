@@ -20,6 +20,8 @@ fn window(
         model_pk,
         window_kind: "rolling".to_string(),
         period_ms: Some(18_000_000),
+        anchor_at: None,
+        upstream_window_kind: None,
         limit_micro_usd,
         reserve_pct: 0,
     }
@@ -33,9 +35,10 @@ fn snapshot_with_windows(windows: Vec<SnapshotBudgetWindow>) -> ConfigSnapshot {
             .or_default()
             .push(window);
     }
-    let mut snapshot = ConfigSnapshot::default();
-    snapshot.budget_windows = Arc::new(by_key);
-    snapshot
+    ConfigSnapshot {
+        budget_windows: Arc::new(by_key),
+        ..ConfigSnapshot::default()
+    }
 }
 
 fn install_counter(
@@ -118,6 +121,108 @@ fn route_windows_gate_only_their_configured_model() {
         runtime.key_budget_admitted(&snapshot, key, None, 1_000),
         "route-scoped windows do not apply without a model context"
     );
+}
+
+#[test]
+#[doc = "Spec: LIM-1 — F05 rebuild creates a counter for every configured window kind"]
+fn rebuild_window_counters_builds_configured_kinds() {
+    use crate::windows::WindowKind;
+
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let mut fixed = window("fixed", key, "upstream_key", None, 10_000_000);
+    fixed.window_kind = "anchored_fixed".to_string();
+    fixed.anchor_at = Some(now - 1_000);
+    let mut calendar = window("calendar", key, "upstream_key", None, 10_000_000);
+    calendar.window_kind = "anchored_calendar_month".to_string();
+    calendar.period_ms = None;
+    calendar.anchor_at = Some(now - 1_000);
+    let mut provider = window("provider", key, "upstream_key", None, 10_000_000);
+    provider.window_kind = "anchored_provider".to_string();
+    provider.upstream_window_kind = Some("5h".to_string());
+
+    let snapshot = snapshot_with_windows(vec![
+        window("rolling", key, "upstream_key", None, 10_000_000),
+        fixed,
+        calendar,
+        provider,
+    ]);
+    runtime.rebuild_window_counters(&snapshot, now);
+
+    assert_eq!(
+        runtime.window_counter("rolling").expect("rolling").kind,
+        WindowKind::Rolling
+    );
+    assert_eq!(
+        runtime.window_counter("fixed").expect("fixed").kind,
+        WindowKind::AnchoredFixed
+    );
+    assert_eq!(
+        runtime.window_counter("calendar").expect("calendar").kind,
+        WindowKind::AnchoredCalendarMonth
+    );
+    assert_eq!(
+        runtime.window_counter("provider").expect("provider").kind,
+        WindowKind::AnchoredProvider
+    );
+}
+
+#[test]
+#[doc = "Spec: LIM-1 — F05 rebuild preserves accumulated usage for unchanged windows"]
+fn rebuild_window_counters_preserves_usage_for_unchanged_config() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let snapshot = snapshot_with_windows(vec![window(
+        "window",
+        key,
+        "upstream_key",
+        None,
+        10_000_000,
+    )]);
+    runtime.rebuild_window_counters(&snapshot, now);
+    let counter = runtime.window_counter("window").expect("counter");
+    crate::windows::BudgetCounter::record_actual(counter.as_ref(), now, 4_000_000);
+
+    runtime.rebuild_window_counters(&snapshot, now);
+    let counter = runtime.window_counter("window").expect("counter");
+    assert_eq!(
+        crate::windows::BudgetCounter::effective_used(counter.as_ref(), now),
+        4_000_000,
+        "a reload must not discard spend already accumulated for the window"
+    );
+}
+
+#[test]
+#[doc = "Spec: LIM-1 — F05 hydrate seeds anchored windows and enforces their cap"]
+fn hydrate_window_counter_seeds_and_enforces_anchored_window() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let mut fixed = window("fixed", key, "upstream_key", None, 10_000_000);
+    fixed.window_kind = "anchored_fixed".to_string();
+    fixed.anchor_at = Some(now - 1_000);
+    let snapshot = snapshot_with_windows(vec![fixed.clone()]);
+
+    runtime.hydrate_window_counter(&fixed, 10_000_000, now);
+
+    assert!(
+        !runtime.key_budget_admitted(&snapshot, key, None, now),
+        "a hydrated anchored window already at its cap must block C8"
+    );
+    assert!(
+        runtime
+            .reserve_key_windows(&snapshot, key, None, 1_000, now)
+            .is_err(),
+        "reservations must respect the hydrated anchored usage"
+    );
+}
+
+fn utc_now_ms_for_tests() -> i64 {
+    // Fixed, bucket-aligned instant that keeps anchored arithmetic deterministic.
+    let base = 1_790_000_000_000_i64;
+    (base / 60_000) * 60_000
 }
 
 #[test]

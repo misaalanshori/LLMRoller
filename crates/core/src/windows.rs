@@ -57,6 +57,24 @@ pub fn utc_to_epoch_millis(year: i32, month: u8, day: u8, minute_of_day: u16) ->
     (days * 86400 + minute_of_day as i64 * 60) * 1000
 }
 
+/// Convert epoch milliseconds to UTC (year, month, day, minute_of_day).
+pub fn epoch_millis_to_utc(ms: i64) -> (i32, u8, u8, u16) {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let minute_of_day = secs.rem_euclid(86_400) / 60;
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u8, day as u8, minute_of_day as u16)
+}
+
 /// Single bucket in a rolling ring.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RingBucket {
@@ -191,13 +209,16 @@ impl AnchoredFixed {
     }
 
     pub fn advance(&mut self, now_ms: i64) {
-        if now_ms >= self.resets_at_ms {
-            let diff = now_ms - self.resets_at_ms;
-            let periods = (diff / self.period_ms) + 1;
-            self.resets_at_ms += periods * self.period_ms;
-            self.window_start_ms = self.resets_at_ms - self.period_ms;
-            self.used_micro_usd = 0;
+        if now_ms >= self.window_start_ms && now_ms < self.resets_at_ms {
+            return;
         }
+        // Resolve the instance on the anchor grid containing `now_ms`. Using
+        // Euclidean division aligns both forward (expired) and backward (anchor
+        // in the future) without accumulating per-period drift.
+        let instance = (now_ms - self.anchor_at_ms).div_euclid(self.period_ms);
+        self.window_start_ms = self.anchor_at_ms + instance * self.period_ms;
+        self.resets_at_ms = self.window_start_ms + self.period_ms;
+        self.used_micro_usd = 0;
     }
 
     pub fn record(&mut self, now_ms: i64, amount_micro_usd: i64) {
@@ -251,28 +272,59 @@ impl AnchoredCalendarMonth {
 
     pub fn advance(&mut self, now_ms: i64) {
         while now_ms >= self.resets_at_ms {
-            self.current_year = if self.current_month == 12 {
-                self.current_year + 1
-            } else {
-                self.current_year
-            };
-            self.current_month = if self.current_month == 12 {
-                1
-            } else {
-                self.current_month + 1
-            };
-
-            self.window_start_ms = self.resets_at_ms;
-
-            let (next_y, next_m) = if self.current_month == 12 {
-                (self.current_year + 1, 1)
-            } else {
-                (self.current_year, self.current_month + 1)
-            };
-            let next_d = self.anchor_day.min(days_in_month(next_y, next_m));
-            self.resets_at_ms = utc_to_epoch_millis(next_y, next_m, next_d, self.anchor_minute);
-            self.used_micro_usd = 0;
+            self.step_forward();
         }
+    }
+
+    /// Aligns the window to the instance containing `now_ms`, moving either
+    /// forward or backward. A billing anchor later in the month therefore maps
+    /// to the previous month's instance instead of a future window.
+    pub fn align_to(&mut self, now_ms: i64) {
+        while now_ms >= self.resets_at_ms {
+            self.step_forward();
+        }
+        while now_ms < self.window_start_ms {
+            self.step_backward();
+        }
+    }
+
+    fn step_forward(&mut self) {
+        self.current_year = if self.current_month == 12 {
+            self.current_year + 1
+        } else {
+            self.current_year
+        };
+        self.current_month = if self.current_month == 12 {
+            1
+        } else {
+            self.current_month + 1
+        };
+
+        self.window_start_ms = self.resets_at_ms;
+
+        let (next_y, next_m) = if self.current_month == 12 {
+            (self.current_year + 1, 1)
+        } else {
+            (self.current_year, self.current_month + 1)
+        };
+        let next_d = self.anchor_day.min(days_in_month(next_y, next_m));
+        self.resets_at_ms = utc_to_epoch_millis(next_y, next_m, next_d, self.anchor_minute);
+        self.used_micro_usd = 0;
+    }
+
+    fn step_backward(&mut self) {
+        let (prev_year, prev_month) = if self.current_month == 1 {
+            (self.current_year - 1, 12)
+        } else {
+            (self.current_year, self.current_month - 1)
+        };
+        self.resets_at_ms = self.window_start_ms;
+        let prev_d = self.anchor_day.min(days_in_month(prev_year, prev_month));
+        self.window_start_ms =
+            utc_to_epoch_millis(prev_year, prev_month, prev_d, self.anchor_minute);
+        self.current_year = prev_year;
+        self.current_month = prev_month;
+        self.used_micro_usd = 0;
     }
 
     pub fn record(&mut self, now_ms: i64, amount_micro_usd: i64) {
@@ -317,7 +369,18 @@ impl AnchoredProvider {
     }
 
     pub fn effective_used(&self, now_ms: i64) -> i64 {
-        let local = match self.window_start_ms {
+        let local = self.local_used(now_ms);
+
+        match &self.observation {
+            None => local,
+            Some(o) => o.project(local, now_ms),
+        }
+    }
+
+    /// Local ring spend since the provider-reported window start (or the sliding
+    /// window before the first observation arrives).
+    pub fn local_used(&self, now_ms: i64) -> i64 {
+        match self.window_start_ms {
             Some(start) => {
                 let mut sum = 0;
                 for bucket in &self.ring.buckets {
@@ -328,11 +391,6 @@ impl AnchoredProvider {
                 sum
             }
             None => self.ring.sum_at(now_ms),
-        };
-
-        match &self.observation {
-            None => local,
-            Some(o) => o.project(local, now_ms),
         }
     }
 }
@@ -377,26 +435,164 @@ pub trait BudgetCounter: Send + Sync {
     fn record_actual(&self, now_ms: i64, amount_micro_usd: i64);
 }
 
-/// Thread-safe in-memory budget counter backed by a rolling ring and atomic reservation ledger.
+/// Configured reset semantics for a budget window (Section 13.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    Rolling,
+    AnchoredFixed,
+    AnchoredCalendarMonth,
+    AnchoredProvider,
+}
+
+impl WindowKind {
+    /// Parses the schema `window_kind` value. Unknown values degrade to rolling,
+    /// which is the safe historical behavior for legacy rows.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "anchored_fixed" => Self::AnchoredFixed,
+            "anchored_calendar_month" => Self::AnchoredCalendarMonth,
+            "anchored_provider" => Self::AnchoredProvider,
+            _ => Self::Rolling,
+        }
+    }
+}
+
+/// Mutable local accounting state for one configured window kind.
+#[derive(Debug)]
+pub enum WindowState {
+    Rolling(RollingRing),
+    AnchoredFixed(AnchoredFixed),
+    AnchoredCalendarMonth(AnchoredCalendarMonth),
+    AnchoredProvider(AnchoredProvider),
+}
+
+impl WindowState {
+    fn local_used(&mut self, now_ms: i64) -> i64 {
+        match self {
+            Self::Rolling(ring) => ring.sum_at(now_ms),
+            Self::AnchoredFixed(window) => window.used_at(now_ms),
+            Self::AnchoredCalendarMonth(window) => window.used_at(now_ms),
+            Self::AnchoredProvider(window) => window.local_used(now_ms),
+        }
+    }
+
+    fn record(&mut self, now_ms: i64, amount_micro_usd: i64) {
+        match self {
+            Self::Rolling(ring) => ring.record(now_ms, amount_micro_usd),
+            Self::AnchoredFixed(window) => window.record(now_ms, amount_micro_usd),
+            Self::AnchoredCalendarMonth(window) => window.record(now_ms, amount_micro_usd),
+            Self::AnchoredProvider(window) => window.record(now_ms, amount_micro_usd),
+        }
+    }
+}
+
+/// Thread-safe in-memory budget counter backed by its configured window kind and
+/// an atomic reservation ledger.
 pub struct AtomicBudgetCounter {
     pub id: u64,
     pub limit_micro_usd: i64,
     pub reserve_percent: i64,
-    pub ring: RwLock<RollingRing>,
+    pub kind: WindowKind,
+    pub period_ms: Option<i64>,
+    pub anchor_at_ms: i64,
+    pub upstream_window_kind: Option<String>,
+    pub state: RwLock<WindowState>,
     pub reserved: AtomicI64,
     pub observation: RwLock<Option<UpstreamObservation>>,
 }
 
 impl AtomicBudgetCounter {
+    /// Rolling counter constructor retained for callers that only configure a
+    /// period (legacy `rolling` windows and unit tests).
     pub fn new(id: u64, limit_micro_usd: i64, reserve_percent: i64, period_ms: i64) -> Self {
+        Self::for_window(
+            id,
+            limit_micro_usd,
+            reserve_percent,
+            WindowKind::Rolling,
+            Some(period_ms),
+            None,
+            None,
+            0,
+        )
+    }
+
+    /// Builds a counter for the configured `window_kind`, aligning anchored
+    /// instances to `now_ms` (including backwards alignment for a future anchor).
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_window(
+        id: u64,
+        limit_micro_usd: i64,
+        reserve_percent: i64,
+        kind: WindowKind,
+        period_ms: Option<i64>,
+        anchor_at_ms: Option<i64>,
+        upstream_window_kind: Option<&str>,
+        now_ms: i64,
+    ) -> Self {
+        let period = period_ms.unwrap_or(2_678_400_000);
+        let anchor = anchor_at_ms.unwrap_or(now_ms);
+        let state = match kind {
+            WindowKind::Rolling => WindowState::Rolling(RollingRing::new(period)),
+            WindowKind::AnchoredFixed => {
+                WindowState::AnchoredFixed(AnchoredFixed::new(period, anchor, now_ms))
+            }
+            WindowKind::AnchoredCalendarMonth => {
+                let (year, month, day, minute_of_day) = epoch_millis_to_utc(anchor);
+                let mut window = AnchoredCalendarMonth::new(day, minute_of_day, year, month);
+                window.align_to(now_ms);
+                WindowState::AnchoredCalendarMonth(window)
+            }
+            WindowKind::AnchoredProvider => {
+                WindowState::AnchoredProvider(AnchoredProvider::new(period))
+            }
+        };
         Self {
             id,
             limit_micro_usd,
             reserve_percent,
-            ring: RwLock::new(RollingRing::new(period_ms)),
+            kind,
+            period_ms: if kind == WindowKind::AnchoredCalendarMonth {
+                None
+            } else {
+                Some(period)
+            },
+            anchor_at_ms: anchor_at_ms.unwrap_or(0),
+            upstream_window_kind: upstream_window_kind.map(str::to_string),
+            state: RwLock::new(state),
             reserved: AtomicI64::new(0),
             observation: RwLock::new(None),
         }
+    }
+
+    /// Whether this counter still reflects the configured window shape.
+    #[must_use]
+    pub fn matches_config(
+        &self,
+        kind: WindowKind,
+        period_ms: Option<i64>,
+        anchor_at_ms: Option<i64>,
+        limit_micro_usd: i64,
+        reserve_percent: i64,
+    ) -> bool {
+        self.kind == kind
+            && self.period_ms == period_ms
+            && self.anchor_at_ms == anchor_at_ms.unwrap_or(0)
+            && self.limit_micro_usd == limit_micro_usd
+            && self.reserve_percent == reserve_percent
+    }
+
+    /// Records an upstream observation for this window. Provider-anchored
+    /// windows additionally move their local window start to the reported reset.
+    pub fn observe(&self, observation: UpstreamObservation) {
+        {
+            let mut state = self.state.write();
+            if let WindowState::AnchoredProvider(window) = &mut *state {
+                window.update_observation(observation);
+            }
+        }
+        *self.observation.write() = Some(observation);
     }
 }
 
@@ -404,6 +600,7 @@ impl std::fmt::Debug for AtomicBudgetCounter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicBudgetCounter")
             .field("id", &self.id)
+            .field("kind", &self.kind)
             .field("limit_micro_usd", &self.limit_micro_usd)
             .field("reserve_percent", &self.reserve_percent)
             .field(
@@ -420,7 +617,7 @@ impl BudgetCounter for AtomicBudgetCounter {
     }
 
     fn effective_used(&self, now_ms: i64) -> i64 {
-        let local = self.ring.read().sum_at(now_ms);
+        let local = self.state.write().local_used(now_ms);
         let obs = *self.observation.read();
         match obs {
             None => local,
@@ -441,7 +638,7 @@ impl BudgetCounter for AtomicBudgetCounter {
     }
 
     fn record_actual(&self, now_ms: i64, amount_micro_usd: i64) {
-        self.ring.write().record(now_ms, amount_micro_usd);
+        self.state.write().record(now_ms, amount_micro_usd);
     }
 }
 

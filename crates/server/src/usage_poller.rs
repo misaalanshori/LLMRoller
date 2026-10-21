@@ -260,6 +260,8 @@ mod tests {
             model_pk: None,
             window_kind: "rolling".to_string(),
             period_ms: Some(18_000_000),
+            anchor_at: None,
+            upstream_window_kind: None,
             limit_micro_usd: 10_000_000,
             reserve_pct: 0,
         };

@@ -291,7 +291,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     runtime_state
         .accumulators
         .merge_from(&rebuilt.monthly_accumulators);
-    runtime_state.rebuild_window_counters(&shared_snapshot.load());
+    runtime_state.rebuild_window_counters(&shared_snapshot.load(), clock.now_ms());
     for (key_id, ring) in &rebuilt.key_rings {
         let windows = shared_snapshot
             .load()

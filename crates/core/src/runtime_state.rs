@@ -294,25 +294,34 @@ impl RuntimeState {
     }
 
     /// Rebuild configured budget counters from the published snapshot.
-    pub fn rebuild_window_counters(&self, snapshot: &ConfigSnapshot) {
+    pub fn rebuild_window_counters(&self, snapshot: &ConfigSnapshot, now_ms: i64) {
         let mut live: Vec<String> = Vec::new();
         for windows in snapshot.budget_windows.values() {
             for window in windows {
                 live.push(window.id.clone());
-                let period = window.period_ms.unwrap_or(2_678_400_000);
-                let reserve = window.reserve_pct;
-                let entry = self
-                    .window_counters
-                    .entry(window.id.clone())
-                    .or_insert_with(|| {
-                        Arc::new(AtomicBudgetCounter::new(
-                            stable_counter_id(&window.id),
-                            window.limit_micro_usd,
-                            reserve,
-                            period,
-                        ))
-                    });
-                let _ = entry;
+                let kind = crate::windows::WindowKind::parse(&window.window_kind);
+                let stale = self.window_counters.get(&window.id).is_none_or(|counter| {
+                    !counter.matches_config(
+                        kind,
+                        window.period_ms,
+                        window.anchor_at,
+                        window.limit_micro_usd,
+                        window.reserve_pct,
+                    )
+                });
+                if stale {
+                    let counter = Arc::new(AtomicBudgetCounter::for_window(
+                        stable_counter_id(&window.id),
+                        window.limit_micro_usd,
+                        window.reserve_pct,
+                        kind,
+                        window.period_ms,
+                        window.anchor_at,
+                        window.upstream_window_kind.as_deref(),
+                        now_ms,
+                    ));
+                    self.window_counters.insert(window.id.clone(), counter);
+                }
             }
         }
         self.window_counters.retain(|id, _| live.contains(id));
@@ -365,7 +374,10 @@ impl RuntimeState {
         now_ms: i64,
     ) {
         for configured in budget_windows {
-            let local_kind = local_window_kind(configured);
+            let local_kind: &str = configured
+                .upstream_window_kind
+                .as_deref()
+                .unwrap_or_else(|| local_window_kind(configured));
             let Some(remote) = windows
                 .iter()
                 .find(|window| kind_matches(&window.kind, local_kind))
@@ -390,7 +402,7 @@ impl RuntimeState {
             let used_micro_usd =
                 (counter.limit_micro_usd() as f64 * remote.used_percent / 100.0).round() as i64;
             let local_at_observation = counter.effective_used(now_ms);
-            *counter.observation.write() = Some(crate::windows::UpstreamObservation {
+            counter.observe(crate::windows::UpstreamObservation {
                 used_micro_usd,
                 observed_at_ms: now_ms,
                 local_at_observation,
@@ -691,7 +703,7 @@ impl RuntimeState {
             }
         }
         if rebuild_windows {
-            self.rebuild_window_counters(snapshot);
+            self.rebuild_window_counters(snapshot, now_ms);
         }
     }
 
@@ -702,12 +714,15 @@ impl RuntimeState {
         ring_seed: i64,
         now_ms: i64,
     ) {
-        let period = window.period_ms.unwrap_or(2_678_400_000);
-        let counter = Arc::new(AtomicBudgetCounter::new(
+        let counter = Arc::new(AtomicBudgetCounter::for_window(
             stable_counter_id(&window.id),
             window.limit_micro_usd,
             window.reserve_pct,
-            period,
+            crate::windows::WindowKind::parse(&window.window_kind),
+            window.period_ms,
+            window.anchor_at,
+            window.upstream_window_kind.as_deref(),
+            now_ms,
         ));
         if ring_seed > 0 {
             crate::windows::BudgetCounter::record_actual(counter.as_ref(), now_ms, ring_seed);

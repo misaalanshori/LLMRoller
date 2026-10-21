@@ -107,7 +107,7 @@ pub async fn load_budget_windows_tx(
 {
     let rows = sqlx::query(
         "SELECT id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms,
-                limit_micro_usd, reserve_pct
+                anchor_at, upstream_window_kind, limit_micro_usd, reserve_pct
          FROM budget_windows",
     )
     .fetch_all(&mut **tx)
@@ -130,6 +130,8 @@ pub async fn load_budget_windows_tx(
                 .and_then(|s| llmroller_core::ids::ModelPk::parse(s).ok()),
             window_kind: row.try_get("window_kind")?,
             period_ms: row.try_get("period_ms").unwrap_or(None),
+            anchor_at: row.try_get("anchor_at").unwrap_or(None),
+            upstream_window_kind: row.try_get("upstream_window_kind").unwrap_or(None),
             limit_micro_usd: row.try_get("limit_micro_usd")?,
             reserve_pct: row.try_get("reserve_pct").unwrap_or(2),
         };
