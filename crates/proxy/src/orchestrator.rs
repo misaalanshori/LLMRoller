@@ -321,7 +321,8 @@ fn hard_route_checks(
             now,
         )
     });
-    let c8 = key.is_some_and(|key| runtime.key_budget_admitted(key.id, now));
+    let c8 = key
+        .is_some_and(|key| runtime.key_budget_admitted(snapshot, key.id, Some(link.model_pk), now));
 
     let retry_after = {
         let mut until = now.saturating_add(60_000);
@@ -1157,7 +1158,12 @@ fn eligibility_route(
             .filter(|pref| pref.upstream_key_id == candidate.upstream_key_id)
             .map(|pref| pref.enabled),
         priority: candidate.priority,
-        budget_admitted: runtime.key_budget_admitted(candidate.upstream_key_id, now),
+        budget_admitted: runtime.key_budget_admitted(
+            snapshot,
+            candidate.upstream_key_id,
+            Some(candidate.model_pk),
+            now,
+        ),
         budget_exhausted_due_to_monthly_cap: false,
     }
 }
@@ -2327,6 +2333,7 @@ pub async fn handle_inference_request(
         let reservation = match state.runtime_state.reserve_key_windows(
             &snapshot,
             candidate.upstream_key_id,
+            Some(candidate.model_pk),
             attempt_estimate,
             now,
         ) {

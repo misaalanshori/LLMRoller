@@ -103,6 +103,17 @@ fn kind_matches(remote: &str, local: &str) -> bool {
     canonical_kind(remote) == canonical_kind(local)
 }
 
+/// Whether a configured window constrains a given model route (C8).
+///
+/// Key-scoped windows constrain every route on the key; route-scoped windows
+/// constrain only the model they were configured for.
+fn window_applies_to_model(window: &SnapshotBudgetWindow, model_pk: Option<ModelPk>) -> bool {
+    match window.scope_kind.as_str() {
+        "route" => model_pk.is_some_and(|model| window.model_pk == Some(model)),
+        _ => true,
+    }
+}
+
 impl KeyHealthEntry {
     #[must_use]
     pub fn is_routable(&self, now_ms: i64) -> bool {
@@ -556,14 +567,28 @@ impl RuntimeState {
         decision
     }
 
-    /// Whether any configured hard budget window for a key is exhausted (C8 quick gate).
+    /// Whether every configured hard budget window that applies to this key and
+    /// model has headroom (C8 quick gate).
+    ///
+    /// Windows are resolved through the published snapshot because window ids are
+    /// opaque UUIDs: `scope_kind = 'upstream_key'` windows always apply, while
+    /// `scope_kind = 'route'` windows apply only to their configured model.
     #[must_use]
-    pub fn key_budget_admitted(&self, key_id: UpstreamKeyId, now_ms: i64) -> bool {
-        self.window_counters
+    pub fn key_budget_admitted(
+        &self,
+        snapshot: &ConfigSnapshot,
+        key_id: UpstreamKeyId,
+        model_pk: Option<ModelPk>,
+        now_ms: i64,
+    ) -> bool {
+        let Some(windows) = snapshot.budget_windows.get(&key_id) else {
+            return true;
+        };
+        windows
             .iter()
-            .filter(|entry| entry.key().starts_with(&format!("{key_id}:")))
-            .all(|entry| {
-                let counter = entry.value();
+            .filter(|window| window_applies_to_model(window, model_pk))
+            .filter_map(|window| self.window_counter(&window.id))
+            .all(|counter| {
                 let used = crate::windows::BudgetCounter::effective_used(counter.as_ref(), now_ms);
                 used < crate::windows::BudgetCounter::max_allowed_spend(counter.as_ref())
             })
@@ -586,6 +611,7 @@ impl RuntimeState {
         &self,
         snapshot: &ConfigSnapshot,
         key_id: UpstreamKeyId,
+        model_pk: Option<ModelPk>,
         estimate_micro_usd: i64,
         now_ms: i64,
     ) -> Result<Option<crate::windows::Reservation>, crate::windows::ReservationError> {
@@ -593,7 +619,10 @@ impl RuntimeState {
             return Ok(None);
         };
         let mut counters: Vec<Arc<dyn crate::windows::BudgetCounter>> = Vec::new();
-        for window in windows {
+        for window in windows
+            .iter()
+            .filter(|window| window_applies_to_model(window, model_pk))
+        {
             if let Some(counter) = self.window_counter(&window.id) {
                 counters.push(counter);
             }
@@ -810,3 +839,5 @@ mod tests {
 
 #[cfg(test)]
 mod f04_tests;
+#[cfg(test)]
+mod f05_tests;
