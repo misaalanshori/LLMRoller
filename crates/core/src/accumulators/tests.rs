@@ -136,6 +136,38 @@ fn test_gate_g7_exhaustion_returns_retry_after_and_cap_invalidation() {
     assert_eq!(on_cap_changed(), CacheInvalidationEvent::CapChanged);
 }
 
+#[doc = "Spec: USR-5, SHR-1 — F05 eligibility/pool selection sees exhausted tier caps"]
+#[test]
+fn test_is_exhausted_detects_tier_cap_and_zero_cap() {
+    let registry = MonthlyAccumulatorRegistry::new();
+    let user_id = crate::ids::UserId::generate();
+    let share_id = crate::ids::ShareId::generate();
+    let ts = utc_to_epoch_millis(2026, 1, 20, 720);
+
+    let user_scope = BudgetScopeId::User(user_id);
+    let share_scope = BudgetScopeId::ProviderShare(share_id);
+    assert!(!registry.is_exhausted(&user_scope, None, ts));
+    assert!(
+        registry.is_exhausted(&user_scope, Some(0), ts),
+        "a zero cap admits no spend"
+    );
+    assert!(!registry.is_exhausted(&user_scope, Some(5_000_000), ts));
+
+    registry
+        .get_or_create(UtcYearMonth::from_epoch_millis(ts), share_scope.clone())
+        .used_micro_usd
+        .store(5_000_000, Ordering::SeqCst);
+    assert!(registry.is_exhausted(&share_scope, Some(5_000_000), ts));
+    assert!(!registry.is_exhausted(&share_scope, Some(6_000_000), ts));
+
+    // Reserved in-flight spend also consumes headroom.
+    let guarded = registry
+        .try_reserve(user_scope.clone(), Some(5_000_000), 1_000_000, ts)
+        .expect("reservation");
+    assert!(registry.is_exhausted(&user_scope, Some(1_000_000), ts));
+    drop(guarded);
+}
+
 fn utc_to_epoch_millis(year: i32, month: u8, day: u8, minute_of_day: u16) -> i64 {
     crate::windows::utc_to_epoch_millis(year, month, day, minute_of_day)
 }

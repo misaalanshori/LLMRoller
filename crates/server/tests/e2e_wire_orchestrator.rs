@@ -18,7 +18,7 @@ use http_body_util::BodyExt as _;
 use tempfile::tempdir;
 use tower::ServiceExt as _;
 
-use llmroller_core::ids::{ModelPk, UserId};
+use llmroller_core::ids::{ModelPk, UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope, SystemSeal, SystemTask};
 use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_string};
@@ -352,4 +352,248 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
     assert!(stream_text.contains("Hello from "));
     assert!(stream_text.contains("mock upstream!"));
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
+}
+
+/// Inserts a user plus an allowed-models client key and returns the raw token.
+async fn seed_user_with_client_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    username: &str,
+    global_budget_micro_usd_month: Option<i64>,
+    entropy: &OsEntropy,
+) -> (UserId, String) {
+    let user_id = UserId::generate();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, global_budget_micro_usd_month, created_at)
+         VALUES (?, ?, 'h', 'user', ?, 1000)",
+    )
+    .bind(user_id.to_string())
+    .bind(username)
+    .bind(global_budget_micro_usd_month)
+    .execute(&mut **tx)
+    .await
+    .expect("insert user");
+
+    let client_key = create_client_key_tx(
+        tx,
+        &ActorScope::system(SystemTask::Writer, SystemSeal::store()),
+        user_id,
+        NewClientKey {
+            label: format!("{username}_key"),
+            allowed_models: Some(vec!["gpt-4o".to_string()]),
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        entropy,
+        1000,
+    )
+    .await
+    .expect("create client key");
+    let token = client_key.raw_token.expose_secret().to_string();
+    (user_id, token)
+}
+
+/// Seeds a provider/key/model/route triple and returns their identifiers.
+async fn seed_provider_route(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    master_key: &MasterKey,
+    _entropy: &OsEntropy,
+    mock_addr: SocketAddr,
+    ownership_scope: OwnershipScope,
+    owner_user_id: Option<UserId>,
+) -> (llmroller_core::ids::ProviderId, UpstreamKeyId) {
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+    let provider = create_provider_tx(
+        tx,
+        &system_actor,
+        NewProvider {
+            name: "Mock Provider".to_string(),
+            kind: ProviderKind::Custom,
+            base_url: format!("http://{}", mock_addr),
+            config_json: "{}".to_string(),
+            ownership_scope,
+            owner_user_id,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: true,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("create provider");
+
+    let upstream_key = create_upstream_key_tx(
+        tx,
+        &system_actor,
+        master_key,
+        "key-0",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: provider.id,
+            label: "Mock Key".to_string(),
+            secret: secret_string("sk-mock-key"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1000,
+    )
+    .await
+    .expect("create upstream key");
+
+    let model_pk = ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk.to_string())
+        .execute(&mut **tx)
+        .await
+        .expect("insert model");
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+         VALUES (?, ?, 'gpt-4o', '[\"chat\",\"responses\",\"messages\"]', 'active', 1000)",
+    )
+    .bind(upstream_key.id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&mut **tx)
+    .await
+    .expect("insert route");
+
+    (provider.id, upstream_key.id)
+}
+
+async fn build_wire_app(pool: &sqlx::SqlitePool, master_key: &MasterKey) -> Router {
+    let (reloader_tx, _reloader_rx) = tokio::sync::mpsc::channel(100);
+    let (writer, _writer_task) = start_writer(pool.clone(), reloader_tx);
+    let snapshot = load_initial_snapshot(pool).await.expect("load snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
+    let mut proxy_auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![])
+        .with_master_key(master_key.clone());
+    proxy_auth_state.is_ready.store(true, Ordering::SeqCst);
+    proxy_auth_state.writer = Some(writer);
+    data_plane_router(proxy_auth_state)
+}
+
+fn chat_request(token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("request")
+}
+
+async fn seed_base(pool: &sqlx::SqlitePool, master_key: &MasterKey) {
+    let entropy = OsEntropy;
+    load_or_initialize(pool, "key-0", master_key, Arc::new(entropy), 1)
+        .await
+        .expect("instance load");
+    seed_defaults(pool, None, 1).await.expect("seed settings");
+}
+
+#[tokio::test]
+#[doc = "Spec: USR-5 — F05 own-tier requests bypass a zero user-global budget"]
+async fn test_own_tier_bypasses_zero_user_global_budget() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("usr5.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xCC; 32]);
+    seed_base(&pool, &master_key).await;
+
+    let entropy = OsEntropy;
+    let mut tx = pool.begin().await.expect("begin");
+    let (user_id, token) = seed_user_with_client_key(&mut tx, "usr5_user", Some(0), &entropy).await;
+    let (_provider_id, _key_id) = seed_provider_route(
+        &mut tx,
+        &master_key,
+        &entropy,
+        mock_addr,
+        OwnershipScope::Personal,
+        Some(user_id),
+    )
+    .await;
+    tx.commit().await.expect("commit");
+
+    let app = build_wire_app(&pool, &master_key).await;
+    let response = app.oneshot(chat_request(&token)).await.expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "own personal routes must not be blocked by the user-global cap"
+    );
+    assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[doc = "Spec: SHR-1 — F05 shared-tier requests enforce the grantor's zero share cap before egress"]
+async fn test_shared_tier_zero_cap_returns_429_without_upstream_call() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("shr1.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xDD; 32]);
+    seed_base(&pool, &master_key).await;
+
+    let entropy = OsEntropy;
+    let mut tx = pool.begin().await.expect("begin");
+    let (grantor_id, _grantor_token) =
+        seed_user_with_client_key(&mut tx, "shr1_grantor", None, &entropy).await;
+    let (grantee_id, grantee_token) =
+        seed_user_with_client_key(&mut tx, "shr1_grantee", None, &entropy).await;
+    let (provider_id, _key_id) = seed_provider_route(
+        &mut tx,
+        &master_key,
+        &entropy,
+        mock_addr,
+        OwnershipScope::Personal,
+        Some(grantor_id),
+    )
+    .await;
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT share_config_fingerprint FROM providers WHERE id = ?")
+            .bind(provider_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("provider fingerprint");
+
+    sqlx::query(
+        "INSERT INTO provider_shares (
+             id, provider_id, owner_user_id, grantee_user_id, max_monthly_micro_usd,
+             accepted_at, accepted_config_fingerprint, admin_approved_at, enabled, created_at
+         ) VALUES (?, ?, ?, ?, 0, 1000, ?, 1000, 1, 1000)",
+    )
+    .bind(llmroller_core::ids::ShareId::generate().to_string())
+    .bind(provider_id.to_string())
+    .bind(grantor_id.to_string())
+    .bind(grantee_id.to_string())
+    .bind(fingerprint)
+    .execute(&mut *tx)
+    .await
+    .expect("insert share");
+    tx.commit().await.expect("commit");
+
+    let app = build_wire_app(&pool, &master_key).await;
+    let response = app
+        .oneshot(chat_request(&grantee_token))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an exhausted share cap must fail closed with 429"
+    );
+    assert_eq!(
+        mock_state.chat_calls.load(Ordering::SeqCst),
+        0,
+        "no upstream request may be issued when the share cap is exhausted"
+    );
 }

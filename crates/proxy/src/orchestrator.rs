@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::stream;
-use llmroller_core::accumulators::MonthReservationGuard;
+use llmroller_core::accumulators::{BudgetScopeId, GateG7Error, MonthReservationGuard};
 use llmroller_core::breaker::OriginKey;
 use llmroller_core::client_key::ClientKeyRecord;
 use llmroller_core::eligibility::{
@@ -1080,6 +1080,86 @@ const fn failure_charge(
     }
 }
 
+/// Monthly cap charged by a candidate's pool tier (USR-5, SHR-1).
+///
+/// Global candidates consume the caller's user-global budget; shared candidates
+/// consume the grantor's per-share cap. Own and blended candidates charge no
+/// tier cap here (the client-key cap is reserved once per request).
+fn candidate_cap_scope(
+    snapshot: &ConfigSnapshot,
+    owner_user_id: UserId,
+    candidate: &RouteCandidate,
+) -> Option<(BudgetScopeId, Option<i64>)> {
+    match candidate.pool_tier {
+        CandidatePoolTier::Global => Some((
+            BudgetScopeId::User(owner_user_id),
+            snapshot
+                .users
+                .get(&owner_user_id)
+                .and_then(|user| user.global_budget_micro_usd_month),
+        )),
+        CandidatePoolTier::Shared => {
+            let share_id = candidate.share_id?;
+            snapshot
+                .shares_by_grantee
+                .get(&owner_user_id)?
+                .iter()
+                .find(|share| share.share_id == share_id)
+                .map(|share| {
+                    (
+                        BudgetScopeId::ProviderShare(share_id),
+                        share.max_monthly_micro_usd,
+                    )
+                })
+        }
+        CandidatePoolTier::Own | CandidatePoolTier::Blended => None,
+    }
+}
+
+/// Tier-scoped monthly reservations acquired for one candidate attempt.
+#[derive(Debug, Default)]
+struct CandidateCapGuards {
+    user: Option<MonthReservationGuard>,
+    share: Option<MonthReservationGuard>,
+}
+
+impl CandidateCapGuards {
+    fn commit(&mut self, actual_micro_usd: i64) {
+        if let Some(guard) = self.user.take() {
+            guard.commit(actual_micro_usd);
+        }
+        if let Some(guard) = self.share.take() {
+            guard.commit(actual_micro_usd);
+        }
+    }
+}
+
+/// Reserves the monthly caps that the candidate's tier actually charges.
+fn reserve_candidate_caps(
+    registry: &llmroller_core::accumulators::MonthlyAccumulatorRegistry,
+    snapshot: &ConfigSnapshot,
+    owner_user_id: UserId,
+    candidate: &RouteCandidate,
+    estimate_micro_usd: i64,
+    now_ms: i64,
+) -> Result<CandidateCapGuards, GateG7Error> {
+    let Some((scope_id, cap)) = candidate_cap_scope(snapshot, owner_user_id, candidate) else {
+        return Ok(CandidateCapGuards::default());
+    };
+    let guard = registry.try_reserve(scope_id, cap, estimate_micro_usd, now_ms)?;
+    Ok(match candidate.pool_tier {
+        CandidatePoolTier::Global => CandidateCapGuards {
+            user: Some(guard),
+            share: None,
+        },
+        CandidatePoolTier::Shared => CandidateCapGuards {
+            user: None,
+            share: Some(guard),
+        },
+        CandidatePoolTier::Own | CandidatePoolTier::Blended => CandidateCapGuards::default(),
+    })
+}
+
 /// Build the C1-C8 eligibility projection for one candidate.
 fn eligibility_route(
     snapshot: &ConfigSnapshot,
@@ -1130,6 +1210,15 @@ fn eligibility_route(
             .find(|route| route.upstream_key_id == candidate.upstream_key_id)
     });
 
+    let tier_cap_exhausted = candidate_cap_scope(snapshot, caller.owner_user_id, candidate)
+        .is_some_and(|(scope, cap)| runtime.accumulators.is_exhausted(&scope, cap, now));
+    let windows_admitted = runtime.key_budget_admitted(
+        snapshot,
+        candidate.upstream_key_id,
+        Some(candidate.model_pk),
+        now,
+    );
+
     EligibilityRoute {
         upstream_key_id: candidate.upstream_key_id,
         model_pk: model.id,
@@ -1158,13 +1247,8 @@ fn eligibility_route(
             .filter(|pref| pref.upstream_key_id == candidate.upstream_key_id)
             .map(|pref| pref.enabled),
         priority: candidate.priority,
-        budget_admitted: runtime.key_budget_admitted(
-            snapshot,
-            candidate.upstream_key_id,
-            Some(candidate.model_pk),
-            now,
-        ),
-        budget_exhausted_due_to_monthly_cap: false,
+        budget_admitted: windows_admitted && !tier_cap_exhausted,
+        budget_exhausted_due_to_monthly_cap: tier_cap_exhausted,
     }
 }
 
@@ -1630,7 +1714,7 @@ struct StreamFinalizer {
     tap: SseUsageTap,
     reservation: Option<Reservation>,
     client_guard: Option<MonthReservationGuard>,
-    user_guard: Option<MonthReservationGuard>,
+    cap_guards: CandidateCapGuards,
     price_entry: Option<PriceEntry>,
     fallback_rates: Rates,
     attempts: Vec<UsageAttemptRecord>,
@@ -1666,9 +1750,7 @@ impl StreamFinalizer {
         if let Some(guard) = self.client_guard.take() {
             guard.commit(cost.cost_micro_usd);
         }
-        if let Some(guard) = self.user_guard.take() {
-            guard.commit(cost.cost_micro_usd);
-        }
+        self.cap_guards.commit(cost.cost_micro_usd);
 
         self.attempts.push(attempt_record(
             self.usage.request_id,
@@ -2146,24 +2228,7 @@ pub async fn handle_inference_request(
             return gate_error_response(&error);
         }
     };
-    let user_cap = snapshot
-        .users
-        .get(&caller.owner_user_id)
-        .and_then(|user| user.global_budget_micro_usd_month);
-    let user_guard = match state.runtime_state.accumulators.try_reserve(
-        llmroller_core::accumulators::BudgetScopeId::User(caller.owner_user_id),
-        user_cap,
-        estimate,
-        now,
-    ) {
-        Ok(guard) => Some(guard),
-        Err(error) => {
-            crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return gate_error_response(&error);
-        }
-    };
     let mut client_guard = client_guard;
-    let mut user_guard = user_guard;
 
     // Stage 6: sticky pin acquisition for an identified session.
     let strategy = model
@@ -2259,6 +2324,7 @@ pub async fn handle_inference_request(
     let mut attempts: Vec<UsageAttemptRecord> = Vec::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_retry_after_ms: Option<i64> = None;
+    let mut last_cap_error: Option<GateG7Error> = None;
     let mut failovers = 0_i64;
     let mut permit = Some(permit);
     let mut attempt_no: usize = 0;
@@ -2330,6 +2396,32 @@ pub async fn handle_inference_request(
             None,
             None,
         );
+        let mut cap_guards = match reserve_candidate_caps(
+            &state.runtime_state.accumulators,
+            &snapshot,
+            caller.owner_user_id,
+            &candidate,
+            attempt_estimate,
+            now,
+        ) {
+            Ok(guards) => guards,
+            Err(error) => {
+                attempts.push(attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::Http429,
+                    Some(429),
+                    body.len(),
+                    0,
+                    "none",
+                ));
+                last_status = StatusCode::TOO_MANY_REQUESTS;
+                last_cap_error = Some(error);
+                continue;
+            }
+        };
         let reservation = match state.runtime_state.reserve_key_windows(
             &snapshot,
             candidate.upstream_key_id,
@@ -2679,7 +2771,7 @@ pub async fn handle_inference_request(
                     tap,
                     reservation,
                     client_guard: client_guard.take(),
-                    user_guard: user_guard.take(),
+                    cap_guards,
                     price_entry: snapshot
                         .price_for(
                             &candidate.provider_id,
@@ -2891,9 +2983,7 @@ pub async fn handle_inference_request(
         if let Some(guard) = client_guard.take() {
             guard.commit(cost.cost_micro_usd);
         }
-        if let Some(guard) = user_guard.take() {
-            guard.commit(cost.cost_micro_usd);
-        }
+        cap_guards.commit(cost.cost_micro_usd);
 
         state.runtime_state.record_upstream_success(
             &origin,
@@ -3000,6 +3090,11 @@ pub async fn handle_inference_request(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
+    if let Some(error) = last_cap_error.take() {
+        crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+        return gate_error_response(&error);
+    }
+
     crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
     if let Some(writer) = &state.writer {
         let usage = UsageContext {
@@ -3061,6 +3156,10 @@ pub async fn handle_inference_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llmroller_core::accumulators::MonthlyAccumulatorRegistry;
+    use llmroller_core::rbac::Role;
+    use llmroller_core::shares::ShareConfig;
+    use llmroller_core::snapshot::UserRecord;
 
     #[test]
     #[doc = "Spec: REL-1 — F02 open_streams tracks live SSE bodies"]
@@ -3075,5 +3174,124 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         drop(first);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    fn tier_candidate(tier: CandidatePoolTier, share_id: Option<ShareId>) -> RouteCandidate {
+        RouteCandidate {
+            upstream_key_id: UpstreamKeyId::generate(),
+            provider_id: ProviderId::generate(),
+            model_pk: ModelPk::generate(),
+            upstream_model_id: "model".to_string(),
+            base_url: "https://example.test".to_string(),
+            allow_private_network: false,
+            pool_tier: tier,
+            ownership_scope: llmroller_core::rbac::OwnershipScope::Global,
+            priority: 1,
+            provider_kind: ProviderKind::OpencodeGo,
+            share_id,
+        }
+    }
+
+    fn tier_snapshot(
+        user_id: UserId,
+        share_id: ShareId,
+        user_cap: Option<i64>,
+        share_cap: Option<i64>,
+    ) -> ConfigSnapshot {
+        ConfigSnapshot {
+            users: Arc::new(HashMap::from([(
+                user_id,
+                UserRecord {
+                    id: user_id,
+                    username: "caller".to_string(),
+                    role: Role::User,
+                    disabled: false,
+                    can_use_global_providers: true,
+                    global_budget_micro_usd_month: user_cap,
+                },
+            )])),
+            shares_by_grantee: Arc::new(HashMap::from([(
+                user_id,
+                vec![ShareConfig {
+                    share_id,
+                    grantor_user_id: UserId::generate(),
+                    grantee_user_id: user_id,
+                    provider_id: ProviderId::generate(),
+                    upstream_key_id: None,
+                    allowed_models: None,
+                    max_monthly_micro_usd: share_cap,
+                    accepted_config_fingerprint: None,
+                    admin_approved_at: None,
+                    enabled: true,
+                }],
+            )])),
+            ..ConfigSnapshot::default()
+        }
+    }
+
+    #[test]
+    #[doc = "Spec: USR-5 — F05 own-tier candidates never charge the user-global cap"]
+    fn own_tier_reserves_no_user_global_cap() {
+        let user_id = UserId::generate();
+        let share_id = ShareId::generate();
+        let snapshot = tier_snapshot(user_id, share_id, Some(0), Some(0));
+        let registry = MonthlyAccumulatorRegistry::new();
+        let candidate = tier_candidate(CandidatePoolTier::Own, None);
+
+        let guards =
+            reserve_candidate_caps(&registry, &snapshot, user_id, &candidate, 1_000, 1_000)
+                .expect("own tier must ignore the exhausted global cap");
+        drop(guards);
+        assert_eq!(registry.usage_for(&BudgetScopeId::User(user_id), 1_000), 0);
+    }
+
+    #[test]
+    #[doc = "Spec: USR-5 — F05 global-tier candidates reserve the user-global cap"]
+    fn global_tier_reserves_user_global_cap() {
+        let user_id = UserId::generate();
+        let share_id = ShareId::generate();
+        let snapshot = tier_snapshot(user_id, share_id, Some(0), Some(1_000_000));
+        let registry = MonthlyAccumulatorRegistry::new();
+        let candidate = tier_candidate(CandidatePoolTier::Global, None);
+
+        assert!(matches!(
+            reserve_candidate_caps(&registry, &snapshot, user_id, &candidate, 1_000, 1_000),
+            Err(GateG7Error::UserGlobalBudgetExhausted { .. })
+        ));
+
+        let snapshot = tier_snapshot(user_id, share_id, Some(1_000_000), Some(0));
+        let guards =
+            reserve_candidate_caps(&registry, &snapshot, user_id, &candidate, 1_000, 1_000)
+                .expect("global tier has headroom");
+        drop(guards);
+        assert!(
+            !registry.is_exhausted(&BudgetScopeId::User(user_id), Some(1_000_000), 1_000),
+            "a dropped reservation releases its headroom"
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: SHR-1 — F05 shared-tier candidates reserve the grantor share cap"]
+    fn shared_tier_reserves_only_the_share_cap() {
+        let user_id = UserId::generate();
+        let share_id = ShareId::generate();
+        let snapshot = tier_snapshot(user_id, share_id, Some(1_000_000), Some(0));
+        let registry = MonthlyAccumulatorRegistry::new();
+        let candidate = tier_candidate(CandidatePoolTier::Shared, Some(share_id));
+
+        assert!(matches!(
+            reserve_candidate_caps(&registry, &snapshot, user_id, &candidate, 1_000, 1_000),
+            Err(GateG7Error::ProviderShareCapExhausted { .. })
+        ));
+
+        let snapshot = tier_snapshot(user_id, share_id, Some(0), Some(1_000_000));
+        let guards =
+            reserve_candidate_caps(&registry, &snapshot, user_id, &candidate, 1_000, 1_000)
+                .expect("share cap has headroom");
+        drop(guards);
+        assert!(
+            registry.usage_for(&BudgetScopeId::ProviderShare(share_id), 1_000) == 0,
+            "a dropped share reservation must not commit spend"
+        );
     }
 }

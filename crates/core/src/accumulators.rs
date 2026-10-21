@@ -251,6 +251,27 @@ impl MonthlyAccumulatorRegistry {
             .map_or(0, |acc| acc.used())
     }
 
+    /// Whether a scope has no remaining headroom for the month containing
+    /// `now_ms`. A configured cap of zero admits no spend at all.
+    #[must_use]
+    pub fn is_exhausted(
+        &self,
+        scope_id: &BudgetScopeId,
+        cap_micro_usd: Option<i64>,
+        now_ms: i64,
+    ) -> bool {
+        let Some(cap) = cap_micro_usd else {
+            return false;
+        };
+        if cap <= 0 {
+            return true;
+        }
+        let month = UtcYearMonth::from_epoch_millis(now_ms);
+        self.accumulators
+            .get(&(month, scope_id.clone()))
+            .is_some_and(|acc| acc.effective_used() >= cap)
+    }
+
     /// Number of active accumulators in registry.
     pub fn len(&self) -> usize {
         self.accumulators.len()
