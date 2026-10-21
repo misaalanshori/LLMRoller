@@ -6,10 +6,14 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#21-sub-phase-21-socket-level-ssrf-guardedconnector-and-url-validation
 
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use thiserror::Error;
 use url::Url;
 
@@ -146,11 +150,68 @@ impl tower::Service<http::Uri> for GuardedConnector {
     }
 }
 
-/// Create a hardened outbound `reqwest::Client` disabling proxies, redirects, and enforcing TLS 1.2+ per SEC-7.
+/// DNS resolver that rejects any hostname resolving to a blocked address (SEC-7).
+#[derive(Debug, Clone)]
+pub struct GuardedDnsResolver {
+    allow_private_network: bool,
+}
+
+impl GuardedDnsResolver {
+    #[must_use]
+    pub const fn new(allow_private_network: bool) -> Self {
+        Self {
+            allow_private_network,
+        }
+    }
+}
+
+impl Resolve for GuardedDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow_private_network = self.allow_private_network;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+
+            if addrs.is_empty() {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no DNS records found for host '{host}'"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+
+            for addr in &addrs {
+                if is_ip_blocked(addr.ip(), allow_private_network) {
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "SSRF guard blocked host '{host}' resolving to {}",
+                            addr.ip()
+                        ),
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
+            let addrs: Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Create a hardened outbound `reqwest::Client` disabling proxies and redirects,
+/// resolving every hostname through [`GuardedDnsResolver`], and enforcing TLS 1.2+
+/// per SEC-7.
 pub fn create_guarded_client(allow_private_network: bool) -> Result<reqwest::Client, SsrfError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(GuardedDnsResolver::new(allow_private_network)))
+        .pool_max_idle_per_host(32)
+        .connect_timeout(Duration::from_secs(10));
 
     if !allow_private_network {
         builder = builder.min_tls_version(reqwest::tls::Version::TLS_1_2);

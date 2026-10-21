@@ -41,6 +41,8 @@ pub struct ProxyAuthState {
     pub runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
     pub master_key: Option<llmroller_store::crypto::MasterKey>,
+    pub http_client_public: reqwest::Client,
+    pub http_client_private_allowed: reqwest::Client,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -70,6 +72,20 @@ impl ProxyAuthState {
             runtime_state: Arc::new(llmroller_core::runtime_state::RuntimeState::new()),
             writer: None,
             master_key: None,
+            http_client_public: crate::ssrf::create_guarded_client(false)
+                .expect("the public HTTP client requires a working TLS backend"),
+            http_client_private_allowed: crate::ssrf::create_guarded_client(true)
+                .expect("the private-network HTTP client requires a working TLS backend"),
+        }
+    }
+
+    /// Select the pooled outbound client matching the provider's egress policy.
+    #[must_use]
+    pub fn select_http_client(&self, allow_private_network: bool) -> &reqwest::Client {
+        if allow_private_network {
+            &self.http_client_private_allowed
+        } else {
+            &self.http_client_public
         }
     }
 

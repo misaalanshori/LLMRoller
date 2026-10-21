@@ -560,10 +560,7 @@ async fn forward_state_bound_response_op(
             "the linked upstream origin is not permitted",
         );
     }
-    let client = match crate::ssrf::create_guarded_client(provider.allow_private_network) {
-        Ok(client) => client,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
+    let client = state.select_http_client(provider.allow_private_network);
     let request_id = RequestId::generate().to_string();
     let upstream = match client
         .request(method.clone(), &url)
@@ -716,10 +713,7 @@ pub async fn post_messages_count_tokens(
         if crate::ssrf::validate_url(&url, candidate.allow_private_network).is_err() {
             continue;
         }
-        let client = match crate::ssrf::create_guarded_client(candidate.allow_private_network) {
-            Ok(client) => client,
-            Err(_) => continue,
-        };
+        let client = state.select_http_client(candidate.allow_private_network);
         let edited = match edit_body(
             body.clone(),
             candidate.pool_tier(),
@@ -2155,10 +2149,7 @@ pub async fn handle_inference_request(
             last_status = StatusCode::BAD_GATEWAY;
             continue;
         }
-        let client = match crate::ssrf::create_guarded_client(candidate.allow_private_network) {
-            Ok(client) => client,
-            Err(_) => continue,
-        };
+        let client = state.select_http_client(candidate.allow_private_network);
 
         let (edited_body, strip_injected_usage) = match edit_body(
             body.clone(),
