@@ -24,5 +24,6 @@ pub mod snapshot;
 pub mod ssrf;
 pub mod strategy;
 pub mod trace_config;
+pub mod usage;
 pub mod windows;
 pub mod wrr;

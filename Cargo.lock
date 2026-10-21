@@ -1724,6 +1724,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "totp-rs",
+ "tracing",
  "ulid",
  "zeroize",
  "zstd",

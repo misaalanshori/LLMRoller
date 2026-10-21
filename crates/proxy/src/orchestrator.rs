@@ -779,11 +779,9 @@ pub async fn handle_inference_request(
                         ts: now_ms,
                         upstream_key_id: cand.upstream_key_id.clone(),
                         share_id: None,
-                        outcome: if status == StatusCode::TOO_MANY_REQUESTS {
-                            "rate_limited".to_string()
-                        } else {
-                            "server_error".to_string()
-                        },
+                        outcome: llmroller_core::usage::AttemptOutcome::from_http_status(
+                            status.as_u16(),
+                        ),
                         http_status: Some(status.as_u16() as i64),
                         bytes_sent: body.len() as i64,
                         charged_micro_usd: 0,
@@ -858,7 +856,7 @@ pub async fn handle_inference_request(
                             output_tokens: extracted.output_tokens,
                             reasoning_tokens: extracted.reasoning_tokens,
                             cost_micro_usd: 100,
-                            cost_source: "provider".to_string(),
+                            cost_source: llmroller_core::pricing::CostSource::Provider,
                             latency_ms: None,
                             ttfb_ms: None,
                             pin_outcome: None,
@@ -887,7 +885,7 @@ pub async fn handle_inference_request(
                     ts: now_ms,
                     upstream_key_id: cand.upstream_key_id.clone(),
                     share_id: None,
-                    outcome: "connection_error".to_string(),
+                    outcome: llmroller_core::usage::AttemptOutcome::ConnectError,
                     http_status: Some(502),
                     bytes_sent: body.len() as i64,
                     charged_micro_usd: 0,

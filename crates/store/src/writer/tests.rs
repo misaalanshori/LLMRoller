@@ -224,7 +224,7 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
             output_tokens: 20,
             reasoning_tokens: 0,
             cost_micro_usd: 150,
-            cost_source: "provider".to_string(),
+            cost_source: llmroller_core::pricing::CostSource::Provider,
             latency_ms: Some(100),
             ttfb_ms: Some(50),
             pin_outcome: None,

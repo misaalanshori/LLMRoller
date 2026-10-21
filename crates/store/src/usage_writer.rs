@@ -9,6 +9,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use llmroller_core::ids::{ClientKeyId, RequestId, UserId};
+use llmroller_core::pricing::CostSource;
+use llmroller_core::usage::AttemptOutcome;
 
 /// Usage event data ready to be persisted into SQLite.
 #[derive(Debug, Clone)]
@@ -38,7 +40,7 @@ pub struct UsageEventRecord {
     pub output_tokens: i64,
     pub reasoning_tokens: i64,
     pub cost_micro_usd: i64,
-    pub cost_source: String,
+    pub cost_source: CostSource,
     pub latency_ms: Option<i64>,
     pub ttfb_ms: Option<i64>,
     pub pin_outcome: Option<String>,
@@ -54,7 +56,7 @@ pub struct UsageAttemptRecord {
     pub ts: i64,
     pub upstream_key_id: String,
     pub share_id: Option<String>,
-    pub outcome: String,
+    pub outcome: AttemptOutcome,
     pub http_status: Option<i64>,
     pub bytes_sent: i64,
     pub charged_micro_usd: i64,
@@ -281,9 +283,72 @@ impl ThreeQueueUsageWriter {
 
         let raw_count = raw_items.len();
 
-        // 3. Commit raw usage_events and usage_attempts
+        // 3. Commit raw usage_events and usage_attempts with per-record SAVEPOINT isolation.
+        // A single malformed row (constraint or foreign-key race) must never roll back the
+        // valid rows batched in the same transaction.
         for (e, attempts) in raw_items {
-            sqlx::query(
+            sqlx::query("SAVEPOINT sp_usage_event")
+                .execute(&mut **tx)
+                .await?;
+            let event_result = insert_usage_event(tx, &e).await;
+            if let Err(err) = event_result {
+                tracing::warn!(
+                    usage_event_id = %e.id,
+                    request_id = %e.request_id,
+                    error = %err,
+                    "dropping invalid usage_event row without aborting the batch"
+                );
+                sqlx::query("ROLLBACK TO SAVEPOINT sp_usage_event")
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT sp_usage_event")
+                    .execute(&mut **tx)
+                    .await?;
+                continue;
+            }
+            sqlx::query("RELEASE SAVEPOINT sp_usage_event")
+                .execute(&mut **tx)
+                .await?;
+
+            for a in attempts {
+                sqlx::query("SAVEPOINT sp_usage_attempt")
+                    .execute(&mut **tx)
+                    .await?;
+                let attempt_result = insert_usage_attempt(tx, &a).await;
+                match attempt_result {
+                    Ok(()) => {
+                        sqlx::query("RELEASE SAVEPOINT sp_usage_attempt")
+                            .execute(&mut **tx)
+                            .await?;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            request_id = %a.request_id,
+                            attempt_no = a.attempt_no,
+                            outcome = a.outcome.as_str(),
+                            error = %err,
+                            "dropping invalid usage_attempt row without aborting the batch"
+                        );
+                        sqlx::query("ROLLBACK TO SAVEPOINT sp_usage_attempt")
+                            .execute(&mut **tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT sp_usage_attempt")
+                            .execute(&mut **tx)
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        Ok(raw_count)
+    }
+}
+
+async fn insert_usage_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    e: &UsageEventRecord,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
                 r#"INSERT INTO usage_events (
                        id, ts, request_id, client_key_id, owner_user_id,
                        upstream_key_id, provider_id, provider_scope, share_id,
@@ -321,7 +386,7 @@ impl ThreeQueueUsageWriter {
             .bind(e.output_tokens)
             .bind(e.reasoning_tokens)
             .bind(e.cost_micro_usd)
-            .bind(&e.cost_source)
+            .bind(e.cost_source.as_str())
             .bind(e.latency_ms)
             .bind(e.ttfb_ms)
             .bind(&e.pin_outcome)
@@ -329,31 +394,32 @@ impl ThreeQueueUsageWriter {
             .bind(&e.error_code)
             .execute(&mut **tx)
             .await?;
+    Ok(())
+}
 
-            for a in attempts {
-                sqlx::query(
-                    r#"INSERT INTO usage_attempts (
-                           request_id, attempt_no, ts, upstream_key_id,
-                           share_id, outcome, http_status, bytes_sent,
-                           charged_micro_usd, charge_basis
-                       )
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-                )
-                .bind(a.request_id.to_string())
-                .bind(a.attempt_no)
-                .bind(a.ts)
-                .bind(&a.upstream_key_id)
-                .bind(&a.share_id)
-                .bind(&a.outcome)
-                .bind(a.http_status)
-                .bind(a.bytes_sent)
-                .bind(a.charged_micro_usd)
-                .bind(&a.charge_basis)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
-
-        Ok(raw_count)
-    }
+async fn insert_usage_attempt(
+    tx: &mut Transaction<'_, Sqlite>,
+    a: &UsageAttemptRecord,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO usage_attempts (
+               request_id, attempt_no, ts, upstream_key_id,
+               share_id, outcome, http_status, bytes_sent,
+               charged_micro_usd, charge_basis
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(a.request_id.to_string())
+    .bind(a.attempt_no)
+    .bind(a.ts)
+    .bind(&a.upstream_key_id)
+    .bind(&a.share_id)
+    .bind(a.outcome.as_str())
+    .bind(a.http_status)
+    .bind(a.bytes_sent)
+    .bind(a.charged_micro_usd)
+    .bind(&a.charge_basis)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }

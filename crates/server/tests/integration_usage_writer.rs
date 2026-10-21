@@ -102,7 +102,7 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
             output_tokens: 10,
             reasoning_tokens: 0,
             cost_micro_usd: 10_000,
-            cost_source: "provider".to_string(),
+            cost_source: llmroller_core::pricing::CostSource::Provider,
             latency_ms: Some(100),
             ttfb_ms: Some(50),
             pin_outcome: Some("new_pin".to_string()),
@@ -185,7 +185,7 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         output_tokens: 0,
         reasoning_tokens: 0,
         cost_micro_usd: 0,
-        cost_source: "price_book".to_string(),
+        cost_source: llmroller_core::pricing::CostSource::PriceBook,
         latency_ms: Some(1),
         ttfb_ms: None,
         pin_outcome: None,
@@ -232,7 +232,7 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         output_tokens: 20,
         reasoning_tokens: 0,
         cost_micro_usd: 20_000,
-        cost_source: "provider".to_string(),
+        cost_source: llmroller_core::pricing::CostSource::Provider,
         latency_ms: Some(250),
         ttfb_ms: Some(100),
         pin_outcome: Some("repin".to_string()),
@@ -246,7 +246,7 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         ts: base_ts + 5000,
         upstream_key_id: "k1".to_string(),
         share_id: None,
-        outcome: "http_5xx".to_string(),
+        outcome: llmroller_core::usage::AttemptOutcome::Http5xx,
         http_status: Some(502),
         bytes_sent: 512,
         charged_micro_usd: 5_000,
@@ -259,7 +259,7 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         ts: base_ts + 5100,
         upstream_key_id: "k2".to_string(),
         share_id: None,
-        outcome: "served".to_string(),
+        outcome: llmroller_core::usage::AttemptOutcome::Served,
         http_status: Some(200),
         bytes_sent: 512,
         charged_micro_usd: 20_000,
@@ -387,7 +387,7 @@ async fn test_live_usage_emission_and_attempt_charging() {
         ts: 1000,
         upstream_key_id: "k1".to_string(),
         share_id: None,
-        outcome: "http_5xx".to_string(),
+        outcome: llmroller_core::usage::AttemptOutcome::Http5xx,
         http_status: Some(502),
         bytes_sent: body.len() as i64,
         charged_micro_usd: charged_est,
@@ -400,7 +400,7 @@ async fn test_live_usage_emission_and_attempt_charging() {
         ts: 1100,
         upstream_key_id: "k2".to_string(),
         share_id: None,
-        outcome: "served".to_string(),
+        outcome: llmroller_core::usage::AttemptOutcome::Served,
         http_status: Some(200),
         bytes_sent: body.len() as i64,
         charged_micro_usd: 15_000,
@@ -433,7 +433,7 @@ async fn test_live_usage_emission_and_attempt_charging() {
         output_tokens: 20,
         reasoning_tokens: 0,
         cost_micro_usd: 15_000,
-        cost_source: "provider".to_string(),
+        cost_source: llmroller_core::pricing::CostSource::Provider,
         latency_ms: Some(200),
         ttfb_ms: Some(80),
         pin_outcome: Some("repin".to_string()),
@@ -497,7 +497,7 @@ async fn test_live_usage_emission_and_attempt_charging() {
         output_tokens: client_gone_usage.output_tokens,
         reasoning_tokens: 0,
         cost_micro_usd: 5_000,
-        cost_source: "estimated_incomplete".to_string(),
+        cost_source: llmroller_core::pricing::CostSource::EstimatedIncomplete,
         latency_ms: Some(150),
         ttfb_ms: Some(50),
         pin_outcome: Some("followed".to_string()),
@@ -670,4 +670,81 @@ async fn test_retention_sweeper_and_wal_checkpoint_supervisor() {
 
     supervisor.clear_storage_full();
     assert!(is_ready.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[doc = "Spec: USG-1"]
+#[tokio::test]
+async fn test_invalid_usage_row_is_isolated_by_savepoint_without_rolling_back_batch() {
+    let (_dir, pool, _master_key, user_id) = setup_usage_writer_test_db().await;
+
+    let client_key_id = ClientKeyId::generate();
+    sqlx::query("INSERT INTO client_keys (id, owner_user_id, label, prefix, key_hash, created_at) VALUES (?, ?, 'Key', 'llr_123', 'hash123', 1000)")
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert client key");
+
+    let writer = ThreeQueueUsageWriter::new(100);
+    let base = UsageEventRecord {
+        id: "event-invalid".to_string(),
+        ts: 1_700_000_000_000,
+        request_id: RequestId::generate(),
+        client_key_id,
+        owner_user_id: user_id,
+        upstream_key_id: None,
+        provider_id: None,
+        provider_scope: Some("personal".to_string()),
+        share_id: None,
+        canonical_id: Some("gpt-4o".to_string()),
+        upstream_model_id: None,
+        endpoint: "not_a_real_endpoint".to_string(),
+        protocol: Some("chat".to_string()),
+        session_hash: None,
+        status: 200,
+        stream: false,
+        incomplete: false,
+        termination: "completed".to_string(),
+        trace_dropped: false,
+        input_uncached_tokens: 1,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 1,
+        reasoning_tokens: 0,
+        cost_micro_usd: 10,
+        cost_source: llmroller_core::pricing::CostSource::Provider,
+        latency_ms: None,
+        ttfb_ms: None,
+        pin_outcome: None,
+        failovers: 0,
+        error_code: None,
+    };
+    let mut valid = base.clone();
+    valid.id = "event-valid".to_string();
+    valid.request_id = RequestId::generate();
+    valid.endpoint = "chat".to_string();
+
+    writer.enqueue(base, vec![]);
+    writer.enqueue(valid, vec![]);
+
+    let mut tx = pool.begin().await.expect("begin");
+    writer
+        .flush_to_db(&mut tx)
+        .await
+        .expect("flush must succeed");
+    tx.commit().await.expect("commit");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 1,
+        "invalid row must be dropped without rolling back the valid batch"
+    );
+    let surviving: String = sqlx::query_scalar("SELECT id FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .expect("surviving id");
+    assert_eq!(surviving, "event-valid");
 }
