@@ -391,6 +391,15 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             .collect()
     };
 
+    // Trace sealing runs on two dedicated OS threads; persist sealed turns off the hot path.
+    let trace_sealer = std::sync::Arc::new(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        master_key.clone(),
+        instance_state.instance_id,
+        entropy.clone(),
+    ));
+    let (sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
+    let sealer_pool = std::sync::Arc::new(sealer_pool);
+
     let mut proxy_auth_state = llmroller_proxy::auth::ProxyAuthState::new(
         shared_snapshot.clone(),
         pool.clone(),
@@ -401,6 +410,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.runtime_state = runtime_state.clone();
     proxy_auth_state.writer = Some(writer_handle.clone());
     proxy_auth_state.master_key = Some(master_key.clone());
+    proxy_auth_state.master_key_id = Some(master_key_id.clone());
+    proxy_auth_state.sealer_pool = Some(sealer_pool.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
 
     let auth_config = llmroller_admin::auth::AuthConfig {
@@ -429,14 +440,6 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_handle.notification_sender(),
         reloader_handle.version_receiver(),
     );
-    // Trace sealing runs on two dedicated OS threads; persist sealed turns off the hot path.
-    let trace_sealer = std::sync::Arc::new(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
-        master_key.clone(),
-        instance_state.instance_id,
-        entropy.clone(),
-    ));
-    let (sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
-    let sealer_pool = std::sync::Arc::new(sealer_pool);
     let trace_pool = pool.clone();
     let trace_master_key_id = master_key_id.clone();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -447,14 +450,32 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 let pool = trace_pool.clone();
                 let key_id = trace_master_key_id.clone();
                 runtime_handle.block_on(async move {
-                    if let Ok(mut tx) = pool.begin().await
-                        && llmroller_store::traces::insert_sealed_trace_tx(
-                            &mut tx, &sealed, &key_id,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        let _ = tx.commit().await;
+                    // The usage writer may not have committed the referenced event yet; retry
+                    // the FK-bound insert briefly instead of dropping the trace permanently.
+                    for attempt in 0..100_u32 {
+                        let result = async {
+                            let mut tx = pool.begin().await?;
+                            llmroller_store::traces::insert_sealed_trace_tx(
+                                &mut tx, &sealed, &key_id,
+                            )
+                            .await?;
+                            tx.commit().await
+                        }
+                        .await;
+                        match result {
+                            Ok(()) => return,
+                            Err(error) if attempt < 99 => {
+                                let _ = error;
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    usage_event_id = %sealed.usage_event_id,
+                                    "trace persist failed after retries: {error}"
+                                );
+                                return;
+                            }
+                        }
                     }
                 });
             }

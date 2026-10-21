@@ -146,3 +146,80 @@ fn drops_oversized_request_blocks_above_four_mebibytes() {
         "oversized_block"
     );
 }
+
+/// Spec: TRC-2; SSE frames may be split across arbitrary chunk boundaries.
+#[test]
+fn test_feed_sse_chunk_reassembles_frames_split_across_chunks() {
+    let mut tap = TraceTap::new().0;
+    tap.feed_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel");
+    assert_eq!(tap.output.assistant_text, "");
+    tap.feed_sse_chunk(b"lo \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\ndata: [DONE]\n\n");
+    assert_eq!(tap.output.assistant_text, "Hello world");
+}
+
+/// Spec: TRC-2; Responses text deltas and Anthropic events share the same collector.
+#[test]
+fn test_feed_sse_chunk_reassembles_responses_and_anthropic_events() {
+    let mut tap = TraceTap::new().0;
+    tap.feed_sse_chunk(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"resp \"}\n\n");
+    tap.feed_sse_chunk(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"claude\"}}\n\n");
+    assert_eq!(tap.output.assistant_text, "resp claude");
+}
+
+/// Spec: TRC-2, TRC-4; non-streaming responses normalize into the same shape.
+#[test]
+fn test_feed_json_response_normalizes_chat_completion() {
+    let mut tap = TraceTap::new().0;
+    tap.feed_json_response(&serde_json::json!({
+        "id": "chatcmpl-1",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "mock answer",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{\"q\":\"x\"}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }));
+    assert_eq!(tap.output.response_id.as_deref(), Some("chatcmpl-1"));
+    assert_eq!(tap.output.assistant_text, "mock answer");
+    assert_eq!(tap.output.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(tap.output.assistant_tool_calls.len(), 1);
+    assert_eq!(tap.output.assistant_tool_calls[0].name, "lookup");
+}
+
+/// Spec: TRC-4; request prompts become ordered, deduplicated content-addressed blocks.
+#[test]
+fn test_split_request_blocks_extracts_messages_and_deduplicates() {
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "stream": false,
+        "system": "be brief",
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let prepared = prepare_request_blocks(&request);
+    assert!(prepared.skeleton.get("messages").is_none());
+    assert!(prepared.skeleton.get("system").is_none());
+    assert_eq!(
+        prepared.blocks.len(),
+        2,
+        "system + one deduplicated user block"
+    );
+    assert_eq!(
+        prepared.block_refs,
+        prepared
+            .blocks
+            .iter()
+            .map(|(hash, _)| hash.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(prepared.dropped_blocks, 0);
+}

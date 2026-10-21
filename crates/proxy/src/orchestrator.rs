@@ -45,8 +45,12 @@ use llmroller_proto::adapters::EndpointKind;
 use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
+use llmroller_proto::trace_tap::{
+    NormalizedTurnOutput, TraceTap, prepare_request_blocks, replace_binary_blocks,
+};
 use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
 use llmroller_store::pins::ResponseLinkRow;
+use llmroller_store::traces::{SealJob, StoredTurnTraceV2};
 use llmroller_store::usage_writer::{UsageAttemptRecord, UsageEventRecord};
 use llmroller_store::writer::{DurableKey, DurableOp};
 use thiserror::Error;
@@ -1348,6 +1352,105 @@ fn gate_error_response(error: &llmroller_core::accumulators::GateG7Error) -> Res
     response
 }
 
+/// Request content prepared once at request start and shared by either response path.
+struct PreparedTraceRequest {
+    skeleton: serde_json::Value,
+    blocks: Vec<(String, Vec<u8>)>,
+    block_refs: Vec<String>,
+    dropped_blocks: u32,
+    expires_at: i64,
+}
+
+/// Streaming collector paired with the prepared request until the turn finalizes.
+struct TraceCapture {
+    prepared: PreparedTraceRequest,
+    tap: TraceTap,
+}
+
+impl TraceCapture {
+    fn new(prepared: PreparedTraceRequest, first_chunk: Option<&Bytes>) -> Self {
+        let (mut tap, _receiver) = TraceTap::new();
+        if let Some(chunk) = first_chunk {
+            tap.feed_sse_chunk(chunk);
+        }
+        Self { prepared, tap }
+    }
+}
+
+/// Build the request skeleton and content-addressed blocks for one turn (TRC-2, TRC-4).
+fn prepare_trace_request(
+    body: &[u8],
+    retention_days: i64,
+    now_ms: i64,
+) -> Option<PreparedTraceRequest> {
+    let mut request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    replace_binary_blocks(&mut request);
+    let prepared = prepare_request_blocks(&request);
+    let retention_ms = retention_days.max(1).saturating_mul(86_400_000);
+    Some(PreparedTraceRequest {
+        skeleton: prepared.skeleton,
+        blocks: prepared.blocks,
+        block_refs: prepared.block_refs,
+        dropped_blocks: prepared.dropped_blocks,
+        expires_at: now_ms.saturating_add(retention_ms),
+    })
+}
+
+/// Static attribution required to seal one trace record.
+struct TraceJobMeta<'a> {
+    usage_event_id: &'a str,
+    request_id: RequestId,
+    ts: i64,
+    owner_user_id: UserId,
+    client_key_id: ClientKeyId,
+    session_hash: &'a str,
+    canonical_id: &'a str,
+    protocol: &'a str,
+    response_raw: Option<serde_json::Value>,
+}
+
+/// Submit a sealed turn to the sealer pool. Returns `false` when tracing is unavailable
+/// or the bounded pool rejected the job, which is reflected in `usage_events.trace_dropped`.
+fn submit_trace_job(
+    state: &ProxyAuthState,
+    meta: TraceJobMeta<'_>,
+    prepared: PreparedTraceRequest,
+    output: &NormalizedTurnOutput,
+    tap_dropped: bool,
+) -> bool {
+    let (Some(pool), Some(master_key_id)) = (&state.sealer_pool, &state.master_key_id) else {
+        return false;
+    };
+
+    let truncated_content = output.truncated || prepared.dropped_blocks > 0 || tap_dropped;
+    let response = serde_json::to_value(output).unwrap_or_else(|_| serde_json::json!({}));
+    let turn_trace = StoredTurnTraceV2 {
+        v: 2,
+        request_skeleton: prepared.skeleton,
+        block_refs: prepared.block_refs,
+        response,
+        response_raw: meta.response_raw,
+        truncation: truncated_content.then(|| "head_tail".to_string()),
+    };
+
+    pool.try_submit(SealJob {
+        master_key_id: master_key_id.clone(),
+        usage_event_id: meta.usage_event_id.to_string(),
+        request_id: meta.request_id,
+        ts: meta.ts,
+        owner_user_id: meta.owner_user_id,
+        client_key_id: meta.client_key_id,
+        session_hash: meta.session_hash.to_string(),
+        thread_id: "main".to_string(),
+        canonical_id: meta.canonical_id.to_string(),
+        protocol: meta.protocol.to_string(),
+        truncated_content,
+        turn_trace,
+        blocks: prepared.blocks,
+        expires_at: prepared.expires_at,
+    })
+}
+
 /// Static usage attribution shared by the non-streaming and streaming finalizers.
 #[derive(Debug, Clone)]
 struct UsageContext {
@@ -1470,6 +1573,7 @@ struct StreamFinalizer {
     fallback_rates: Rates,
     attempts: Vec<UsageAttemptRecord>,
     response_link: Option<ResponseLinkFinalizer>,
+    trace: Option<TraceCapture>,
     started_ms: i64,
     ttfb_ms: Option<i64>,
     finalized: bool,
@@ -1517,7 +1621,7 @@ impl StreamFinalizer {
         ));
 
         if let Some(writer) = &self.state.writer {
-            let event = self.usage.event(
+            let mut event = self.usage.event(
                 finished_ms,
                 self.http_status,
                 true,
@@ -1529,6 +1633,29 @@ impl StreamFinalizer {
                 self.ttfb_ms,
                 Some(finished_ms - self.started_ms),
             );
+            if let Some(trace) = self.trace.take() {
+                let accepted = submit_trace_job(
+                    &self.state,
+                    TraceJobMeta {
+                        usage_event_id: &event.id,
+                        request_id: self.usage.request_id,
+                        ts: finished_ms,
+                        owner_user_id: self.usage.owner_user_id,
+                        client_key_id: self.usage.client_key_id,
+                        session_hash: self.usage.session_hash.as_deref().unwrap_or_default(),
+                        canonical_id: &self.usage.canonical_model,
+                        protocol: &self.usage.endpoint_str,
+                        response_raw: None,
+                    },
+                    trace.prepared,
+                    &trace.tap.output,
+                    trace
+                        .tap
+                        .trace_dropped
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+                event.trace_dropped = !accepted;
+            }
             writer
                 .queues
                 .usage_writer
@@ -1731,6 +1858,22 @@ pub async fn handle_inference_request(
     }
 
     let scope = parse_scope(&caller.routing_scope);
+    // Trace mode is decided exactly once at request start (TRC-1).
+    let trace_config = &snapshot.settings.traceability_config;
+    let trace_enabled = state.sealer_pool.is_some()
+        && state.master_key_id.is_some()
+        && llmroller_core::trace_config::should_trace_request(
+            trace_config,
+            &caller.owner_user_id,
+            &caller.id,
+            &model.canonical_id,
+            now,
+        );
+    let mut trace_prepared = if trace_enabled {
+        prepare_trace_request(&body, trace_config.retention_days, now)
+    } else {
+        None
+    };
     // 5. Response-link session inheritance and HardKey affinity (RTE-12, Section 11.1.2).
     let hard_link: Option<ResponseLinkRow> = if matches!(endpoint, EndpointKind::Responses) {
         match scan.previous_response_id.as_ref() {
@@ -2421,6 +2564,9 @@ pub async fn handle_inference_request(
                     failovers,
                     error_code: None,
                 };
+                let trace = trace_prepared
+                    .take()
+                    .map(|prepared| TraceCapture::new(prepared, first_chunk.as_ref()));
                 let finalizer = StreamFinalizer {
                     state: state.clone(),
                     usage,
@@ -2440,6 +2586,7 @@ pub async fn handle_inference_request(
                     fallback_rates: Rates::from(&snapshot.settings.unpriced_fallback_rates),
                     attempts: std::mem::take(&mut attempts),
                     response_link,
+                    trace,
                     started_ms: attempt_started,
                     ttfb_ms: Some(ttfb_ms),
                     finalized: false,
@@ -2474,6 +2621,9 @@ pub async fn handle_inference_request(
                             Some(Ok(chunk)) => {
                                 if let Some(finalizer) = &mut stream_state.finalizer {
                                     finalizer.tap.feed_chunk(&chunk);
+                                    if let Some(trace) = &mut finalizer.trace {
+                                        trace.tap.feed_sse_chunk(&chunk);
+                                    }
                                 }
                                 let parts = stream_state.forwarder.process_chunk(&chunk);
                                 stream_state.pending.extend(parts);
@@ -2666,6 +2816,12 @@ pub async fn handle_inference_request(
             "actual",
         ));
 
+        let trace_output = trace_prepared.take().map(|prepared| {
+            let (mut tap, _receiver) = TraceTap::new();
+            tap.feed_json_response(&json_value);
+            (prepared, tap)
+        });
+
         if let Some(writer) = &state.writer {
             let usage = UsageContext {
                 request_id,
@@ -2685,7 +2841,7 @@ pub async fn handle_inference_request(
                 failovers,
                 error_code: None,
             };
-            let event = usage.event(
+            let mut event = usage.event(
                 now,
                 status_value.as_u16(),
                 false,
@@ -2697,6 +2853,30 @@ pub async fn handle_inference_request(
                 None,
                 Some(now_ms() - attempt_started),
             );
+            if let Some((prepared, tap)) = trace_output {
+                let raw_size = serde_json::to_vec(&json_value).map_or(usize::MAX, |raw| raw.len());
+                let response_raw = (raw_size
+                    <= llmroller_proto::trace_tap::MAX_RESPONSE_OUTPUT_BYTES)
+                    .then(|| json_value.clone());
+                let accepted = submit_trace_job(
+                    &state,
+                    TraceJobMeta {
+                        usage_event_id: &event.id,
+                        request_id,
+                        ts: now,
+                        owner_user_id: caller.owner_user_id,
+                        client_key_id: caller.id,
+                        session_hash: pin_key.as_ref().map_or("", |key| key.session_hash.as_str()),
+                        canonical_id: &model.canonical_id,
+                        protocol: endpoint_str,
+                        response_raw,
+                    },
+                    prepared,
+                    &tap.output,
+                    tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire),
+                );
+                event.trace_dropped = !accepted;
+            }
             writer
                 .queues
                 .usage_writer

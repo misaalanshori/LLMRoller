@@ -295,6 +295,9 @@ mod tests {
         let exit_code = supervisor.execute_graceful_shutdown().await;
         assert_eq!(exit_code, EXIT_SUCCESS);
         assert!(!ready.load(Ordering::SeqCst), "readiness must flip to 503");
-        assert!(observer.await.expect("observer"), "step 5 must broadcast stop");
+        assert!(
+            observer.await.expect("observer"),
+            "step 5 must broadcast stop"
+        );
     }
 }

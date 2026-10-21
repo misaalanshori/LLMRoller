@@ -5,20 +5,25 @@
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+
+use crate::sse_frame::find_frame_delimiter;
 
 pub const MAX_REQUEST_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 pub const MAX_RESPONSE_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const HALF_RESPONSE_OUTPUT_BYTES: usize = 512 * 1024; // 512 KiB
 pub const GLOBAL_TRACE_BUDGET_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 pub const MAX_INFLIGHT_TRACE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB per turn
+pub const MAX_REQUEST_TRACE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB of request blocks per turn
+pub const MAX_SSE_PENDING_BYTES: usize = 2 * 1024 * 1024; // incomplete frame guard
 
 /// Global accumulator tracking trace memory usage across all active streams (PERF-5).
 pub static GLOBAL_TRACE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AssembledToolCall {
     pub id: String,
     pub name: String,
@@ -35,7 +40,7 @@ pub struct AssembledResponse {
 }
 
 /// Protocol-agnostic reassembly of streamed deltas into one assistant turn.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NormalizedTurnOutput {
     pub response_id: Option<String>,
     pub assistant_text: String,
@@ -98,6 +103,108 @@ pub fn replace_binary_blocks(value: &mut serde_json::Value) {
     }
 }
 
+/// Request body split into an audit skeleton plus ordered content-addressed blocks.
+#[derive(Debug, Clone)]
+pub struct PreparedRequestBlocks {
+    /// Request metadata with prompt-bearing fields removed (`model`, `stream`, ...).
+    pub skeleton: serde_json::Value,
+    /// Deduplicated `(sha256_hex, canonical_block_bytes)` pairs.
+    pub blocks: Vec<(String, Vec<u8>)>,
+    /// Ordered block hashes corresponding to the conversation history.
+    pub block_refs: Vec<String>,
+    /// Number of oversized or budget-exceeding blocks replaced with markers.
+    pub dropped_blocks: u32,
+}
+
+/// Split a request into a metadata skeleton and content-addressed message blocks.
+///
+/// The preview API replays `block_refs` in order, so system content is emitted
+/// before `messages`/`input`. Duplicate blocks (for example a repeated system
+/// prompt or a retried user turn) are stored once. Blocks above the 4 MiB
+/// per-block cap or the 16 MiB per-turn budget are replaced by an omission
+/// marker so tracing can never retain unbounded prompt bytes (TRC-2, TRC-4).
+#[must_use]
+pub fn prepare_request_blocks(request: &serde_json::Value) -> PreparedRequestBlocks {
+    let mut skeleton = request.clone();
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(object) = skeleton.as_object_mut() {
+        for key in ["system", "messages", "input"] {
+            let Some(value) = object.remove(key) else {
+                continue;
+            };
+            match value {
+                serde_json::Value::Array(items) => candidates.extend(items),
+                serde_json::Value::String(text) => {
+                    candidates.push(serde_json::json!({
+                        "role": if key == "system" { "system" } else { "user" },
+                        "content": text,
+                    }));
+                }
+                serde_json::Value::Null => {}
+                other => candidates.push(other),
+            }
+        }
+    }
+
+    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut total_bytes = 0_usize;
+    let mut dropped_blocks = 0_u32;
+
+    for message in candidates {
+        let bytes = match serde_json::to_vec(&message) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                dropped_blocks = dropped_blocks.saturating_add(1);
+                continue;
+            }
+        };
+
+        let bytes = if bytes.len() > MAX_REQUEST_BLOCKS_BYTES {
+            dropped_blocks = dropped_blocks.saturating_add(1);
+            serde_json::to_vec(&serde_json::json!({
+                "llmroller_omitted": "oversized_block",
+                "bytes": bytes.len(),
+            }))
+            .unwrap_or_else(|_| b"{}".to_vec())
+        } else if total_bytes.saturating_add(bytes.len()) > MAX_REQUEST_TRACE_BYTES {
+            dropped_blocks = dropped_blocks.saturating_add(1);
+            serde_json::to_vec(&serde_json::json!({
+                "llmroller_omitted": "trace_budget_exceeded",
+                "bytes": bytes.len(),
+            }))
+            .unwrap_or_else(|_| b"{}".to_vec())
+        } else {
+            bytes
+        };
+
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        let hash = hex_sha256(&bytes);
+        if seen.insert(hash.clone()) {
+            blocks.push((hash, bytes));
+        }
+    }
+
+    let block_refs: Vec<String> = blocks.iter().map(|(hash, _)| hash.clone()).collect();
+    if let Some(object) = skeleton.as_object_mut() {
+        object.insert(
+            "_llmroller_trace".to_string(),
+            serde_json::json!({
+                "block_refs": block_refs,
+                "dropped_blocks": dropped_blocks,
+            }),
+        );
+    }
+
+    PreparedRequestBlocks {
+        skeleton,
+        blocks,
+        block_refs,
+        dropped_blocks,
+    }
+}
+
 /// Enforces 1 MiB response output cap using head/tail truncation (TRC-3).
 pub fn apply_head_tail_truncation(text: &mut String) -> (bool, usize) {
     if text.len() <= MAX_RESPONSE_OUTPUT_BYTES {
@@ -129,6 +236,8 @@ pub struct TraceTap {
     pub trace_dropped: Arc<AtomicBool>,
     allocated_bytes: AtomicUsize,
     inflight_bytes: usize,
+    /// Partial SSE frame carried across upstream chunks.
+    sse_pending: Vec<u8>,
     /// Deltas reassembled from the response stream.
     pub output: NormalizedTurnOutput,
 }
@@ -142,6 +251,7 @@ impl TraceTap {
                 trace_dropped: Arc::new(AtomicBool::new(false)),
                 allocated_bytes: AtomicUsize::new(0),
                 inflight_bytes: 0,
+                sse_pending: Vec::new(),
                 output: NormalizedTurnOutput::default(),
             },
             rx,
@@ -270,6 +380,210 @@ impl TraceTap {
                         arguments_json: arguments,
                     });
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Feed raw upstream SSE bytes, reassembling frames split across chunk boundaries.
+    ///
+    /// Non-JSON frames, comments, and the `[DONE]` sentinel are ignored. An
+    /// incomplete frame larger than [`MAX_SSE_PENDING_BYTES`] marks the trace
+    /// truncated instead of retaining unbounded memory.
+    pub fn feed_sse_chunk(&mut self, chunk: &[u8]) {
+        if self.output.truncated {
+            return;
+        }
+        self.sse_pending.extend_from_slice(chunk);
+        while let Some(end) = find_frame_delimiter(&self.sse_pending) {
+            let frame: Vec<u8> = self.sse_pending.drain(..end).collect();
+            self.feed_sse_frame(&frame);
+        }
+        if self.sse_pending.len() > MAX_SSE_PENDING_BYTES {
+            self.sse_pending.clear();
+            self.output.truncated = true;
+        }
+    }
+
+    fn feed_sse_frame(&mut self, frame: &[u8]) {
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return;
+        };
+        for line in text.lines() {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                self.feed_sse_data_json(&value);
+            }
+        }
+    }
+
+    /// Feed a complete (non-streaming) upstream response body.
+    ///
+    /// Normalizes OpenAI Chat Completions, OpenAI Responses, and Anthropic
+    /// Messages into the same [`NormalizedTurnOutput`] shape used for SSE.
+    pub fn feed_json_response(&mut self, value: &serde_json::Value) {
+        if self.output.truncated {
+            return;
+        }
+        if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+            self.output.response_id = Some(id.to_string());
+        }
+
+        if let Some(choice) = value.pointer("/choices/0") {
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.output.finish_reason = Some(reason.to_string());
+            }
+            if let Some(message) = choice.get("message") {
+                self.absorb_message(message);
+            }
+        }
+
+        if let Some(output) = value.get("output") {
+            match output {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        self.absorb_responses_item(item);
+                    }
+                }
+                serde_json::Value::String(text) => self.append_output_text(text, false),
+                _ => {}
+            }
+            if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+                self.output.finish_reason = Some(status.to_string());
+            }
+        }
+
+        if let Some(blocks) = value.get("content").and_then(serde_json::Value::as_array) {
+            for block in blocks {
+                self.absorb_content_block(block);
+            }
+        }
+        if let Some(stop_reason) = value.get("stop_reason").and_then(serde_json::Value::as_str) {
+            self.output.finish_reason = Some(stop_reason.to_string());
+        }
+    }
+
+    fn absorb_message(&mut self, message: &serde_json::Value) {
+        if let Some(content) = message.get("content") {
+            match content {
+                serde_json::Value::String(text) => self.append_output_text(text, false),
+                serde_json::Value::Array(blocks) => {
+                    for block in blocks {
+                        self.absorb_content_block(block);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(reasoning) = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(serde_json::Value::as_str)
+        {
+            self.append_output_text(reasoning, true);
+        }
+        if let Some(calls) = message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for call in calls {
+                let function = call.get("function");
+                self.output.assistant_tool_calls.push(AssembledToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: function
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments_json: function
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    fn absorb_responses_item(&mut self, item: &serde_json::Value) {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => {
+                if let Some(blocks) = item.get("content").and_then(serde_json::Value::as_array) {
+                    for block in blocks {
+                        self.absorb_content_block(block);
+                    }
+                }
+            }
+            Some("function_call") => {
+                self.output.assistant_tool_calls.push(AssembledToolCall {
+                    id: item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments_json: item
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn absorb_content_block(&mut self, block: &serde_json::Value) {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text" | "output_text" | "input_text") => {
+                if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                    self.append_output_text(text, false);
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.append_output_text(text, true);
+                }
+            }
+            Some("tool_use") => {
+                let input = block
+                    .get("input")
+                    .map_or_else(String::new, serde_json::Value::to_string);
+                self.output.assistant_tool_calls.push(AssembledToolCall {
+                    id: block
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: block
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments_json: input,
+                });
             }
             _ => {}
         }
