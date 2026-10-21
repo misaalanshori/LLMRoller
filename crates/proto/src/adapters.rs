@@ -42,7 +42,7 @@ pub enum ErrorClass {
     Other(u16),
 }
 
-const QUOTA_EXHAUSTED_SUBSTRINGS: [&str; 7] = [
+const QUOTA_EXHAUSTED_SUBSTRINGS: [&str; 9] = [
     "insufficient_quota",
     "quota_exceeded",
     "out of credits",
@@ -50,6 +50,8 @@ const QUOTA_EXHAUSTED_SUBSTRINGS: [&str; 7] = [
     "billing_not_active",
     "monthly_limit_reached",
     "credit_limit",
+    "window_limit_reached",
+    "insufficient_credits",
 ];
 
 const REQUEST_REJECTED_SUBSTRINGS: [&str; 2] = ["flagged", "moderation"];
@@ -59,10 +61,74 @@ const PLAN_RESTRICTED_SUBSTRINGS: [&str; 2] = ["upgrade_required", "not availabl
 const CREDENTIAL_INVALID_SUBSTRINGS: [&str; 3] =
     ["invalid_api_key", "invalid x-api-key", "unauthorized"];
 
+/// Per-provider error-classification overrides configured in `providers.config_json` (PRV-3).
+///
+/// Substrings are matched case-insensitively against the first 8 KiB of the upstream body
+/// and are evaluated before the built-in preset patterns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ErrorClassifiers {
+    #[serde(default)]
+    pub quota_exhausted_substrings: Vec<String>,
+    #[serde(default)]
+    pub request_rejected_substrings: Vec<String>,
+    #[serde(default)]
+    pub plan_restricted_substrings: Vec<String>,
+    #[serde(default)]
+    pub credential_invalid_substrings: Vec<String>,
+}
+
+impl ErrorClassifiers {
+    /// Extract `error_classifiers` from a provider `config_json` document, if present.
+    #[must_use]
+    pub fn from_provider_config(config_json: &str) -> Self {
+        serde_json::from_str::<serde_json::Value>(config_json)
+            .ok()
+            .and_then(|value| value.get("error_classifiers").cloned())
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    fn matches(list: &[String], body: &str) -> bool {
+        list.iter()
+            .map(|sub| sub.to_ascii_lowercase())
+            .any(|sub| !sub.is_empty() && body.contains(&sub))
+    }
+}
+
 /// Classify an upstream error response against the five ordered classes per Section 10.5.2.
 #[must_use]
 pub fn classify_error(status: u16, body_8k: &[u8]) -> ErrorClass {
+    classify_error_with_classifiers(status, body_8k, None)
+}
+
+/// Classify an upstream error response honoring per-provider `error_classifiers` (PRV-3).
+#[must_use]
+pub fn classify_error_with_classifiers(
+    status: u16,
+    body_8k: &[u8],
+    classifiers: Option<&ErrorClassifiers>,
+) -> ErrorClass {
     let body_str = String::from_utf8_lossy(body_8k).to_ascii_lowercase();
+
+    if let Some(custom) = classifiers {
+        if matches!(status, 402 | 403 | 429)
+            && ErrorClassifiers::matches(&custom.quota_exhausted_substrings, &body_str)
+        {
+            return ErrorClass::QuotaExhausted;
+        }
+        if status == 403
+            && ErrorClassifiers::matches(&custom.request_rejected_substrings, &body_str)
+        {
+            return ErrorClass::RequestRejected;
+        }
+        if status == 403 && ErrorClassifiers::matches(&custom.plan_restricted_substrings, &body_str)
+        {
+            return ErrorClass::PlanRestricted;
+        }
+        if ErrorClassifiers::matches(&custom.credential_invalid_substrings, &body_str) {
+            return ErrorClass::CredentialInvalid;
+        }
+    }
 
     // 1. QuotaExhausted: Status in {402, 403, 429} and body matches quota_exhausted_substrings
     if matches!(status, 402 | 403 | 429)

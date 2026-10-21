@@ -104,13 +104,22 @@ pub fn evaluate_candidate(
             if route.provider_owner_id == Some(*ctx.caller_user_id) {
                 CandidatePoolTier::Own
             } else {
-                // Must have active share
-                let matching_share = shares.iter().find(|s| {
-                    s.grantee_user_id == *ctx.caller_user_id
-                        && s.provider_id == route.provider_id
-                        && (s.upstream_key_id.is_none()
-                            || s.upstream_key_id == Some(route.upstream_key_id))
-                });
+                // Must have an active share. A key-specific share strictly takes
+                // precedence over a provider-wide share regardless of row order (SHR-1).
+                let matching_share = shares
+                    .iter()
+                    .find(|s| {
+                        s.grantee_user_id == *ctx.caller_user_id
+                            && s.provider_id == route.provider_id
+                            && s.upstream_key_id == Some(route.upstream_key_id)
+                    })
+                    .or_else(|| {
+                        shares.iter().find(|s| {
+                            s.grantee_user_id == *ctx.caller_user_id
+                                && s.provider_id == route.provider_id
+                                && s.upstream_key_id.is_none()
+                        })
+                    });
 
                 match matching_share {
                     Some(s) => {
@@ -148,8 +157,10 @@ pub fn evaluate_candidate(
     if ctx.model_exposed == Some(false) {
         return Err(CheckFailure::C4ModelNotExposedOrKilled);
     }
-    if ctx.merge_state == MergeState::PendingReview {
-        // Pending review models require confirmed vendor match or admin approval
+    // A cross-vendor model still awaiting merge confirmation is routable only on
+    // the caller's own personal keys until an admin confirms the merge (MDL-2, RTE-2).
+    if ctx.merge_state == MergeState::PendingReview && tier != CandidatePoolTier::Own {
+        return Err(CheckFailure::C4ModelNotExposedOrKilled);
     }
     if route.user_pref_enabled == Some(false) {
         return Err(CheckFailure::C4ModelNotExposedOrKilled);

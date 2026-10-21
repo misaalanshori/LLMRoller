@@ -279,3 +279,110 @@ fn test_three_tier_pool_selector_personal_first_ordering_and_caps() {
     let res_no_route = select_pool(&[], &ctx, &[], RoutingScope::OwnOnly);
     assert_eq!(res_no_route, Err(PoolSelectionError::NoEligibleRoute));
 }
+
+#[doc = "Spec: SHR-1, RTE-2"]
+#[test]
+fn test_c2_key_specific_share_beats_provider_wide_share_regardless_of_order() {
+    let alice = UserId::generate();
+    let bob = UserId::generate();
+    let model_pk = ModelPk::generate();
+
+    let route = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
+
+    let ctx = CallerContext {
+        caller_user_id: &bob,
+        can_use_global: true,
+        owner_disabled: false,
+        model_exposed: None,
+        merge_state: MergeState::Confirmed,
+        inbound_protocol: "chat",
+        model_canonical_id: "test-model",
+    };
+
+    // Provider-wide share is disabled; the key-specific share is enabled.
+    let provider_wide = ShareConfig {
+        share_id: ShareId::generate(),
+        grantor_user_id: alice,
+        grantee_user_id: bob,
+        provider_id: route.provider_id,
+        upstream_key_id: None,
+        allowed_models: None,
+        max_monthly_micro_usd: Some(1_000_000),
+        accepted_config_fingerprint: Some("fp-test".to_string()),
+        admin_approved_at: None,
+        enabled: false,
+    };
+    let key_specific = ShareConfig {
+        share_id: ShareId::generate(),
+        grantor_user_id: alice,
+        grantee_user_id: bob,
+        provider_id: route.provider_id,
+        upstream_key_id: Some(route.upstream_key_id),
+        allowed_models: None,
+        max_monthly_micro_usd: Some(50_000_000),
+        accepted_config_fingerprint: Some("fp-test".to_string()),
+        admin_approved_at: None,
+        enabled: true,
+    };
+
+    // Provider-wide first in the slice must not shadow the key-specific grant.
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[provider_wide, key_specific.clone()]),
+        Ok(CandidatePoolTier::Shared)
+    );
+
+    // Key-specific first still passes, and a second disabled provider-wide grant must not
+    // be consulted once the key-specific grant has matched.
+    let second_provider_wide = ShareConfig {
+        share_id: ShareId::generate(),
+        grantor_user_id: alice,
+        grantee_user_id: bob,
+        provider_id: route.provider_id,
+        upstream_key_id: None,
+        allowed_models: None,
+        max_monthly_micro_usd: None,
+        accepted_config_fingerprint: None,
+        admin_approved_at: None,
+        enabled: false,
+    };
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[key_specific, second_provider_wide]),
+        Ok(CandidatePoolTier::Shared)
+    );
+}
+
+#[doc = "Spec: MDL-2, MDL-3, RTE-2"]
+#[test]
+fn test_c4_pending_review_model_is_restricted_to_own_tier() {
+    let alice = UserId::generate();
+    let bob = UserId::generate();
+    let model_pk = ModelPk::generate();
+
+    let own_route = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
+    let global_route = make_valid_candidate(bob, OwnershipScope::Global, model_pk);
+
+    let mut ctx = CallerContext {
+        caller_user_id: &alice,
+        can_use_global: true,
+        owner_disabled: false,
+        model_exposed: None,
+        merge_state: MergeState::PendingReview,
+        inbound_protocol: "chat",
+        model_canonical_id: "test-model",
+    };
+
+    assert_eq!(
+        evaluate_candidate(&own_route, &ctx, &[]),
+        Ok(CandidatePoolTier::Own)
+    );
+    assert_eq!(
+        evaluate_candidate(&global_route, &ctx, &[]),
+        Err(CheckFailure::C4ModelNotExposedOrKilled)
+    );
+
+    ctx.merge_state = MergeState::Confirmed;
+    assert_eq!(
+        evaluate_candidate(&global_route, &ctx, &[]),
+        Ok(CandidatePoolTier::Global)
+    );
+}

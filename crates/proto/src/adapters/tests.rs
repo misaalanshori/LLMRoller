@@ -6,7 +6,10 @@
 //! Spec: ./docs/srdd/10. SRDD - Routing Design.md#1052-normative-timeout-and-failover-eligibility-tables
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#26-sub-phase-26-built-in-provideradapter-implementations-5-class-error-classifier-and-preset-toml-files
 
-use crate::adapters::{EndpointKind, ErrorClass, classify_error, get_adapter};
+use crate::adapters::{
+    EndpointKind, ErrorClass, ErrorClassifiers, classify_error, classify_error_with_classifiers,
+    get_adapter,
+};
 use crate::body_edit::ChatStreamMode;
 use crate::headers::UaPolicy;
 use llmroller_core::provider::ProviderKind;
@@ -115,5 +118,47 @@ fn test_five_class_error_classifier_ordering() {
     assert_eq!(
         classify_error(403, body_other_403),
         ErrorClass::Unclassified403
+    );
+}
+
+#[doc = "Spec: PRV-3"]
+#[test]
+fn test_per_provider_error_classifiers_override_builtin_patterns() {
+    let custom = ErrorClassifiers {
+        quota_exhausted_substrings: vec!["TEAPOT_QUOTA_GONE".to_string()],
+        request_rejected_substrings: vec!["custom_content_block".to_string()],
+        plan_restricted_substrings: vec!["tier_too_low".to_string()],
+        credential_invalid_substrings: vec!["revoked_by_tenant".to_string()],
+    };
+
+    assert_eq!(
+        classify_error_with_classifiers(429, b"{\"error\":\"teapot_quota_gone\"}", Some(&custom)),
+        ErrorClass::QuotaExhausted
+    );
+    assert_eq!(
+        classify_error_with_classifiers(403, b"custom_content_block", Some(&custom)),
+        ErrorClass::RequestRejected
+    );
+    assert_eq!(
+        classify_error_with_classifiers(403, b"tier_too_low", Some(&custom)),
+        ErrorClass::PlanRestricted
+    );
+    assert_eq!(
+        classify_error_with_classifiers(403, b"revoked_by_tenant", Some(&custom)),
+        ErrorClass::CredentialInvalid
+    );
+
+    // Built-in fallback remains intact when no custom pattern matches.
+    assert_eq!(
+        classify_error_with_classifiers(429, b"insufficient_credits", Some(&custom)),
+        ErrorClass::QuotaExhausted
+    );
+
+    let parsed = ErrorClassifiers::from_provider_config(
+        r#"{"error_classifiers":{"quota_exhausted_substrings":["window_limit_reached"]}}"#,
+    );
+    assert_eq!(
+        parsed.quota_exhausted_substrings,
+        vec!["window_limit_reached"]
     );
 }

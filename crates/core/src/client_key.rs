@@ -158,10 +158,20 @@ pub fn evaluate_request_gates(
     rpm_limiter: Option<&ClientKeyRpmLimiter>,
     now_ms: i64,
 ) -> Result<(ClientKeyRecord, HashRole), GateFailure> {
-    // Gate G1: Constant-time hash lookup in ConfigSnapshot
+    // Gate G1: Constant-time hash lookup in ConfigSnapshot (SEC-3)
     let Some((key_record, hash_role)) = snapshot.client_keys_by_hash.get(token_hash) else {
         return Err(GateFailure::G1AuthenticationError);
     };
+    use subtle::ConstantTimeEq as _;
+    let expected_hash = match hash_role {
+        HashRole::Current => key_record.key_hash,
+        HashRole::Previous => key_record
+            .prev_key_hash
+            .ok_or(GateFailure::G1AuthenticationError)?,
+    };
+    if !bool::from(expected_hash.ct_eq(token_hash)) {
+        return Err(GateFailure::G1AuthenticationError);
+    }
 
     if *hash_role == HashRole::Previous {
         if let Some(exp) = key_record.prev_key_expires_at {
