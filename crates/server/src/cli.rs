@@ -417,13 +417,27 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         clock: clock.clone(),
         entropy: entropy.clone(),
     };
-    let mut api_state =
-        llmroller_admin::ApiAppState::new(auth_state.clone(), master_key.clone(), master_key_id);
+    let mut api_state = llmroller_admin::ApiAppState::new(
+        auth_state.clone(),
+        master_key.clone(),
+        master_key_id.clone(),
+    );
     api_state.writer = Some(writer_handle.clone());
     api_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
     api_state.attach_reloader(
         reloader_handle.notification_sender(),
         reloader_handle.version_receiver(),
+    );
+    let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller(
+        llmroller_server::usage_poller::UsagePollerDeps {
+            pool: pool.clone(),
+            snapshot: shared_snapshot.clone(),
+            runtime_state: runtime_state.clone(),
+            writer: writer_handle.clone(),
+            master_key: master_key.clone(),
+            master_key_id: master_key_id.clone(),
+            instance_id: instance_state.instance_id,
+        },
     );
     let admin_router =
         llmroller_admin::control_plane_router_full(setup_state, auth_state, api_state);

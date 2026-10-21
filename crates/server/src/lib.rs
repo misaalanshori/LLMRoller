@@ -7,3 +7,4 @@
 pub mod backup;
 pub mod reloader;
 pub mod shutdown;
+pub mod usage_poller;
