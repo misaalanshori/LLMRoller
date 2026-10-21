@@ -1580,6 +1580,7 @@ dependencies = [
  "bytes",
  "http",
  "llmroller-core",
+ "llmroller-proto",
  "llmroller-store",
  "parking_lot",
  "secrecy",

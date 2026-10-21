@@ -359,3 +359,176 @@ async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
     assert!(overview_json["projected_disk_mb"].is_number());
     assert!(overview_json["unpriced_models_count"].is_number());
 }
+
+#[doc = "Spec: USG-1, USG-2, USG-3, SEC-6, UI-1, UI-2"]
+#[tokio::test]
+async fn test_usage_explorer_summary_events_and_formula_safe_csv_export() {
+    use axum::http::header;
+    use llmroller_core::ids::{ClientKeyId, RequestId, UsageEventId};
+    use llmroller_core::seams::Clock as _;
+
+    let (dir, pool, master_key, _admin_id) = setup_dashboard_test_db().await;
+
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let entropy = OsEntropy;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+
+    // 1. Create Alice user
+    let alice = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "alice_usage",
+            password: "supersecretalicepass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("alice");
+
+    // Authenticate Alice session
+    let raw_session = "alice_usage_session_token_1234567890";
+    let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
+    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: alice.id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("alice-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert alice session");
+
+    let alice_cookie = format!("llmroller_session={raw_session}");
+
+    // 2. Insert usage events for Alice: one normal, one with malicious CSV formula cell (=SUM and +CMD)
+    let ev1_id = UsageEventId::generate();
+    let req1_id = RequestId::generate();
+    let ev2_id = UsageEventId::generate();
+    let req2_id = RequestId::generate();
+    let clk_id = ClientKeyId::generate();
+
+    sqlx::query(
+        "INSERT INTO usage_events (
+            id, ts, request_id, client_key_id, owner_user_id, canonical_id, endpoint, protocol,
+            status, stream, cost_micro_usd, cost_source, input_uncached_tokens, cache_read_tokens,
+            output_tokens, error_code
+        ) VALUES
+        (?, ?, ?, ?, ?, 'claude-sonnet-4.6', 'chat', 'chat', 200, 1, 15000, 'price_book', 1000, 200, 300, NULL),
+        (?, ?, ?, ?, ?, 'gpt-4o', 'chat', 'chat', 500, 0, 5000, 'price_book', 500, 0, 0, '+CMD|/C calc')"
+    )
+    .bind(ev1_id.to_string())
+    .bind(now_ms)
+    .bind(req1_id.to_string())
+    .bind(clk_id.to_string())
+    .bind(alice.id.to_string())
+    .bind(ev2_id.to_string())
+    .bind(now_ms)
+    .bind(req2_id.to_string())
+    .bind(clk_id.to_string())
+    .bind(alice.id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert alice usage events");
+
+    // 3. GET /api/user/usage/summary: returns aggregated usage metrics
+    let summary_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/usage/summary")
+        .header(header::COOKIE, &alice_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let summary_res = app.clone().oneshot(summary_req).await.expect("res");
+    assert_eq!(summary_res.status(), StatusCode::OK);
+    let summary_bytes = summary_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let summary_json: serde_json::Value =
+        serde_json::from_slice(&summary_bytes).expect("summary json");
+    assert_eq!(summary_json["total_requests"], 2);
+    assert_eq!(summary_json["input_tokens"], 1500);
+    assert_eq!(summary_json["cached_tokens"], 200);
+    assert_eq!(summary_json["output_tokens"], 300);
+    assert_eq!(summary_json["total_cost_micro_usd"], 20000);
+
+    // 4. GET /api/user/usage/events: returns paginated event list
+    let events_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/usage/events?limit=10")
+        .header(header::COOKIE, &alice_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let events_res = app.clone().oneshot(events_req).await.expect("res");
+    assert_eq!(events_res.status(), StatusCode::OK);
+    let events_bytes = events_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let events_json: serde_json::Value =
+        serde_json::from_slice(&events_bytes).expect("events json");
+    assert!(events_json["events"].is_array());
+    assert_eq!(events_json["events"].as_array().expect("arr").len(), 2);
+
+    // 5. GET /api/user/usage/export.csv: streams formula-safe CSV export (SEC-6)
+    let csv_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/usage/export.csv")
+        .header(header::COOKIE, &alice_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let csv_res = app.oneshot(csv_req).await.expect("res");
+    assert_eq!(csv_res.status(), StatusCode::OK);
+    let ct = csv_res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content-type")
+        .to_str()
+        .expect("str");
+    assert!(ct.contains("text/csv"));
+
+    let csv_bytes = csv_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let csv_str = std::str::from_utf8(&csv_bytes).expect("utf8");
+
+    // Invariant SEC-6: +CMD is sanitized with leading single-quote: '+CMD
+    assert!(
+        csv_str.contains("'+CMD|/C calc"),
+        "Formula injection payloads starting with +,-,=,@ must be prefixed with single quote (SEC-6)"
+    );
+    assert!(csv_str.contains("claude-sonnet-4.6"));
+}

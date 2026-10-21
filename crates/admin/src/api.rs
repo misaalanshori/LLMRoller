@@ -1993,6 +1993,306 @@ async fn post_test_upstream_key_handler(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Usage Explorer & CSV Export (USG-1..USG-3, SEC-6)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct UsageFilterParams {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub limit: Option<i64>,
+    pub after: Option<String>,
+}
+
+async fn get_user_usage_summary_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    get_usage_summary_internal(&state, Some(user_id.to_string()), params).await
+}
+
+async fn get_admin_usage_summary_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_summary_internal(&state, None, params).await
+}
+
+async fn get_usage_summary_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    params: UsageFilterParams,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let query_str = if owner_user_id.is_some() {
+        "SELECT COUNT(*) as total_requests,
+                COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
+         FROM usage_events
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)"
+    } else {
+        "SELECT COUNT(*) as total_requests,
+                COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
+         FROM usage_events
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)"
+    };
+
+    let row = if let Some(ref uid) = owner_user_id {
+        sqlx::query(query_str)
+            .bind(uid)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_one(&state.auth.pool)
+            .await
+    } else {
+        sqlx::query(query_str)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_one(&state.auth.pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let total_requests: i64 = row.try_get("total_requests").unwrap_or(0);
+    let input_tokens: i64 = row.try_get("input_tokens").unwrap_or(0);
+    let cached_tokens: i64 = row.try_get("cached_tokens").unwrap_or(0);
+    let output_tokens: i64 = row.try_get("output_tokens").unwrap_or(0);
+    let total_cost_micro_usd: i64 = row.try_get("total_cost_micro_usd").unwrap_or(0);
+
+    let total_input = (input_tokens + cached_tokens).max(1) as f64;
+    let cache_hit_rate = (cached_tokens as f64 / total_input * 1000.0).round() / 1000.0;
+
+    Ok(Json(serde_json::json!({
+        "total_requests": total_requests,
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_cost_micro_usd": total_cost_micro_usd,
+        "cache_hit_rate": cache_hit_rate,
+    })))
+}
+
+async fn get_user_usage_events_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    get_usage_events_internal(&state, Some(user_id.to_string()), params).await
+}
+
+async fn get_admin_usage_events_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_events_internal(&state, None, params).await
+}
+
+async fn get_usage_events_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    params: UsageFilterParams,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 5000);
+    use sqlx::Row as _;
+
+    let query_str = if owner_user_id.is_some() {
+        "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+         FROM usage_events
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR id < ?)
+         ORDER BY id DESC
+         LIMIT ?"
+    } else {
+        "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+         FROM usage_events
+         WHERE (? IS NULL OR id < ?)
+         ORDER BY id DESC
+         LIMIT ?"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(query_str)
+            .bind(uid)
+            .bind(&params.after)
+            .bind(&params.after)
+            .bind(limit)
+            .fetch_all(&state.auth.pool)
+            .await
+    } else {
+        sqlx::query(query_str)
+            .bind(&params.after)
+            .bind(&params.after)
+            .bind(limit)
+            .fetch_all(&state.auth.pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut events = Vec::new();
+    let mut last_id = None;
+
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        last_id = Some(id.clone());
+        events.push(serde_json::json!({
+            "id": id,
+            "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
+            "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
+            "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
+            "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+            "status": r.try_get::<i64, _>("status").unwrap_or(0),
+            "cost_micro_usd": r.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
+            "input_tokens": r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or_default(),
+            "cached_tokens": r.try_get::<Option<i64>, _>("cache_read_tokens").unwrap_or_default(),
+            "output_tokens": r.try_get::<Option<i64>, _>("output_tokens").unwrap_or_default(),
+            "error_code": r.try_get::<Option<String>, _>("error_code").unwrap_or_default(),
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "next_cursor": last_id,
+    })))
+}
+
+async fn get_user_usage_export_csv_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    export_csv_internal(&state, Some(user_id.to_string())).await
+}
+
+async fn get_admin_usage_export_csv_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    export_csv_internal(&state, None).await
+}
+
+async fn export_csv_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use llmroller_proto::headers::sanitize_csv_cell;
+    use sqlx::Row as _;
+
+    let query_str = if owner_user_id.is_some() {
+        "SELECT id, ts, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+         FROM usage_events
+         WHERE owner_user_id = ?
+         ORDER BY id DESC
+         LIMIT 5000"
+    } else {
+        "SELECT id, ts, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+         FROM usage_events
+         ORDER BY id DESC
+         LIMIT 5000"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(query_str)
+            .bind(uid)
+            .fetch_all(&state.auth.pool)
+            .await
+    } else {
+        sqlx::query(query_str).fetch_all(&state.auth.pool).await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut csv = String::from(
+        "id,ts,canonical_id,status,cost_micro_usd,input_tokens,cached_tokens,output_tokens,error_code\r\n",
+    );
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let ts: i64 = r.try_get("ts").unwrap_or(0);
+        let canonical_id: String = r
+            .try_get::<Option<String>, _>("canonical_id")
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let status: i64 = r.try_get("status").unwrap_or(0);
+        let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+        let input: i64 = r
+            .try_get::<Option<i64>, _>("input_uncached_tokens")
+            .unwrap_or_default()
+            .unwrap_or(0);
+        let cached: i64 = r
+            .try_get::<Option<i64>, _>("cache_read_tokens")
+            .unwrap_or_default()
+            .unwrap_or(0);
+        let output: i64 = r
+            .try_get::<Option<i64>, _>("output_tokens")
+            .unwrap_or_default()
+            .unwrap_or(0);
+        let error_code: String = r
+            .try_get::<Option<String>, _>("error_code")
+            .unwrap_or_default()
+            .unwrap_or_default();
+
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{}\r\n",
+            sanitize_csv_cell(&id),
+            ts,
+            sanitize_csv_cell(&canonical_id),
+            status,
+            cost,
+            input,
+            cached,
+            output,
+            sanitize_csv_cell(&error_code),
+        );
+        csv.push_str(&line);
+    }
+
+    let response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"usage_export.csv\"",
+        )
+        .body(axum::body::Body::from(csv))
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(response)
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // Web UI screens
@@ -2073,6 +2373,15 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/providers/{id}/prices",
             put(put_user_provider_price_handler),
         )
+        .route(
+            "/api/user/usage/summary",
+            get(get_user_usage_summary_handler),
+        )
+        .route("/api/user/usage/events", get(get_user_usage_events_handler))
+        .route(
+            "/api/user/usage/export.csv",
+            get(get_user_usage_export_csv_handler),
+        )
         // Admin endpoints
         .route(
             "/admin/api/providers",
@@ -2139,6 +2448,18 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/overview",
             get(get_admin_overview_telemetry_handler),
+        )
+        .route(
+            "/admin/api/usage/summary",
+            get(get_admin_usage_summary_handler),
+        )
+        .route(
+            "/admin/api/usage/events",
+            get(get_admin_usage_events_handler),
+        )
+        .route(
+            "/admin/api/usage/export.csv",
+            get(get_admin_usage_export_csv_handler),
         )
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))

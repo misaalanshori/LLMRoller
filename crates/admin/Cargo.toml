@@ -20,6 +20,7 @@ base64.workspace = true
 bytes.workspace = true
 http.workspace = true
 llmroller-core = { path = "../core" }
+llmroller-proto = { path = "../proto" }
 llmroller-store = { path = "../store" }
 parking_lot.workspace = true
 secrecy.workspace = true
