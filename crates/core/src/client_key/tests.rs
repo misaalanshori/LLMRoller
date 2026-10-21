@@ -44,10 +44,8 @@ fn setup_test_snapshot(
     ConfigSnapshot {
         config_version: 1,
         users: Arc::new(users),
-        settings: Arc::new(crate::settings::RuntimeSettings::default()),
-        providers: Arc::new(HashMap::new()),
-        upstream_keys: Arc::new(HashMap::new()),
         client_keys_by_hash: Arc::new(client_keys),
+        ..ConfigSnapshot::default()
     }
 }
 
@@ -132,10 +130,8 @@ fn test_client_key_grace_rotation() {
         ConfigSnapshot {
             config_version: 2,
             users: Arc::new(users),
-            settings: Arc::new(crate::settings::RuntimeSettings::default()),
-            providers: Arc::new(HashMap::new()),
-            upstream_keys: Arc::new(HashMap::new()),
             client_keys_by_hash: Arc::new(map),
+            ..ConfigSnapshot::default()
         }
     };
 

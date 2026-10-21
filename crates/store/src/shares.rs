@@ -269,3 +269,55 @@ pub async fn get_provider_share_tx(
         enabled: enabled_int == 1,
     })
 }
+
+/// Loads all provider shares grouped by grantee for the hot-path snapshot.
+pub async fn load_share_configs_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<std::collections::HashMap<UserId, Vec<ShareConfig>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, provider_id, upstream_key_id, owner_user_id, grantee_user_id,
+                allowed_models, max_monthly_micro_usd, accepted_config_fingerprint,
+                admin_approved_at, enabled
+         FROM provider_shares WHERE revoked_at IS NULL",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut out: std::collections::HashMap<UserId, Vec<ShareConfig>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let id_str: String = row.try_get("id")?;
+        let provider_str: String = row.try_get("provider_id")?;
+        let owner_str: String = row.try_get("owner_user_id")?;
+        let grantee_str: String = row.try_get("grantee_user_id")?;
+        let key_str: Option<String> = row.try_get("upstream_key_id").unwrap_or(None);
+        let (Ok(share_id), Ok(provider_id), Ok(owner_id), Ok(grantee_id)) = (
+            ShareId::parse(&id_str),
+            ProviderId::parse(&provider_str),
+            UserId::parse(&owner_str),
+            UserId::parse(&grantee_str),
+        ) else {
+            continue;
+        };
+        let allowed_models: Option<Vec<String>> = row
+            .try_get::<Option<String>, _>("allowed_models")
+            .unwrap_or(None)
+            .and_then(|json| serde_json::from_str(&json).ok());
+        let share = ShareConfig {
+            share_id,
+            grantor_user_id: owner_id,
+            grantee_user_id: grantee_id,
+            provider_id,
+            upstream_key_id: key_str
+                .as_deref()
+                .and_then(|s| UpstreamKeyId::parse(s).ok()),
+            allowed_models,
+            max_monthly_micro_usd: row.try_get("max_monthly_micro_usd").unwrap_or(None),
+            accepted_config_fingerprint: row.try_get("accepted_config_fingerprint").unwrap_or(None),
+            admin_approved_at: row.try_get("admin_approved_at").unwrap_or(None),
+            enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
+        };
+        out.entry(grantee_id).or_default().push(share);
+    }
+    Ok(out)
+}

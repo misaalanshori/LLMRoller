@@ -128,3 +128,63 @@ pub async fn get_price_tx(
 
     Ok(None)
 }
+
+/// Loads all price-book entries for the immutable ConfigSnapshot.
+pub async fn load_price_entries_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<
+    std::collections::HashMap<
+        llmroller_core::snapshot::PriceKey,
+        llmroller_core::pricing::PriceEntry,
+    >,
+    sqlx::Error,
+> {
+    let rows = sqlx::query(
+        "SELECT provider_id, provider_kind, upstream_model_id,
+                input_per_mtok_micro_usd, output_per_mtok_micro_usd,
+                cache_read_per_mtok_micro_usd, cache_write_per_mtok_micro_usd,
+                tiers_json, schedule_json
+         FROM prices",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let provider_id: String = row.try_get("provider_id")?;
+        let provider_kind: String = row.try_get("provider_kind")?;
+        let upstream_model_id: String = row.try_get("upstream_model_id")?;
+        let base_rates = Rates {
+            input_per_mtok_micro_usd: row.try_get("input_per_mtok_micro_usd")?,
+            output_per_mtok_micro_usd: row.try_get("output_per_mtok_micro_usd")?,
+            cache_read_per_mtok_micro_usd: row.try_get("cache_read_per_mtok_micro_usd")?,
+            cache_write_per_mtok_micro_usd: row.try_get("cache_write_per_mtok_micro_usd")?,
+        };
+        let tiers: Vec<ContextTier> = row
+            .try_get::<Option<String>, _>("tiers_json")
+            .unwrap_or(None)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let schedules: Vec<Schedule> = row
+            .try_get::<Option<String>, _>("schedule_json")
+            .unwrap_or(None)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        out.insert(
+            llmroller_core::snapshot::PriceKey {
+                provider_id,
+                provider_kind,
+                upstream_model_id,
+            },
+            llmroller_core::pricing::PriceEntry {
+                provider_id: String::new(),
+                provider_kind: String::new(),
+                upstream_model_id: String::new(),
+                base_rates,
+                tiers,
+                schedules,
+            },
+        );
+    }
+    Ok(out)
+}

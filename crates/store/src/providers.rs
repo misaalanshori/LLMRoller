@@ -827,6 +827,8 @@ pub async fn load_upstream_key_records_tx(
                 owner_user_id: k.owner_user_id,
                 label: k.label,
                 secret_last4: k.secret_last4,
+                secret_enc: k.secret_enc,
+                master_key_id: k.master_key_id,
                 enabled: k.enabled,
                 priority: k.priority,
                 strict_tier: k.strict_tier,

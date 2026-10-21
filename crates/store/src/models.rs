@@ -397,3 +397,177 @@ pub async fn add_model_alias_tx(
 
     Ok(())
 }
+
+/// All catalog domain slices required by [`llmroller_core::snapshot::ConfigSnapshot`].
+#[derive(Debug, Default, Clone)]
+pub struct CatalogSnapshot {
+    pub models: HashMap<llmroller_core::ids::ModelPk, llmroller_core::snapshot::SnapshotModel>,
+    pub models_by_canonical: HashMap<String, llmroller_core::ids::ModelPk>,
+    pub aliases: HashMap<String, llmroller_core::ids::ModelPk>,
+    pub redirects: HashMap<String, llmroller_core::ids::ModelPk>,
+    pub routes_by_model:
+        HashMap<llmroller_core::ids::ModelPk, Vec<llmroller_core::snapshot::SnapshotModelRoute>>,
+    pub user_route_prefs: HashMap<
+        (UserId, llmroller_core::ids::ModelPk),
+        llmroller_core::snapshot::SnapshotRoutePreference,
+    >,
+}
+
+/// Loads the complete model catalog in one consistent read transaction (`PERF-1`).
+pub async fn load_catalog_snapshot_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<CatalogSnapshot, sqlx::Error> {
+    use llmroller_core::catalog::{MergeState, ModelOrigin, RouteStatus};
+
+    let mut snapshot = CatalogSnapshot::default();
+
+    let rows = sqlx::query(
+        "SELECT model_pk, canonical_id, display_name, exposed, distribution,
+                routing_strategy, merge_state, origin, created_by_user_id
+         FROM models",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in rows {
+        let pk_str: String = row.try_get("model_pk")?;
+        let Ok(pk) = ModelPk::parse(&pk_str) else {
+            continue;
+        };
+        let canonical_id: String = row.try_get("canonical_id")?;
+        let exposed: Option<i64> = row.try_get("exposed").unwrap_or(None);
+        let distribution: String = row
+            .try_get("distribution")
+            .unwrap_or_else(|_| "weighted".to_string());
+        let strategy_str: Option<String> = row.try_get("routing_strategy").unwrap_or(None);
+        let merge_str: String = row
+            .try_get("merge_state")
+            .unwrap_or_else(|_| "confirmed".to_string());
+        let origin_str: String = row
+            .try_get("origin")
+            .unwrap_or_else(|_| "global".to_string());
+        let created_by: Option<String> = row.try_get("created_by_user_id").unwrap_or(None);
+
+        let model = llmroller_core::snapshot::SnapshotModel {
+            id: pk,
+            canonical_id: canonical_id.clone(),
+            display_name: row.try_get("display_name").unwrap_or(None),
+            exposed: exposed.map(|v| v != 0),
+            merge_state: if merge_str == "pending_review" {
+                MergeState::PendingReview
+            } else {
+                MergeState::Confirmed
+            },
+            distribution,
+            routing_strategy: strategy_str
+                .and_then(|s| s.parse::<llmroller_core::strategy::RoutingStrategy>().ok()),
+            origin: if origin_str == "personal" {
+                ModelOrigin::Personal
+            } else {
+                ModelOrigin::Global
+            },
+            owner_user_id: created_by.and_then(|s| UserId::parse(&s).ok()),
+        };
+        snapshot.models.insert(pk, model);
+        snapshot.models_by_canonical.insert(canonical_id, pk);
+    }
+
+    let aliases = sqlx::query("SELECT alias, model_pk FROM model_aliases WHERE confirmed = 1")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in aliases {
+        let alias: String = row.try_get("alias")?;
+        let pk_str: String = row.try_get("model_pk")?;
+        if let Ok(pk) = ModelPk::parse(&pk_str) {
+            snapshot.aliases.insert(alias, pk);
+        }
+    }
+
+    let redirects = sqlx::query("SELECT old_canonical_id, model_pk FROM model_redirects")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in redirects {
+        let old: String = row.try_get("old_canonical_id")?;
+        let pk_str: String = row.try_get("model_pk")?;
+        if let Ok(pk) = ModelPk::parse(&pk_str) {
+            snapshot.redirects.insert(old, pk);
+        }
+    }
+
+    let routes = sqlx::query(
+        "SELECT upstream_key_id, model_pk, upstream_model_id, protocols, status,
+                enabled, priority_override, route_health, route_health_until
+         FROM model_routes",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in routes {
+        let key_str: String = row.try_get("upstream_key_id")?;
+        let pk_str: String = row.try_get("model_pk")?;
+        let (Ok(key_id), Ok(model_pk)) = (UpstreamKeyId::parse(&key_str), ModelPk::parse(&pk_str))
+        else {
+            continue;
+        };
+        let protocols_json: String = row
+            .try_get("protocols")
+            .unwrap_or_else(|_| "[]".to_string());
+        let protocols: Vec<String> = serde_json::from_str(&protocols_json).unwrap_or_default();
+        let status_str: String = row
+            .try_get("status")
+            .unwrap_or_else(|_| "active".to_string());
+        let status = match status_str.as_str() {
+            "missing" => RouteStatus::Missing,
+            "retired" => RouteStatus::Retired,
+            _ => RouteStatus::Active,
+        };
+        let route = llmroller_core::snapshot::SnapshotModelRoute {
+            upstream_key_id: key_id,
+            model_pk,
+            upstream_model_id: row.try_get("upstream_model_id")?,
+            protocols,
+            status,
+            enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
+            priority_override: row.try_get("priority_override").unwrap_or(None),
+            route_health: row
+                .try_get("route_health")
+                .unwrap_or_else(|_| "healthy".to_string()),
+            route_health_until: row.try_get("route_health_until").unwrap_or(None),
+        };
+        snapshot
+            .routes_by_model
+            .entry(model_pk)
+            .or_default()
+            .push(route);
+    }
+
+    let prefs = sqlx::query(
+        "SELECT user_id, upstream_key_id, model_pk, priority_override, enabled
+         FROM user_route_preferences",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in prefs {
+        let user_str: String = row.try_get("user_id")?;
+        let key_str: String = row.try_get("upstream_key_id")?;
+        let pk_str: String = row.try_get("model_pk")?;
+        let (Ok(user_id), Ok(key_id), Ok(model_pk)) = (
+            UserId::parse(&user_str),
+            UpstreamKeyId::parse(&key_str),
+            ModelPk::parse(&pk_str),
+        ) else {
+            continue;
+        };
+        snapshot.user_route_prefs.insert(
+            (user_id, model_pk),
+            llmroller_core::snapshot::SnapshotRoutePreference {
+                user_id,
+                upstream_key_id: key_id,
+                model_pk,
+                priority_override: row.try_get("priority_override").unwrap_or(100),
+                enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
+            },
+        );
+    }
+
+    Ok(snapshot)
+}

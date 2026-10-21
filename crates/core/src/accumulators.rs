@@ -224,6 +224,33 @@ impl MonthlyAccumulatorRegistry {
         });
     }
 
+    /// Merge another registry's committed usage into this one (startup hydration).
+    pub fn merge_from(&self, other: &Self) {
+        for entry in other.accumulators.iter() {
+            let (month, scope_id) = entry.key();
+            let used = entry
+                .value()
+                .used_micro_usd
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if used == 0 {
+                continue;
+            }
+            let target = self.get_or_create(*month, scope_id.clone());
+            target
+                .used_micro_usd
+                .fetch_add(used, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Current committed usage for a scope in the month containing `now_ms`.
+    #[must_use]
+    pub fn usage_for(&self, scope_id: &BudgetScopeId, now_ms: i64) -> i64 {
+        let month = UtcYearMonth::from_epoch_millis(now_ms);
+        self.accumulators
+            .get(&(month, scope_id.clone()))
+            .map_or(0, |acc| acc.used())
+    }
+
     /// Number of active accumulators in registry.
     pub fn len(&self) -> usize {
         self.accumulators.len()

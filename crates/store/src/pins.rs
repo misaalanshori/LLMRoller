@@ -101,3 +101,62 @@ pub async fn get_response_link_tx(
         None => Ok(None),
     }
 }
+
+/// A persisted confirmed pin joined with its canonical model identifier.
+#[derive(Debug, Clone)]
+pub struct ActivePinRow {
+    pub client_key_id: ClientKeyId,
+    pub session_hash: String,
+    pub model_pk: ModelPk,
+    pub canonical_id: String,
+    pub upstream_key_id: UpstreamKeyId,
+    pub pool_tier: i64,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub expires_at: i64,
+    pub repin_count: i64,
+}
+
+/// Loads unexpired confirmed pins for startup preload (RTE-10).
+pub async fn load_active_pins(
+    pool: &sqlx::SqlitePool,
+    now_ms: i64,
+) -> Result<Vec<ActivePinRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT p.client_key_id, p.session_hash, p.model_pk, m.canonical_id,
+                  p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at,
+                  p.expires_at, p.repin_count
+           FROM pins p JOIN models m ON p.model_pk = m.id
+           WHERE p.expires_at > ?"#,
+    )
+    .bind(now_ms)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let client_str: String = row.try_get("client_key_id")?;
+        let key_str: String = row.try_get("upstream_key_id")?;
+        let model_str: String = row.try_get("model_pk")?;
+        let (Ok(client_key_id), Ok(upstream_key_id), Ok(model_pk)) = (
+            ClientKeyId::parse(&client_str),
+            UpstreamKeyId::parse(&key_str),
+            ModelPk::parse(&model_str),
+        ) else {
+            continue;
+        };
+        out.push(ActivePinRow {
+            client_key_id,
+            session_hash: row.try_get("session_hash")?,
+            model_pk,
+            canonical_id: row.try_get("canonical_id")?,
+            upstream_key_id,
+            pool_tier: row.try_get("pool_tier").unwrap_or(0),
+            created_at: row.try_get("created_at")?,
+            last_used_at: row.try_get("last_used_at")?,
+            expires_at: row.try_get("expires_at")?,
+            repin_count: row.try_get("repin_count").unwrap_or(0),
+        });
+    }
+    Ok(out)
+}

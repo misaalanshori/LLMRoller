@@ -349,6 +349,14 @@ impl PinStore {
         });
     }
 
+    /// Insert an already-confirmed pin loaded from SQLite at startup (RTE-10).
+    pub fn insert_hydrated(&self, pin_key: PinKey, entry: PinEntry) {
+        if self.entries.len() >= self.max_active_pins {
+            return;
+        }
+        self.entries.insert(pin_key, Arc::new(Mutex::new(entry)));
+    }
+
     /// Sweeper removes expired pins every 60s (RTE-10).
     pub fn sweep(&self, now_ms: i64) {
         self.entries.retain(|_, arc| {

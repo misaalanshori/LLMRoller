@@ -280,16 +280,101 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_tx.clone(),
     );
 
-    // 7. Fast rebuild window states and monthly accumulators (< 2 s)
-    let _ = llmroller_store::budgets::reconstruct_budgets_from_rollups(
+    // 7. Fast rebuild window states and monthly accumulators (< 2 s) and hydrate RuntimeState
+    let rebuilt = llmroller_store::budgets::reconstruct_budgets_from_rollups(
         &pool,
         clock.now_ms(),
         30 * 86_400_000,
     )
-    .await;
+    .await
+    .map_err(|e| CliFailure::new(13, format!("budget reconstruction failed: {e}")))?;
+    runtime_state
+        .accumulators
+        .merge_from(&rebuilt.monthly_accumulators);
+    runtime_state.rebuild_window_counters(&shared_snapshot.load());
+    for (key_id, ring) in &rebuilt.key_rings {
+        let windows = shared_snapshot
+            .load()
+            .budget_windows
+            .get(key_id)
+            .cloned()
+            .unwrap_or_default();
+        for window in windows {
+            runtime_state.hydrate_window_counter(
+                &window,
+                ring.sum_at(clock.now_ms()),
+                clock.now_ms(),
+            );
+        }
+    }
 
-    // 8. Preload confirmed pins
+    // Seed in-memory key health from persisted health rows.
+    if let Ok(rows) = sqlx::query_as::<_, (String, String, Option<i64>, i64)>(
+        "SELECT id, health, health_until, health_version FROM upstream_keys",
+    )
+    .fetch_all(&pool)
+    .await
+    {
+        for (id, health, health_until, _version) in rows {
+            if let Ok(key_id) = llmroller_core::ids::UpstreamKeyId::parse(&id) {
+                let healthy = health == "healthy";
+                runtime_state.key_health.insert(
+                    key_id,
+                    llmroller_core::runtime_state::KeyHealthEntry {
+                        healthy,
+                        cooldown_until_ms: if health == "cooling_down" {
+                            health_until
+                        } else {
+                            None
+                        },
+                        exhausted_until_ms: if health == "exhausted" {
+                            health_until
+                        } else {
+                            None
+                        },
+                        consecutive_failures: 0,
+                        quarantine_reason: if health == "invalid" {
+                            Some("persisted_invalid".to_string())
+                        } else {
+                            None
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    // 8. Preload unexpired confirmed pins
     let pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
+    if let Ok(active_pins) = llmroller_store::pins::load_active_pins(&pool, clock.now_ms()).await {
+        for pin in active_pins {
+            use llmroller_core::eligibility::CandidatePoolTier;
+            let tier = match pin.pool_tier {
+                0 => CandidatePoolTier::Own,
+                1 => CandidatePoolTier::Shared,
+                2 => CandidatePoolTier::Global,
+                _ => CandidatePoolTier::Blended,
+            };
+            pin_store.insert_hydrated(
+                llmroller_core::pins::PinKey {
+                    client_key_id: pin.client_key_id,
+                    canonical_id: pin.canonical_id,
+                    session_hash: pin.session_hash,
+                },
+                llmroller_core::pins::PinEntry {
+                    state: llmroller_core::pins::PinState::Confirmed,
+                    upstream_key_id: pin.upstream_key_id,
+                    generation: 1,
+                    pool_tier: tier,
+                    created_ms: pin.created_at,
+                    last_used_ms: pin.last_used_at,
+                    expires_ms: pin.expires_at,
+                    repin_count: u32::try_from(pin.repin_count).unwrap_or(0),
+                    tried_this_generation: Vec::new(),
+                },
+            );
+        }
+    }
 
     // 9. Bind data-plane, control-plane, and metrics TCP listeners
     let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));

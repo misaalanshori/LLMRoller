@@ -100,3 +100,40 @@ pub async fn reconstruct_budgets_from_rollups(
 
 #[cfg(test)]
 pub mod tests;
+/// Loads configured budget windows grouped by upstream key for the hot-path snapshot.
+pub async fn load_budget_windows_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<HashMap<UpstreamKeyId, Vec<llmroller_core::snapshot::SnapshotBudgetWindow>>, sqlx::Error>
+{
+    let rows = sqlx::query(
+        "SELECT id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms,
+                limit_micro_usd, reserve_pct
+         FROM budget_windows",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut out: HashMap<UpstreamKeyId, Vec<llmroller_core::snapshot::SnapshotBudgetWindow>> =
+        HashMap::new();
+    for row in rows {
+        let key_str: String = row.try_get("upstream_key_id")?;
+        let Ok(key_id) = UpstreamKeyId::parse(&key_str) else {
+            continue;
+        };
+        let model_str: Option<String> = row.try_get("model_pk").unwrap_or(None);
+        let window = llmroller_core::snapshot::SnapshotBudgetWindow {
+            id: row.try_get("id")?,
+            scope_kind: row.try_get("scope_kind")?,
+            upstream_key_id: key_id,
+            model_pk: model_str
+                .as_deref()
+                .and_then(|s| llmroller_core::ids::ModelPk::parse(s).ok()),
+            window_kind: row.try_get("window_kind")?,
+            period_ms: row.try_get("period_ms").unwrap_or(None),
+            limit_micro_usd: row.try_get("limit_micro_usd")?,
+            reserve_pct: row.try_get("reserve_pct").unwrap_or(2),
+        };
+        out.entry(key_id).or_default().push(window);
+    }
+    Ok(out)
+}

@@ -6,17 +6,22 @@
 //! Spec: ./docs/srdd/21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md#2162-versioned-configsnapshot-publication-reloader
 //! Phase: ./docs/bigbang/big-bang-phases-1.md#16-sub-phase-16-dual-priority-sqlite-writer-closed-settings-registry-reloader-task-and-runtimestate
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::snapshot::{ConfigDomain, ConfigSnapshot};
+use llmroller_store::budgets::load_budget_windows_tx;
 use llmroller_store::client_keys::{ClientKeyError, load_client_key_records_tx};
+use llmroller_store::models::{CatalogSnapshot, load_catalog_snapshot_tx};
+use llmroller_store::prices::load_price_entries_tx;
 use llmroller_store::providers::{
     ProviderError, load_provider_records_tx, load_upstream_key_records_tx,
 };
 use llmroller_store::settings::{SettingsError, load_settings_tx};
+use llmroller_store::shares::load_share_configs_tx;
 use llmroller_store::users::{UserError, load_user_records_tx};
 use llmroller_store::writer::ReloadNotification;
 use sqlx::SqlitePool;
@@ -104,6 +109,106 @@ impl ReloaderHandle {
     }
 }
 
+/// Budget/price/catalog slices that are rebuilt together whenever any of their domains change.
+#[derive(Debug, Clone)]
+struct DomainSlices {
+    catalog: CatalogSnapshot,
+    shares: HashMap<llmroller_core::ids::UserId, Vec<llmroller_core::shares::ShareConfig>>,
+    prices: HashMap<llmroller_core::snapshot::PriceKey, llmroller_core::pricing::PriceEntry>,
+    budget_windows: HashMap<
+        llmroller_core::ids::UpstreamKeyId,
+        Vec<llmroller_core::snapshot::SnapshotBudgetWindow>,
+    >,
+}
+
+async fn load_domain_slices(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<DomainSlices, ReloaderError> {
+    let catalog = load_catalog_snapshot_tx(&mut *tx)
+        .await
+        .map_err(ReloaderError::Sqlx)?;
+    let shares = load_share_configs_tx(&mut *tx)
+        .await
+        .map_err(ReloaderError::Sqlx)?;
+    let prices = load_price_entries_tx(&mut *tx)
+        .await
+        .map_err(ReloaderError::Sqlx)?;
+    let budget_windows = load_budget_windows_tx(&mut *tx)
+        .await
+        .map_err(ReloaderError::Sqlx)?;
+    Ok(DomainSlices {
+        catalog,
+        shares,
+        prices,
+        budget_windows,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct DomainArcs {
+    models: Arc<HashMap<llmroller_core::ids::ModelPk, llmroller_core::snapshot::SnapshotModel>>,
+    models_by_canonical: Arc<HashMap<String, llmroller_core::ids::ModelPk>>,
+    aliases: Arc<HashMap<String, llmroller_core::ids::ModelPk>>,
+    redirects: Arc<HashMap<String, llmroller_core::ids::ModelPk>>,
+    routes_by_model: Arc<
+        HashMap<llmroller_core::ids::ModelPk, Vec<llmroller_core::snapshot::SnapshotModelRoute>>,
+    >,
+    user_route_prefs: Arc<
+        HashMap<
+            (llmroller_core::ids::UserId, llmroller_core::ids::ModelPk),
+            llmroller_core::snapshot::SnapshotRoutePreference,
+        >,
+    >,
+    shares: Arc<HashMap<llmroller_core::ids::UserId, Vec<llmroller_core::shares::ShareConfig>>>,
+    prices: Arc<HashMap<llmroller_core::snapshot::PriceKey, llmroller_core::pricing::PriceEntry>>,
+    budget_windows: Arc<
+        HashMap<
+            llmroller_core::ids::UpstreamKeyId,
+            Vec<llmroller_core::snapshot::SnapshotBudgetWindow>,
+        >,
+    >,
+}
+
+impl DomainArcs {
+    fn from_slices(slices: DomainSlices) -> Self {
+        Self {
+            models: Arc::new(slices.catalog.models),
+            models_by_canonical: Arc::new(slices.catalog.models_by_canonical),
+            aliases: Arc::new(slices.catalog.aliases),
+            redirects: Arc::new(slices.catalog.redirects),
+            routes_by_model: Arc::new(slices.catalog.routes_by_model),
+            user_route_prefs: Arc::new(slices.catalog.user_route_prefs),
+            shares: Arc::new(slices.shares),
+            prices: Arc::new(slices.prices),
+            budget_windows: Arc::new(slices.budget_windows),
+        }
+    }
+
+    fn clone_from(current: &ConfigSnapshot) -> Self {
+        Self {
+            models: current.models.clone(),
+            models_by_canonical: current.models_by_canonical.clone(),
+            aliases: current.aliases.clone(),
+            redirects: current.redirects.clone(),
+            routes_by_model: current.routes_by_model.clone(),
+            user_route_prefs: current.user_route_prefs.clone(),
+            shares: current.shares_by_grantee.clone(),
+            prices: current.prices.clone(),
+            budget_windows: current.budget_windows.clone(),
+        }
+    }
+}
+
+async fn load_instance_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> [u8; 16] {
+    let bytes: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_optional(&mut **tx)
+            .await
+            .ok()
+            .flatten();
+    bytes.and_then(|b| b.try_into().ok()).unwrap_or([0_u8; 16])
+}
+
 /// Load the initial immutable [`ConfigSnapshot`] directly from SQLite during server startup.
 pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, ReloaderError> {
     let mut tx = pool.begin().await?;
@@ -116,21 +221,67 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
 
+    let instance_id = load_instance_id(&mut tx).await;
     let users = load_user_records_tx(&mut tx).await?;
     let settings = load_settings_tx(&mut tx).await?;
     let providers = load_provider_records_tx(&mut tx).await?;
     let upstream_keys = load_upstream_key_records_tx(&mut tx).await?;
     let client_keys = load_client_key_records_tx(&mut tx, now_ms).await?;
+    let slices = load_domain_slices(&mut tx).await?;
     tx.commit().await?;
 
-    Ok(ConfigSnapshot {
-        config_version: v,
-        users: Arc::new(users),
-        settings: Arc::new(settings),
-        providers: Arc::new(providers),
-        upstream_keys: Arc::new(upstream_keys),
-        client_keys_by_hash: Arc::new(client_keys),
-    })
+    Ok(assemble_snapshot(
+        v,
+        instance_id,
+        Arc::new(users),
+        Arc::new(settings),
+        Arc::new(providers),
+        Arc::new(upstream_keys),
+        Arc::new(client_keys),
+        DomainArcs::from_slices(slices),
+    ))
+}
+
+fn assemble_snapshot(
+    version: i64,
+    instance_id: [u8; 16],
+    users: Arc<HashMap<llmroller_core::ids::UserId, llmroller_core::snapshot::UserRecord>>,
+    settings: Arc<llmroller_core::settings::RuntimeSettings>,
+    providers: Arc<
+        HashMap<llmroller_core::ids::ProviderId, llmroller_core::snapshot::ProviderRecord>,
+    >,
+    upstream_keys: Arc<
+        HashMap<llmroller_core::ids::UpstreamKeyId, llmroller_core::snapshot::UpstreamKeyRecord>,
+    >,
+    client_keys: Arc<
+        HashMap<
+            [u8; 32],
+            (
+                llmroller_core::client_key::ClientKeyRecord,
+                llmroller_core::client_key::HashRole,
+            ),
+        >,
+    >,
+    slices: DomainArcs,
+) -> ConfigSnapshot {
+    ConfigSnapshot {
+        config_version: version,
+        instance_id,
+        users,
+        settings,
+        providers,
+        upstream_keys,
+        client_keys_by_hash: client_keys,
+        models: slices.models,
+        models_by_canonical: slices.models_by_canonical,
+        aliases: slices.aliases,
+        redirects: slices.redirects,
+        routes_by_model: slices.routes_by_model,
+        shares_by_grantee: slices.shares,
+        user_route_prefs: slices.user_route_prefs,
+        prices: slices.prices,
+        budget_windows: slices.budget_windows,
+    }
 }
 
 /// Spawn the single versioned [`Reloader`] background actor per SRDD Section 21.6.2.
@@ -190,11 +341,22 @@ pub fn start_reloader(
                     }
                 };
 
-            let current = shared_snapshot.load();
+            let current = shared_snapshot.load_full();
 
             // 4. If v > published.version: rebuild only changed domain Arc slices
             if db_version > current.config_version {
                 let reload_all = changed_domains.is_empty();
+                let reload_catalog = reload_all
+                    || changed_domains.iter().any(|d| {
+                        matches!(
+                            d,
+                            ConfigDomain::Models
+                                | ConfigDomain::Shares
+                                | ConfigDomain::Prices
+                                | ConfigDomain::BudgetWindows
+                                | ConfigDomain::Traceability
+                        )
+                    });
 
                 let next_users = if reload_all || changed_domains.contains(&ConfigDomain::Users) {
                     match load_user_records_tx(&mut tx).await {
@@ -265,28 +427,46 @@ pub fn start_reloader(
                         current.client_keys_by_hash.clone()
                     };
 
+                let next_slices = if reload_catalog {
+                    match load_domain_slices(&mut tx).await {
+                        Ok(slices) => DomainArcs::from_slices(slices),
+                        Err(err) => {
+                            tracing::error!("reloader failed to load catalog slices: {err}");
+                            continue;
+                        }
+                    }
+                } else {
+                    DomainArcs::clone_from(&current)
+                };
+
+                let next_instance_id =
+                    if reload_all || changed_domains.contains(&ConfigDomain::Providers) {
+                        load_instance_id(&mut tx).await
+                    } else {
+                        current.instance_id
+                    };
+
                 if let Err(err) = tx.commit().await {
                     tracing::error!("reloader failed to commit read transaction: {err}");
                     continue;
                 }
 
-                let new_snapshot = ConfigSnapshot {
-                    config_version: db_version,
-                    users: next_users,
-                    settings: next_settings,
-                    providers: next_providers,
-                    upstream_keys: next_upstream_keys,
-                    client_keys_by_hash: next_client_keys,
-                };
+                let new_snapshot = assemble_snapshot(
+                    db_version,
+                    next_instance_id,
+                    next_users,
+                    next_settings,
+                    next_providers,
+                    next_upstream_keys,
+                    next_client_keys,
+                    next_slices,
+                );
 
                 // Store new snapshot atomically
-                shared_snapshot.store(Arc::new(new_snapshot));
+                shared_snapshot.store(Arc::new(new_snapshot.clone()));
 
                 // Apply CacheInvalidationEvents after arc_swap.store per REL-4
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as i64);
-                runtime_state.apply_invalidations(&invalidations, now_ms);
+                runtime_state.apply_invalidations(&invalidations, &new_snapshot, now_ms);
 
                 // Notify waiting control handlers
                 let _ = published_version_tx.send_replace(db_version);
