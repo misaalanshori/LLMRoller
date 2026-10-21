@@ -428,6 +428,37 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_handle.notification_sender(),
         reloader_handle.version_receiver(),
     );
+    // Trace sealing runs on two dedicated OS threads; persist sealed turns off the hot path.
+    let trace_sealer = std::sync::Arc::new(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        master_key.clone(),
+        instance_state.instance_id,
+        entropy.clone(),
+    ));
+    let (_sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
+    let trace_pool = pool.clone();
+    let trace_master_key_id = master_key_id.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("llmroller-trace-writer".to_string())
+        .spawn(move || {
+            while let Ok(sealed) = sealed_trace_rx.recv() {
+                let pool = trace_pool.clone();
+                let key_id = trace_master_key_id.clone();
+                runtime_handle.block_on(async move {
+                    if let Ok(mut tx) = pool.begin().await
+                        && llmroller_store::traces::insert_sealed_trace_tx(
+                            &mut tx, &sealed, &key_id,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let _ = tx.commit().await;
+                    }
+                });
+            }
+        })
+        .expect("spawn trace writer thread");
+
     let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller(
         llmroller_server::usage_poller::UsagePollerDeps {
             pool: pool.clone(),

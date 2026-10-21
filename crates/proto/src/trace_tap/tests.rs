@@ -82,3 +82,67 @@ fn test_trace_tap_non_blocking_try_send_and_memory_budget() {
     // Subsequent chunks immediately rejected without delay (< 1 ms, never blocking forwarder) (PERF-2)
     assert!(!tap.try_feed_chunk(Bytes::from_static(b"after drop")));
 }
+
+#[doc = "Spec: TRC-2, TRC-3, API-5"]
+#[test]
+fn reassembles_chat_responses_and_messages_deltas() {
+    let (_tap, _rx) = TraceTap::new();
+    let mut tap = TraceTap::new().0;
+    tap.feed_sse_data_json(&serde_json::json!({
+        "id": "chatcmpl",
+        "choices": [{"delta": {"content": "Hel"}}]
+    }));
+    tap.feed_sse_data_json(&serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": "lo",
+                "tool_calls": [{"index": 0, "id": "call_1",
+                    "function": {"name": "lookup", "arguments": "{\"q\":"}}]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }));
+    assert_eq!(tap.output.response_id.as_deref(), Some("chatcmpl"));
+    assert_eq!(tap.output.assistant_text, "Hello");
+    assert_eq!(tap.output.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(tap.output.assistant_tool_calls[0].name, "lookup");
+    assert_eq!(tap.output.assistant_tool_calls[0].arguments_json, "{\"q\":");
+
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.output_text.delta", "delta": " world"
+    }));
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.reasoning_summary_text.delta", "delta": "thinking"
+    }));
+    assert_eq!(tap.output.assistant_text, "Hello world");
+    assert_eq!(tap.output.assistant_reasoning, "thinking");
+
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "!"}
+    }));
+    assert_eq!(tap.output.assistant_text, "Hello world!");
+}
+
+#[doc = "Spec: TRC-2"]
+#[test]
+fn drops_oversized_request_blocks_above_four_mebibytes() {
+    let mut tap = TraceTap::new().0;
+    let huge = "x".repeat(MAX_REQUEST_BLOCKS_BYTES + 1);
+    let mut request = serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "keep"},
+                {"type": "image", "data": huge}
+            ]
+        }]
+    });
+    assert!(tap.sanitize_request_blocks(&mut request));
+    assert_eq!(tap.output.dropped_block_count, 1);
+    assert_eq!(request["messages"][0]["content"][0]["text"], "keep");
+    assert_eq!(
+        request["messages"][0]["content"][1]["llmroller_omitted"],
+        "oversized_block"
+    );
+}
