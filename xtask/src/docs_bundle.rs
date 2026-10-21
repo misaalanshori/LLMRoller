@@ -515,6 +515,13 @@ mod tests {
                 fs::write(root.join("docs/bigbang").join(name), body).expect("bigbang part");
             }
 
+            fs::create_dir_all(root.join("crates/server/tests")).expect("tests dir");
+            fs::write(
+                root.join("crates/server/tests/e2e_setup_and_auth.rs"),
+                "// test",
+            )
+            .expect("test file");
+
             fs::write(
                 root.join("docs/srdd/requirements.toml"),
                 r#"
@@ -524,7 +531,7 @@ schema_version = 1
 priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.4"
-tests = ["tests/e2e_setup_and_auth.rs"]
+tests = ["crates/server/tests/e2e_setup_and_auth.rs"]
 "#,
             )
             .expect("requirements");
