@@ -355,3 +355,295 @@ async fn test_cross_tenant_existence_oracle_and_mutation_guards() {
         "Bob must receive ProviderNotFound when deleting unowned personal provider, got: {err_delete_alice:?}"
     );
 }
+
+#[doc = "Spec: RTE-4, RTE-5, RTE-6, USR-4, AUTH-4, AUTH-6, PRV-6, UI-1"]
+#[tokio::test]
+async fn test_user_routing_matrix_and_self_service_security() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt as _;
+    use llmroller_admin::auth::{AuthConfig, derive_session_csrf};
+    use llmroller_admin::setup::SetupAppState;
+    use llmroller_admin::{ApiAppState, AuthAppState, control_plane_router_full};
+    use llmroller_store::crypto::sha256_hex;
+    use llmroller_store::models::upsert_discovered_models_tx;
+    use tower::ServiceExt as _;
+
+    let (dir, pool, master_key, alice_id, _bob_id) = setup_rbac_test_db().await;
+
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let alice_actor = ActorScope::user(alice_id, Role::User);
+    let admin_actor = ActorScope::user(UserId::generate(), Role::Admin);
+    let entropy = OsEntropy;
+
+    // 1. Setup Alice's personal provider and key
+    let alice_prov = create_provider(
+        &pool,
+        &alice_actor,
+        NewProvider {
+            name: "alice_personal".to_string(),
+            kind: ProviderKind::Openrouter,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Personal,
+            owner_user_id: Some(alice_id),
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+        },
+        100,
+    )
+    .await
+    .expect("alice provider");
+
+    let alice_key = create_upstream_key(
+        &pool,
+        &alice_actor,
+        &master_key,
+        "key-0",
+        Arc::new(entropy),
+        NewUpstreamKey {
+            provider_id: alice_prov.id,
+            label: "alice_key".to_string(),
+            secret: secret_string("sk-alice-test"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        100,
+    )
+    .await
+    .expect("alice key");
+
+    // 2. Setup Global provider and key
+    let global_prov = create_provider(
+        &pool,
+        &admin_actor,
+        NewProvider {
+            name: "global_pool".to_string(),
+            kind: ProviderKind::Openrouter,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+        },
+        100,
+    )
+    .await
+    .expect("global prov");
+
+    let global_key = create_upstream_key(
+        &pool,
+        &admin_actor,
+        &master_key,
+        "key-0",
+        Arc::new(entropy),
+        NewUpstreamKey {
+            provider_id: global_prov.id,
+            label: "global_secret_key".to_string(),
+            secret: secret_string("sk-global-test"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        100,
+    )
+    .await
+    .expect("global key");
+
+    use llmroller_core::seams::Clock as _;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    // Discover a canonical model for both keys
+    let mut tx = pool.begin().await.expect("tx");
+    upsert_discovered_models_tx(
+        &mut tx,
+        &alice_key.id,
+        false,
+        Some(&alice_id),
+        now_ms,
+        &["claude-sonnet-4.6".to_string()],
+        100,
+    )
+    .await
+    .expect("discover alice");
+    upsert_discovered_models_tx(
+        &mut tx,
+        &global_key.id,
+        true,
+        None,
+        now_ms,
+        &["claude-sonnet-4.6".to_string()],
+        100,
+    )
+    .await
+    .expect("discover global");
+    tx.commit().await.expect("commit discover");
+
+    // 3. Establish Alice's authenticated session
+    let raw_session = "alice_test_session_token_1234567890123456";
+    let id_hash = sha256_hex(raw_session.as_bytes());
+    let csrf_token = derive_session_csrf(raw_session);
+    let csrf_hash = sha256_hex(csrf_token.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: alice_id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("alice-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert alice session");
+
+    let alice_cookie = format!("llmroller_session={raw_session}");
+
+    // 4. GET /api/user/routes: Alice views the routing matrix
+    let routes_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/routes")
+        .header(header::COOKIE, &alice_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let routes_res = app.clone().oneshot(routes_req).await.expect("res");
+    assert_eq!(routes_res.status(), StatusCode::OK);
+    let routes_body = routes_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let routes_json: serde_json::Value = serde_json::from_slice(&routes_body).expect("parse json");
+    assert!(routes_json["models"].is_array());
+    let models_arr = routes_json["models"].as_array().expect("models array");
+    assert!(!models_arr.is_empty());
+    // Invariant USR-4: Global keys are collapsed into "Global pool", no global key ID/label exposed
+    let json_str = routes_json.to_string();
+    assert!(
+        !json_str.contains("global_secret_key"),
+        "Global key label must be redacted to standard user (USR-4)"
+    );
+
+    // 5. PUT /api/user/routes/{alice_key.id}/{model}: Updating Alice's own key route preference succeeds
+    let put_own_route_req = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/api/user/routes/{}/claude-sonnet-4.6",
+            alice_key.id
+        ))
+        .header(header::COOKIE, &alice_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "priority_override": 250,
+                "enabled": true
+            })
+            .to_string(),
+        ))
+        .expect("req");
+    let put_own_res = app.clone().oneshot(put_own_route_req).await.expect("res");
+    assert_eq!(put_own_res.status(), StatusCode::OK);
+
+    // 6. PUT /api/user/routes/{global_key.id}/{model}: Modifying global route preference fails with 403 Forbidden (RTE-5)
+    let put_global_route_req = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/api/user/routes/{}/claude-sonnet-4.6",
+            global_key.id
+        ))
+        .header(header::COOKIE, &alice_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "priority_override": 500,
+                "enabled": true
+            })
+            .to_string(),
+        ))
+        .expect("req");
+    let put_global_res = app
+        .clone()
+        .oneshot(put_global_route_req)
+        .await
+        .expect("res");
+    assert_eq!(
+        put_global_res.status(),
+        StatusCode::FORBIDDEN,
+        "Standard user cannot set route preference on global key (RTE-5)"
+    );
+
+    // 7. Self-Service: POST /api/user/password (AUTH-4)
+    let pw_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/password")
+        .header(header::COOKIE, &alice_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "current_password": "supersecretalicepass123",
+                "new_password": "newsupersecretalicepass456"
+            })
+            .to_string(),
+        ))
+        .expect("req");
+    let pw_res = app.clone().oneshot(pw_req).await.expect("res");
+    assert_eq!(pw_res.status(), StatusCode::OK);
+
+    // 8. Self-Service: POST /api/user/totp/enroll (AUTH-6)
+    let totp_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/totp/enroll")
+        .header(header::COOKIE, &alice_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .expect("req");
+    let totp_res = app.clone().oneshot(totp_req).await.expect("res");
+    assert_eq!(totp_res.status(), StatusCode::OK);
+    let totp_body = totp_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let totp_json: serde_json::Value = serde_json::from_slice(&totp_body).expect("totp json");
+    assert!(totp_json["otpauth_url"].as_str().is_some());
+    assert!(totp_json["recovery_codes"].as_array().is_some());
+
+    // 9. Key testing: POST /api/user/upstream-keys/{id}/test (PRV-6)
+    let test_key_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/user/upstream-keys/{}/test", alice_key.id))
+        .header(header::COOKIE, &alice_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .expect("req");
+    let test_key_res = app.oneshot(test_key_req).await.expect("res");
+    assert_eq!(test_key_res.status(), StatusCode::OK);
+}

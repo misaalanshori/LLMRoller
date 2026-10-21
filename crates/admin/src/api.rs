@@ -1447,6 +1447,426 @@ async fn delete_pin_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---------------------------------------------------------------------------
+// User Routing Matrix (/api/user/routes)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct PutRoutePreferenceRequest {
+    pub priority_override: Option<u32>,
+    pub enabled: Option<bool>,
+}
+
+async fn get_user_routes_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let model_rows = sqlx::query(
+        "SELECT model_pk, canonical_id, origin, exposed, merge_state, distribution, routing_strategy
+         FROM models WHERE (exposed IS NULL OR exposed != 0) ORDER BY canonical_id ASC",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut models = Vec::new();
+    for m in model_rows {
+        let model_pk: String = m.try_get::<String, _>("model_pk").unwrap_or_default();
+        let canonical_id: String = m.try_get::<String, _>("canonical_id").unwrap_or_default();
+        let distribution: String = m.try_get::<String, _>("distribution").unwrap_or_default();
+        let routing_strategy: String = m
+            .try_get::<Option<String>, _>("routing_strategy")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "smooth_weighted_rr".to_string());
+
+        let route_rows = sqlx::query(
+            "SELECT r.upstream_key_id, r.priority_override as route_prio_override,
+                    k.priority, k.strict_tier,
+                    k.label as key_label, k.owner_user_id, p.ownership_scope,
+                    p.name as provider_name, p.kind as provider_kind
+             FROM model_routes r
+             JOIN upstream_keys k ON r.upstream_key_id = k.id
+             JOIN providers p ON k.provider_id = p.id
+             WHERE r.model_pk = ? AND k.enabled = 1 AND p.enabled = 1 AND r.enabled = 1",
+        )
+        .bind(&model_pk)
+        .fetch_all(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let pref_rows = sqlx::query(
+            "SELECT upstream_key_id, priority_override, enabled
+             FROM user_route_preferences
+             WHERE user_id = ? AND model_pk = ?",
+        )
+        .bind(user_id.to_string())
+        .bind(&model_pk)
+        .fetch_all(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let mut prefs_map = std::collections::HashMap::new();
+        for p in pref_rows {
+            let kid: String = p
+                .try_get::<String, _>("upstream_key_id")
+                .unwrap_or_default();
+            let prio: i64 = p.try_get::<i64, _>("priority_override").unwrap_or(100);
+            let en: i64 = p.try_get::<i64, _>("enabled").unwrap_or(1);
+            prefs_map.insert(kid, (prio, en == 1));
+        }
+
+        let mut own_keys = Vec::new();
+        let mut shared_keys = Vec::new();
+        let mut global_count = 0;
+
+        for r in route_rows {
+            let key_id: String = r
+                .try_get::<String, _>("upstream_key_id")
+                .unwrap_or_default();
+            let scope: String = r
+                .try_get::<String, _>("ownership_scope")
+                .unwrap_or_default();
+            let owner: Option<String> = r
+                .try_get::<Option<String>, _>("owner_user_id")
+                .unwrap_or_default();
+            let label: String = r.try_get::<String, _>("key_label").unwrap_or_default();
+            let priority: i64 = r.try_get::<i64, _>("priority").unwrap_or(100);
+            let strict_tier: i64 = r.try_get::<i64, _>("strict_tier").unwrap_or(1);
+            let weight: i64 = priority;
+
+            let (user_prio, user_en) = prefs_map.get(&key_id).copied().unwrap_or((priority, true));
+
+            if scope == "personal" && owner.as_deref() == Some(&user_id.to_string()) {
+                own_keys.push(serde_json::json!({
+                    "upstream_key_id": key_id,
+                    "label": label,
+                    "priority": priority,
+                    "strict_tier": strict_tier,
+                    "weight": weight,
+                    "priority_override": user_prio,
+                    "enabled": user_en,
+                }));
+            } else if scope == "global" {
+                global_count += 1;
+            } else {
+                let is_shared = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM provider_shares WHERE grantee_user_id = ? AND (upstream_key_id = ? OR upstream_key_id IS NULL) AND enabled = 1 AND revoked_at IS NULL LIMIT 1",
+                )
+                .bind(user_id.to_string())
+                .bind(&key_id)
+                .fetch_optional(&state.auth.pool)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .is_some();
+
+                if is_shared {
+                    shared_keys.push(serde_json::json!({
+                        "upstream_key_id": key_id,
+                        "label": label,
+                        "priority": priority,
+                        "strict_tier": strict_tier,
+                        "weight": weight,
+                        "priority_override": user_prio,
+                        "enabled": user_en,
+                    }));
+                }
+            }
+        }
+
+        models.push(serde_json::json!({
+            "model_pk": model_pk,
+            "canonical_id": canonical_id,
+            "distribution": distribution,
+            "routing_strategy": routing_strategy,
+            "own_keys": own_keys,
+            "shared_keys": shared_keys,
+            "global_pool": {
+                "available": global_count > 0,
+                "count": global_count,
+                "label": "Global pool"
+            }
+        }));
+    }
+
+    Ok(Json(serde_json::json!({ "models": models })))
+}
+
+async fn put_user_route_preference_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path((key_id, canonical_id)): Path<(UpstreamKeyId, String)>,
+    Json(payload): Json<PutRoutePreferenceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let key_info = sqlx::query(
+        "SELECT k.owner_user_id, p.ownership_scope
+         FROM upstream_keys k
+         JOIN providers p ON k.provider_id = p.id
+         WHERE k.id = ?",
+    )
+    .bind(key_id.to_string())
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "upstream key not found"))?;
+
+    let scope: String = key_info.try_get("ownership_scope").unwrap_or_default();
+    if scope == "global" && !actor.is_admin() {
+        return Err(map_price_error(
+            StatusCode::FORBIDDEN,
+            "cannot configure route preference on global key",
+        ));
+    }
+
+    let model_pk: String = if let Some(m) =
+        sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = ?")
+            .bind(&canonical_id)
+            .fetch_optional(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        m
+    } else if let Some(a) = sqlx::query_scalar("SELECT model_pk FROM model_aliases WHERE alias = ?")
+        .bind(&canonical_id)
+        .fetch_optional(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        a
+    } else {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
+    };
+
+    let priority_override = payload.priority_override.unwrap_or(100).clamp(1, 1000) as i64;
+    let enabled = if payload.enabled.unwrap_or(true) {
+        1i64
+    } else {
+        0i64
+    };
+
+    sqlx::query(
+        "INSERT INTO user_route_preferences (user_id, upstream_key_id, model_pk, priority_override, enabled)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (user_id, upstream_key_id, model_pk) DO UPDATE SET
+            priority_override = excluded.priority_override,
+            enabled = excluded.enabled",
+    )
+    .bind(user_id.to_string())
+    .bind(key_id.to_string())
+    .bind(model_pk)
+    .bind(priority_override)
+    .bind(enabled)
+    .execute(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// Self-Service Security Endpoints
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyTotpRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisableTotpRequest {
+    pub password: Option<String>,
+}
+
+async fn post_user_password_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+
+    let cookie_header = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let session_token =
+        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
+            .unwrap_or("");
+    let id_hash = llmroller_store::crypto::sha256_hex(session_token.as_bytes());
+
+    llmroller_store::users::change_password(
+        &state.auth.pool,
+        &actor,
+        &payload.current_password,
+        &payload.new_password,
+        state.auth.entropy.as_ref(),
+        Some(&id_hash),
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn load_sealer(
+    state: &ApiAppState,
+) -> Result<llmroller_store::crypto::XChaCha20Poly1305Sealer, (StatusCode, Json<serde_json::Value>)>
+{
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let instance_id: [u8; 16] = instance_id_vec
+        .try_into()
+        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "corrupt instance_id"))?;
+    Ok(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        state.master_key.clone(),
+        instance_id,
+        state.auth.entropy.clone(),
+    ))
+}
+
+async fn post_user_totp_enroll_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let sealer = load_sealer(&state).await?;
+
+    let enrollment = llmroller_store::users::enroll_totp(
+        &state.auth.pool,
+        &actor,
+        &sealer,
+        &state.master_key_id,
+        state.auth.entropy.as_ref(),
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let recovery_codes: Vec<&str> = enrollment
+        .recovery_codes
+        .iter()
+        .map(|c| c.expose_secret())
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "otpauth_url": enrollment.otpauth_url,
+        "recovery_codes": recovery_codes,
+    })))
+}
+
+async fn post_user_totp_verify_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<VerifyTotpRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let sealer = load_sealer(&state).await?;
+    let now_ms = state.auth.clock.now_ms();
+
+    llmroller_store::users::confirm_totp(
+        &state.auth.pool,
+        &actor,
+        &payload.code,
+        &sealer,
+        &state.master_key_id,
+        now_ms,
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn post_user_totp_disable_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(_payload): Json<DisableTotpRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    llmroller_store::users::clear_totp(&state.auth.pool, &actor, user_id)
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn delete_user_session_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id_hash): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+
+    llmroller_store::users::delete_owned_web_session(&state.auth.pool, &actor, &id_hash)
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Upstream Key Test (PRV-6)
+// ---------------------------------------------------------------------------
+async fn post_test_upstream_key_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UpstreamKeyId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+
+    use sqlx::Row as _;
+    let key = sqlx::query(
+        "SELECT k.id, k.owner_user_id, p.ownership_scope, p.base_url, p.kind
+         FROM upstream_keys k
+         JOIN providers p ON k.provider_id = p.id
+         WHERE k.id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "upstream key not found"))?;
+
+    let scope: String = key.try_get("ownership_scope").unwrap_or_default();
+    let owner: Option<String> = key.try_get("owner_user_id").unwrap_or_default();
+    if scope == "personal" && !actor.is_admin() {
+        let uid = actor.user_id().map(|u| u.to_string());
+        if owner != uid {
+            return Err(map_price_error(
+                StatusCode::NOT_FOUND,
+                "upstream key not found",
+            ));
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "message": "Key validated successfully",
+        "key_id": id.to_string()
+    })))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // Web UI screens
@@ -1472,6 +1892,26 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_user_upstream_key_handler)
                 .patch(patch_user_upstream_key_handler)
                 .delete(delete_user_upstream_key_handler),
+        )
+        .route(
+            "/api/user/upstream-keys/{id}/test",
+            post(post_test_upstream_key_handler),
+        )
+        .route("/api/user/routes", get(get_user_routes_handler))
+        .route(
+            "/api/user/routes/{key_id}/{canonical_id}",
+            put(put_user_route_preference_handler),
+        )
+        .route("/api/user/password", post(post_user_password_handler))
+        .route("/api/user/totp/enroll", post(post_user_totp_enroll_handler))
+        .route("/api/user/totp/verify", post(post_user_totp_verify_handler))
+        .route(
+            "/api/user/totp/disable",
+            post(post_user_totp_disable_handler),
+        )
+        .route(
+            "/api/user/web-sessions/{id_hash}",
+            delete(delete_user_session_handler),
         )
         .route(
             "/api/user/client-keys",

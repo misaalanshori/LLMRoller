@@ -196,7 +196,10 @@ async function loadKeysForProvider(provId) {
                             <td>${k.priority}</td>
                             <td>Tier ${k.strict_tier}</td>
                             <td><span class="badge badge-${k.enabled ? 'success' : 'danger'}">${k.enabled ? 'Active' : 'Disabled'}</span></td>
-                            <td><button class="btn btn-xs btn-danger" onclick="deleteUpstreamKey('${k.id}', '${provId}')">Remove</button></td>
+                            <td>
+                                <button class="btn btn-xs btn-ghost" onclick="testUpstreamKey('${k.id}')">Test</button>
+                                <button class="btn btn-xs btn-danger" onclick="deleteUpstreamKey('${k.id}', '${provId}')">Remove</button>
+                            </td>
                         </tr>
                     `).join('')}
                 </tbody>
@@ -700,6 +703,56 @@ async function loadAuditLog() {
     }
 }
 
+async function testUpstreamKey(keyId) {
+    try {
+        const res = await fetch(`/api/user/upstream-keys/${keyId}/test`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: '{}'
+        });
+        const data = await res.json();
+        alert(data.message || 'Key test completed!');
+    } catch (e) {
+        alert('Key test failed: ' + e);
+    }
+}
+
+async function loadRoutingMatrix() {
+    const tbody = document.getElementById('matrix-body');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/user/routes');
+        const data = await res.json();
+        const models = data.models || [];
+        if (models.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No models discovered yet. Add an upstream key or test providers.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = models.map(m => {
+            const ownKeysText = m.own_keys.length > 0
+                ? m.own_keys.map(k => `${k.label} (Prio: ${k.priority_override})`).join(', ')
+                : '—';
+            const sharedKeysText = m.shared_keys.length > 0
+                ? m.shared_keys.map(k => `${k.label} (Prio: ${k.priority_override})`).join(', ')
+                : '—';
+            const globalText = m.global_pool.available ? 'Global pool' : '—';
+
+            return `
+                <tr>
+                    <td><strong>${m.canonical_id}</strong></td>
+                    <td><span class="badge badge-info">${m.routing_strategy}</span></td>
+                    <td>${ownKeysText}</td>
+                    <td>${sharedKeysText}</td>
+                    <td><span class="badge badge-success">${globalText}</span></td>
+                </tr>
+            `;
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Error loading routing matrix: ${e}</td></tr>`;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Document Ready Dispatcher
 // ---------------------------------------------------------------------------
@@ -710,6 +763,7 @@ document.addEventListener('DOMContentLoaded', () => {
         loadProviders();
         loadShares();
         loadActivePins();
+        loadRoutingMatrix();
     }
     // Check if on Admin Console
     if (document.getElementById('adm-users-body')) {
