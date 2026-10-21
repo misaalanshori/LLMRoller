@@ -1,21 +1,415 @@
-<div class="personal-workspace">
-    <h2>Personal Workspace</h2>
-    <div id="routing-matrix">
-        <table>
-            <thead>
-                <tr>
-                    <th>Model</th>
-                    <th>Routing</th>
-                    <th>Global Pool</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>claude-sonnet-4.6</td>
-                    <td>personal_first</td>
-                    <td>Global pool</td>
-                </tr>
-            </tbody>
-        </table>
+<div class="workspace-layout">
+    <div class="workspace-header">
+        <div>
+            <h2>Personal Workspace</h2>
+            <p class="subtitle">Manage your coding agent client keys, personal providers, and sharing grants.</p>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-primary" onclick="openModal('modal-new-key')">+ New Client Key</button>
+            <button class="btn btn-secondary" onclick="openModal('modal-new-provider')">+ Add Provider</button>
+        </div>
+    </div>
+
+    <!-- Tab Navigation -->
+    <div class="tabs-nav">
+        <button class="tab-btn active" onclick="switchTab('tab-overview', this)">Overview</button>
+        <button class="tab-btn" onclick="switchTab('tab-client-keys', this)">Client Keys</button>
+        <button class="tab-btn" onclick="switchTab('tab-providers', this)">Providers & Keys</button>
+        <button class="tab-btn" onclick="switchTab('tab-sharing', this)">Sharing</button>
+        <button class="tab-btn" onclick="switchTab('tab-matrix', this)">Routing Matrix</button>
+        <button class="tab-btn" onclick="switchTab('tab-sessions', this)">Active Sessions</button>
+    </div>
+
+    <!-- Tab: Overview -->
+    <div id="tab-overview" class="tab-pane active">
+        <div class="stats-grid">
+            <div class="card stat-card">
+                <div class="stat-label">Active Client Keys</div>
+                <div class="stat-val" id="stat-keys-count">-</div>
+                <div class="stat-desc">Issued agent tokens</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Personal Providers</div>
+                <div class="stat-val" id="stat-providers-count">-</div>
+                <div class="stat-desc">Configured endpoints</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Active Pinned Sessions</div>
+                <div class="stat-val" id="stat-sessions-count">-</div>
+                <div class="stat-desc">Sticky agent turns</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Default Routing</div>
+                <div class="stat-val text-primary" style="font-size: 1.1rem; padding-top: 0.5rem;">SWRR</div>
+                <div class="stat-desc">Smooth Weighted Round Robin</div>
+            </div>
+        </div>
+
+        <div class="card connect-card">
+            <h3>⚡ Quick Connect Coding Assistants</h3>
+            <p class="card-desc">Point your coding agent directly to LLMRoller's data-plane listener:</p>
+            <div class="code-block">
+                <div class="code-header">
+                    <span>Claude Code Shell Configuration</span>
+                    <button class="btn btn-xs btn-ghost" onclick="copySnippet('snippet-claude')">Copy</button>
+                </div>
+                <pre id="snippet-claude">export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
+export ANTHROPIC_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+            </div>
+            <div class="code-block">
+                <div class="code-header">
+                    <span>OpenAI Compatible SDK / Codex</span>
+                    <button class="btn btn-xs btn-ghost" onclick="copySnippet('snippet-openai')">Copy</button>
+                </div>
+                <pre id="snippet-openai">export OPENAI_BASE_URL="http://127.0.0.1:8082/v1"
+export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Client Keys -->
+    <div id="tab-client-keys" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Issued Client Keys</h3>
+                    <p class="card-desc">Keys authenticating coding agents with rate limits, monthly caps, and CIDR guards.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-key')">+ Generate Key</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Prefix</th>
+                            <th>Label</th>
+                            <th>Routing Scope</th>
+                            <th>RPM Limit</th>
+                            <th>Monthly Budget</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="client-keys-body">
+                        <tr><td colspan="7" class="text-center text-muted">Loading client keys...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Providers & Keys -->
+    <div id="tab-providers" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Personal Providers & Upstream Keys</h3>
+                    <p class="card-desc">Upstream API providers, endpoints, and sealed API keys.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-provider')">+ Add Provider</button>
+            </div>
+            <div id="providers-list" class="providers-stack">
+                <p class="text-muted">Loading personal providers...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Sharing -->
+    <div id="tab-sharing" class="tab-pane">
+        <div class="grid-2col">
+            <div class="card">
+                <div class="card-header-flex">
+                    <div>
+                        <h3>Outgoing Share Grants</h3>
+                        <p class="card-desc">Shares of your personal providers or keys granted to other users.</p>
+                    </div>
+                    <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-share')">+ Grant Share</button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Target User</th>
+                                <th>Resource</th>
+                                <th>Monthly Cap</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="outgoing-shares-body">
+                            <tr><td colspan="5" class="text-center text-muted">Loading outgoing shares...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Shared With Me</h3>
+                <p class="card-desc">Personal keys shared by other users with explicit provider routing disclosure.</p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Provider</th>
+                                <th>Owner</th>
+                                <th>Allowed Models</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="incoming-shares-body">
+                            <tr><td colspan="5" class="text-center text-muted">Loading incoming shares...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Routing Matrix -->
+    <div id="tab-matrix" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Routing Matrix</h3>
+                    <p class="card-desc">Visual projection of models across personal, shared, and global pools.</p>
+                </div>
+                <span class="badge badge-info">Strategy: smooth_weighted_rr</span>
+            </div>
+            <div id="routing-matrix" class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Model</th>
+                            <th>Routing</th>
+                            <th>Own Keys</th>
+                            <th>Shared Keys</th>
+                            <th>Global Pool</th>
+                        </tr>
+                    </thead>
+                    <tbody id="matrix-body">
+                        <tr>
+                            <td><strong>claude-sonnet-4.6</strong></td>
+                            <td><span class="badge badge-success">personal_first</span></td>
+                            <td>1 Key (Priority 100)</td>
+                            <td>—</td>
+                            <td>Global pool</td>
+                        </tr>
+                        <tr>
+                            <td><strong>gpt-4o</strong></td>
+                            <td><span class="badge badge-success">personal_first</span></td>
+                            <td>—</td>
+                            <td>—</td>
+                            <td>Global pool</td>
+                        </tr>
+                        <tr>
+                            <td><strong>deepseek-v4.1-flash</strong></td>
+                            <td><span class="badge badge-info">blended</span></td>
+                            <td>1 Key (Priority 150)</td>
+                            <td>1 Key ($5.00 Cap)</td>
+                            <td>Global pool</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Active Sessions -->
+    <div id="tab-sessions" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Active Pinned Sessions</h3>
+                    <p class="card-desc">Sessions currently held in PinStore ensuring multi-turn cache stickiness.</p>
+                </div>
+                <button class="btn btn-sm btn-ghost" onclick="loadActivePins()">Refresh</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Session Hash</th>
+                            <th>Client Key</th>
+                            <th>Model</th>
+                            <th>Pinned Key</th>
+                            <th>Tier</th>
+                            <th>Last Used</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="active-pins-body">
+                        <tr><td colspan="7" class="text-center text-muted">Loading active pinned sessions...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: New Client Key -->
+<div id="modal-new-key" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Generate Client Key</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-key')">&times;</button>
+        </div>
+        <form id="form-new-key" onsubmit="handleCreateClientKey(event)">
+            <div class="form-group">
+                <label for="key-label">Key Label / Name</label>
+                <input id="key-label" type="text" required placeholder="e.g. Claude Code Laptop">
+            </div>
+            <div class="form-group">
+                <label for="key-scope">Routing Scope</label>
+                <select id="key-scope">
+                    <option value="personal_first" selected>personal_first (Own keys first, fallback to shared/global)</option>
+                    <option value="blended">blended (Even weighted distribution)</option>
+                    <option value="personal_only">personal_only (Own and accepted shared keys only)</option>
+                    <option value="own_only">own_only (Strictly user's own keys)</option>
+                    <option value="global_only">global_only (Strictly global pool keys)</option>
+                </select>
+            </div>
+            <div class="grid-2col">
+                <div class="form-group">
+                    <label for="key-rpm">Rate Limit (RPM)</label>
+                    <input id="key-rpm" type="number" placeholder="Default: 60" min="1" max="10000">
+                </div>
+                <div class="form-group">
+                    <label for="key-budget">Monthly Budget ($)</label>
+                    <input id="key-budget" type="number" step="0.01" placeholder="e.g. 50.00">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-key')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Generate Token</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: Revealed Token -->
+<div id="modal-token-reveal" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Client Key Generated</h3>
+            <button class="modal-close" onclick="closeModal('modal-token-reveal')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p class="alert alert-warning">Make sure to copy your API key now. You will not be able to see it again!</p>
+            <div class="token-box">
+                <code id="revealed-token-text">llr_live_...</code>
+                <button class="btn btn-sm btn-primary" onclick="copySnippet('revealed-token-text')">Copy</button>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-primary" onclick="closeModal('modal-token-reveal')">Done</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: New Provider -->
+<div id="modal-new-provider" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Add Personal Provider</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-provider')">&times;</button>
+        </div>
+        <form id="form-new-provider" onsubmit="handleCreateProvider(event)">
+            <div class="form-group">
+                <label for="prov-name">Provider Name</label>
+                <input id="prov-name" type="text" required placeholder="e.g. My OpenRouter Account">
+            </div>
+            <div class="form-group">
+                <label for="prov-kind">Provider Kind</label>
+                <select id="prov-kind" onchange="onProviderKindChange(this.value)">
+                    <option value="openrouter" selected>OpenRouter (https://openrouter.ai/api/v1)</option>
+                    <option value="opencode_go">OpenCode Go (https://opencode.ai/zen/go/v1)</option>
+                    <option value="command_code">Command Code</option>
+                    <option value="custom">Custom Upstream URL</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="prov-url">Base URL</label>
+                <input id="prov-url" type="url" required value="https://openrouter.ai/api/v1">
+            </div>
+            <div class="form-group checkbox-group">
+                <input id="prov-private-net" type="checkbox">
+                <label for="prov-private-net">Allow Private Network (Bypass SSRF filter for home lab / local Ollama)</label>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-provider')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Add Provider</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: New Upstream Key -->
+<div id="modal-new-upstream-key" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Add Upstream Key</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-upstream-key')">&times;</button>
+        </div>
+        <form id="form-new-upstream-key" onsubmit="handleCreateUpstreamKey(event)">
+            <input type="hidden" id="target-provider-id">
+            <div class="form-group">
+                <label for="uk-label">Key Label</label>
+                <input id="uk-label" type="text" required placeholder="e.g. Primary Production Key">
+            </div>
+            <div class="form-group">
+                <label for="uk-secret">Raw Secret Key</label>
+                <input id="uk-secret" type="password" required placeholder="sk-...">
+                <div class="help">Sealed with XChaCha20-Poly1305. Never exposed in plain text again.</div>
+            </div>
+            <div class="grid-2col">
+                <div class="form-group">
+                    <label for="uk-priority">Priority (1-1000)</label>
+                    <input id="uk-priority" type="number" value="100" min="1" max="1000">
+                </div>
+                <div class="form-group">
+                    <label for="uk-tier">Strict Tier (1-10)</label>
+                    <input id="uk-tier" type="number" value="1" min="1" max="10">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-upstream-key')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Key</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: New Share -->
+<div id="modal-new-share" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Grant Provider Share</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-share')">&times;</button>
+        </div>
+        <form id="form-new-share" onsubmit="handleCreateShare(event)">
+            <div class="form-group">
+                <label for="share-grantee">Grantee User ID</label>
+                <input id="share-grantee" type="text" required placeholder="Paste grantee's UserId (ULID)">
+            </div>
+            <div class="form-group">
+                <label for="share-provider-select">Select Personal Provider</label>
+                <select id="share-provider-select" required></select>
+            </div>
+            <div class="grid-2col">
+                <div class="form-group">
+                    <label for="share-cap">Monthly Spend Cap ($)</label>
+                    <input id="share-cap" type="number" step="0.01" placeholder="e.g. 10.00">
+                </div>
+                <div class="form-group">
+                    <label for="share-models">Allowed Models (Optional)</label>
+                    <input id="share-models" type="text" placeholder="e.g. deepseek-v4.1-flash">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-share')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Grant Share</button>
+            </div>
+        </form>
     </div>
 </div>

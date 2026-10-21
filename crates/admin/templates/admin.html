@@ -1,7 +1,268 @@
-<div class="admin-console">
-    <h2>Admin Console</h2>
-    <div id="disk-meter" class="disk-meter">
-        <p>Projected Disk Usage: 50.0 MB</p>
+<div class="workspace-layout">
+    <div class="workspace-header">
+        <div>
+            <h2>Admin Console</h2>
+            <p class="subtitle">Global infrastructure governance, tenant accounts, model catalog, and settings.</p>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-primary" onclick="openModal('modal-new-user')">+ New User Account</button>
+            <button class="btn btn-secondary" onclick="openModal('modal-new-global-prov')">+ Add Global Provider</button>
+        </div>
     </div>
-    <div id="uplot-chart" class="uplot-container"></div>
+
+    <!-- Tab Navigation -->
+    <div class="tabs-nav">
+        <button class="tab-btn active" onclick="switchTab('tab-adm-overview', this)">Overview</button>
+        <button class="tab-btn" onclick="switchTab('tab-adm-users', this)">User Accounts</button>
+        <button class="tab-btn" onclick="switchTab('tab-adm-providers', this)">Global Providers</button>
+        <button class="tab-btn" onclick="switchTab('tab-adm-catalog', this)">Model Catalog</button>
+        <button class="tab-btn" onclick="switchTab('tab-adm-settings', this)">Runtime Settings</button>
+        <button class="tab-btn" onclick="switchTab('tab-adm-audit', this)">Audit Log</button>
+    </div>
+
+    <!-- Tab: Overview -->
+    <div id="tab-adm-overview" class="tab-pane active">
+        <div class="stats-grid">
+            <div class="card stat-card">
+                <div class="stat-label">Projected Disk Usage</div>
+                <div id="disk-meter" class="disk-meter">
+                    <p class="stat-val" style="font-size: 1.5rem;">Projected Disk Usage: 50.0 MB</p>
+                </div>
+                <div class="stat-desc">A6 disk telemetry meter</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Total Users</div>
+                <div class="stat-val" id="stat-adm-users-count">-</div>
+                <div class="stat-desc">Standard & admin accounts</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Global Providers</div>
+                <div class="stat-val" id="stat-adm-prov-count">-</div>
+                <div class="stat-desc">Shared upstream routes</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">System Health</div>
+                <div class="stat-val text-success">Healthy</div>
+                <div class="stat-desc">WAL Checkpoint Normal</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Cluster Spend & Throughput</h3>
+            <p class="card-desc">Real-time aggregate consumption across all active coding agent pools.</p>
+            <div id="uplot-chart" class="uplot-container" style="min-height: 240px; display: flex; align-items: center; justify-content: center; background: #090d16; border-radius: 8px; border: 1px dashed #334155;">
+                <span class="text-muted">Metrics aggregated from usage_rollups_5min</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: User Accounts -->
+    <div id="tab-adm-users" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>User Accounts & Role Governance</h3>
+                    <p class="card-desc">Manage standard user accounts, global budget caps, and account status.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-user')">+ Add User</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>Role</th>
+                            <th>Global Pool Access</th>
+                            <th>Monthly Budget Cap</th>
+                            <th>Status</th>
+                            <th>Created</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adm-users-body">
+                        <tr><td colspan="7" class="text-center text-muted">Loading user accounts...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Global Providers -->
+    <div id="tab-adm-providers" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Global Upstream Providers</h3>
+                    <p class="card-desc">Providers shared instance-wide to all authorized users via the Global Pool.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-global-prov')">+ Add Global Provider</button>
+            </div>
+            <div id="adm-providers-list" class="providers-stack">
+                <p class="text-muted">Loading global providers...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Model Catalog -->
+    <div id="tab-adm-catalog" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Discovered Models & Catalog Aliases</h3>
+                    <p class="card-desc">Manage model availability, kill switches, and confirmed aliases (MDL-1..7).</p>
+                </div>
+                <button class="btn btn-sm btn-primary" onclick="openModal('modal-new-alias')">+ Add Confirmed Alias</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Canonical Model ID</th>
+                            <th>Origin</th>
+                            <th>Routes</th>
+                            <th>Status</th>
+                            <th>Killswitch</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adm-models-body">
+                        <tr><td colspan="5" class="text-center text-muted">Loading model catalog...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Runtime Settings -->
+    <div id="tab-adm-settings" class="tab-pane">
+        <div class="card">
+            <h3>Closed 14-Key Runtime Settings Registry</h3>
+            <p class="card-desc">Dynamic settings loaded by Reloader on monotonic version increments.</p>
+            <div class="settings-grid" id="adm-settings-container">
+                <p class="text-muted">Loading runtime settings...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Audit Log -->
+    <div id="tab-adm-audit" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Cryptographic Audit Log</h3>
+                    <p class="card-desc">HMAC-SHA256 chained audit sequence recording all mutations.</p>
+                </div>
+                <button class="btn btn-sm btn-ghost" onclick="loadAuditLog()">Refresh Log</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Seq</th>
+                            <th>Timestamp</th>
+                            <th>Actor</th>
+                            <th>Action</th>
+                            <th>Target</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adm-audit-body">
+                        <tr><td colspan="6" class="text-center text-muted">Loading audit log entries...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: New User -->
+<div id="modal-new-user" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Create User Account</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-user')">&times;</button>
+        </div>
+        <form id="form-new-user" onsubmit="handleCreateUser(event)">
+            <div class="form-group">
+                <label for="u-username">Username</label>
+                <input id="u-username" type="text" required placeholder="username">
+            </div>
+            <div class="form-group">
+                <label for="u-password">Password</label>
+                <input id="u-password" type="password" required minlength="12" placeholder="••••••••••••">
+                <div class="help">Must contain at least 12 characters.</div>
+            </div>
+            <div class="form-group">
+                <label for="u-role">Role</label>
+                <select id="u-role">
+                    <option value="user" selected>Standard User</option>
+                    <option value="admin">Administrator</option>
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-user')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create User</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: New Global Provider -->
+<div id="modal-new-global-prov" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Add Global Provider</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-global-prov')">&times;</button>
+        </div>
+        <form id="form-new-global-prov" onsubmit="handleCreateGlobalProvider(event)">
+            <div class="form-group">
+                <label for="gp-name">Provider Name</label>
+                <input id="gp-name" type="text" required placeholder="e.g. Primary Global OpenRouter">
+            </div>
+            <div class="form-group">
+                <label for="gp-kind">Provider Kind</label>
+                <select id="gp-kind">
+                    <option value="openrouter" selected>OpenRouter (https://openrouter.ai/api/v1)</option>
+                    <option value="opencode_go">OpenCode Go</option>
+                    <option value="command_code">Command Code</option>
+                    <option value="custom">Custom URL</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="gp-url">Base URL</label>
+                <input id="gp-url" type="url" required value="https://openrouter.ai/api/v1">
+            </div>
+            <div class="form-group checkbox-group">
+                <input id="gp-private" type="checkbox">
+                <label for="gp-private">Allow Private Network</label>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-global-prov')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Add Global Provider</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: New Alias -->
+<div id="modal-new-alias" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Add Model Alias</h3>
+            <button class="modal-close" onclick="closeModal('modal-new-alias')">&times;</button>
+        </div>
+        <form id="form-new-alias" onsubmit="handleAddAlias(event)">
+            <div class="form-group">
+                <label for="alias-name">Alias Name</label>
+                <input id="alias-name" type="text" required placeholder="e.g. claude-3-7-sonnet">
+            </div>
+            <div class="form-group">
+                <label for="alias-target-pk">Target Model (Select)</label>
+                <select id="alias-target-pk" required></select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modal-new-alias')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Alias</button>
+            </div>
+        </form>
+    </div>
 </div>

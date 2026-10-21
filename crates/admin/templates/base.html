@@ -2,6 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <title>{{ title }} - LLMRoller</title>
     <link rel="stylesheet" href="/static/app.css">
     <link rel="stylesheet" href="/static/uPlot.min.css">
@@ -16,14 +18,30 @@
     </div>
     {% endif %}
 
-    <nav class="navbar">
-        <a href="/app">Workspace</a>
-        {% if is_admin %}
-        <a href="/admin">Admin Console</a>
-        {% endif %}
-    </nav>
+    <header class="app-header">
+        <div class="header-left">
+            <a href="/" class="brand-link">
+                <span class="brand-icon">⚡</span>
+                <span class="brand-name">LLMRoller</span>
+            </a>
+            <nav class="nav-links">
+                <a href="/app" class="nav-link {% if !is_admin %}active{% endif %}">Personal Workspace</a>
+                {% if is_admin %}
+                <a href="/admin" class="nav-link {% if is_admin %}active{% endif %}">Admin Console</a>
+                {% endif %}
+            </nav>
+        </div>
+        <div class="header-right">
+            <span class="status-indicator" title="Service Ready">
+                <span class="status-dot"></span> Ready
+            </span>
+            <form method="POST" action="/api/auth/logout" class="logout-form">
+                <button type="submit" class="btn btn-sm btn-ghost">Sign Out</button>
+            </form>
+        </div>
+    </header>
 
-    <main class="content">
+    <main class="main-container">
         {{ content|safe }}
     </main>
 </body>

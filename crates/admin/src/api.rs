@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
-use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId};
+use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope};
 use llmroller_core::seams::secret_string;
@@ -882,6 +882,571 @@ async fn get_session_preview_internal(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Client Key In-Place Rotation (/api/user/client-keys/{id}/rotate)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct RotateKeyRequest {
+    pub grace_period_secs: Option<u64>,
+}
+
+async fn post_rotate_client_key_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ClientKeyId>,
+    Json(payload): Json<RotateKeyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let grace = payload.grace_period_secs.unwrap_or(86400) as i64;
+    let now_ms = state.auth.clock.now_ms();
+    let res = llmroller_store::client_keys::rotate_client_key(
+        &state.auth.pool,
+        &actor,
+        id,
+        grace,
+        state.auth.entropy.as_ref(),
+        now_ms,
+    )
+    .await
+    .map_err(map_client_key_error)?;
+
+    use llmroller_core::seams::ExposeSecret as _;
+    Ok(Json(serde_json::json!({
+        "client_key": res.client_key,
+        "raw_token": res.raw_token.expose_secret()
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sharing Endpoints (/api/user/shares)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct CreateShareRequest {
+    pub provider_id: ProviderId,
+    pub upstream_key_id: Option<UpstreamKeyId>,
+    pub grantee_user_id: UserId,
+    pub allowed_models: Option<Vec<String>>,
+    pub max_monthly_micro_usd: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcceptShareRequest {
+    pub fingerprint: String,
+}
+
+async fn get_user_shares_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let outgoing_rows = sqlx::query(
+        "SELECT id, provider_id, upstream_key_id, grantee_user_id, allowed_models, max_monthly_micro_usd, accepted_config_fingerprint, admin_approved_at, enabled, created_at, revoked_at FROM provider_shares WHERE owner_user_id = ? ORDER BY created_at DESC"
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut outgoing = Vec::new();
+    for r in outgoing_rows {
+        outgoing.push(serde_json::json!({
+            "id": r.try_get::<String, _>("id").unwrap_or_default(),
+            "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
+            "upstream_key_id": r.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default(),
+            "grantee_user_id": r.try_get::<String, _>("grantee_user_id").unwrap_or_default(),
+            "allowed_models": r.try_get::<Option<String>, _>("allowed_models").unwrap_or_default(),
+            "max_monthly_micro_usd": r.try_get::<Option<i64>, _>("max_monthly_micro_usd").unwrap_or_default(),
+            "accepted_config_fingerprint": r.try_get::<Option<String>, _>("accepted_config_fingerprint").unwrap_or_default(),
+            "enabled": r.try_get::<i64, _>("enabled").unwrap_or_default() == 1,
+            "created_at": r.try_get::<i64, _>("created_at").unwrap_or_default(),
+        }));
+    }
+
+    let incoming_rows = sqlx::query(
+        "SELECT s.id, s.provider_id, s.upstream_key_id, s.owner_user_id, s.allowed_models, s.max_monthly_micro_usd, s.accepted_config_fingerprint, s.admin_approved_at, s.enabled, p.name as provider_name, p.kind as provider_kind, p.share_config_fingerprint as current_fingerprint FROM provider_shares s JOIN providers p ON s.provider_id = p.id WHERE s.grantee_user_id = ? ORDER BY s.created_at DESC"
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut incoming = Vec::new();
+    for r in incoming_rows {
+        incoming.push(serde_json::json!({
+            "id": r.try_get::<String, _>("id").unwrap_or_default(),
+            "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
+            "provider_name": r.try_get::<String, _>("provider_name").unwrap_or_default(),
+            "provider_kind": r.try_get::<String, _>("provider_kind").unwrap_or_default(),
+            "upstream_key_id": r.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default(),
+            "owner_user_id": r.try_get::<String, _>("owner_user_id").unwrap_or_default(),
+            "allowed_models": r.try_get::<Option<String>, _>("allowed_models").unwrap_or_default(),
+            "max_monthly_micro_usd": r.try_get::<Option<i64>, _>("max_monthly_micro_usd").unwrap_or_default(),
+            "accepted_config_fingerprint": r.try_get::<Option<String>, _>("accepted_config_fingerprint").unwrap_or_default(),
+            "current_fingerprint": r.try_get::<String, _>("current_fingerprint").unwrap_or_default(),
+            "enabled": r.try_get::<i64, _>("enabled").unwrap_or_default() == 1,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "outgoing": outgoing,
+        "incoming": incoming,
+    })))
+}
+
+async fn post_user_share_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateShareRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let share = llmroller_store::shares::create_provider_share_tx(
+        &mut tx,
+        &user_id,
+        llmroller_store::shares::NewShare {
+            provider_id: payload.provider_id,
+            upstream_key_id: payload.upstream_key_id,
+            grantee_user_id: payload.grantee_user_id,
+            allowed_models: payload.allowed_models,
+            max_monthly_micro_usd: payload.max_monthly_micro_usd,
+        },
+        now_ms,
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "share_id": share.share_id.to_string() })),
+    ))
+}
+
+async fn post_accept_share_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ShareId>,
+    Json(payload): Json<AcceptShareRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    llmroller_store::shares::accept_provider_share_tx(
+        &mut tx,
+        &id,
+        &user_id,
+        &payload.fingerprint,
+        now_ms,
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::OK)
+}
+
+async fn delete_user_share_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ShareId>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    llmroller_store::shares::revoke_provider_share_tx(&mut tx, &id, &user_id, now_ms)
+        .await
+        .map_err(|e| map_price_error(StatusCode::NOT_FOUND, format!("{e:?}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// User Management Endpoints (/admin/api/users)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub role: Option<String>,
+    pub must_change_password: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchUserRequest {
+    pub role: Option<String>,
+    pub disabled: Option<bool>,
+    pub can_use_global_providers: Option<bool>,
+    pub global_budget_micro_usd_month: Option<Option<i64>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteUserParams {
+    pub confirm: Option<String>,
+}
+
+async fn get_admin_users_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let users = llmroller_store::users::list_users(&state.auth.pool, &actor)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let json_list: Vec<serde_json::Value> = users
+        .into_iter()
+        .map(|u| {
+            serde_json::json!({
+                "id": u.id.to_string(),
+                "username": u.username,
+                "role": u.role,
+                "can_use_global_providers": u.can_use_global_providers,
+                "global_budget_micro_usd_month": u.global_budget_micro_usd_month,
+                "disabled": u.disabled,
+                "created_at": u.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json_list))
+}
+
+async fn post_admin_user_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let role = match payload.role.as_deref().unwrap_or("user") {
+        "admin" => llmroller_core::rbac::Role::Admin,
+        _ => llmroller_core::rbac::Role::User,
+    };
+
+    let user = llmroller_store::users::create_user(
+        &state.auth.pool,
+        &actor,
+        llmroller_store::users::NewUser {
+            username: &payload.username,
+            password: &payload.password,
+            role,
+            must_change_password: payload.must_change_password.unwrap_or(false),
+        },
+        state.auth.entropy.as_ref(),
+        now_ms,
+    )
+    .await
+    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": user.id.to_string(),
+            "username": user.username,
+            "role": user.role,
+        })),
+    ))
+}
+
+async fn patch_admin_user_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UserId>,
+    Json(payload): Json<PatchUserRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+
+    if let Some(ref role_str) = payload.role {
+        let role = match role_str.as_str() {
+            "admin" => llmroller_core::rbac::Role::Admin,
+            _ => llmroller_core::rbac::Role::User,
+        };
+        llmroller_store::users::set_role(&state.auth.pool, &actor, id, role, now_ms)
+            .await
+            .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    }
+
+    if let Some(disabled) = payload.disabled {
+        llmroller_store::users::set_disabled(&state.auth.pool, &actor, id, disabled, now_ms)
+            .await
+            .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    }
+
+    if let Some(can_use) = payload.can_use_global_providers {
+        let _ = sqlx::query("UPDATE users SET can_use_global_providers = ? WHERE id = ?")
+            .bind(if can_use { 1i64 } else { 0i64 })
+            .bind(id.to_string())
+            .execute(&state.auth.pool)
+            .await;
+    }
+
+    if let Some(budget_opt) = payload.global_budget_micro_usd_month {
+        let _ = sqlx::query("UPDATE users SET global_budget_micro_usd_month = ? WHERE id = ?")
+            .bind(budget_opt)
+            .bind(id.to_string())
+            .execute(&state.auth.pool)
+            .await;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn delete_admin_user_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UserId>,
+    axum::extract::Query(params): axum::extract::Query<DeleteUserParams>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let confirm = params.confirm.unwrap_or_default();
+
+    llmroller_store::users::delete_user(&state.auth.pool, &actor, id, &confirm, now_ms)
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Model Catalog & Aliases (/admin/api/models)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+pub struct AddAliasRequest {
+    pub alias: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchModelRequest {
+    pub exposed: Option<i64>,
+}
+
+async fn get_admin_models_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let model_rows = sqlx::query(
+        "SELECT m.model_pk, m.canonical_id, m.origin, m.exposed, m.merge_state,
+                (SELECT COUNT(*) FROM model_routes r WHERE r.model_pk = m.model_pk) as route_count
+         FROM models m ORDER BY m.canonical_id ASC",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut models = Vec::new();
+    for r in model_rows {
+        models.push(serde_json::json!({
+            "model_pk": r.try_get::<String, _>("model_pk").unwrap_or_default(),
+            "canonical_id": r.try_get::<String, _>("canonical_id").unwrap_or_default(),
+            "origin": r.try_get::<String, _>("origin").unwrap_or_default(),
+            "exposed": r.try_get::<Option<i64>, _>("exposed").unwrap_or_default(),
+            "merge_state": r.try_get::<String, _>("merge_state").unwrap_or_default(),
+            "route_count": r.try_get::<i64, _>("route_count").unwrap_or(0),
+        }));
+    }
+
+    let alias_rows =
+        sqlx::query("SELECT alias, model_pk, confirmed FROM model_aliases ORDER BY alias ASC")
+            .fetch_all(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut aliases = Vec::new();
+    for r in alias_rows {
+        aliases.push(serde_json::json!({
+            "alias": r.try_get::<String, _>("alias").unwrap_or_default(),
+            "model_pk": r.try_get::<String, _>("model_pk").unwrap_or_default(),
+            "confirmed": r.try_get::<i64, _>("confirmed").unwrap_or(0) == 1,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "models": models,
+        "aliases": aliases,
+    })))
+}
+
+async fn post_admin_model_alias_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ModelPk>,
+    Json(payload): Json<AddAliasRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    llmroller_store::models::add_model_alias_tx(&mut tx, &payload.alias, &id)
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn patch_admin_model_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<llmroller_core::ids::ModelPk>,
+    Json(payload): Json<PatchModelRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let _ = sqlx::query("UPDATE models SET exposed = ? WHERE model_pk = ?")
+        .bind(payload.exposed)
+        .bind(id.to_string())
+        .execute(&state.auth.pool)
+        .await;
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// Audit Log Viewer (/admin/api/audit-log)
+// ---------------------------------------------------------------------------
+async fn get_admin_audit_log_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT seq, ts, actor_user_id, action, target_type, target_id, payload_json FROM audit_log ORDER BY seq DESC LIMIT 100"
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut list = Vec::new();
+    for r in rows {
+        list.push(serde_json::json!({
+            "seq": r.try_get::<i64, _>("seq").unwrap_or_default(),
+            "ts": r.try_get::<i64, _>("ts").unwrap_or_default(),
+            "actor_user_id": r.try_get::<Option<String>, _>("actor_user_id").unwrap_or_default(),
+            "action": r.try_get::<String, _>("action").unwrap_or_default(),
+            "target_type": r.try_get::<String, _>("target_type").unwrap_or_default(),
+            "target_id": r.try_get::<Option<String>, _>("target_id").unwrap_or_default(),
+            "payload_json": r.try_get::<String, _>("payload_json").unwrap_or_default(),
+        }));
+    }
+
+    Ok(Json(list))
+}
+
+// ---------------------------------------------------------------------------
+// Active Pins & Sessions (/api/user/pins, /admin/api/pins)
+// ---------------------------------------------------------------------------
+async fn get_active_pins_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let query_str = if actor.is_admin() {
+        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label
+         FROM pins p
+         LEFT JOIN models m ON p.model_pk = m.model_pk
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         ORDER BY p.last_used_at DESC LIMIT 50"
+    } else {
+        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label
+         FROM pins p
+         JOIN client_keys ck ON p.client_key_id = ck.id
+         LEFT JOIN models m ON p.model_pk = m.model_pk
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         WHERE ck.owner_user_id = ?
+         ORDER BY p.last_used_at DESC LIMIT 50"
+    };
+
+    let rows = if actor.is_admin() {
+        sqlx::query(query_str).fetch_all(&state.auth.pool).await
+    } else {
+        let uid = actor.user_id().map(|u| u.to_string()).unwrap_or_default();
+        sqlx::query(query_str)
+            .bind(uid)
+            .fetch_all(&state.auth.pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut list = Vec::new();
+    for r in rows {
+        list.push(serde_json::json!({
+            "session_hash": r.try_get::<String, _>("session_hash").unwrap_or_default(),
+            "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
+            "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+            "key_label": r.try_get::<Option<String>, _>("key_label").unwrap_or_default(),
+            "pool_tier": r.try_get::<i64, _>("pool_tier").unwrap_or(1),
+            "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
+            "last_used_at": r.try_get::<i64, _>("last_used_at").unwrap_or(0),
+        }));
+    }
+
+    Ok(Json(list))
+}
+
+async fn delete_pin_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_actor(&state, &headers, true).await?;
+    let _ = sqlx::query("DELETE FROM pins WHERE session_hash = ?")
+        .bind(&hash)
+        .execute(&state.auth.pool)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // Web UI screens
@@ -916,6 +1481,20 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/client-keys/{id}",
             patch(patch_user_client_key_handler).delete(delete_user_client_key_handler),
         )
+        .route(
+            "/api/user/client-keys/{id}/rotate",
+            post(post_rotate_client_key_handler),
+        )
+        .route(
+            "/api/user/shares",
+            get(get_user_shares_handler).post(post_user_share_handler),
+        )
+        .route(
+            "/api/user/shares/{id}/accept",
+            post(post_accept_share_handler),
+        )
+        .route("/api/user/shares/{id}", delete(delete_user_share_handler))
+        .route("/api/user/pins", get(get_active_pins_handler))
         .route(
             "/api/user/client-keys/{id}/sessions",
             get(get_user_client_key_sessions_handler),
@@ -965,6 +1544,23 @@ pub fn router(state: ApiAppState) -> Router {
             "/admin/api/settings/traceability",
             put(put_admin_traceability_handler),
         )
+        .route(
+            "/admin/api/users",
+            get(get_admin_users_handler).post(post_admin_user_handler),
+        )
+        .route(
+            "/admin/api/users/{id}",
+            patch(patch_admin_user_handler).delete(delete_admin_user_handler),
+        )
+        .route("/admin/api/models", get(get_admin_models_handler))
+        .route("/admin/api/models/{id}", patch(patch_admin_model_handler))
+        .route(
+            "/admin/api/models/{id}/aliases",
+            post(post_admin_model_alias_handler),
+        )
+        .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
+        .route("/admin/api/pins", get(get_active_pins_handler))
+        .route("/admin/api/sessions/{hash}/pin", delete(delete_pin_handler))
         .route("/admin/api/prices", put(put_admin_price_handler))
         .route(
             "/admin/api/prices/sync",
