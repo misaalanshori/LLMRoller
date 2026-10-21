@@ -407,7 +407,10 @@ async function loadActivePins() {
                 <td>${p.key_label || p.upstream_key_id.slice(0, 8)}</td>
                 <td><span class="badge badge-info">Tier ${p.pool_tier}</span></td>
                 <td>${new Date(p.last_used_at).toLocaleTimeString()}</td>
-                <td><button class="btn btn-xs btn-danger" onclick="deletePin('${p.session_hash}')">Unpin</button></td>
+                <td>
+                    <button class="btn btn-xs btn-primary" onclick="openChatPreview('${p.session_hash}')">Preview Chat</button>
+                    <button class="btn btn-xs btn-danger" onclick="deletePin('${p.session_hash}')">Unpin</button>
+                </td>
             </tr>
         `).join('');
     } catch (e) {
@@ -424,6 +427,71 @@ async function deletePin(hash) {
         loadActivePins();
     } catch (e) {
         alert('Error: ' + e);
+    }
+}
+
+async function openChatPreview(sessionHash) {
+    const modal = document.getElementById('modal-chat-preview');
+    const container = document.getElementById('chat-preview-turns');
+    const hashSpan = document.getElementById('chat-preview-hash');
+    if (!modal || !container) return;
+
+    if (hashSpan) hashSpan.textContent = sessionHash.slice(0, 16) + '...';
+    container.innerHTML = '<p class="text-muted">Reconstructing multi-turn session timeline...</p>';
+    openModal('modal-chat-preview');
+
+    try {
+        const res = await fetch(`/api/user/sessions/${sessionHash}/chat`);
+        if (!res.ok) {
+            container.innerHTML = '<p class="text-muted">No stored trace turns found for this session (traceability may be disabled or retention expired).</p>';
+            return;
+        }
+        const data = await res.json();
+        if (!data.timeline || data.timeline.length === 0) {
+            container.innerHTML = '<p class="text-muted">Zero recorded turns for this session.</p>';
+            return;
+        }
+
+        container.innerHTML = data.timeline.map(turn => {
+            const inputHtml = (turn.new_input_messages || []).map(m => `
+                <div class="chat-msg user-msg">
+                    <div class="chat-role">User</div>
+                    <pre class="chat-content">${m.content ? m.content : JSON.stringify(m)}</pre>
+                </div>
+            `).join('');
+
+            const reasoningHtml = turn.assistant_reasoning ? `
+                <details class="chat-reasoning">
+                    <summary>Thinking / Reasoning</summary>
+                    <pre>${turn.assistant_reasoning}</pre>
+                </details>
+            ` : '';
+
+            const toolCallsHtml = (turn.assistant_tool_calls || []).map(tc => `
+                <div class="chat-tool-call">
+                    <span class="badge badge-warning">Tool Call: ${tc.name || tc.id}</span>
+                    <pre>${JSON.stringify(tc.arguments || tc.parameters || tc, null, 2)}</pre>
+                </div>
+            `).join('');
+
+            return `
+                <div class="chat-turn-card">
+                    <div class="chat-turn-header">
+                        <span>Turn #${turn.ordinal} (${turn.canonical_model})</span>
+                        <span class="text-muted">${new Date(turn.ts).toLocaleTimeString()}</span>
+                    </div>
+                    ${inputHtml}
+                    ${reasoningHtml}
+                    ${toolCallsHtml}
+                    <div class="chat-msg assistant-msg">
+                        <div class="chat-role">Assistant</div>
+                        <div class="chat-assistant-body">${turn.assistant_text || '<em>(no text output)</em>'}</div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    } catch (e) {
+        container.innerHTML = `<p class="text-danger">Failed to load chat preview: ${e}</p>`;
     }
 }
 

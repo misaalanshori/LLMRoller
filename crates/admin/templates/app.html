@@ -413,3 +413,21 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
         </form>
     </div>
 </div>
+
+<!-- Modal: Session Chat Preview -->
+<div id="modal-chat-preview" class="modal-backdrop">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-header">
+            <h3>Session Chat Preview (<span id="chat-preview-hash"></span>)</h3>
+            <button class="modal-close" onclick="closeModal('modal-chat-preview')">&times;</button>
+        </div>
+        <div class="modal-body chat-preview-body">
+            <div id="chat-preview-turns" class="chat-turns-stack">
+                <p class="text-muted">Loading preview...</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-ghost" onclick="closeModal('modal-chat-preview')">Close</button>
+        </div>
+    </div>
+</div>

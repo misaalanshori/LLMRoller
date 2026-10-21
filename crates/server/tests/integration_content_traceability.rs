@@ -457,3 +457,271 @@ async fn test_rbac_isolated_sessions_and_preview() {
     let r2 = vec!["b1".to_string(), "b2".to_string(), "b3".to_string()];
     assert_eq!(compute_lcp(&r1, &r2), 2);
 }
+
+#[doc = "Spec: TRC-5, TRC-6, TRC-7, TRC-8, SEC-19"]
+#[tokio::test]
+async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
+    use axum::http::header;
+    use llmroller_core::ids::RequestId;
+    use llmroller_core::seams::Clock as _;
+    use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
+    use llmroller_store::traces::{
+        SealJob, StoredTurnTraceV2, insert_sealed_trace_tx, seal_turn_sync,
+    };
+
+    let (dir, pool, master_key, admin_id) = setup_traceability_test_db().await;
+
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+    let entropy = OsEntropy;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    let charlie = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "charlie_trc",
+            password: "supersecretcharliepass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("charlie");
+
+    // Authenticate Charlie session
+    let raw_charlie = "charlie_trace_session_token_123456789";
+    let id_hash = llmroller_store::crypto::sha256_hex(raw_charlie.as_bytes());
+    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_charlie);
+    let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: charlie.id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("charlie-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert charlie session");
+    let charlie_cookie = format!("llmroller_session={raw_charlie}");
+
+    // Authenticate Admin session
+    let raw_admin = "admin_trace_session_token_123456789";
+    let admin_id_hash = llmroller_store::crypto::sha256_hex(raw_admin.as_bytes());
+    let admin_csrf = llmroller_admin::auth::derive_session_csrf(raw_admin);
+    let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &admin_id_hash,
+            user_id: admin_id,
+            csrf_hash: &admin_csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert admin session");
+    let admin_cookie = format!("llmroller_session={raw_admin}");
+
+    // Create client key and sealed turn for Charlie
+    let charlie_actor = ActorScope::user(charlie.id, Role::User);
+    let mut tx = pool.begin().await.expect("begin");
+    let charlie_key = create_client_key_tx(
+        &mut tx,
+        &charlie_actor,
+        charlie.id,
+        NewClientKey {
+            label: "Charlie Key".to_string(),
+            allowed_models: None,
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("create charlie key");
+
+    let req_id = RequestId::generate();
+    let usage_ev_id = "ev-charlie-1";
+    sqlx::query(
+        r#"INSERT INTO usage_events (
+               id, ts, request_id, client_key_id, owner_user_id,
+               endpoint, status, stream, incomplete, termination,
+               trace_dropped, cost_micro_usd, cost_source
+           )
+           VALUES (?, ?, ?, ?, ?, 'chat', 200, 0, 0, 'completed', 0, 1500, 'price_book')"#,
+    )
+    .bind(usage_ev_id)
+    .bind(now_ms)
+    .bind(req_id.to_string())
+    .bind(charlie_key.client_key.id.to_string())
+    .bind(charlie.id.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert usage event");
+
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("instance_id");
+    let instance_id: [u8; 16] = instance_id_vec.try_into().expect("16 bytes");
+    let sealer = Arc::new(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        master_key,
+        instance_id,
+        Arc::new(entropy),
+    ));
+
+    let charlie_job = SealJob {
+        master_key_id: "key-0".to_string(),
+        usage_event_id: usage_ev_id.to_string(),
+        request_id: req_id,
+        ts: now_ms,
+        owner_user_id: charlie.id,
+        client_key_id: charlie_key.client_key.id,
+        session_hash: "charlie-session-hash-1".to_string(),
+        thread_id: "main".to_string(),
+        canonical_id: "claude-sonnet-4.6".to_string(),
+        protocol: "chat".to_string(),
+        truncated_content: false,
+        turn_trace: StoredTurnTraceV2 {
+            v: 2,
+            request_skeleton: serde_json::json!({
+                "system": "You are a helpful assistant.",
+                "tools": []
+            }),
+            block_refs: vec!["blk_charlie_prompt".to_string()],
+            response: serde_json::json!({
+                "assistant_text": "Hello Charlie! How can I help you?",
+                "assistant_reasoning": "User greeted warmly."
+            }),
+            response_raw: None,
+            truncation: None,
+        },
+        blocks: vec![(
+            "blk_charlie_prompt".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "role": "user",
+                "content": "Hello! Can you help me write Rust?"
+            }))
+            .expect("block bytes"),
+        )],
+        expires_at: now_ms + 86400 * 14 * 1000,
+    };
+    let sealed_charlie = seal_turn_sync(&charlie_job, &sealer).expect("seal charlie");
+    insert_sealed_trace_tx(&mut tx, &sealed_charlie, "key-0")
+        .await
+        .expect("insert trace");
+    tx.commit().await.expect("commit charlie");
+
+    // 1. Charlie queries his own reconstructed chat preview timeline (TRC-5)
+    let req_chat = Request::builder()
+        .method("GET")
+        .uri("/api/user/sessions/charlie-session-hash-1/chat")
+        .header(header::COOKIE, &charlie_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let resp_chat = app.clone().oneshot(req_chat).await.expect("resp");
+    assert_eq!(resp_chat.status(), StatusCode::OK);
+    let chat_bytes = resp_chat
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let chat_json: serde_json::Value = serde_json::from_slice(&chat_bytes).expect("parse chat");
+    assert_eq!(chat_json["session_hash"], "charlie-session-hash-1");
+    assert_eq!(chat_json["total_turns"], 1);
+
+    let timeline = chat_json["timeline"].as_array().expect("timeline array");
+    assert_eq!(timeline.len(), 1);
+    assert_eq!(timeline[0]["canonical_model"], "claude-sonnet-4.6");
+    assert_eq!(timeline[0]["assistant_reasoning"], "User greeted warmly.");
+    assert!(
+        timeline[0]["assistant_text"]
+            .as_str()
+            .expect("assistant_text str")
+            .contains("Hello Charlie")
+    );
+
+    let messages = timeline[0]["new_input_messages"]
+        .as_array()
+        .expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .expect("content str")
+            .contains("Hello! Can you help me write Rust?")
+    );
+
+    // 2. Single turn raw JSON drawer: GET /api/user/traces/{request_id}
+    let req_single = Request::builder()
+        .method("GET")
+        .uri(format!("/api/user/traces/{}", req_id))
+        .header(header::COOKIE, &charlie_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let resp_single = app.clone().oneshot(req_single).await.expect("resp");
+    assert_eq!(resp_single.status(), StatusCode::OK);
+    let single_bytes = resp_single
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let single_json: serde_json::Value =
+        serde_json::from_slice(&single_bytes).expect("parse single");
+    assert_eq!(single_json["v"], 2);
+
+    // 3. Admin purges the session trace (TRC-7): DELETE /admin/api/sessions/{session_hash}/trace
+    let req_purge = Request::builder()
+        .method("DELETE")
+        .uri("/admin/api/sessions/charlie-session-hash-1/trace")
+        .header(header::COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .body(Body::empty())
+        .expect("req");
+    let resp_purge = app.clone().oneshot(req_purge).await.expect("resp");
+    assert_eq!(resp_purge.status(), StatusCode::NO_CONTENT);
+
+    // 4. After purge, querying chat preview returns 404 (session trace gone)
+    let req_chat_after = Request::builder()
+        .method("GET")
+        .uri("/api/user/sessions/charlie-session-hash-1/chat")
+        .header(header::COOKIE, &charlie_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let resp_chat_after = app.oneshot(req_chat_after).await.expect("resp");
+    assert_eq!(resp_chat_after.status(), StatusCode::NOT_FOUND);
+}

@@ -860,7 +860,7 @@ async fn get_user_session_preview_handler(
         return Err(map_price_error(StatusCode::NOT_FOUND, "session not found"));
     }
 
-    get_session_preview_internal(&state, &session_hash).await
+    get_session_preview_internal(&state, &session_hash, Some(owner_id.to_string())).await
 }
 
 async fn get_admin_session_preview_handler(
@@ -868,18 +868,462 @@ async fn get_admin_session_preview_handler(
     headers: HeaderMap,
     Path(session_hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let _actor = authenticate_admin(&state, &headers, false).await?;
-    get_session_preview_internal(&state, &session_hash).await
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let admin_id = actor.user_id().map(|u| u.to_string());
+    let now_ms = state.auth.clock.now_ms();
+
+    let recent_audit: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM audit_log WHERE actor_user_id = ? AND action = 'trace.viewed' AND target_id = ? AND ts >= ? LIMIT 1",
+    )
+    .bind(&admin_id)
+    .bind(&session_hash)
+    .bind(now_ms - 30 * 60 * 1000)
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .is_some();
+
+    if !recent_audit {
+        let _ = append_audit_entry_helper(
+            &state,
+            now_ms,
+            admin_id.as_deref(),
+            "trace.viewed",
+            "session",
+            Some(&session_hash),
+        )
+        .await;
+    }
+
+    get_session_preview_internal(&state, &session_hash, None).await
 }
 
 async fn get_session_preview_internal(
-    _state: &ApiAppState,
+    state: &ApiAppState,
     session_hash: &str,
+    owner_user_id: Option<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use llmroller_core::chat_preview::{compute_lcp, sanitize_assistant_text};
+    use llmroller_core::seams::ExposeSecret as _;
+    use llmroller_store::crypto::SecretSealer as _;
+    use llmroller_store::traces::StoredTurnTraceV2;
+    use sqlx::Row as _;
+
+    let query_str = if owner_user_id.is_some() {
+        "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+         FROM trace_records
+         WHERE session_hash = ? AND owner_user_id = ?
+         ORDER BY ts ASC, request_id ASC"
+    } else {
+        "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+         FROM trace_records
+         WHERE session_hash = ?
+         ORDER BY ts ASC, request_id ASC"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(query_str)
+            .bind(session_hash)
+            .bind(uid)
+            .fetch_all(&state.auth.pool)
+            .await
+    } else {
+        sqlx::query(query_str)
+            .bind(session_hash)
+            .fetch_all(&state.auth.pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "session trace not found",
+        ));
+    }
+
+    let sealer = load_sealer(state).await?;
+
+    let mut timeline = Vec::new();
+    let mut prev_block_refs: Vec<String> = Vec::new();
+    let mut prev_thread_id = String::new();
+    let mut first_owner_user_id = String::new();
+    let mut first_client_key_id = String::new();
+
+    for (idx, r) in rows.iter().enumerate() {
+        let req_id: String = r.try_get("request_id").unwrap_or_default();
+        let ts: i64 = r.try_get("ts").unwrap_or(0);
+        let row_owner: String = r.try_get("owner_user_id").unwrap_or_default();
+        let client_key_id: String = r.try_get("client_key_id").unwrap_or_default();
+        let thread_id: String = r
+            .try_get("thread_id")
+            .unwrap_or_else(|_| "main".to_string());
+        let canonical_model: String = r.try_get("canonical_id").unwrap_or_default();
+        let protocol: String = r.try_get("protocol").unwrap_or_default();
+        let truncated_content: bool = r.try_get::<i64, _>("truncated_content").unwrap_or(0) == 1;
+        let payload_enc: Vec<u8> = r.try_get("payload_enc").unwrap_or_default();
+        let master_key_id: String = r.try_get("master_key_id").unwrap_or_default();
+
+        if idx == 0 {
+            first_owner_user_id = row_owner.clone();
+            first_client_key_id = client_key_id.clone();
+        }
+
+        let decrypted_trace = sealer
+            .open(
+                "trace_record",
+                &[
+                    master_key_id.as_bytes(),
+                    req_id.as_bytes(),
+                    row_owner.as_bytes(),
+                    session_hash.as_bytes(),
+                ],
+                &payload_enc,
+            )
+            .map_err(|e| {
+                map_price_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("open trace: {e:?}"),
+                )
+            })?;
+
+        let decompressed_trace =
+            zstd::bulk::decompress(decrypted_trace.expose_secret(), 10 * 1024 * 1024).map_err(
+                |e| {
+                    map_price_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("decompress trace: {e}"),
+                    )
+                },
+            )?;
+
+        let turn_trace: StoredTurnTraceV2 =
+            serde_json::from_slice(&decompressed_trace).map_err(|e| {
+                map_price_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("parse turn: {e}"),
+                )
+            })?;
+
+        let lcp = if thread_id == prev_thread_id {
+            compute_lcp(&prev_block_refs, &turn_trace.block_refs)
+        } else {
+            0
+        };
+        prev_block_refs = turn_trace.block_refs.clone();
+        prev_thread_id = thread_id.clone();
+
+        let mut new_input_messages = Vec::new();
+        for hash in &turn_trace.block_refs[lcp..] {
+            let block_row = sqlx::query(
+                "SELECT payload_enc, master_key_id FROM trace_blocks WHERE owner_user_id = ? AND block_hash = ?",
+            )
+            .bind(&row_owner)
+            .bind(hash)
+            .fetch_optional(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            if let Some(br) = block_row {
+                let blk_enc: Vec<u8> = br.try_get("payload_enc").unwrap_or_default();
+                let blk_mk: String = br.try_get("master_key_id").unwrap_or_default();
+                let dec_blk = sealer
+                    .open(
+                        "trace_block",
+                        &[blk_mk.as_bytes(), row_owner.as_bytes(), hash.as_bytes()],
+                        &blk_enc,
+                    )
+                    .map_err(|e| {
+                        map_price_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("open block: {e:?}"),
+                        )
+                    })?;
+
+                let decomp_blk = zstd::bulk::decompress(dec_blk.expose_secret(), 10 * 1024 * 1024)
+                    .map_err(|e| {
+                        map_price_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("decompress block: {e}"),
+                        )
+                    })?;
+
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&decomp_blk) {
+                    new_input_messages.push(val);
+                } else {
+                    let text = String::from_utf8_lossy(&decomp_blk).to_string();
+                    new_input_messages.push(serde_json::json!({ "role": "user", "content": text }));
+                }
+            } else {
+                new_input_messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "content expired",
+                    "expired": true
+                }));
+            }
+        }
+
+        let raw_assistant = turn_trace
+            .response
+            .get("assistant_text")
+            .and_then(|v| v.as_str())
+            .or_else(|| turn_trace.response.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let sanitized_assistant = sanitize_assistant_text(raw_assistant);
+
+        let assistant_reasoning = turn_trace
+            .response
+            .get("assistant_reasoning")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        let assistant_tool_calls = turn_trace
+            .response
+            .get("assistant_tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        timeline.push(serde_json::json!({
+            "ordinal": idx + 1,
+            "request_id": req_id,
+            "ts": ts,
+            "thread_id": thread_id,
+            "canonical_model": canonical_model,
+            "protocol": protocol,
+            "truncated_content": truncated_content,
+            "new_input_messages": new_input_messages,
+            "assistant_text": sanitized_assistant,
+            "assistant_reasoning": assistant_reasoning,
+            "assistant_tool_calls": assistant_tool_calls,
+        }));
+    }
+
+    let pin_rows = sqlx::query(
+        "SELECT p.upstream_key_id, p.canonical_id, p.pool_tier, k.label as key_label
+         FROM pins p
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         WHERE p.session_hash = ?",
+    )
+    .bind(session_hash)
+    .fetch_all(&state.auth.pool)
+    .await
+    .unwrap_or_default();
+
+    let mut current_pins = Vec::new();
+    for pr in pin_rows {
+        current_pins.push(serde_json::json!({
+            "upstream_key_id": pr.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default(),
+            "canonical_id": pr.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+            "pool_tier": pr.try_get::<i64, _>("pool_tier").unwrap_or(1),
+            "key_label": pr.try_get::<Option<String>, _>("key_label").unwrap_or_default(),
+        }));
+    }
+
     Ok(Json(serde_json::json!({
         "session_hash": session_hash,
-        "turns": []
+        "owner_user_id": first_owner_user_id,
+        "client_key_id": first_client_key_id,
+        "total_turns": timeline.len(),
+        "current_pins": current_pins,
+        "timeline": timeline,
     })))
+}
+
+async fn get_user_trace_record_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    get_trace_record_internal(&state, &request_id, Some(user_id.to_string())).await
+}
+
+async fn get_admin_trace_record_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_trace_record_internal(&state, &request_id, None).await
+}
+
+async fn get_trace_record_internal(
+    state: &ApiAppState,
+    request_id: &str,
+    owner_user_id: Option<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use llmroller_core::seams::ExposeSecret as _;
+    use llmroller_store::crypto::SecretSealer as _;
+    use llmroller_store::traces::StoredTurnTraceV2;
+    use sqlx::Row as _;
+
+    let row = sqlx::query(
+        "SELECT request_id, owner_user_id, session_hash, payload_enc, master_key_id
+         FROM trace_records
+         WHERE request_id = ?",
+    )
+    .bind(request_id)
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "trace record not found"))?;
+
+    let row_owner: String = row.try_get("owner_user_id").unwrap_or_default();
+    if let Some(ref uid) = owner_user_id
+        && &row_owner != uid
+    {
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "trace record not found",
+        ));
+    }
+
+    let session_hash: String = row.try_get("session_hash").unwrap_or_default();
+    let payload_enc: Vec<u8> = row.try_get("payload_enc").unwrap_or_default();
+    let master_key_id: String = row.try_get("master_key_id").unwrap_or_default();
+
+    let sealer = load_sealer(state).await?;
+    let decrypted = sealer
+        .open(
+            "trace_record",
+            &[
+                master_key_id.as_bytes(),
+                request_id.as_bytes(),
+                row_owner.as_bytes(),
+                session_hash.as_bytes(),
+            ],
+            &payload_enc,
+        )
+        .map_err(|e| {
+            map_price_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("open trace: {e:?}"),
+            )
+        })?;
+
+    let decompressed = zstd::bulk::decompress(decrypted.expose_secret(), 10 * 1024 * 1024)
+        .map_err(|e| {
+            map_price_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("decompress trace: {e}"),
+            )
+        })?;
+
+    let turn_trace: StoredTurnTraceV2 = serde_json::from_slice(&decompressed).map_err(|e| {
+        map_price_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("parse turn: {e}"),
+        )
+    })?;
+
+    Ok(Json(serde_json::to_value(turn_trace).unwrap_or_default()))
+}
+
+async fn delete_admin_session_trace_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(session_hash): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT owner_user_id FROM trace_records WHERE session_hash = ? LIMIT 1")
+        .bind(&session_hash)
+        .fetch_optional(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let Some(r) = row else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
+    let owner_user_id = llmroller_core::ids::UserId::parse(&owner_str)
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    llmroller_store::traces::delete_session_trace_tx(&mut tx, &owner_user_id, &session_hash)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_admin_traces_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let _ = sqlx::query("DELETE FROM trace_records WHERE expires_at <= ?")
+        .bind(now_ms)
+        .execute(&state.auth.pool)
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn append_audit_entry_helper(
+    state: &ApiAppState,
+    now_ms: i64,
+    actor_user_id: Option<&str>,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM audit_log")
+        .fetch_one(&state.auth.pool)
+        .await
+        .unwrap_or(0);
+    let prev_hash: String = if max_seq == 0 {
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+    } else {
+        sqlx::query_scalar("SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(&state.auth.pool)
+            .await
+            .unwrap_or_else(|_| {
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            })
+    };
+    let seq = max_seq + 1;
+    let computed_hash = llmroller_store::crypto::sha256_hex(
+        format!("{seq}:{prev_hash}:{action}:{}", target_id.unwrap_or("")).as_bytes(),
+    );
+
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (seq, id, ts, actor_user_id, ip_addr, action, target_type, target_id, payload_json, hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)",
+    )
+    .bind(seq)
+    .bind(&audit_id)
+    .bind(now_ms)
+    .bind(actor_user_id)
+    .bind("127.0.0.1")
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(computed_hash)
+    .execute(&state.auth.pool)
+    .await;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2366,8 +2810,16 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_user_client_key_sessions_handler),
         )
         .route(
+            "/api/user/sessions/{session_hash}/chat",
+            get(get_user_session_preview_handler),
+        )
+        .route(
             "/api/user/sessions/{session_hash}/preview",
             get(get_user_session_preview_handler),
+        )
+        .route(
+            "/api/user/traces/{request_id}",
+            get(get_user_trace_record_handler),
         )
         .route(
             "/api/user/providers/{id}/prices",
@@ -2408,9 +2860,22 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_admin_client_key_sessions_handler),
         )
         .route(
+            "/admin/api/sessions/{session_hash}/chat",
+            get(get_admin_session_preview_handler),
+        )
+        .route(
             "/admin/api/sessions/{session_hash}/preview",
             get(get_admin_session_preview_handler),
         )
+        .route(
+            "/admin/api/traces/{request_id}",
+            get(get_admin_trace_record_handler),
+        )
+        .route(
+            "/admin/api/sessions/{session_hash}/trace",
+            delete(delete_admin_session_trace_handler),
+        )
+        .route("/admin/api/traces", delete(delete_admin_traces_handler))
         .route(
             "/admin/api/settings",
             get(get_admin_settings_handler).patch(patch_admin_settings_handler),

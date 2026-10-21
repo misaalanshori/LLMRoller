@@ -144,3 +144,23 @@ h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.25rem; }
 .setting-item { background: #0c1222; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; }
 .setting-key { font-family: monospace; font-size: 0.8125rem; font-weight: 600; color: #a5f3fc; margin-bottom: 0.25rem; }
 .setting-desc { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.5rem; }
+
+/* Chat Preview Modal & Timeline */
+.modal-lg { max-width: 820px; max-height: 85vh; display: flex; flex-direction: column; }
+.chat-preview-body { overflow-y: auto; flex: 1; padding: 1rem; }
+.chat-turns-stack { display: flex; flex-direction: column; gap: 1rem; }
+.chat-turn-card { background: #080c18; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+.chat-turn-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 0.75rem; font-size: 0.8125rem; font-weight: 600; color: #94a3b8; }
+.chat-msg { margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
+.user-msg { background: rgba(59, 130, 246, 0.08); border-left: 3px solid var(--primary); }
+.assistant-msg { background: rgba(16, 185, 129, 0.08); border-left: 3px solid var(--success); }
+.chat-role { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin-bottom: 0.25rem; }
+.chat-content { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8125rem; white-space: pre-wrap; word-break: break-word; color: #f1f5f9; }
+.chat-assistant-body { font-size: 0.875rem; line-height: 1.5; color: #f1f5f9; }
+.chat-assistant-body p { margin-bottom: 0.5rem; }
+.chat-assistant-body pre { background: #040711; padding: 0.5rem; border-radius: 4px; overflow-x: auto; font-size: 0.8125rem; }
+.chat-reasoning { background: rgba(245, 158, 11, 0.08); border-left: 3px solid var(--warning); padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 0.75rem; }
+.chat-reasoning summary { cursor: pointer; font-size: 0.75rem; font-weight: 600; color: var(--warning); }
+.chat-reasoning pre { font-family: ui-monospace, monospace; font-size: 0.8125rem; white-space: pre-wrap; color: #fde68a; margin-top: 0.5rem; }
+.chat-tool-call { background: #0d1527; border: 1px dashed #3b82f6; border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
+.chat-tool-call pre { font-size: 0.75rem; color: #93c5fd; overflow-x: auto; margin-top: 0.25rem; }
