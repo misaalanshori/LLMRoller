@@ -123,7 +123,7 @@ pub fn compute_session_hash(
     let mut mac =
         HmacSha256::new_from_slice(session_hmac_secret).expect("HMAC accepts any key length");
     mac.update(owner_user_id.to_string().as_bytes());
-    mac.update(b" ");
+    mac.update(b"\0");
     mac.update(raw_session_id.as_bytes());
     let result = mac.finalize().into_bytes();
     hex_lower(&result[..16])
@@ -143,7 +143,7 @@ pub fn compute_step8_fingerprint(
     let usr = &canon_usr[..usr_len];
 
     let mut hasher = Sha256::new();
-    hasher.update(b"llmroller.fp.v1 ");
+    hasher.update(b"llmroller.fp.v1\0");
 
     let k_bytes = client_key_id.to_string();
     hasher.update((k_bytes.len() as u32).to_be_bytes());
@@ -163,6 +163,130 @@ pub fn compute_step8_fingerprint(
     let digest = hasher.finalize();
     let hex_full = hex_lower(&digest);
     format!("fp:{}", &hex_full[..32])
+}
+
+fn canonical_block(block: &serde_json::Value) -> Vec<u8> {
+    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+    if block_type == "text" || block_type == "input_text" {
+        let text_bytes = block
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes())
+            .unwrap_or(b"");
+        let mut out = Vec::with_capacity(1 + text_bytes.len());
+        out.push(b'T');
+        out.extend_from_slice(text_bytes);
+        out
+    } else {
+        let mut out = Vec::new();
+        out.push(b'B');
+        out.extend_from_slice(block_type.as_bytes());
+        out.push(0x1F);
+        let mut cleaned_block = block.clone();
+        if let serde_json::Value::Object(ref mut map) = cleaned_block {
+            map.remove("cache_control");
+            map.remove("citations");
+        }
+        let cleaned_bytes = serde_json::to_vec(&cleaned_block).unwrap_or_default();
+        let hash = Sha256::digest(&cleaned_bytes);
+        out.extend_from_slice(&hash);
+        out
+    }
+}
+
+/// Canonical content extractor canon(content) per Section 11.1.3.
+/// Strips cache_control and citations across Chat, Responses, and Messages content blocks.
+pub fn canonical_content(content_val: &serde_json::Value) -> Vec<u8> {
+    match content_val {
+        serde_json::Value::String(s) => s.as_bytes().to_vec(),
+        serde_json::Value::Array(blocks) => {
+            let mut out = Vec::new();
+            for (i, block) in blocks.iter().enumerate() {
+                if i > 0 {
+                    out.push(0x1E);
+                }
+                out.extend_from_slice(&canonical_block(block));
+            }
+            out
+        }
+        serde_json::Value::Object(_) => canonical_block(content_val),
+        other => serde_json::to_vec(other).unwrap_or_default(),
+    }
+}
+
+/// Extracts canonical byte slices for SYS and USER1 per Section 11.1.3.
+pub fn extract_canonical_sys_and_user1(protocol: &str, body: &serde_json::Value) -> (Vec<u8>, Vec<u8>) {
+    let mut sys = Vec::new();
+    let mut usr = Vec::new();
+
+    match protocol {
+        "messages" => {
+            if let Some(sys_val) = body.get("system") {
+                sys = canonical_content(sys_val);
+            }
+            if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+                for msg in messages {
+                    if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(content) = msg.get("content") {
+                            usr = canonical_content(content);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        "responses" => {
+            if let Some(instructions) = body.get("instructions") {
+                sys.extend_from_slice(&canonical_content(instructions));
+            }
+            if let Some(input) = body.get("input") {
+                if let Some(s) = input.as_str() {
+                    usr = s.as_bytes().to_vec();
+                } else if let Some(items) = input.as_array() {
+                    let mut found_user = false;
+                    for item in items {
+                        let role = item.get("role").and_then(|r| r.as_str());
+                        if !found_user && (role == Some("system") || role == Some("developer")) {
+                            if !sys.is_empty() {
+                                sys.push(0x1E);
+                            }
+                            if let Some(c) = item.get("content") {
+                                sys.extend_from_slice(&canonical_content(c));
+                            }
+                        } else if role == Some("user") && !found_user {
+                            found_user = true;
+                            if let Some(c) = item.get("content") {
+                                usr = canonical_content(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+                let mut found_user = false;
+                for msg in messages {
+                    let role = msg.get("role").and_then(|r| r.as_str());
+                    if !found_user && (role == Some("system") || role == Some("developer")) {
+                        if !sys.is_empty() {
+                            sys.push(0x1E);
+                        }
+                        if let Some(c) = msg.get("content") {
+                            sys.extend_from_slice(&canonical_content(c));
+                        }
+                    } else if role == Some("user") && !found_user {
+                        found_user = true;
+                        if let Some(c) = msg.get("content") {
+                            usr = canonical_content(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (sys, usr)
 }
 
 /// Single slot in the 21-slot constant session detector.

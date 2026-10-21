@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use llmroller_core::ids::RequestId;
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 use llmroller_proto::adapters::EndpointKind;
 use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use thiserror::Error;
@@ -370,7 +370,7 @@ pub async fn handle_inference_request(
         // Select route and edit body
         let (_edited_bytes, _strip) = edit_body(
             body,
-            OwnershipScope::Personal,
+            PoolTier::Own,
             None,
             ChatStreamMode::Native,
             None,

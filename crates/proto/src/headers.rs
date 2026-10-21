@@ -7,7 +7,7 @@
 
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -59,9 +59,13 @@ const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 10] = [
 ];
 
 /// Session-affinity headers stripped when routing to Shared or Global tiers per SEC-16.
-const SESSION_HEADERS_STRIP_ON_POOLED: [&str; 7] = [
+const SESSION_HEADERS_STRIP_ON_POOLED: [&str; 11] = [
     "x-session-affinity",
     "x-session-id",
+    "session-id",
+    "session_id",
+    "conversation-id",
+    "x-bf-session-id",
     "x-opencode-session",
     "x-parent-session-id",
     "prompt-cache-key",
@@ -115,7 +119,7 @@ pub fn validate_request_smuggling(headers: &HeaderMap) -> Result<(), SmugglingEr
 /// Apply the deterministic 4-rule request header pipeline to outbound requests per Section 12.1.
 pub fn apply_request_header_pipeline(
     inbound: &HeaderMap,
-    tier: OwnershipScope,
+    tier: PoolTier,
     auth_header: Option<(&str, &str)>,
     strip_headers: &[String],
     strip_header_tokens: &[String],
@@ -152,7 +156,7 @@ pub fn apply_request_header_pipeline(
         }
 
         // On Shared or Global tiers: strip recognized session headers per SEC-16
-        if tier != OwnershipScope::Personal
+        if tier != PoolTier::Own
             && SESSION_HEADERS_STRIP_ON_POOLED.contains(&name_lower.as_str())
         {
             continue;
@@ -224,7 +228,7 @@ pub fn apply_request_header_pipeline(
 #[must_use]
 pub fn apply_response_header_pipeline(
     upstream_headers: &HeaderMap,
-    tier: OwnershipScope,
+    tier: PoolTier,
     is_admin: bool,
     request_id: &str,
     response_header_allow: &[String],
@@ -265,7 +269,7 @@ pub fn apply_response_header_pipeline(
 
         // R4: When chosen key is Shared or Global (and caller is not admin),
         // strip org, project, ratelimits, cf-ray, server, and via (overrides allowlist)
-        if tier != OwnershipScope::Personal
+        if tier != PoolTier::Own
             && !is_admin
             && (name_lower == "openai-organization"
                 || name_lower == "openai-project"
@@ -284,7 +288,7 @@ pub fn apply_response_header_pipeline(
         let is_config_allowed = response_header_allow
             .iter()
             .any(|allowed| allowed.to_ascii_lowercase() == name_lower);
-        let is_rate_limit_allowed = (tier == OwnershipScope::Personal || is_admin)
+        let is_rate_limit_allowed = (tier == PoolTier::Own || is_admin)
             && (name_lower.starts_with("x-ratelimit-")
                 || name_lower.starts_with("anthropic-ratelimit-"));
 
@@ -298,9 +302,9 @@ pub fn apply_response_header_pipeline(
         out.insert(HeaderName::from_static("x-llmroller-request-id"), id_val);
     }
 
-    if tier != OwnershipScope::Personal {
+    if tier != PoolTier::Own {
         let scope_str = match tier {
-            OwnershipScope::Global => "global",
+            PoolTier::Global => "global",
             _ => "shared",
         };
         out.insert(

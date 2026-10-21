@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 
 use bytes::Bytes;
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 use thiserror::Error;
 
 /// Body editing and JSON envelope errors.
@@ -50,6 +50,17 @@ pub enum StreamOptionsState {
     },
 }
 
+/// Top-level field record capturing exact key and value spans with comma boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopLevelField {
+    pub key: String,
+    pub key_start: usize,
+    pub val_start: usize,
+    pub val_end: usize,
+    pub leading_comma: Option<usize>,
+    pub trailing_comma: Option<usize>,
+}
+
 /// Scan results from parsing the top-level JSON object.
 #[derive(Debug, Clone)]
 pub struct TopLevelScan {
@@ -61,6 +72,8 @@ pub struct TopLevelScan {
     pub previous_response_id: Option<(String, Range<usize>)>,
     pub stream_options: Option<StreamOptionsState>,
     pub session_spans: Vec<(String, Range<usize>)>,
+    pub fields: Vec<TopLevelField>,
+    pub metadata_span: Option<Range<usize>>,
 }
 
 /// Scan top-level object members in a single pass enforcing all validation constraints.
@@ -99,6 +112,9 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
     let mut previous_response_id = None;
     let mut stream_options = None;
     let mut session_spans = Vec::new();
+    let mut fields: Vec<TopLevelField> = Vec::new();
+    let mut metadata_span: Option<Range<usize>> = None;
+    let mut last_comma: Option<usize> = None;
     let mut is_empty_object = true;
 
     while cursor < closing_brace {
@@ -162,7 +178,7 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
                         "stream must be a boolean".into(),
                     ));
                 } else if is_session_key(&unescaped_key) {
-                    session_spans.push((unescaped_key, key_start..val_end));
+                    session_spans.push((unescaped_key.clone(), key_start..val_end));
                 }
             }
             b't' | b'f' => {
@@ -222,8 +238,10 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
                         span: val_start..val_end,
                         include_usage: usage_opt,
                     });
+                } else if unescaped_key == "metadata" {
+                    metadata_span = Some(val_start..val_end);
                 } else if is_session_key(&unescaped_key) {
-                    session_spans.push((unescaped_key, key_start..val_end));
+                    session_spans.push((unescaped_key.clone(), key_start..val_end));
                 }
             }
             b'[' => {
@@ -239,7 +257,7 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
                         "previous_response_id must be a string".into(),
                     ));
                 } else if is_session_key(&unescaped_key) {
-                    session_spans.push((unescaped_key, key_start..val_end));
+                    session_spans.push((unescaped_key.clone(), key_start..val_end));
                 }
             }
             b'0'..=b'9' | b'-' => {
@@ -260,16 +278,30 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
             _ => return Err(BodyEditError::NotAnObject),
         }
 
+        let val_end = cursor;
+
         skip_ws(bytes, &mut cursor);
+        let mut next_comma = None;
         if cursor < closing_brace {
             if bytes[cursor] == b',' {
+                next_comma = Some(cursor);
                 cursor += 1;
             } else if bytes[cursor] == b'}' {
-                break;
+                // finished object
             } else {
                 return Err(BodyEditError::NotAnObject);
             }
         }
+
+        fields.push(TopLevelField {
+            key: unescaped_key,
+            key_start,
+            val_start,
+            val_end,
+            leading_comma: last_comma,
+            trailing_comma: next_comma,
+        });
+        last_comma = next_comma;
     }
 
     Ok(TopLevelScan {
@@ -281,13 +313,15 @@ pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
         previous_response_id,
         stream_options,
         session_spans,
+        fields,
+        metadata_span,
     })
 }
 
 /// Surgically edit the JSON body per Section 12.3.
 pub fn edit_body(
     original: Bytes,
-    tier: OwnershipScope,
+    tier: PoolTier,
     target_model: Option<&str>,
     chat_stream_mode: ChatStreamMode,
     session_field: Option<(&str, &str)>,
@@ -328,14 +362,21 @@ pub fn edit_body(
     let strip_injected_usage = !matches!(stream_options_action, StreamOptionsAction::None);
 
     let session_edits_needed = match tier {
-        OwnershipScope::Personal => {
+        PoolTier::Own => {
             if let Some((field_name, _)) = session_field {
-                !scan.session_spans.iter().any(|(k, _)| k == field_name)
+                !scan.fields.iter().any(|f| f.key == field_name)
             } else {
                 false
             }
         }
-        OwnershipScope::Global => !scan.session_spans.is_empty() || session_field.is_some(),
+        _ => {
+            let has_top_session = scan.fields.iter().any(|f| is_session_key(&f.key));
+            let has_meta_session = scan.metadata_span.as_ref().is_some_and(|range| {
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&original[range.clone()])
+                    .is_ok_and(|m| m.contains_key("session_id") || m.contains_key("user_id"))
+            });
+            has_top_session || has_meta_session || session_field.is_some()
+        }
     };
 
     // TRN-1 check: If no edits apply, return the original buffer with identical pointer identity
@@ -348,10 +389,14 @@ pub fn edit_body(
 
     // Apply edits
     let mut buf = Vec::with_capacity(original.len() + 128);
-
-    // If session edit on Global tier requires removing existing session spans, or if replacing in-place:
-    // We construct the new body cleanly preserving surrounding byte sequence (TRN-2)
     let orig_bytes = &original[..];
+
+    let session_fields_to_remove_count = if tier != PoolTier::Own {
+        scan.fields.iter().filter(|f| is_session_key(&f.key)).count()
+    } else {
+        0
+    };
+    let remaining_fields_count = scan.fields.len().saturating_sub(session_fields_to_remove_count);
 
     // 1. Copy up to opening brace + 1
     buf.extend_from_slice(&orig_bytes[..scan.opening_brace + 1]);
@@ -368,8 +413,8 @@ pub fn edit_body(
     // (b) Insert session field if needed
     if let Some((field_name, token)) = session_field {
         let should_insert = match tier {
-            OwnershipScope::Personal => !scan.session_spans.iter().any(|(k, _)| k == field_name),
-            OwnershipScope::Global => true,
+            PoolTier::Own => !scan.fields.iter().any(|f| f.key == field_name),
+            _ => true,
         };
         if should_insert {
             if inserted_something {
@@ -383,14 +428,11 @@ pub fn edit_body(
         }
     }
 
-    if inserted_something && !scan.is_empty_object {
+    if inserted_something && remaining_fields_count > 0 {
         buf.push(b',');
     }
 
     // 3. Process existing spans between opening { and closing }
-    let mut cursor = scan.opening_brace + 1;
-
-    // Build replacement spans ordered by start index
     let mut replacements: Vec<(Range<usize>, Vec<u8>)> = Vec::new();
 
     // Model replacement
@@ -409,7 +451,6 @@ pub fn edit_body(
             replacements.push((span, b"true".to_vec()));
         }
         StreamOptionsAction::InsertIntoObject(obj_start) => {
-            // Insert right after { of stream_options
             let brace_idx = orig_bytes[obj_start..]
                 .iter()
                 .position(|&b| b == b'{')
@@ -429,16 +470,54 @@ pub fn edit_body(
         _ => {}
     }
 
-    // Remove session spans on Global tier
-    if tier == OwnershipScope::Global {
-        for (_, span) in &scan.session_spans {
-            replacements.push((span.clone(), Vec::new()));
+    // Metadata sanitization on Shared/Global tier
+    if tier != PoolTier::Own
+        && let Some(meta_range) = &scan.metadata_span
+        && let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&orig_bytes[meta_range.clone()])
+    {
+        let removed_session = map.remove("session_id").is_some();
+        let removed_user = map.remove("user_id").is_some();
+        if removed_session || removed_user {
+            let new_meta_bytes = serde_json::to_vec(&map).unwrap_or_else(|_| b"{}".to_vec());
+            replacements.push((meta_range.clone(), new_meta_bytes));
+        }
+    }
+
+    // Remove top-level session spans on Shared/Global tier
+    if tier != PoolTier::Own {
+        let mut i = 0;
+        while i < scan.fields.len() {
+            if is_session_key(&scan.fields[i].key) {
+                let start_idx = i;
+                while i < scan.fields.len() && is_session_key(&scan.fields[i].key) {
+                    i += 1;
+                }
+                let end_idx = i - 1;
+                let first = &scan.fields[start_idx];
+                let last = &scan.fields[end_idx];
+
+                let range_to_remove = if let Some(comma_pos) = first.leading_comma {
+                    comma_pos..last.val_end
+                } else if let Some(comma_pos) = last.trailing_comma {
+                    let mut end = comma_pos + 1;
+                    while end < scan.closing_brace && orig_bytes[end].is_ascii_whitespace() {
+                        end += 1;
+                    }
+                    first.key_start..end
+                } else {
+                    first.key_start..last.val_end
+                };
+                replacements.push((range_to_remove, Vec::new()));
+            } else {
+                i += 1;
+            }
         }
     }
 
     // Sort replacements by start index
     replacements.sort_by_key(|r| r.0.start);
 
+    let mut cursor = scan.opening_brace + 1;
     for (range, repl) in replacements {
         if range.start >= cursor {
             buf.extend_from_slice(&orig_bytes[cursor..range.start]);
@@ -464,7 +543,7 @@ enum StreamOptionsAction {
 fn is_session_key(key: &str) -> bool {
     matches!(
         key,
-        "session_id" | "prompt_cache_key" | "promptCacheKey" | "metadata"
+        "session_id" | "prompt_cache_key" | "promptCacheKey"
     )
 }
 

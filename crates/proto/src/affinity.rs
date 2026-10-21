@@ -5,7 +5,7 @@
 use hmac::{Hmac, KeyInit, Mac};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use llmroller_core::ids::UserId;
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -50,9 +50,9 @@ pub fn compute_salted_affinity_token(
 ) -> String {
     let mut mac =
         HmacSha256::new_from_slice(session_hmac_secret).expect("HMAC accepts any key length");
-    mac.update(b"affinity.v1 ");
+    mac.update(b"affinity.v1\0");
     mac.update(owner_user_id.to_string().as_bytes());
-    mac.update(b" ");
+    mac.update(b"\0");
     mac.update(raw_session_id.as_bytes());
     let result = mac.finalize().into_bytes();
     let b32 = encode_base32_lower(&result);
@@ -60,9 +60,13 @@ pub fn compute_salted_affinity_token(
     format!("llr_{token_26}")
 }
 
-const SESSION_HEADERS_TO_STRIP: [&str; 7] = [
+const SESSION_HEADERS_TO_STRIP: [&str; 11] = [
     "x-session-affinity",
     "x-session-id",
+    "session-id",
+    "session_id",
+    "conversation-id",
+    "x-bf-session-id",
     "x-opencode-session",
     "x-parent-session-id",
     "prompt-cache-key",
@@ -73,12 +77,12 @@ const SESSION_HEADERS_TO_STRIP: [&str; 7] = [
 /// Applies outbound session headers based on key tier and provider profile (SEC-16).
 pub fn apply_outbound_session_affinity(
     headers: &mut HeaderMap,
-    tier: OwnershipScope,
+    tier: PoolTier,
     profile: &SessionProfile,
     salted_token: &str,
     raw_session_id: &str,
 ) {
-    if tier == OwnershipScope::Personal {
+    if tier == PoolTier::Own {
         // Own tier: forward client session headers verbatim; write affinity headers only if absent
         let token = if raw_session_id.is_empty() {
             salted_token
@@ -145,7 +149,7 @@ mod tests {
         );
         apply_outbound_session_affinity(
             &mut own_headers,
-            OwnershipScope::Personal,
+            PoolTier::Own,
             &profile,
             &token,
             raw_sess,
@@ -175,7 +179,7 @@ mod tests {
         );
         apply_outbound_session_affinity(
             &mut shared_headers,
-            OwnershipScope::Global,
+            PoolTier::Shared,
             &profile,
             &token,
             raw_sess,

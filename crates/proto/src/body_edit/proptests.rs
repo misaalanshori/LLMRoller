@@ -5,7 +5,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#24-sub-phase-24-zero-copy-surgical-json-span-editor-duplicate-key-guard-and-body-edit-fuzzer
 
 use bytes::Bytes;
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 use proptest::prelude::*;
 
 use crate::body_edit::{BodyEditError, ChatStreamMode, edit_body, scan_top_level};
@@ -93,7 +93,7 @@ fn test_trn1_pointer_identity_when_unmodified() {
 
     let (out, strip) = edit_body(
         raw.clone(),
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None, // no model rewrite
         ChatStreamMode::Native,
         None, // no session field injection
@@ -115,7 +115,7 @@ fn test_trn2_model_rewrite_byte_preservation() {
     let target_model = "provider/custom-model:special\"with\\escapes";
     let (out, _) = edit_body(
         raw,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         Some(target_model),
         ChatStreamMode::Native,
         None,
@@ -143,7 +143,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     let c1 = Bytes::from_static(b"{\"model\":\"gpt-4o\"}");
     let (out1, strip1) = edit_body(
         c1.clone(),
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -156,7 +156,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     let c2 = Bytes::from_static(b"{\"stream\":true,\"model\":\"gpt-4o\"}");
     let (out2, strip2) = edit_body(
         c2,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -170,7 +170,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     let c3 = Bytes::from_static(b"{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":null}");
     let (out3, strip3) = edit_body(
         c3,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -186,7 +186,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     );
     let (out4, strip4) = edit_body(
         c4,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -203,7 +203,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     );
     let (out5, strip5) = edit_body(
         c5,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -219,7 +219,7 @@ fn test_stream_options_chat_stream_injection_cases() {
     );
     let (out6, strip6) = edit_body(
         c6.clone(),
-        OwnershipScope::Personal,
+        PoolTier::Own,
         None,
         ChatStreamMode::Inject,
         None,
@@ -227,6 +227,89 @@ fn test_stream_options_chat_stream_injection_cases() {
     .expect("c6 edit");
     assert!(!strip6);
     assert_eq!(out6.as_ptr(), c6.as_ptr());
+}
+
+#[doc = "Spec: API-4, TRN-2, SEC-16"]
+#[test]
+fn test_edit_body_strips_session_keys_without_comma_corruption() {
+    // 1. Session id at start
+    let raw1 = Bytes::from_static(br#"{"session_id":"s1","model":"gpt-4o"}"#);
+    let (out1, _) = edit_body(
+        raw1,
+        PoolTier::Global,
+        Some("gpt-4o"),
+        ChatStreamMode::Native,
+        None,
+    )
+    .expect("edit");
+    let parsed1: serde_json::Value =
+        serde_json::from_slice(&out1).expect("valid json when session_id at start");
+    assert_eq!(parsed1["model"], "gpt-4o");
+    assert!(parsed1.get("session_id").is_none());
+
+    // 2. Session id in middle
+    let raw2 = Bytes::from_static(br#"{"a":1,"session_id":"s1","model":"gpt-4o"}"#);
+    let (out2, _) = edit_body(
+        raw2,
+        PoolTier::Global,
+        Some("gpt-4o"),
+        ChatStreamMode::Native,
+        None,
+    )
+    .expect("edit");
+    let parsed2: serde_json::Value =
+        serde_json::from_slice(&out2).expect("valid json when session_id in middle");
+    assert_eq!(parsed2["a"], 1);
+    assert_eq!(parsed2["model"], "gpt-4o");
+    assert!(parsed2.get("session_id").is_none());
+
+    // 3. Session id at end
+    let raw3 = Bytes::from_static(br#"{"model":"gpt-4o","session_id":"s1"}"#);
+    let (out3, _) = edit_body(
+        raw3,
+        PoolTier::Global,
+        Some("gpt-4o"),
+        ChatStreamMode::Native,
+        None,
+    )
+    .expect("edit");
+    let parsed3: serde_json::Value =
+        serde_json::from_slice(&out3).expect("valid json when session_id at end");
+    assert_eq!(parsed3["model"], "gpt-4o");
+    assert!(parsed3.get("session_id").is_none());
+
+    // 4. Session id as sole key
+    let raw4 = Bytes::from_static(br#"{"session_id":"s1"}"#);
+    let (out4, _) = edit_body(
+        raw4,
+        PoolTier::Global,
+        None,
+        ChatStreamMode::Native,
+        None,
+    )
+    .expect("edit");
+    let parsed4: serde_json::Value =
+        serde_json::from_slice(&out4).expect("valid json when session_id sole key");
+    assert!(parsed4.get("session_id").is_none());
+
+    // 5. Metadata containing session_id and custom field
+    let raw5 = Bytes::from_static(
+        br#"{"metadata":{"session_id":"s1","user_id":"u1","custom":"keep_me"},"model":"gpt-4o"}"#,
+    );
+    let (out5, _) = edit_body(
+        raw5,
+        PoolTier::Shared,
+        Some("gpt-4o"),
+        ChatStreamMode::Native,
+        None,
+    )
+    .expect("edit");
+    let parsed5: serde_json::Value =
+        serde_json::from_slice(&out5).expect("valid json when metadata stripped");
+    assert_eq!(parsed5["model"], "gpt-4o");
+    assert_eq!(parsed5["metadata"]["custom"], "keep_me");
+    assert!(parsed5["metadata"].get("session_id").is_none());
+    assert!(parsed5["metadata"].get("user_id").is_none());
 }
 
 proptest! {
@@ -237,7 +320,7 @@ proptest! {
         let raw = Bytes::from_static(b"{\"messages\":[],\"model\":\"old\"}");
         let (out, _) = edit_body(
             raw,
-            OwnershipScope::Personal,
+            PoolTier::Own,
             Some(&model_name),
             ChatStreamMode::Native,
             None,

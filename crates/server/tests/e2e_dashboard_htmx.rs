@@ -104,7 +104,8 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     let malicious = "<script>alert('xss')</script><img src=x onerror=alert(1)>";
     let sanitized = sanitize_assistant_text(malicious);
     assert!(!sanitized.contains("<script"));
-    assert!(sanitized.contains("&lt;script&gt;"));
+    assert!(!sanitized.contains("alert('xss')"));
+    assert!(!sanitized.contains("<img"));
 
     let escaped = escape_html(malicious);
     assert!(!escaped.contains('<'));

@@ -130,6 +130,38 @@ fn test_step8_byte_safe_slicing_and_large_payload_speed() {
 
 #[doc = "Spec: RTE-1, SEC-16"]
 #[test]
+fn test_nul_separator_and_canonical_content_extractor() {
+    let secret = b"01234567890123456789012345678901";
+    let user_id = UserId::generate();
+    let hash = compute_session_hash(secret, &user_id, "sess-123");
+    assert_eq!(hash.len(), 32);
+
+    // Test canonical_content with cache_control and citations stripped
+    let block1 = serde_json::json!({
+        "type": "text",
+        "text": "hello system",
+        "cache_control": {"type": "ephemeral"}
+    });
+    let block2 = serde_json::json!({
+        "type": "text",
+        "text": "hello system"
+    });
+    // Two blocks with different cache_control yield identical text emission
+    assert_eq!(canonical_content(&block1), canonical_content(&block2));
+
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "user", "content": [{"type": "text", "text": "What is 2+2?"}]}
+        ]
+    });
+    let (sys, usr) = extract_canonical_sys_and_user1("chat", &body);
+    assert_eq!(sys, b"You are a helpful assistant");
+    assert_eq!(usr, b"TWhat is 2+2?");
+}
+
+#[doc = "Spec: RTE-1, SEC-16"]
+#[test]
 fn test_21_slot_exact_constant_session_detector() {
     let detector = ConstantSessionDetector::new();
     let key_id = ClientKeyId::generate();

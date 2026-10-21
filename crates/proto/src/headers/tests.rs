@@ -5,7 +5,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
 
 use http::{HeaderMap, HeaderValue, header};
-use llmroller_core::rbac::OwnershipScope;
+use llmroller_core::rbac::PoolTier;
 
 use crate::headers::{
     SmugglingError, UaPolicy, apply_request_header_pipeline, apply_response_header_pipeline,
@@ -96,7 +96,7 @@ fn test_request_header_pipeline() {
     // Case A: Own/Personal tier
     let out_own = apply_request_header_pipeline(
         &headers,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         auth_header,
         &strip_headers,
         &strip_tokens,
@@ -145,7 +145,7 @@ fn test_request_header_pipeline() {
     // Case B: Global tier: session headers stripped per SEC-16
     let out_global = apply_request_header_pipeline(
         &headers,
-        OwnershipScope::Global,
+        PoolTier::Global,
         auth_header,
         &strip_headers,
         &strip_tokens,
@@ -203,7 +203,7 @@ fn test_response_header_pipeline() {
     // Case A: Global tier, non-admin user
     let out_global = apply_response_header_pipeline(
         &resp_headers,
-        OwnershipScope::Global,
+        PoolTier::Global,
         false, // not admin
         "01M5CE420F8JP4KE2B3JC4NX88",
         &[],
@@ -254,7 +254,7 @@ fn test_response_header_pipeline() {
     // Case B: Own tier (personal key owner) -> rate limits preserved!
     let out_own = apply_response_header_pipeline(
         &resp_headers,
-        OwnershipScope::Personal,
+        PoolTier::Own,
         false,
         "01M5CE420F8JP4KE2B3JC4NX88",
         &[],
