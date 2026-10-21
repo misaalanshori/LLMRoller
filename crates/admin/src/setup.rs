@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bytes::Bytes;
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::Role;
 use llmroller_core::seams::{Clock, EntropySource, OsEntropy, SystemClock};
@@ -54,6 +55,9 @@ pub enum SetupError {
     /// Setup race conflict.
     #[error("setup conflict")]
     Conflict,
+    /// Invalid request payload.
+    #[error("invalid payload: {0}")]
+    InvalidPayload(String),
 }
 
 impl IntoResponse for SetupError {
@@ -65,6 +69,7 @@ impl IntoResponse for SetupError {
                 StatusCode::CONFLICT,
                 "setup conflict; instance already initialized",
             ),
+            Self::InvalidPayload(_) => (StatusCode::BAD_REQUEST, "invalid payload"),
             Self::User(UserError::WeakPassword) => (StatusCode::BAD_REQUEST, "password too weak"),
             Self::User(UserError::InvalidUsername(_)) => {
                 (StatusCode::BAD_REQUEST, "invalid username")
@@ -211,10 +216,96 @@ async fn get_setup_page(State(state): State<SetupAppState>) -> Result<Response, 
     if count > 0 {
         return Err(SetupError::AlreadyInitialized);
     }
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LLMRoller - First-Admin Setup</title>
+    <style>
+        :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --primary-hover: #2563eb; --error: #ef4444; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 440px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }
+        p.subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 1.5rem; text-align: center; }
+        .form-group { margin-bottom: 1.25rem; }
+        label { display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.375rem; color: #cbd5e1; }
+        input { width: 100%; padding: 0.625rem 0.875rem; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.9375rem; outline: none; transition: border-color 0.2s; }
+        input:focus { border-color: var(--primary); }
+        .help { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+        button { width: 100%; padding: 0.75rem; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 0.9375rem; cursor: pointer; transition: background 0.2s; margin-top: 0.5rem; }
+        button:hover { background: var(--primary-hover); }
+        .alert { display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--error); color: #fca5a5; padding: 0.75rem; border-radius: 6px; font-size: 0.875rem; margin-bottom: 1.25rem; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>LLMRoller Setup</h1>
+        <p class="subtitle">Create the initial administrator account</p>
+        <div id="error-box" class="alert"></div>
+        <form id="setup-form" method="POST" action="/admin/api/setup">
+            <div class="form-group">
+                <label for="username">Administrator Username</label>
+                <input id="username" name="username" type="text" required autofocus placeholder="admin">
+            </div>
+            <div class="form-group">
+                <label for="password">Strong Password</label>
+                <input id="password" name="password" type="password" required placeholder="••••••••••••" minlength="12">
+                <div class="help">Must be at least 12 characters.</div>
+            </div>
+            <div class="form-group">
+                <label for="setup_token">Setup Token</label>
+                <input id="setup_token" name="setup_token" type="text" required placeholder="Paste token from setup-token file">
+                <div class="help">Found in data directory setup-token file.</div>
+            </div>
+            <button type="submit" id="submit-btn">Initialize Administrator</button>
+        </form>
+    </div>
+    <script>
+        const form = document.getElementById('setup-form');
+        const errBox = document.getElementById('error-box');
+        const btn = document.getElementById('submit-btn');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            errBox.style.display = 'none';
+            btn.disabled = true;
+            btn.textContent = 'Initializing...';
+
+            const payload = {
+                username: form.username.value.trim(),
+                password: form.password.value,
+                setup_token: form.setup_token.value.trim()
+            };
+
+            try {
+                const res = await fetch('/admin/api/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok) {
+                    window.location.href = '/login';
+                } else {
+                    errBox.textContent = data.error || ('Setup failed with status ' + res.status);
+                    errBox.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Initialize Administrator';
+                }
+            } catch (err) {
+                // If fetch fails, fallback to native form submission
+                form.submit();
+            }
+        });
+    </script>
+</body>
+</html>"#;
     Ok((
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
-        "<!DOCTYPE html><html><head><title>LLMRoller Setup</title></head><body><h1>First-Admin Setup</h1><form method=\"POST\" action=\"/admin/api/setup\"><input name=\"username\" placeholder=\"Username\" required><input type=\"password\" name=\"password\" placeholder=\"Password\" required><input name=\"setup_token\" placeholder=\"Setup Token\"><button type=\"submit\">Initialize Admin</button></form></body></html>",
+        html,
     )
         .into_response())
 }
@@ -236,13 +327,35 @@ async fn get_setup_status(
 #[doc = "Spec: AUTH-1, Spec: AUTH-2, Spec: AUTH-3"]
 async fn post_setup(
     State(state): State<SetupAppState>,
-    Json(payload): Json<SetupRequest>,
-) -> Result<(StatusCode, Json<SetupResponse>), SetupError> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, SetupError> {
     // 1. Permanent lockout check before anything else
     let count = count_users(&state.pool).await?;
     if count > 0 {
         return Err(SetupError::AlreadyInitialized);
     }
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let payload: SetupRequest = if content_type.contains("application/json") {
+        serde_json::from_slice(&body)
+            .map_err(|e| SetupError::InvalidPayload(format!("invalid JSON payload: {e}")))?
+    } else {
+        let params: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(&body).into_owned().collect();
+        SetupRequest {
+            username: params.get("username").cloned().unwrap_or_default(),
+            password: params.get("password").cloned().unwrap_or_default(),
+            setup_token: params
+                .get("setup_token")
+                .cloned()
+                .filter(|s| !s.trim().is_empty()),
+        }
+    };
 
     // 2. Token validation per AUTH-2
     if let Some(ref expected) = state.expected_token {
@@ -292,13 +405,19 @@ async fn post_setup(
     // 4. Delete setup token file on completion per AUTH-2
     delete_setup_token_file(&state.data_dir);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(SetupResponse {
-            user_id: id,
-            username: username.to_owned(),
-            role: Role::Admin,
-            status: "created",
-        }),
-    ))
+    let is_json = content_type.contains("application/json");
+    if is_json {
+        Ok((
+            StatusCode::CREATED,
+            Json(SetupResponse {
+                user_id: id,
+                username: username.to_owned(),
+                role: Role::Admin,
+                status: "created",
+            }),
+        )
+            .into_response())
+    } else {
+        Ok((StatusCode::SEE_OTHER, [("location", "/login")]).into_response())
+    }
 }

@@ -37,9 +37,19 @@ pub async fn get_app_ui(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let session = authenticate_session(&state.auth, &headers)
-        .await
-        .map_err(map_auth_error)?;
+    let session = match authenticate_session(&state.auth, &headers).await {
+        Ok(s) => s,
+        Err(e) => {
+            let accepts_html = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.contains("text/html"));
+            if accepts_html {
+                return Ok((StatusCode::SEE_OTHER, [("location", "/login")]).into_response());
+            }
+            return Err(map_auth_error(e));
+        }
+    };
 
     let cookie_header = headers
         .get(COOKIE)
@@ -71,11 +81,28 @@ pub async fn get_admin_ui(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    let session = authenticate_session(&state.auth, &headers)
-        .await
-        .map_err(map_auth_error)?;
+    let session = match authenticate_session(&state.auth, &headers).await {
+        Ok(s) => s,
+        Err(e) => {
+            let accepts_html = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.contains("text/html"));
+            if accepts_html {
+                return Ok((StatusCode::SEE_OTHER, [("location", "/login")]).into_response());
+            }
+            return Err(map_auth_error(e));
+        }
+    };
 
     if session.user.role != Role::Admin {
+        let accepts_html = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("text/html"));
+        if accepts_html {
+            return Ok((StatusCode::SEE_OTHER, [("location", "/app")]).into_response());
+        }
         return Err(map_auth_error(crate::auth::AuthError::Forbidden));
     }
 

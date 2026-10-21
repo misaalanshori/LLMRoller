@@ -311,3 +311,154 @@ async fn login_csrf_and_security_headers() {
         Ok(())
     );
 }
+
+#[doc = "Spec: AUTH-1, AUTH-2, AUTH-3, AUTH-7, UI-1"]
+#[tokio::test]
+async fn test_browser_web_flow_setup_login_and_redirects() {
+    let (_dir, pool, setup_state, auth_state) = setup_test_env().await;
+    let expected_token = setup_state.expected_token.clone().expect("token");
+
+    let master_key = llmroller_store::crypto::MasterKey::from_bytes([0x77; 32]);
+    llmroller_store::instance::load_or_initialize(
+        &pool,
+        "key-0",
+        &master_key,
+        Arc::new(llmroller_core::seams::OsEntropy),
+        1,
+    )
+    .await
+    .expect("load");
+    llmroller_store::settings::seed_defaults(&pool, None, 1)
+        .await
+        .expect("seed");
+
+    let api_state =
+        llmroller_admin::ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let app = llmroller_admin::control_plane_router_full(setup_state, auth_state, api_state);
+
+    // 1. GET / redirects to /setup when zero users exist
+    let req_root = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .expect("request");
+    let resp_root = app.clone().oneshot(req_root).await.expect("response");
+    assert_eq!(resp_root.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_root.headers().get("location").expect("location"),
+        "/setup"
+    );
+
+    // 2. Browser form submission (application/x-www-form-urlencoded) on /admin/api/setup succeeds and redirects to /login
+    let form_body =
+        format!("username=web_admin&password=Password12345!%23&setup_token={expected_token}");
+    let req_setup = Request::builder()
+        .method("POST")
+        .uri("/admin/api/setup")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "text/html")
+        .body(Body::from(form_body))
+        .expect("request");
+    let resp_setup = app.clone().oneshot(req_setup).await.expect("response");
+    assert_eq!(resp_setup.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_setup.headers().get("location").expect("location"),
+        "/login"
+    );
+
+    // 3. GET /setup now returns 404 (permanent lockout per AUTH-3)
+    let req_setup_page = Request::builder()
+        .method("GET")
+        .uri("/setup")
+        .body(Body::empty())
+        .expect("request");
+    let resp_setup_page = app.clone().oneshot(req_setup_page).await.expect("response");
+    assert_eq!(resp_setup_page.status(), StatusCode::NOT_FOUND);
+
+    // 4. GET / now redirects to /login since users exist
+    let req_root2 = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .expect("request");
+    let resp_root2 = app.clone().oneshot(req_root2).await.expect("response");
+    assert_eq!(resp_root2.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_root2.headers().get("location").expect("location"),
+        "/login"
+    );
+
+    // 5. GET /login returns login HTML with CSRF cookie
+    let req_login_page = Request::builder()
+        .method("GET")
+        .uri("/login")
+        .body(Body::empty())
+        .expect("request");
+    let resp_login_page = app.clone().oneshot(req_login_page).await.expect("response");
+    assert_eq!(resp_login_page.status(), StatusCode::OK);
+    let login_cookie = resp_login_page
+        .headers()
+        .get("set-cookie")
+        .expect("csrf cookie")
+        .to_str()
+        .expect("str");
+    let csrf_val = resp_login_page
+        .headers()
+        .get("x-csrf-token")
+        .expect("csrf token")
+        .to_str()
+        .expect("str");
+
+    // 6. Browser form submission (application/x-www-form-urlencoded) on /api/auth/login succeeds and redirects to /admin
+    let login_form_body =
+        format!("username=web_admin&password=Password12345!%23&csrf_token={csrf_val}");
+    let req_login = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "text/html")
+        .header("cookie", login_cookie)
+        .body(Body::from(login_form_body))
+        .expect("request");
+    let resp_login = app.clone().oneshot(req_login).await.expect("response");
+    assert_eq!(resp_login.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_login.headers().get("location").expect("location"),
+        "/admin"
+    );
+    let session_cookie = resp_login
+        .headers()
+        .get("set-cookie")
+        .expect("session cookie")
+        .to_str()
+        .expect("str")
+        .to_string();
+
+    // 7. GET / with session cookie redirects to /admin
+    let req_root3 = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("cookie", &session_cookie)
+        .body(Body::empty())
+        .expect("request");
+    let resp_root3 = app.clone().oneshot(req_root3).await.expect("response");
+    assert_eq!(resp_root3.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_root3.headers().get("location").expect("location"),
+        "/admin"
+    );
+
+    // 8. GET /app without session cookie redirects browser (accept: text/html) to /login
+    let req_app_unauth = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header("accept", "text/html,application/xhtml+xml")
+        .body(Body::empty())
+        .expect("request");
+    let resp_app_unauth = app.clone().oneshot(req_app_unauth).await.expect("response");
+    assert_eq!(resp_app_unauth.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp_app_unauth.headers().get("location").expect("location"),
+        "/login"
+    );
+}

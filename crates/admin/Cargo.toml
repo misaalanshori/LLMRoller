@@ -17,6 +17,7 @@ workspace = true
 askama.workspace = true
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 http.workspace = true
 llmroller-core = { path = "../core" }
 llmroller-store = { path = "../store" }
@@ -31,6 +32,7 @@ time.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

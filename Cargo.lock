@@ -1577,6 +1577,7 @@ dependencies = [
  "askama",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "http",
  "llmroller-core",
  "llmroller-store",
@@ -1592,6 +1593,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]

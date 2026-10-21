@@ -19,12 +19,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bytes::Bytes;
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::Role;
 use llmroller_core::seams::{Clock, EntropySource, OsEntropy, SystemClock};
 use llmroller_store::crypto::sha256_hex;
 use llmroller_store::users::{
-    NewWebSession, SessionWithUser, User, delete_web_session, find_login_record,
+    NewWebSession, SessionWithUser, User, count_users, delete_web_session, find_login_record,
     insert_web_session, load_web_session, touch_web_session, verify_password,
 };
 use parking_lot::Mutex;
@@ -442,6 +443,15 @@ pub struct LoginRequest {
     pub totp_code: Option<String>,
 }
 
+/// Login form submission payload for browser form POSTs.
+#[derive(Debug, Deserialize)]
+pub struct LoginForm {
+    pub username: String,
+    pub password: String,
+    pub totp_code: Option<String>,
+    pub csrf_token: Option<String>,
+}
+
 /// Login success response with user projection and CSRF token.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
@@ -454,11 +464,28 @@ pub struct LoginResponse {
 /// Build the authentication router.
 pub fn router(state: AuthAppState) -> Router {
     Router::new()
+        .route("/", get(get_root_redirect))
         .route("/login", get(get_login_page))
         .route("/api/auth/login", post(post_login))
         .route("/api/auth/logout", post(post_logout))
         .route("/api/auth/me", get(get_me))
         .with_state(state)
+}
+
+#[doc = "Spec: AUTH-1, Spec: AUTH-3, Spec: UI-1"]
+async fn get_root_redirect(State(state): State<AuthAppState>, headers: HeaderMap) -> Response {
+    let count = count_users(&state.pool).await.unwrap_or(0);
+    if count == 0 {
+        return (StatusCode::SEE_OTHER, [("location", "/setup")]).into_response();
+    }
+    if let Ok(session) = authenticate_session(&state, &headers).await {
+        if session.user.role == Role::Admin {
+            return (StatusCode::SEE_OTHER, [("location", "/admin")]).into_response();
+        } else {
+            return (StatusCode::SEE_OTHER, [("location", "/app")]).into_response();
+        }
+    }
+    (StatusCode::SEE_OTHER, [("location", "/login")]).into_response()
 }
 
 #[doc = "Spec: SEC-5"]
@@ -478,7 +505,99 @@ async fn get_login_page(State(state): State<AuthAppState>) -> Response {
     );
 
     let html = format!(
-        "<!DOCTYPE html><html><head><title>LLMRoller Login</title><meta name=\"csrf-token\" content=\"{csrf_token}\"></head><body><h1>Login</h1><form method=\"POST\" action=\"/api/auth/login\"><input name=\"username\" placeholder=\"Username\" required><input type=\"password\" name=\"password\" placeholder=\"Password\" required><input name=\"totp_code\" placeholder=\"2FA Code (if enabled)\"><button type=\"submit\">Sign In</button></form></body></html>"
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{csrf_token}">
+    <title>LLMRoller - Sign In</title>
+    <style>
+        :root {{ --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --primary-hover: #2563eb; --error: #ef4444; }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+        body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }}
+        .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 400px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+        h1 {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }}
+        p.subtitle {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 1.5rem; text-align: center; }}
+        .form-group {{ margin-bottom: 1.25rem; }}
+        label {{ display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.375rem; color: #cbd5e1; }}
+        input {{ width: 100%; padding: 0.625rem 0.875rem; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.9375rem; outline: none; transition: border-color 0.2s; }}
+        input:focus {{ border-color: var(--primary); }}
+        button {{ width: 100%; padding: 0.75rem; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 0.9375rem; cursor: pointer; transition: background 0.2s; margin-top: 0.5rem; }}
+        button:hover {{ background: var(--primary-hover); }}
+        .alert {{ display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--error); color: #fca5a5; padding: 0.75rem; border-radius: 6px; font-size: 0.875rem; margin-bottom: 1.25rem; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>LLMRoller</h1>
+        <p class="subtitle">Sign in to your control workspace</p>
+        <div id="error-box" class="alert"></div>
+        <form id="login-form" method="POST" action="/api/auth/login">
+            <input type="hidden" name="csrf_token" value="{csrf_token}">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" required autofocus placeholder="username">
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password" required placeholder="••••••••••••">
+            </div>
+            <div class="form-group">
+                <label for="totp_code">2FA Code (Optional)</label>
+                <input id="totp_code" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code">
+            </div>
+            <button type="submit" id="submit-btn">Sign In</button>
+        </form>
+    </div>
+    <script>
+        const form = document.getElementById('login-form');
+        const errBox = document.getElementById('error-box');
+        const btn = document.getElementById('submit-btn');
+
+        form.addEventListener('submit', async (e) => {{
+            e.preventDefault();
+            errBox.style.display = 'none';
+            btn.disabled = true;
+            btn.textContent = 'Signing in...';
+
+            const payload = {{
+                username: form.username.value.trim(),
+                password: form.password.value,
+                totp_code: form.totp_code.value.trim() || null
+            }};
+
+            try {{
+                const res = await fetch('/api/auth/login', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'X-CSRF-Token': '{csrf_token}'
+                    }},
+                    body: JSON.stringify(payload)
+                }});
+                const data = await res.json().catch(() => ({{}}));
+                if (res.ok) {{
+                    if (data.role === 'admin') {{
+                        window.location.href = '/admin';
+                    }} else {{
+                        window.location.href = '/app';
+                    }}
+                }} else {{
+                    errBox.textContent = data.error || ('Authentication failed with status ' + res.status);
+                    errBox.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Sign In';
+                }}
+            }} catch (err) {{
+                // Fallback to native form post
+                form.submit();
+            }}
+        }});
+    </script>
+</body>
+</html>"#
     );
 
     (
@@ -497,7 +616,7 @@ async fn get_login_page(State(state): State<AuthAppState>) -> Response {
 async fn post_login(
     State(state): State<AuthAppState>,
     parts: Parts,
-    Json(payload): Json<LoginRequest>,
+    body: Bytes,
 ) -> Result<Response, AuthError> {
     let now_ms = state.clock.now_ms();
     let peer_addr = parts
@@ -508,6 +627,36 @@ async fn post_login(
             |ci| ci.0,
         );
     let client_ip = extract_client_ip(peer_addr, &parts.headers, &state.config.trusted_proxies);
+
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let (payload, form_csrf): (LoginRequest, Option<String>) =
+        if content_type.contains("application/json") {
+            let req: LoginRequest =
+                serde_json::from_slice(&body).map_err(|_| AuthError::InvalidCredentials)?;
+            (req, None)
+        } else {
+            let params: HashMap<String, String> =
+                url::form_urlencoded::parse(&body).into_owned().collect();
+            (
+                LoginRequest {
+                    username: params.get("username").cloned().unwrap_or_default(),
+                    password: params.get("password").cloned().unwrap_or_default(),
+                    totp_code: params
+                        .get("totp_code")
+                        .cloned()
+                        .filter(|s| !s.trim().is_empty()),
+                },
+                params
+                    .get("csrf_token")
+                    .cloned()
+                    .filter(|s| !s.trim().is_empty()),
+            )
+        };
 
     // 1. Validate Login CSRF token per SEC-5
     let login_csrf_cookie_name = state.config.login_csrf_cookie_name();
@@ -521,7 +670,10 @@ async fn post_login(
     let header_csrf = parts
         .headers
         .get("x-csrf-token")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or(form_csrf);
+
     let (Some(expected), Some(header_token)) = (expected_csrf, header_csrf) else {
         return Err(AuthError::InvalidCsrf);
     };
@@ -609,19 +761,34 @@ async fn post_login(
         SESSION_ABSOLUTE_TIMEOUT_MS / 1000
     );
 
-    let body = Json(LoginResponse {
-        user_id: record.user.id,
-        username: record.user.username,
-        role: record.user.role,
-        csrf_token: csrf_token.clone(),
-    });
+    let target_path = if record.user.role == Role::Admin {
+        "/admin"
+    } else {
+        "/app"
+    };
 
-    Ok((
-        StatusCode::OK,
-        [("set-cookie", cookie_header), ("x-csrf-token", csrf_token)],
-        body,
-    )
-        .into_response())
+    let is_json = content_type.contains("application/json");
+    if is_json {
+        let body = Json(LoginResponse {
+            user_id: record.user.id,
+            username: record.user.username,
+            role: record.user.role,
+            csrf_token: csrf_token.clone(),
+        });
+
+        Ok((
+            StatusCode::OK,
+            [("set-cookie", cookie_header), ("x-csrf-token", csrf_token)],
+            body,
+        )
+            .into_response())
+    } else {
+        Ok((
+            StatusCode::SEE_OTHER,
+            [("location", target_path), ("set-cookie", &cookie_header)],
+        )
+            .into_response())
+    }
 }
 
 #[doc = "Spec: AUTH-7"]
