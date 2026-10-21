@@ -911,14 +911,11 @@ async fn post_admin_prices_sync_handler(
     llmroller_core::ssrf::validate_url(url, false)
         .map_err(|_| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid catalog URL"))?;
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
+    let client = llmroller_core::ssrf::create_guarded_client(false)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let catalog: serde_json::Value = client
         .get(url)
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?
@@ -2740,16 +2737,13 @@ async fn post_test_upstream_key_handler(
             "provider URL is not allowed",
         ));
     }
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
+    let client = llmroller_core::ssrf::create_guarded_client(allow_private)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let started = std::time::Instant::now();
     let response = client
         .get(&target)
         .header("authorization", format!("Bearer {secret}"))
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await;
     let latency_ms = started.elapsed().as_millis() as i64;
