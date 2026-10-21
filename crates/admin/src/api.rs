@@ -9,6 +9,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::Html;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
@@ -292,7 +293,11 @@ async fn delete_user_provider_handler(
     delete_provider(&state.auth.pool, &actor, id)
         .await
         .map_err(map_provider_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +386,11 @@ async fn delete_user_upstream_key_handler(
     delete_upstream_key(&state.auth.pool, &actor, id)
         .await
         .map_err(map_provider_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +476,11 @@ async fn delete_user_client_key_handler(
     delete_client_key(&state.auth.pool, &actor, id)
         .await
         .map_err(map_client_key_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,7 +1501,7 @@ async fn post_accept_share_handler(
     headers: HeaderMap,
     Path(id): Path<llmroller_core::ids::ShareId>,
     Json(payload): Json<AcceptShareRequest>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, true).await?;
     let user_id = actor
         .user_id()
@@ -1514,7 +1527,13 @@ async fn post_accept_share_handler(
     tx.commit()
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(StatusCode::OK)
+    if headers.contains_key("hx-request") {
+        use axum::response::IntoResponse as _;
+        Ok(Html("<span class=\"badge badge-success\">Accepted</span>").into_response())
+    } else {
+        use axum::response::IntoResponse as _;
+        Ok(StatusCode::OK.into_response())
+    }
 }
 
 async fn delete_user_share_handler(
@@ -1541,7 +1560,11 @@ async fn delete_user_share_handler(
     tx.commit()
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,7 +1713,11 @@ async fn delete_admin_user_handler(
         .await
         .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
 
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2014,7 +2041,11 @@ async fn delete_pin_handler(
         .bind(&hash)
         .execute(&state.auth.pool)
         .await;
-    Ok(StatusCode::NO_CONTENT)
+    if headers.contains_key("hx-request") {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,11 +2768,833 @@ async fn export_csv_internal(
     Ok(response)
 }
 
+// ---------------------------------------------------------------------------
+// HTMX Partial Endpoints (SRDD Section 14.3)
+// ---------------------------------------------------------------------------
+
+async fn get_partial_pins_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let is_admin = actor.is_admin();
+    let uid = actor.user_id().map(|u| u.to_string()).unwrap_or_default();
+
+    use sqlx::Row as _;
+    let query_str = if is_admin {
+        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label
+         FROM pins p
+         LEFT JOIN models m ON p.model_pk = m.model_pk
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         ORDER BY p.last_used_at DESC LIMIT 50"
+    } else {
+        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label
+         FROM pins p
+         JOIN client_keys ck ON p.client_key_id = ck.id
+         LEFT JOIN models m ON p.model_pk = m.model_pk
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         WHERE ck.owner_user_id = ?
+         ORDER BY p.last_used_at DESC LIMIT 50"
+    };
+
+    let rows = if is_admin {
+        sqlx::query(query_str).fetch_all(&state.auth.pool).await
+    } else {
+        sqlx::query(query_str)
+            .bind(&uid)
+            .fetch_all(&state.auth.pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"7\" class=\"text-center text-muted\">No active sessions pinned right now.</td></tr>".to_string()
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let hash: String = r.try_get("session_hash").unwrap_or_default();
+        let short_hash = if hash.len() > 12 { &hash[..12] } else { &hash };
+        let clk: String = r.try_get("client_key_id").unwrap_or_default();
+        let short_clk = if clk.len() > 10 { &clk[..10] } else { &clk };
+        let model: String = r
+            .try_get::<Option<String>, _>("canonical_id")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "unresolved".to_string());
+        let key_label: String = r
+            .try_get::<Option<String>, _>("key_label")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "key".to_string());
+        let pool_tier: i64 = r.try_get("pool_tier").unwrap_or(1);
+        let last_used: i64 = r.try_get("last_used_at").unwrap_or(0);
+        let time_str = format!(
+            "{}s ago",
+            (state.auth.clock.now_ms() - last_used).max(0) / 1000
+        );
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><code>{short_hash}...</code></td>\
+                <td><code>{short_clk}...</code></td>\
+                <td><strong>{model}</strong></td>\
+                <td>{key_label}</td>\
+                <td><span class=\"badge badge-info\">Tier {pool_tier}</span></td>\
+                <td>{time_str}</td>\
+                <td>\
+                    <button class=\"btn btn-xs btn-primary\" data-action=\"preview-chat\" data-session-hash=\"{hash}\">Preview Chat</button>\
+                    <button class=\"btn btn-xs btn-danger\" hx-delete=\"/admin/api/sessions/{hash}/pin\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Unpin</button>\
+                </td>\
+            </tr>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_client_keys_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, prefix, label, routing_scope, rate_limit_rpm, budget_micro_usd_month, created_at
+         FROM client_keys WHERE owner_user_id = ? ORDER BY created_at DESC",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"7\" class=\"text-center text-muted\">No client keys issued yet. Click \"+ New Client Key\" above.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let prefix: String = r.try_get("prefix").unwrap_or_default();
+        let label: String = r.try_get("label").unwrap_or_default();
+        let scope: String = r.try_get("routing_scope").unwrap_or_default();
+        let rpm: Option<i64> = r.try_get("rate_limit_rpm").unwrap_or_default();
+        let rpm_str = rpm.map_or_else(|| "Unlimited".to_string(), |v| format!("{v} RPM"));
+        let budget: Option<i64> = r.try_get("budget_micro_usd_month").unwrap_or_default();
+        let budget_str = budget.map_or_else(
+            || "No Cap".to_string(),
+            |b| format!("${:.2}", b as f64 / 1_000_000.0),
+        );
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><code>{prefix}...</code></td>\
+                <td><strong>{label}</strong></td>\
+                <td><span class=\"badge badge-info\">{scope}</span></td>\
+                <td>{rpm_str}</td>\
+                <td>{budget_str}</td>\
+                <td>Active</td>\
+                <td>\
+                    <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/client-keys/{id}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Revoke this client key?\">Revoke</button>\
+                </td>\
+            </tr>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_providers_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let prov_rows = sqlx::query(
+        "SELECT id, name, kind, base_url, enabled FROM providers WHERE owner_user_id = ? ORDER BY created_at ASC",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if prov_rows.is_empty() {
+        return Ok(Html(
+            "<p class=\"text-muted\">No personal providers configured yet. Click \"+ Add Provider\" above.</p>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for p in prov_rows {
+        let pid: String = p.try_get("id").unwrap_or_default();
+        let name: String = p.try_get("name").unwrap_or_default();
+        let kind: String = p.try_get("kind").unwrap_or_default();
+        let base_url: String = p.try_get("base_url").unwrap_or_default();
+
+        let key_rows = sqlx::query(
+            "SELECT id, label, secret_last4, priority, strict_tier, enabled FROM upstream_keys WHERE provider_id = ?",
+        )
+        .bind(&pid)
+        .fetch_all(&state.auth.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut keys_html = String::new();
+        if key_rows.is_empty() {
+            keys_html = "<p class=\"text-muted\" style=\"font-size: 0.8125rem; padding: 0.5rem 0;\">No upstream keys under this provider. Add one to enable routing.</p>".to_string();
+        } else {
+            keys_html.push_str("<table class=\"data-table\" style=\"margin-top: 0.5rem; background: #080c18;\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
+            for k in key_rows {
+                let kid: String = k.try_get("id").unwrap_or_default();
+                let klabel: String = k.try_get("label").unwrap_or_default();
+                let last4: Option<String> = k.try_get("secret_last4").unwrap_or_default();
+                let mask = last4.map_or_else(|| "sealed".to_string(), |l| format!("••••{l}"));
+                let prio: i64 = k.try_get("priority").unwrap_or(100);
+                let tier: i64 = k.try_get("strict_tier").unwrap_or(1);
+                let enabled: bool = k.try_get::<i64, _>("enabled").unwrap_or(1) == 1;
+
+                keys_html.push_str(&format!(
+                    "<tr>\
+                        <td><strong>{klabel}</strong> <span class=\"text-muted\">({mask})</span></td>\
+                        <td>{prio}</td>\
+                        <td>Tier {tier}</td>\
+                        <td><span class=\"badge badge-{}\">{}</span></td>\
+                        <td>\
+                            <button class=\"btn btn-xs btn-ghost\" data-action=\"test-key\" data-key-id=\"{kid}\">Test</button>\
+                            <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/upstream-keys/{kid}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Remove this upstream key?\">Remove</button>\
+                        </td>\
+                    </tr>",
+                    if enabled { "success" } else { "danger" },
+                    if enabled { "Active" } else { "Disabled" }
+                ));
+            }
+            keys_html.push_str("</tbody></table>");
+        }
+
+        html.push_str(&format!(
+            "<div class=\"provider-box\">\
+                <div class=\"provider-header\">\
+                    <div>\
+                        <h4 style=\"font-size: 1rem; margin-bottom: 0.25rem;\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <div style=\"font-size: 0.8125rem; font-family: monospace; color: var(--muted);\">{base_url}</div>\
+                    </div>\
+                    <div>\
+                        <button class=\"btn btn-xs btn-primary\" data-modal-open=\"modal-new-upstream-key\" data-provider-id=\"{pid}\" data-provider-name=\"{name}\">+ Add Key</button>\
+                        <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/providers/{pid}\" hx-target=\"closest .provider-box\" hx-swap=\"outerHTML\" hx-confirm=\"Delete this provider and all attached keys?\">Delete</button>\
+                    </div>\
+                </div>\
+                <div class=\"keys-sublist\">{keys_html}</div>\
+            </div>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_shares_outgoing_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, grantee_user_id, allowed_models, max_monthly_micro_usd, enabled
+         FROM provider_shares WHERE owner_user_id = ? ORDER BY created_at DESC",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"5\" class=\"text-center text-muted\">No outgoing shares granted yet. Click \"+ Grant Share\" above.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let grantee: String = r.try_get("grantee_user_id").unwrap_or_default();
+        let short_grantee = if grantee.len() > 10 {
+            &grantee[..10]
+        } else {
+            &grantee
+        };
+        let models: Option<String> = r.try_get("allowed_models").unwrap_or_default();
+        let models_str = models.unwrap_or_else(|| "All".to_string());
+        let cap: Option<i64> = r.try_get("max_monthly_micro_usd").unwrap_or_default();
+        let cap_str = cap.map_or_else(
+            || "No Cap".to_string(),
+            |c| format!("${:.2}", c as f64 / 1_000_000.0),
+        );
+        let enabled: bool = r.try_get::<i64, _>("enabled").unwrap_or(1) == 1;
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><code>{short_grantee}...</code></td>\
+                <td>{models_str}</td>\
+                <td>{cap_str}</td>\
+                <td><span class=\"badge badge-{}\">{}</span></td>\
+                <td>\
+                    <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/shares/{id}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Revoke this share?\">Revoke</button>\
+                </td>\
+            </tr>",
+            if enabled { "success" } else { "danger" },
+            if enabled { "Active" } else { "Revoked" }
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_shares_incoming_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT s.id, s.owner_user_id, s.allowed_models, s.accepted_config_fingerprint, p.name as provider_name, p.kind as provider_kind, p.share_config_fingerprint as current_fingerprint
+         FROM provider_shares s
+         JOIN providers p ON s.provider_id = p.id
+         WHERE s.grantee_user_id = ? ORDER BY s.created_at DESC",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"5\" class=\"text-center text-muted\">No shares shared with you.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let pname: String = r.try_get("provider_name").unwrap_or_default();
+        let pkind: String = r.try_get("provider_kind").unwrap_or_default();
+        let owner: String = r.try_get("owner_user_id").unwrap_or_default();
+        let short_owner = if owner.len() > 10 {
+            &owner[..10]
+        } else {
+            &owner
+        };
+        let models: Option<String> = r.try_get("allowed_models").unwrap_or_default();
+        let models_str = models.unwrap_or_else(|| "All".to_string());
+        let accepted_fp: Option<String> =
+            r.try_get("accepted_config_fingerprint").unwrap_or_default();
+        let current_fp: String = r.try_get("current_fingerprint").unwrap_or_default();
+        let is_matching = accepted_fp.as_deref() == Some(&current_fp);
+
+        let action_btn = if is_matching {
+            "<span class=\"text-muted\">Active</span>".to_string()
+        } else {
+            format!(
+                "<button class=\"btn btn-xs btn-primary\" hx-post=\"/api/user/shares/{id}/accept\" hx-vals='{{\"fingerprint\": \"{current_fp}\"}}' hx-target=\"closest tr\" hx-swap=\"outerHTML\">Accept Share</button>"
+            )
+        };
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><strong>{pname}</strong> <span class=\"badge badge-info\">{pkind}</span></td>\
+                <td><code>{short_owner}...</code></td>\
+                <td>{models_str}</td>\
+                <td><span class=\"badge badge-{}\">{}</span></td>\
+                <td>{action_btn}</td>\
+            </tr>",
+            if is_matching { "success" } else { "warning" },
+            if is_matching {
+                "Accepted"
+            } else {
+                "Pending Consent"
+            }
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_matrix_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let res = get_user_routes_handler(State(state), headers).await?;
+    let json = res.0;
+    let models = json.get("models").and_then(|v| v.as_array());
+
+    let Some(arr) = models else {
+        return Ok(Html(
+            "<tr><td colspan=\"5\" class=\"text-center text-muted\">No models found.</td></tr>"
+                .to_string(),
+        ));
+    };
+
+    if arr.is_empty() {
+        return Ok(Html("<tr><td colspan=\"5\" class=\"text-center text-muted\">No models discovered yet. Add an upstream key to discover routes.</td></tr>".to_string()));
+    }
+
+    let mut html = String::new();
+    for m in arr {
+        let cid = m["canonical_id"].as_str().unwrap_or("unknown");
+        let strategy = m["routing_strategy"]
+            .as_str()
+            .unwrap_or("smooth_weighted_rr");
+        let own_keys = m["own_keys"].as_array().map_or("—".to_string(), |keys| {
+            if keys.is_empty() {
+                "—".to_string()
+            } else {
+                keys.iter()
+                    .map(|k| {
+                        format!(
+                            "{} (Prio: {})",
+                            k["label"].as_str().unwrap_or("key"),
+                            k["priority_override"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        });
+        let shared_keys = m["shared_keys"].as_array().map_or("—".to_string(), |keys| {
+            if keys.is_empty() {
+                "—".to_string()
+            } else {
+                keys.iter()
+                    .map(|k| {
+                        format!(
+                            "{} (Prio: {})",
+                            k["label"].as_str().unwrap_or("key"),
+                            k["priority_override"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        });
+        let global_avail = m["global_pool"]["available"].as_bool().unwrap_or(false);
+        let global_html = if global_avail {
+            "<span class=\"badge badge-success\">Global pool</span>"
+        } else {
+            "—"
+        };
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><strong>{cid}</strong></td>\
+                <td><span class=\"badge badge-info\">{strategy}</span></td>\
+                <td>{own_keys}</td>\
+                <td>{shared_keys}</td>\
+                <td>{global_html}</td>\
+            </tr>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_overview_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let res = get_admin_overview_telemetry_handler(State(state.clone()), headers).await?;
+    let data = res.0;
+
+    let proj_disk = data["projected_disk_mb"].as_f64().unwrap_or(0.0);
+    let unpriced = data["unpriced_models_count"].as_i64().unwrap_or(0);
+    let events_cnt = data["usage_events_count"].as_i64().unwrap_or(0);
+    let ret_days = data["retention_days"].as_i64().unwrap_or(7);
+
+    let users_count: i64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.auth.pool)
+        .await
+        .unwrap_or(0);
+
+    let prov_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM providers WHERE ownership_scope = 'global'",
+    )
+    .fetch_one(&state.auth.pool)
+    .await
+    .unwrap_or(0);
+
+    let unpriced_badge = if unpriced > 0 {
+        format!(
+            "<span class=\"badge badge-warning\" style=\"margin-top: 0.25rem;\">{unpriced} unpriced models</span>"
+        )
+    } else {
+        String::new()
+    };
+
+    let html = format!(
+        "<div class=\"stats-grid\">\
+            <div class=\"card stat-card\">\
+                <div class=\"stat-label\">Projected Disk Usage</div>\
+                <div id=\"disk-meter\" class=\"disk-meter\">\
+                    <p class=\"stat-val\" style=\"font-size: 1.5rem;\">Projected Disk Usage: {proj_disk} MB</p>\
+                    {unpriced_badge}\
+                    <div class=\"stat-desc\" style=\"font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;\">\
+                        {events_cnt} events ({ret_days}d retention)\
+                    </div>\
+                </div>\
+                <div class=\"stat-desc\">A6 disk telemetry meter</div>\
+            </div>\
+            <div class=\"card stat-card\">\
+                <div class=\"stat-label\">Total Users</div>\
+                <div class=\"stat-val\">{users_count}</div>\
+                <div class=\"stat-desc\">Standard & admin accounts</div>\
+            </div>\
+            <div class=\"card stat-card\">\
+                <div class=\"stat-label\">Global Providers</div>\
+                <div class=\"stat-val\">{prov_count}</div>\
+                <div class=\"stat-desc\">Shared upstream routes</div>\
+            </div>\
+            <div class=\"card stat-card\">\
+                <div class=\"stat-label\">System Health</div>\
+                <div class=\"stat-val text-success\">Healthy</div>\
+                <div class=\"stat-desc\">WAL Checkpoint Normal</div>\
+            </div>\
+        </div>"
+    );
+
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_users_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, username, role, can_use_global_providers, global_budget_micro_usd_month, disabled
+         FROM users ORDER BY created_at ASC",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut html = String::new();
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let username: String = r.try_get("username").unwrap_or_default();
+        let role: String = r.try_get("role").unwrap_or_default();
+        let can_use: bool = r.try_get::<i64, _>("can_use_global_providers").unwrap_or(1) == 1;
+        let budget: Option<i64> = r
+            .try_get("global_budget_micro_usd_month")
+            .unwrap_or_default();
+        let budget_str = budget.map_or_else(
+            || "No Cap".to_string(),
+            |b| format!("${:.2}", b as f64 / 1_000_000.0),
+        );
+        let disabled: bool = r.try_get::<i64, _>("disabled").unwrap_or(0) == 1;
+
+        let delete_btn = if role != "admin" {
+            format!(
+                "<button class=\"btn btn-xs btn-danger\" hx-delete=\"/admin/api/users/{id}?confirm={username}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Delete user {username}?\">Delete</button>"
+            )
+        } else {
+            String::new()
+        };
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><strong>{username}</strong></td>\
+                <td><span class=\"badge badge-{}\">{role}</span></td>\
+                <td>{}</td>\
+                <td>{budget_str}</td>\
+                <td><span class=\"badge badge-{}\">{}</span></td>\
+                <td>Active</td>\
+                <td>\
+                    <button class=\"btn btn-xs btn-secondary\" data-action=\"toggle-user\" data-id=\"{id}\" data-disabled=\"{}\">{}</button>\
+                    {delete_btn}\
+                </td>\
+            </tr>",
+            if role == "admin" { "primary" } else { "info" },
+            if can_use { "Allowed" } else { "Restricted" },
+            if disabled { "danger" } else { "success" },
+            if disabled { "Disabled" } else { "Active" },
+            !disabled,
+            if disabled { "Enable" } else { "Disable" }
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_providers_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let prov_rows = sqlx::query(
+        "SELECT id, name, kind, base_url, enabled FROM providers WHERE ownership_scope = 'global' ORDER BY created_at ASC",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if prov_rows.is_empty() {
+        return Ok(Html(
+            "<p class=\"text-muted\">No global providers configured yet. Click \"+ Add Global Provider\" above.</p>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for p in prov_rows {
+        let pid: String = p.try_get("id").unwrap_or_default();
+        let name: String = p.try_get("name").unwrap_or_default();
+        let kind: String = p.try_get("kind").unwrap_or_default();
+        let base_url: String = p.try_get("base_url").unwrap_or_default();
+
+        let key_rows = sqlx::query(
+            "SELECT id, label, secret_last4, priority, strict_tier, enabled FROM upstream_keys WHERE provider_id = ?",
+        )
+        .bind(&pid)
+        .fetch_all(&state.auth.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut keys_html = String::new();
+        if key_rows.is_empty() {
+            keys_html = "<p class=\"text-muted\" style=\"font-size: 0.8125rem; padding: 0.5rem 0;\">No upstream keys under this global provider.</p>".to_string();
+        } else {
+            keys_html.push_str("<table class=\"data-table\" style=\"margin-top: 0.5rem; background: #080c18;\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
+            for k in key_rows {
+                let kid: String = k.try_get("id").unwrap_or_default();
+                let klabel: String = k.try_get("label").unwrap_or_default();
+                let last4: Option<String> = k.try_get("secret_last4").unwrap_or_default();
+                let mask = last4.map_or_else(|| "sealed".to_string(), |l| format!("••••{l}"));
+                let prio: i64 = k.try_get("priority").unwrap_or(100);
+                let tier: i64 = k.try_get("strict_tier").unwrap_or(1);
+                let enabled: bool = k.try_get::<i64, _>("enabled").unwrap_or(1) == 1;
+
+                keys_html.push_str(&format!(
+                    "<tr>\
+                        <td><strong>{klabel}</strong> <span class=\"text-muted\">({mask})</span></td>\
+                        <td>{prio}</td>\
+                        <td>Tier {tier}</td>\
+                        <td><span class=\"badge badge-{}\">{}</span></td>\
+                        <td>\
+                            <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/upstream-keys/{kid}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Remove this upstream key?\">Remove</button>\
+                        </td>\
+                    </tr>",
+                    if enabled { "success" } else { "danger" },
+                    if enabled { "Active" } else { "Disabled" }
+                ));
+            }
+            keys_html.push_str("</tbody></table>");
+        }
+
+        html.push_str(&format!(
+            "<div class=\"provider-box\">\
+                <div class=\"provider-header\">\
+                    <div>\
+                        <h4 style=\"font-size: 1rem; margin-bottom: 0.25rem;\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <div style=\"font-size: 0.8125rem; font-family: monospace; color: var(--muted);\">{base_url}</div>\
+                    </div>\
+                    <div>\
+                        <button class=\"btn btn-xs btn-primary\" data-modal-open=\"modal-new-upstream-key\" data-provider-id=\"{pid}\" data-provider-name=\"{name}\">+ Add Key</button>\
+                        <button class=\"btn btn-xs btn-danger\" hx-delete=\"/admin/api/providers/{pid}\" hx-target=\"closest .provider-box\" hx-swap=\"outerHTML\" hx-confirm=\"Delete this global provider and all attached keys?\">Delete</button>\
+                    </div>\
+                </div>\
+                <div class=\"keys-sublist\">{keys_html}</div>\
+            </div>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_catalog_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let model_rows = sqlx::query(
+        "SELECT m.model_pk, m.canonical_id, m.origin, m.exposed, m.merge_state,
+                (SELECT COUNT(*) FROM model_routes r WHERE r.model_pk = m.model_pk) as route_count
+         FROM models m ORDER BY m.canonical_id ASC",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if model_rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"6\" class=\"text-center text-muted\">No models in catalog.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in model_rows {
+        let pk: String = r.try_get("model_pk").unwrap_or_default();
+        let cid: String = r.try_get("canonical_id").unwrap_or_default();
+        let origin: String = r.try_get("origin").unwrap_or_default();
+        let exposed: Option<i64> = r.try_get("exposed").unwrap_or_default();
+        let is_exposed = exposed != Some(0);
+        let merge_state: String = r.try_get("merge_state").unwrap_or_default();
+        let count: i64 = r.try_get("route_count").unwrap_or(0);
+
+        let confirm_btn = if merge_state == "pending_review" {
+            format!(
+                "<button class=\"btn btn-xs btn-primary\" hx-post=\"/admin/api/models/{pk}/confirm-merge\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Confirm Merge</button> "
+            )
+        } else {
+            String::new()
+        };
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><strong>{cid}</strong></td>\
+                <td><span class=\"badge badge-info\">{origin}</span></td>\
+                <td><span class=\"badge badge-{}\">{merge_state}</span></td>\
+                <td><span class=\"badge badge-{}\">{}</span></td>\
+                <td>{count} routes</td>\
+                <td>\
+                    {confirm_btn}\
+                    <button class=\"btn btn-xs btn-{}\" data-action=\"toggle-model\" data-id=\"{pk}\" data-exposed=\"{}\">{}</button>\
+                </td>\
+            </tr>",
+            if merge_state == "confirmed" { "success" } else { "warning" },
+            if is_exposed { "success" } else { "danger" },
+            if is_exposed { "Exposed" } else { "Disabled" },
+            if is_exposed { "danger" } else { "success" },
+            if is_exposed { 0 } else { 1 },
+            if is_exposed { "Kill-Switch" } else { "Expose" }
+        ));
+    }
+
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_audit_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT seq, ts, actor_user_id, action, target_type, target_id, payload_json
+         FROM audit_log ORDER BY seq DESC LIMIT 100",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"6\" class=\"text-center text-muted\">No audit log entries recorded yet.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let seq: i64 = r.try_get("seq").unwrap_or(0);
+        let ts: i64 = r.try_get("ts").unwrap_or(0);
+        let actor: Option<String> = r.try_get("actor_user_id").unwrap_or_default();
+        let actor_str = actor.as_deref().map_or("System".to_string(), |a| {
+            if a.len() > 10 {
+                format!("{}...", &a[..10])
+            } else {
+                a.to_string()
+            }
+        });
+        let action: String = r.try_get("action").unwrap_or_default();
+        let target_type: String = r
+            .try_get::<Option<String>, _>("target_type")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "—".to_string());
+        let target_id: Option<String> = r.try_get("target_id").unwrap_or_default();
+        let target_str = target_id.map_or(target_type.clone(), |tid| {
+            let short = if tid.len() > 8 { &tid[..8] } else { &tid };
+            format!("{target_type} ({short})")
+        });
+        let payload: String = r.try_get("payload_json").unwrap_or_default();
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><code>#{seq}</code></td>\
+                <td>{ts}</td>\
+                <td><code>{actor_str}</code></td>\
+                <td><span class=\"badge badge-info\">{action}</span></td>\
+                <td>{target_str}</td>\
+                <td style=\"font-family: monospace; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\">{payload}</td>\
+            </tr>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
-        // Web UI screens
+        // Web UI screens & HTMX Partials
         .route("/app", get(crate::ui::get_app_ui))
+        .route("/app/partials/pins", get(get_partial_pins_handler))
+        .route(
+            "/app/partials/client-keys",
+            get(get_partial_client_keys_handler),
+        )
+        .route(
+            "/app/partials/providers",
+            get(get_partial_providers_handler),
+        )
+        .route(
+            "/app/partials/shares/outgoing",
+            get(get_partial_shares_outgoing_handler),
+        )
+        .route(
+            "/app/partials/shares/incoming",
+            get(get_partial_shares_incoming_handler),
+        )
+        .route("/app/partials/matrix", get(get_partial_matrix_handler))
         .route("/admin", get(crate::ui::get_admin_ui))
+        .route(
+            "/admin/partials/overview",
+            get(get_partial_admin_overview_handler),
+        )
+        .route(
+            "/admin/partials/users",
+            get(get_partial_admin_users_handler),
+        )
+        .route(
+            "/admin/partials/providers",
+            get(get_partial_admin_providers_handler),
+        )
+        .route(
+            "/admin/partials/catalog",
+            get(get_partial_admin_catalog_handler),
+        )
+        .route(
+            "/admin/partials/audit",
+            get(get_partial_admin_audit_handler),
+        )
         // User endpoints
         .route(
             "/api/user/providers",

@@ -68,29 +68,55 @@ async fn setup_csrf_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey
 #[test]
 fn test_template_lint_zero_external_assets_and_zero_eval() {
     // 1. Template lint scans all crates/admin/templates/**/*.html (UI-3)
-    let template_dir = Path::new("crates/admin/templates");
-    if template_dir.exists() {
-        let mut template_files = Vec::new();
-        collect_html_files(template_dir, &mut template_files);
-        assert!(!template_files.is_empty(), "templates must exist");
+    let template_dir = if Path::new("crates/admin/templates").exists() {
+        Path::new("crates/admin/templates")
+    } else {
+        Path::new("../../crates/admin/templates")
+    };
+    assert!(
+        template_dir.exists(),
+        "template directory must exist at {}",
+        template_dir.display()
+    );
 
-        for path in template_files {
-            let content = fs::read_to_string(&path).expect("read template");
+    let mut template_files = Vec::new();
+    collect_html_files(template_dir, &mut template_files);
+    assert!(!template_files.is_empty(), "templates must exist");
 
-            // Zero external http:// or https:// asset URLs (UI-3)
-            assert!(
-                !content.contains("http://") && !content.contains("https://"),
-                "Template {} contains external asset URL (UI-3 violation)",
-                path.display()
-            );
+    for path in template_files {
+        let content = fs::read_to_string(&path).expect("read template");
 
-            // Zero hx-on:* or js: attributes to prevent eval-based XSS (SEC-5)
-            assert!(
-                !content.contains("hx-on:") && !content.contains("js:"),
-                "Template {} contains hx-on: or js: eval attributes (SEC-5 violation)",
-                path.display()
-            );
-        }
+        // Zero external script/stylesheet asset URLs (UI-3)
+        assert!(
+            !content.contains("src=\"http://")
+                && !content.contains("src=\"https://")
+                && !content.contains("src='http://")
+                && !content.contains("src='https://")
+                && !content.contains("href=\"http://")
+                && !content.contains("href=\"https://")
+                && !content.contains("href='http://")
+                && !content.contains("href='https://"),
+            "Template {} contains external asset URL (UI-3 violation)",
+            path.display()
+        );
+
+        // Zero hx-on:* or js: attributes to prevent eval-based XSS (SEC-5)
+        assert!(
+            !content.contains("hx-on:") && !content.contains("js:"),
+            "Template {} contains hx-on: or js: eval attributes (SEC-5 violation)",
+            path.display()
+        );
+
+        // Zero inline event handlers (onclick=, onsubmit=, onchange=, onload=, onerror=) to prevent CSP violations (SEC-5, UI-3)
+        assert!(
+            !content.contains("onclick=")
+                && !content.contains("onsubmit=")
+                && !content.contains("onchange=")
+                && !content.contains("onload=")
+                && !content.contains("onerror="),
+            "Template {} contains inline event handler (CSP script-src 'self' violation)",
+            path.display()
+        );
     }
 
     // 2. /static/app.js sets required HTMX CSP flags

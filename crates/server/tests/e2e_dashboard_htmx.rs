@@ -532,3 +532,222 @@ async fn test_usage_explorer_summary_events_and_formula_safe_csv_export() {
     );
     assert!(csv_str.contains("claude-sonnet-4.6"));
 }
+
+#[doc = "Spec: UI-1, UI-2, UI-3, UI-4, SEC-5, SEC-6, SHR-3, RTE-7"]
+#[tokio::test]
+async fn test_htmx_partial_endpoints_and_live_swapping() {
+    use axum::http::header;
+    use llmroller_core::ids::ClientKeyId;
+    use llmroller_core::seams::Clock as _;
+
+    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
+
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let entropy = OsEntropy;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+
+    // 1. Create User Dave
+    let dave = create_user(
+        &pool,
+        &system_actor,
+        NewUser {
+            username: "dave_htmx",
+            password: "supersecretdavepass123",
+            role: Role::User,
+            must_change_password: false,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("dave");
+
+    let raw_dave = "dave_session_token_123456789012345";
+    let id_hash = llmroller_store::crypto::sha256_hex(raw_dave.as_bytes());
+    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_dave);
+    let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &id_hash,
+            user_id: dave.id,
+            csrf_hash: &csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("dave-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert dave session");
+    let dave_cookie = format!("llmroller_session={raw_dave}");
+
+    // Authenticate Admin session
+    let raw_admin = "admin_htmx_session_token_123456789";
+    let admin_id_hash = llmroller_store::crypto::sha256_hex(raw_admin.as_bytes());
+    let admin_csrf = llmroller_admin::auth::derive_session_csrf(raw_admin);
+    let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &admin_id_hash,
+            user_id: admin_id,
+            csrf_hash: &admin_csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert admin session");
+    let admin_cookie = format!("llmroller_session={raw_admin}");
+
+    // Insert client key and pin for Dave
+    let clk_id = ClientKeyId::generate();
+    let prov_id = llmroller_core::ids::ProviderId::generate();
+    let uk_id = llmroller_core::ids::UpstreamKeyId::generate();
+    let model_pk = llmroller_core::ids::ModelPk::generate();
+
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query(
+        "INSERT INTO client_keys (id, owner_user_id, prefix, key_hash, label, routing_scope, created_at)
+         VALUES (?, ?, 'llr_dave', 'dummyhash123', 'Dave Laptop', 'personal_first', ?)"
+    )
+    .bind(clk_id.to_string())
+    .bind(dave.id.to_string())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .expect("insert client key");
+
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, owner_user_id, created_at)
+         VALUES (?, 'dave_prov', 'custom', 'https://dave.ai', '{}', 'personal', ?, ?)"
+    )
+    .bind(prov_id.to_string())
+    .bind(dave.id.to_string())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .expect("insert provider");
+
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, owner_user_id, label, secret_enc, secret_last4, master_key_id, created_at)
+         VALUES (?, ?, ?, 'dave_key', X'00', '1234', 'key-0', ?)"
+    )
+    .bind(uk_id.to_string())
+    .bind(prov_id.to_string())
+    .bind(dave.id.to_string())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .expect("insert upstream key");
+
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id)
+         VALUES (?, 'claude-sonnet-4.6')",
+    )
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model");
+
+    sqlx::query(
+        "INSERT INTO pins (client_key_id, session_hash, model_pk, upstream_key_id, pool_tier, created_at, last_used_at, expires_at)
+         VALUES (?, 'dave-active-hash', ?, ?, 1, ?, ?, ?)"
+    )
+    .bind(clk_id.to_string())
+    .bind(model_pk.to_string())
+    .bind(uk_id.to_string())
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(now_ms + 3600 * 1000)
+    .execute(&mut *tx)
+    .await
+    .expect("insert pin");
+    tx.commit().await.expect("commit");
+
+    // 1. GET /app/partials/pins: returns rendered HTML rows with live HTMX Unpin & Chat Preview actions
+    let pins_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/pins")
+        .header(header::COOKIE, &dave_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let pins_res = app.clone().oneshot(pins_req).await.expect("res");
+    assert_eq!(pins_res.status(), StatusCode::OK);
+    let pins_body = pins_res.into_body().collect().await.expect("b").to_bytes();
+    let pins_html = std::str::from_utf8(&pins_body).expect("utf8");
+    assert!(pins_html.contains("dave-active-"));
+    assert!(pins_html.contains("data-action=\"preview-chat\""));
+    assert!(pins_html.contains("hx-delete=\"/admin/api/sessions/dave-active-hash/pin\""));
+
+    // 2. GET /app/partials/client-keys: returns rendered HTML rows with HTMX Revoke action
+    let clk_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/client-keys")
+        .header(header::COOKIE, &dave_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let clk_res = app.clone().oneshot(clk_req).await.expect("res");
+    assert_eq!(clk_res.status(), StatusCode::OK);
+    let clk_body = clk_res.into_body().collect().await.expect("b").to_bytes();
+    let clk_html = std::str::from_utf8(&clk_body).expect("utf8");
+    assert!(clk_html.contains("Dave Laptop"));
+    assert!(clk_html.contains(&format!("hx-delete=\"/api/user/client-keys/{clk_id}\"")));
+
+    // 3. HTMX Unpin action: DELETE /admin/api/sessions/dave-active-hash/pin with hx-request returns 200 OK
+    let unpin_req = Request::builder()
+        .method("DELETE")
+        .uri("/admin/api/sessions/dave-active-hash/pin")
+        .header(header::COOKIE, &dave_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let unpin_res = app.clone().oneshot(unpin_req).await.expect("res");
+    assert_eq!(
+        unpin_res.status(),
+        StatusCode::OK,
+        "HTMX DELETE requests must return 200 OK so HTMX replaces/removes the target row"
+    );
+
+    // 4. GET /admin/partials/overview: returns rendered A6 telemetry cards for admin
+    let adm_ov_req = Request::builder()
+        .method("GET")
+        .uri("/admin/partials/overview")
+        .header(header::COOKIE, &admin_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let adm_ov_res = app.oneshot(adm_ov_req).await.expect("res");
+    assert_eq!(adm_ov_res.status(), StatusCode::OK);
+    let adm_ov_body = adm_ov_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
+    let adm_ov_html = std::str::from_utf8(&adm_ov_body).expect("utf8");
+    assert!(adm_ov_html.contains("Projected Disk Usage:"));
+    assert!(adm_ov_html.contains("disk-meter"));
+}
