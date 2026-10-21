@@ -362,6 +362,14 @@ pub async fn patch_provider_tx(
     _now_ms: i64,
 ) -> Result<Provider, ProviderError> {
     let existing = get_provider_tx(tx, actor, id).await?;
+    if !actor.is_admin() && !actor.is_system() {
+        if existing.ownership_scope == OwnershipScope::Global {
+            return Err(ProviderError::Forbidden);
+        }
+        if existing.owner_user_id != actor.user_id() {
+            return Err(ProviderError::ProviderNotFound(id));
+        }
+    }
 
     let new_name = patch.name.unwrap_or(existing.name);
     let new_base_url = patch.base_url.unwrap_or(existing.base_url);
@@ -439,7 +447,14 @@ pub async fn delete_provider_tx(
     id: ProviderId,
 ) -> Result<(), ProviderError> {
     let existing = get_provider_tx(tx, actor, id).await?;
-    check_provider_access(actor, &existing)?;
+    if !actor.is_admin() && !actor.is_system() {
+        if existing.ownership_scope == OwnershipScope::Global {
+            return Err(ProviderError::Forbidden);
+        }
+        if existing.owner_user_id != actor.user_id() {
+            return Err(ProviderError::ProviderNotFound(id));
+        }
+    }
 
     sqlx::query("DELETE FROM providers WHERE id = ?")
         .bind(id.to_string())
@@ -471,6 +486,14 @@ pub async fn create_upstream_key_tx(
     now_ms: i64,
 ) -> Result<UpstreamKey, ProviderError> {
     let provider = get_provider_tx(tx, actor, new_key.provider_id).await?;
+    if !actor.is_admin() && !actor.is_system() {
+        if provider.ownership_scope == OwnershipScope::Global {
+            return Err(ProviderError::Forbidden);
+        }
+        if provider.owner_user_id != actor.user_id() {
+            return Err(ProviderError::ProviderNotFound(new_key.provider_id));
+        }
+    }
 
     // Quotas: max 50 personal keys per user (SEC-8)
     if let Some(owner_id) = provider.owner_user_id {
@@ -509,11 +532,10 @@ pub async fn create_upstream_key_tx(
         secret_exposed.to_string()
     };
 
-    let instance_id_vec: Vec<u8> = sqlx::query_scalar(
-        "SELECT instance_id FROM instance_meta WHERE singleton = 1",
-    )
-    .fetch_one(&mut **tx)
-    .await?;
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&mut **tx)
+            .await?;
     let instance_id: [u8; 16] = instance_id_vec
         .try_into()
         .map_err(|_| ProviderError::Validation("corrupt instance_id in instance_meta".into()))?;
@@ -663,6 +685,9 @@ pub async fn patch_upstream_key_tx(
     patch: UpstreamKeyPatch,
 ) -> Result<UpstreamKey, ProviderError> {
     let existing = get_upstream_key_tx(tx, actor, id).await?;
+    if !actor.is_admin() && !actor.is_system() && existing.owner_user_id != actor.user_id() {
+        return Err(ProviderError::UpstreamKeyNotFound(id));
+    }
 
     let new_label = patch.label.unwrap_or(existing.label);
     let new_priority = patch.priority.unwrap_or(existing.priority);
@@ -729,7 +754,9 @@ pub async fn delete_upstream_key_tx(
     id: UpstreamKeyId,
 ) -> Result<(), ProviderError> {
     let existing = get_upstream_key_tx(tx, actor, id).await?;
-    check_key_access(actor, &existing)?;
+    if !actor.is_admin() && !actor.is_system() && existing.owner_user_id != actor.user_id() {
+        return Err(ProviderError::UpstreamKeyNotFound(id));
+    }
 
     sqlx::query("DELETE FROM upstream_keys WHERE id = ?")
         .bind(id.to_string())
@@ -901,9 +928,10 @@ fn check_provider_access(actor: &ActorScope, provider: &Provider) -> Result<(), 
                 .user_id()
                 .is_some_and(|uid| Some(uid) == provider.owner_user_id)
             {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(ProviderError::ProviderNotFound(provider.id))
             }
-            Err(ProviderError::Forbidden)
         }
     }
 }
@@ -916,7 +944,8 @@ fn check_key_access(actor: &ActorScope, key: &UpstreamKey) -> Result<(), Provide
         .user_id()
         .is_some_and(|uid| Some(uid) == key.owner_user_id)
     {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(ProviderError::UpstreamKeyNotFound(key.id))
     }
-    Err(ProviderError::Forbidden)
 }

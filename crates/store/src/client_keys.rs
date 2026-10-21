@@ -553,9 +553,10 @@ fn check_client_key_access(actor: &ActorScope, key: &ClientKey) -> Result<(), Cl
         return Ok(());
     }
     if actor.user_id().is_some_and(|uid| uid == key.owner_user_id) {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(ClientKeyError::NotFound(key.id))
     }
-    Err(ClientKeyError::Forbidden)
 }
 
 fn validate_routing_scope(scope: &str) -> Result<(), ClientKeyError> {
