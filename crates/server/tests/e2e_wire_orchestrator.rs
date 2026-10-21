@@ -233,13 +233,11 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
     .expect("create upstream key");
 
     let model_pk = ModelPk::generate();
-    sqlx::query(
-        "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)",
-    )
-    .bind(model_pk.to_string())
-    .execute(&mut *tx)
-    .await
-    .expect("insert model gpt-4o");
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model gpt-4o");
 
     let forbidden_model_pk = ModelPk::generate();
     sqlx::query(
@@ -270,7 +268,9 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .uri("/v1/chat/completions")
         .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"model":"definitely-not-in-catalog","messages":[{"role":"user","content":"hi"}]}"#))
+        .body(Body::from(
+            r#"{"model":"definitely-not-in-catalog","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
         .expect("req");
     let res_unknown = app.clone().oneshot(req_unknown).await.expect("res");
     assert_eq!(
@@ -285,7 +285,9 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .uri("/v1/chat/completions")
         .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#))
+        .body(Body::from(
+            r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
         .expect("req");
     let res_forbidden = app.clone().oneshot(req_forbidden).await.expect("res");
     assert_eq!(
@@ -300,13 +302,23 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .uri("/v1/chat/completions")
         .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#))
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
         .expect("req");
     let res_chat = app.clone().oneshot(req_chat).await.expect("res");
     assert_eq!(res_chat.status(), StatusCode::OK);
-    let chat_body = res_chat.into_body().collect().await.expect("body").to_bytes();
+    let chat_body = res_chat
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
     let chat_json: serde_json::Value = serde_json::from_slice(&chat_body).expect("json");
-    assert_eq!(chat_json["choices"][0]["message"]["content"], "mock upstream answer");
+    assert_eq!(
+        chat_json["choices"][0]["message"]["content"],
+        "mock upstream answer"
+    );
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 1);
 
     // 4. Streaming SSE request receives forwarded chunks from mock upstream (API-6)
@@ -319,7 +331,12 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .expect("req");
     let res_stream = app.clone().oneshot(req_stream).await.expect("res");
     assert_eq!(res_stream.status(), StatusCode::OK);
-    let stream_body = res_stream.into_body().collect().await.expect("body").to_bytes();
+    let stream_body = res_stream
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
     let stream_text = String::from_utf8_lossy(&stream_body);
     assert!(stream_text.contains("Hello from "));
     assert!(stream_text.contains("mock upstream!"));

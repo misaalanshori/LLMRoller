@@ -524,11 +524,13 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         .expect("insert model gpt-4o");
 
     let model_pk2 = ModelPk::generate();
-    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-3-5-sonnet', 1)")
-        .bind(model_pk2.to_string())
-        .execute(&mut *tx)
-        .await
-        .expect("insert model claude");
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-3-5-sonnet', 1)",
+    )
+    .bind(model_pk2.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model claude");
 
     let created_key = create_client_key_tx(
         &mut tx,

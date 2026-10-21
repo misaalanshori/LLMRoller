@@ -507,11 +507,7 @@ async fn post_login(
             || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             |ci| ci.0,
         );
-    let client_ip = extract_client_ip(
-        peer_addr,
-        &parts.headers,
-        &state.config.trusted_proxies,
-    );
+    let client_ip = extract_client_ip(peer_addr, &parts.headers, &state.config.trusted_proxies);
 
     // 1. Validate Login CSRF token per SEC-5
     let login_csrf_cookie_name = state.config.login_csrf_cookie_name();
@@ -522,7 +518,10 @@ async fn post_login(
         .unwrap_or("");
     let expected_csrf = parse_cookie_value(cookie_header, login_csrf_cookie_name);
 
-    let header_csrf = parts.headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
+    let header_csrf = parts
+        .headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok());
     let (Some(expected), Some(header_token)) = (expected_csrf, header_csrf) else {
         return Err(AuthError::InvalidCsrf);
     };
@@ -588,7 +587,10 @@ async fn post_login(
             user_id: record.user.id,
             csrf_hash: &csrf_hash,
             ip_addr: Some(&client_ip.to_string()),
-            user_agent: parts.headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            user_agent: parts
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
             created_at: now_ms,
             expires_at,
         },

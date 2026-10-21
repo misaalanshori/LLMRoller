@@ -12,7 +12,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
-use axum::http::header::{HeaderValue, CONTENT_TYPE};
+use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -103,7 +103,14 @@ pub async fn post_chat_completions(
     client_key: Option<Extension<ClientKeyRecord>>,
     body: Bytes,
 ) -> Response {
-    handle_inference_request(state, EndpointKind::Chat, headers, body, client_key.map(|e| e.0)).await
+    handle_inference_request(
+        state,
+        EndpointKind::Chat,
+        headers,
+        body,
+        client_key.map(|e| e.0),
+    )
+    .await
 }
 
 /// Handler for POST /v1/responses.
@@ -113,7 +120,14 @@ pub async fn post_responses(
     client_key: Option<Extension<ClientKeyRecord>>,
     body: Bytes,
 ) -> Response {
-    handle_inference_request(state, EndpointKind::Responses, headers, body, client_key.map(|e| e.0)).await
+    handle_inference_request(
+        state,
+        EndpointKind::Responses,
+        headers,
+        body,
+        client_key.map(|e| e.0),
+    )
+    .await
 }
 
 /// Handler for POST /v1/messages.
@@ -123,7 +137,14 @@ pub async fn post_messages(
     client_key: Option<Extension<ClientKeyRecord>>,
     body: Bytes,
 ) -> Response {
-    handle_inference_request(state, EndpointKind::Messages, headers, body, client_key.map(|e| e.0)).await
+    handle_inference_request(
+        state,
+        EndpointKind::Messages,
+        headers,
+        body,
+        client_key.map(|e| e.0),
+    )
+    .await
 }
 
 /// Handler for POST /v1/messages/count_tokens.
@@ -150,7 +171,14 @@ pub async fn post_responses_compact(
     client_key: Option<Extension<ClientKeyRecord>>,
     body: Bytes,
 ) -> Response {
-    handle_inference_request(state, EndpointKind::Responses, headers, body, client_key.map(|e| e.0)).await
+    handle_inference_request(
+        state,
+        EndpointKind::Responses,
+        headers,
+        body,
+        client_key.map(|e| e.0),
+    )
+    .await
 }
 
 /// Handler for GET /v1/responses/{id}.
@@ -209,12 +237,10 @@ pub async fn delete_response_by_id(
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
     use sqlx::Row as _;
-    let row = sqlx::query(
-        "SELECT owner_user_id FROM response_links WHERE response_id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await;
+    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await;
 
     match row {
         Ok(Some(r)) => {
@@ -255,12 +281,10 @@ pub async fn get_response_input_items(
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
     use sqlx::Row as _;
-    let row = sqlx::query(
-        "SELECT owner_user_id FROM response_links WHERE response_id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await;
+    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await;
 
     match row {
         Ok(Some(r)) => {
@@ -296,12 +320,10 @@ pub async fn post_response_cancel(
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
     use sqlx::Row as _;
-    let row = sqlx::query(
-        "SELECT owner_user_id FROM response_links WHERE response_id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await;
+    let row = sqlx::query("SELECT owner_user_id FROM response_links WHERE response_id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await;
 
     match row {
         Ok(Some(r)) => {
@@ -313,10 +335,11 @@ pub async fn post_response_cancel(
                 )
                     .into_response();
             }
-            let _ = sqlx::query("UPDATE response_links SET status = 'cancelled' WHERE response_id = ?")
-                .bind(&id)
-                .execute(&state.pool)
-                .await;
+            let _ =
+                sqlx::query("UPDATE response_links SET status = 'cancelled' WHERE response_id = ?")
+                    .bind(&id)
+                    .execute(&state.pool)
+                    .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -415,7 +438,9 @@ async fn find_candidate_routes(
     client_key: Option<&ClientKeyRecord>,
 ) -> Vec<CandidateRoute> {
     use sqlx::Row as _;
-    let caller_user_id = client_key.map(|k| k.owner_user_id.to_string()).unwrap_or_default();
+    let caller_user_id = client_key
+        .map(|k| k.owner_user_id.to_string())
+        .unwrap_or_default();
 
     let mut routes = Vec::new();
     let rows = sqlx::query(
@@ -449,7 +474,9 @@ async fn find_candidate_routes(
         routes.push(CandidateRoute {
             provider_id: r.try_get("provider_id").unwrap_or_default(),
             upstream_key_id: r.try_get("upstream_key_id").unwrap_or_default(),
-            upstream_model_id: r.try_get("upstream_model_id").unwrap_or_else(|_| canonical_model.to_string()),
+            upstream_model_id: r
+                .try_get("upstream_model_id")
+                .unwrap_or_else(|_| canonical_model.to_string()),
             base_url: r.try_get("base_url").unwrap_or_default(),
             allow_private_network: r.try_get::<i64, _>("allow_private_network").unwrap_or(0) == 1,
             pool_tier: tier,
@@ -489,7 +516,8 @@ async fn find_candidate_routes(
                 upstream_key_id: r.try_get("upstream_key_id").unwrap_or_default(),
                 upstream_model_id: canonical_model.to_string(),
                 base_url: r.try_get("base_url").unwrap_or_default(),
-                allow_private_network: r.try_get::<i64, _>("allow_private_network").unwrap_or(0) == 1,
+                allow_private_network: r.try_get::<i64, _>("allow_private_network").unwrap_or(0)
+                    == 1,
                 pool_tier: tier,
                 secret_enc: r.try_get("secret_enc").unwrap_or_default(),
                 master_key_id: r.try_get("master_key_id").unwrap_or_default(),
@@ -502,12 +530,11 @@ async fn find_candidate_routes(
 }
 
 async fn unseal_upstream_key(pool: &SqlitePool, cand: &CandidateRoute) -> String {
-    let instance_id_vec: Vec<u8> = sqlx::query_scalar(
-        "SELECT instance_id FROM instance_meta WHERE singleton = 1",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or_else(|_| vec![0u8; 16]);
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| vec![0u8; 16]);
     let instance_id: [u8; 16] = instance_id_vec.try_into().unwrap_or([0u8; 16]);
 
     let master_key = llmroller_store::crypto::load_master_key_from_env()
@@ -657,7 +684,8 @@ pub async fn handle_inference_request(
             .into_response();
     }
 
-    let candidates = find_candidate_routes(&state.pool, &canonical_model, client_key.as_ref()).await;
+    let candidates =
+        find_candidate_routes(&state.pool, &canonical_model, client_key.as_ref()).await;
     if candidates.is_empty() {
         crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
         return (
@@ -699,7 +727,11 @@ pub async fn handle_inference_request(
             body.clone(),
             cand.pool_tier,
             Some(&cand.upstream_model_id),
-            if is_streaming { ChatStreamMode::Inject } else { ChatStreamMode::Native },
+            if is_streaming {
+                ChatStreamMode::Inject
+            } else {
+                ChatStreamMode::Native
+            },
             None,
         ) {
             Ok(b) => b,
@@ -747,7 +779,11 @@ pub async fn handle_inference_request(
                         ts: now_ms,
                         upstream_key_id: cand.upstream_key_id.clone(),
                         share_id: None,
-                        outcome: if status == StatusCode::TOO_MANY_REQUESTS { "rate_limited".to_string() } else { "server_error".to_string() },
+                        outcome: if status == StatusCode::TOO_MANY_REQUESTS {
+                            "rate_limited".to_string()
+                        } else {
+                            "server_error".to_string()
+                        },
                         http_status: Some(status.as_u16() as i64),
                         bytes_sent: body.len() as i64,
                         charged_micro_usd: 0,
@@ -767,7 +803,8 @@ pub async fn handle_inference_request(
                 );
 
                 if is_streaming {
-                    resp_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                    resp_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     let stream = resp.bytes_stream();
                     let response_body = Body::from_stream(stream);
                     crate::metrics::record_request_metric(endpoint_str, "2xx", "completed");
@@ -782,16 +819,25 @@ pub async fn handle_inference_request(
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 } else {
                     let resp_bytes = resp.bytes().await.unwrap_or_default();
-                    let json_val = serde_json::from_slice(&resp_bytes).unwrap_or(serde_json::json!({}));
-                    let extracted = llmroller_proto::json_usage::extract_json_usage(endpoint, &json_val).unwrap_or_default();
+                    let json_val =
+                        serde_json::from_slice(&resp_bytes).unwrap_or(serde_json::json!({}));
+                    let extracted =
+                        llmroller_proto::json_usage::extract_json_usage(endpoint, &json_val)
+                            .unwrap_or_default();
 
                     if let Some(ref writer) = state.writer {
                         let event = llmroller_store::usage_writer::UsageEventRecord {
                             id: llmroller_core::ids::UsageEventId::generate().to_string(),
                             ts: now_ms,
                             request_id: req_id,
-                            client_key_id: client_key.as_ref().map(|k| k.id).unwrap_or_else(ClientKeyId::generate),
-                            owner_user_id: client_key.as_ref().map(|k| k.owner_user_id).unwrap_or_else(UserId::generate),
+                            client_key_id: client_key
+                                .as_ref()
+                                .map(|k| k.id)
+                                .unwrap_or_else(ClientKeyId::generate),
+                            owner_user_id: client_key
+                                .as_ref()
+                                .map(|k| k.owner_user_id)
+                                .unwrap_or_else(UserId::generate),
                             upstream_key_id: Some(cand.upstream_key_id.clone()),
                             provider_id: Some(cand.provider_id.clone()),
                             provider_scope: Some(cand.pool_tier.to_string()),

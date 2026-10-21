@@ -289,10 +289,7 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         .find(token_marker)
         .expect("hx-headers x-csrf-token")
         + token_marker.len();
-    let token_end = app_html[token_start..]
-        .find('"')
-        .expect("token end quote")
-        + token_start;
+    let token_end = app_html[token_start..].find('"').expect("token end quote") + token_start;
     let extracted_csrf = &app_html[token_start..token_end];
 
     // Mutating request using extracted CSRF token succeeds

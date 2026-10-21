@@ -136,11 +136,13 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
         .expect("insert model");
 
     let model_pk2 = llmroller_core::ids::ModelPk::generate();
-    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-sonnet-4.6', 1)")
-        .bind(model_pk2.to_string())
-        .execute(&pool)
-        .await
-        .expect("insert model claude");
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-sonnet-4.6', 1)",
+    )
+    .bind(model_pk2.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert model claude");
 
     // Create upstream key
     create_upstream_key(

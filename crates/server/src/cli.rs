@@ -371,14 +371,14 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             data_listener,
             data_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .with_graceful_shutdown(async move {
-                while !*stop_rx1.borrow_and_update() {
-                    if stop_rx1.changed().await.is_err() {
-                        break;
-                    }
+        .with_graceful_shutdown(async move {
+            while !*stop_rx1.borrow_and_update() {
+                if stop_rx1.changed().await.is_err() {
+                    break;
                 }
-            })
-            .await;
+            }
+        })
+        .await;
     });
 
     let admin_server = tokio::spawn(async move {
@@ -386,14 +386,14 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             admin_listener,
             admin_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .with_graceful_shutdown(async move {
-                while !*stop_rx2.borrow_and_update() {
-                    if stop_rx2.changed().await.is_err() {
-                        break;
-                    }
+        .with_graceful_shutdown(async move {
+            while !*stop_rx2.borrow_and_update() {
+                if stop_rx2.changed().await.is_err() {
+                    break;
                 }
-            })
-            .await;
+            }
+        })
+        .await;
     });
 
     let metrics_server = tokio::spawn(async move {

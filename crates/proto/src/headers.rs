@@ -156,9 +156,7 @@ pub fn apply_request_header_pipeline(
         }
 
         // On Shared or Global tiers: strip recognized session headers per SEC-16
-        if tier != PoolTier::Own
-            && SESSION_HEADERS_STRIP_ON_POOLED.contains(&name_lower.as_str())
-        {
+        if tier != PoolTier::Own && SESSION_HEADERS_STRIP_ON_POOLED.contains(&name_lower.as_str()) {
             continue;
         }
 

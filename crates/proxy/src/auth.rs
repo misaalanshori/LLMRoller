@@ -190,11 +190,7 @@ pub async fn client_key_auth_middleware(
             |ci| ci.0,
         );
 
-    let client_ip = extract_client_ip(
-        peer_addr,
-        &headers,
-        &state.trusted_proxies,
-    );
+    let client_ip = extract_client_ip(peer_addr, &headers, &state.trusted_proxies);
 
     // 1. Check IP failure rate limit (SEC-12)
     if state.is_ip_rate_limited(client_ip, now_ms) {

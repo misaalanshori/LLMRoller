@@ -133,17 +133,32 @@ fn test_xss_escaping_and_sanitization() {
     let js_a_tag = "<a href=\"javascript:alert(1)\">click</a>";
 
     let sanitized_svg = sanitize_assistant_text(svg_xss);
-    assert!(!sanitized_svg.contains("<svg"), "svg tag should be stripped or escaped");
+    assert!(
+        !sanitized_svg.contains("<svg"),
+        "svg tag should be stripped or escaped"
+    );
 
     let sanitized_img = sanitize_assistant_text(img_xss);
-    assert!(!sanitized_img.contains("<img"), "img tag should be stripped");
-    assert!(!sanitized_img.contains("onerror"), "onerror with whitespace should be stripped");
+    assert!(
+        !sanitized_img.contains("<img"),
+        "img tag should be stripped"
+    );
+    assert!(
+        !sanitized_img.contains("onerror"),
+        "onerror with whitespace should be stripped"
+    );
 
     let sanitized_link = sanitize_assistant_text(js_link);
-    assert!(!sanitized_link.contains("javascript:"), "javascript: link scheme should be stripped");
+    assert!(
+        !sanitized_link.contains("javascript:"),
+        "javascript: link scheme should be stripped"
+    );
 
     let sanitized_a = sanitize_assistant_text(js_a_tag);
-    assert!(!sanitized_a.contains("javascript:"), "javascript: scheme in a tag should be stripped");
+    assert!(
+        !sanitized_a.contains("javascript:"),
+        "javascript: scheme in a tag should be stripped"
+    );
 
     // Safe Markdown is preserved and converted to safe HTML tags
     let safe_md = "**bold text** and `code span` and [safe link](https://example.com)";

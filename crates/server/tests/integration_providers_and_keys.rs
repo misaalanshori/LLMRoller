@@ -234,12 +234,11 @@ async fn test_provider_and_key_crud_rbac_quotas_and_encryption() {
     assert_eq!(key.strict_tier, 2);
 
     // Verify key secret is sealed with XChaCha20-Poly1305 under domain "upstream_key"
-    let instance_id_vec: Vec<u8> = sqlx::query_scalar(
-        "SELECT instance_id FROM instance_meta WHERE singleton = 1",
-    )
-    .fetch_one(&writer_pool)
-    .await
-    .expect("fetch instance_id");
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&writer_pool)
+            .await
+            .expect("fetch instance_id");
     let instance_id: [u8; 16] = instance_id_vec.try_into().expect("16-byte instance_id");
 
     let sealer = XChaCha20Poly1305Sealer::new(

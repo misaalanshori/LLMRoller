@@ -372,8 +372,10 @@ pub fn edit_body(
         _ => {
             let has_top_session = scan.fields.iter().any(|f| is_session_key(&f.key));
             let has_meta_session = scan.metadata_span.as_ref().is_some_and(|range| {
-                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&original[range.clone()])
-                    .is_ok_and(|m| m.contains_key("session_id") || m.contains_key("user_id"))
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+                    &original[range.clone()],
+                )
+                .is_ok_and(|m| m.contains_key("session_id") || m.contains_key("user_id"))
             });
             has_top_session || has_meta_session || session_field.is_some()
         }
@@ -392,11 +394,17 @@ pub fn edit_body(
     let orig_bytes = &original[..];
 
     let session_fields_to_remove_count = if tier != PoolTier::Own {
-        scan.fields.iter().filter(|f| is_session_key(&f.key)).count()
+        scan.fields
+            .iter()
+            .filter(|f| is_session_key(&f.key))
+            .count()
     } else {
         0
     };
-    let remaining_fields_count = scan.fields.len().saturating_sub(session_fields_to_remove_count);
+    let remaining_fields_count = scan
+        .fields
+        .len()
+        .saturating_sub(session_fields_to_remove_count);
 
     // 1. Copy up to opening brace + 1
     buf.extend_from_slice(&orig_bytes[..scan.opening_brace + 1]);
@@ -473,7 +481,9 @@ pub fn edit_body(
     // Metadata sanitization on Shared/Global tier
     if tier != PoolTier::Own
         && let Some(meta_range) = &scan.metadata_span
-        && let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&orig_bytes[meta_range.clone()])
+        && let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+            &orig_bytes[meta_range.clone()],
+        )
     {
         let removed_session = map.remove("session_id").is_some();
         let removed_user = map.remove("user_id").is_some();
@@ -541,10 +551,7 @@ enum StreamOptionsAction {
 }
 
 fn is_session_key(key: &str) -> bool {
-    matches!(
-        key,
-        "session_id" | "prompt_cache_key" | "promptCacheKey"
-    )
+    matches!(key, "session_id" | "prompt_cache_key" | "promptCacheKey")
 }
 
 fn skip_ws(bytes: &[u8], cursor: &mut usize) {

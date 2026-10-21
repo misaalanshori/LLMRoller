@@ -320,7 +320,9 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
 
     for (idx, (_key, op)) in durable_items.into_iter().enumerate() {
         let sp_name = format!("item_{idx}");
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+            .execute(&mut *transaction)
+            .await;
         let res = match op {
             DurableOp::PinUpsert {
                 client_key_id,
@@ -331,9 +333,8 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 created_at,
                 last_used_at,
                 expires_at,
-            } => {
-                sqlx::query(
-                    r#"INSERT INTO pins (
+            } => sqlx::query(
+                r#"INSERT INTO pins (
                            client_key_id, session_hash, model_pk, upstream_key_id,
                            pool_tier, created_at, last_used_at, expires_at
                        )
@@ -343,19 +344,18 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                            pool_tier = excluded.pool_tier,
                            last_used_at = excluded.last_used_at,
                            expires_at = excluded.expires_at"#,
-                )
-                .bind(client_key_id)
-                .bind(session_hash)
-                .bind(model_pk)
-                .bind(upstream_key_id)
-                .bind(pool_tier as i64)
-                .bind(created_at)
-                .bind(last_used_at)
-                .bind(expires_at)
-                .execute(&mut *transaction)
-                .await
-                .map(|_| ())
-            }
+            )
+            .bind(client_key_id)
+            .bind(session_hash)
+            .bind(model_pk)
+            .bind(upstream_key_id)
+            .bind(pool_tier as i64)
+            .bind(created_at)
+            .bind(last_used_at)
+            .bind(expires_at)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
             DurableOp::ResponseLinkUpsert(link) => {
                 crate::pins::insert_response_link_tx(&mut transaction, &link).await
             }
@@ -365,27 +365,31 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 health_until,
                 health_version,
                 last_error,
-            } => {
-                sqlx::query(
-                    r#"UPDATE upstream_keys SET
+            } => sqlx::query(
+                r#"UPDATE upstream_keys SET
                            health = ?, health_until = ?, health_version = ?, last_error = ?
                        WHERE id = ?"#,
-                )
-                .bind(health)
-                .bind(health_until)
-                .bind(health_version)
-                .bind(last_error)
-                .bind(upstream_key_id)
-                .execute(&mut *transaction)
-                .await
-                .map(|_| ())
-            }
+            )
+            .bind(health)
+            .bind(health_until)
+            .bind(health_version)
+            .bind(last_error)
+            .bind(upstream_key_id)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
         };
 
         if res.is_ok() {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                .execute(&mut *transaction)
+                .await;
         } else {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ROLLBACK TO SAVEPOINT {sp_name}"
+            )))
+            .execute(&mut *transaction)
+            .await;
         }
     }
 

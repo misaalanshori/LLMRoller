@@ -215,7 +215,10 @@ pub fn canonical_content(content_val: &serde_json::Value) -> Vec<u8> {
 }
 
 /// Extracts canonical byte slices for SYS and USER1 per Section 11.1.3.
-pub fn extract_canonical_sys_and_user1(protocol: &str, body: &serde_json::Value) -> (Vec<u8>, Vec<u8>) {
+pub fn extract_canonical_sys_and_user1(
+    protocol: &str,
+    body: &serde_json::Value,
+) -> (Vec<u8>, Vec<u8>) {
     let mut sys = Vec::new();
     let mut usr = Vec::new();
 

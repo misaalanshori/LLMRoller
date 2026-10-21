@@ -259,6 +259,9 @@ fn test_sealer_pool_bounded_queue_and_drop_on_full() {
             break;
         }
     }
-    assert!(dropped, "rapid submissions must overflow the 64-item channel");
+    assert!(
+        dropped,
+        "rapid submissions must overflow the 64-item channel"
+    );
     assert!(pool.dropped_jobs_count.load(Ordering::SeqCst) >= 1);
 }

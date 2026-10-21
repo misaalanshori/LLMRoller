@@ -154,28 +154,16 @@ fn test_stream_options_chat_stream_injection_cases() {
 
     // Case 2: stream: true, no stream_options present -> insert "stream_options":{"include_usage":true} after {, strip = true
     let c2 = Bytes::from_static(b"{\"stream\":true,\"model\":\"gpt-4o\"}");
-    let (out2, strip2) = edit_body(
-        c2,
-        PoolTier::Own,
-        None,
-        ChatStreamMode::Inject,
-        None,
-    )
-    .expect("c2 edit");
+    let (out2, strip2) =
+        edit_body(c2, PoolTier::Own, None, ChatStreamMode::Inject, None).expect("c2 edit");
     assert!(strip2);
     let v2: serde_json::Value = serde_json::from_slice(&out2).expect("c2 parse");
     assert_eq!(v2["stream_options"]["include_usage"], true);
 
     // Case 3: stream_options is null -> replace null with {"include_usage":true}, strip = true
     let c3 = Bytes::from_static(b"{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":null}");
-    let (out3, strip3) = edit_body(
-        c3,
-        PoolTier::Own,
-        None,
-        ChatStreamMode::Inject,
-        None,
-    )
-    .expect("c3 edit");
+    let (out3, strip3) =
+        edit_body(c3, PoolTier::Own, None, ChatStreamMode::Inject, None).expect("c3 edit");
     assert!(strip3);
     let v3: serde_json::Value = serde_json::from_slice(&out3).expect("c3 parse");
     assert_eq!(v3["stream_options"]["include_usage"], true);
@@ -184,14 +172,8 @@ fn test_stream_options_chat_stream_injection_cases() {
     let c4 = Bytes::from_static(
         b"{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"extra\":1}}",
     );
-    let (out4, strip4) = edit_body(
-        c4,
-        PoolTier::Own,
-        None,
-        ChatStreamMode::Inject,
-        None,
-    )
-    .expect("c4 edit");
+    let (out4, strip4) =
+        edit_body(c4, PoolTier::Own, None, ChatStreamMode::Inject, None).expect("c4 edit");
     assert!(strip4);
     let v4: serde_json::Value = serde_json::from_slice(&out4).expect("c4 parse");
     assert_eq!(v4["stream_options"]["include_usage"], true);
@@ -201,14 +183,8 @@ fn test_stream_options_chat_stream_injection_cases() {
     let c5 = Bytes::from_static(
         b"{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"include_usage\":false}}",
     );
-    let (out5, strip5) = edit_body(
-        c5,
-        PoolTier::Own,
-        None,
-        ChatStreamMode::Inject,
-        None,
-    )
-    .expect("c5 edit");
+    let (out5, strip5) =
+        edit_body(c5, PoolTier::Own, None, ChatStreamMode::Inject, None).expect("c5 edit");
     assert!(strip5);
     let v5: serde_json::Value = serde_json::from_slice(&out5).expect("c5 parse");
     assert_eq!(v5["stream_options"]["include_usage"], true);
@@ -280,14 +256,8 @@ fn test_edit_body_strips_session_keys_without_comma_corruption() {
 
     // 4. Session id as sole key
     let raw4 = Bytes::from_static(br#"{"session_id":"s1"}"#);
-    let (out4, _) = edit_body(
-        raw4,
-        PoolTier::Global,
-        None,
-        ChatStreamMode::Native,
-        None,
-    )
-    .expect("edit");
+    let (out4, _) =
+        edit_body(raw4, PoolTier::Global, None, ChatStreamMode::Native, None).expect("edit");
     let parsed4: serde_json::Value =
         serde_json::from_slice(&out4).expect("valid json when session_id sole key");
     assert!(parsed4.get("session_id").is_none());

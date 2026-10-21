@@ -41,8 +41,13 @@ pub async fn get_app_ui(
         .await
         .map_err(map_auth_error)?;
 
-    let cookie_header = headers.get(COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let session_token = crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name()).unwrap_or("");
+    let cookie_header = headers
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let session_token =
+        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
+            .unwrap_or("");
     let csrf_token = crate::auth::derive_session_csrf(session_token);
 
     let app_content = AppTemplate {}.render().unwrap_or_default();
@@ -74,8 +79,13 @@ pub async fn get_admin_ui(
         return Err(map_auth_error(crate::auth::AuthError::Forbidden));
     }
 
-    let cookie_header = headers.get(COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let session_token = crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name()).unwrap_or("");
+    let cookie_header = headers
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let session_token =
+        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
+            .unwrap_or("");
     let csrf_token = crate::auth::derive_session_csrf(session_token);
 
     let admin_content = AdminTemplate {}.render().unwrap_or_default();

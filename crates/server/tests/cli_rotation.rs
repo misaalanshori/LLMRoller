@@ -19,9 +19,7 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::providers::{
     NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
 };
-use llmroller_store::traces::{
-    SealJob, StoredTurnTraceV2, insert_sealed_trace_tx, seal_turn_sync,
-};
+use llmroller_store::traces::{SealJob, StoredTurnTraceV2, insert_sealed_trace_tx, seal_turn_sync};
 use llmroller_store::usage_snapshots::{NewUsageSnapshot, insert_usage_snapshot_tx};
 
 fn encoded(byte: u8) -> String {
@@ -126,12 +124,11 @@ async fn rotate_master_key_cli_rotates_all_sealed_tables_successfully() {
     .await
     .expect("create upstream key");
 
-    let instance_id_vec: Vec<u8> = sqlx::query_scalar(
-        "SELECT instance_id FROM instance_meta WHERE singleton = 1",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .expect("fetch instance_id");
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("fetch instance_id");
     let instance_id: [u8; 16] = instance_id_vec.try_into().expect("16-byte instance_id");
 
     let old_sealer = XChaCha20Poly1305Sealer::new(
@@ -242,13 +239,12 @@ async fn rotate_master_key_cli_rotates_all_sealed_tables_successfully() {
     );
 
     // 1. Verify upstream key unsealing
-    let key_secret_enc: Vec<u8> = sqlx::query_scalar(
-        "SELECT secret_enc FROM upstream_keys WHERE id = ?",
-    )
-    .bind(upstream_key.id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("fetch secret_enc");
+    let key_secret_enc: Vec<u8> =
+        sqlx::query_scalar("SELECT secret_enc FROM upstream_keys WHERE id = ?")
+            .bind(upstream_key.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch secret_enc");
 
     let unsealed_key = new_sealer
         .open(
@@ -264,20 +260,15 @@ async fn rotate_master_key_cli_rotates_all_sealed_tables_successfully() {
     assert_eq!(unsealed_key.expose_secret(), b"sk-test-secret-value-12345");
 
     // 2. Verify usage snapshot unsealing
-    let snap_raw_enc: Vec<u8> = sqlx::query_scalar(
-        "SELECT raw_json_enc FROM upstream_usage_snapshots WHERE id = ?",
-    )
-    .bind(&snap_id)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch raw_json_enc");
+    let snap_raw_enc: Vec<u8> =
+        sqlx::query_scalar("SELECT raw_json_enc FROM upstream_usage_snapshots WHERE id = ?")
+            .bind(&snap_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch raw_json_enc");
 
     let unsealed_snap = new_sealer
-        .open(
-            "usage_raw",
-            &[b"mk_new", snap_id.as_bytes()],
-            &snap_raw_enc,
-        )
+        .open("usage_raw", &[b"mk_new", snap_id.as_bytes()], &snap_raw_enc)
         .expect("unseal usage snapshot with mk_new");
     assert_eq!(unsealed_snap.expose_secret(), b"{\"raw_usage\": 123}");
 
@@ -298,18 +289,17 @@ async fn rotate_master_key_cli_rotates_all_sealed_tables_successfully() {
             &block_payload_enc,
         )
         .expect("unseal trace block with mk_new");
-    let decompressed_block = zstd::bulk::decompress(unsealed_block.expose_secret(), 1024)
-        .expect("decompress block");
+    let decompressed_block =
+        zstd::bulk::decompress(unsealed_block.expose_secret(), 1024).expect("decompress block");
     assert_eq!(decompressed_block, b"block 1 payload");
 
     // 4. Verify trace record unsealing
-    let record_payload_enc: Vec<u8> = sqlx::query_scalar(
-        "SELECT payload_enc FROM trace_records WHERE usage_event_id = ?",
-    )
-    .bind("ue-01")
-    .fetch_one(&pool)
-    .await
-    .expect("fetch record payload_enc");
+    let record_payload_enc: Vec<u8> =
+        sqlx::query_scalar("SELECT payload_enc FROM trace_records WHERE usage_event_id = ?")
+            .bind("ue-01")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch record payload_enc");
 
     let unsealed_record = new_sealer
         .open(
@@ -323,8 +313,8 @@ async fn rotate_master_key_cli_rotates_all_sealed_tables_successfully() {
             &record_payload_enc,
         )
         .expect("unseal trace record with mk_new");
-    let decompressed_record = zstd::bulk::decompress(unsealed_record.expose_secret(), 4096)
-        .expect("decompress record");
+    let decompressed_record =
+        zstd::bulk::decompress(unsealed_record.expose_secret(), 4096).expect("decompress record");
     assert!(decompressed_record.starts_with(b"{\"v\":2"));
 
     pool.close().await;

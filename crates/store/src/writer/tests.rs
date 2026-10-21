@@ -163,13 +163,11 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
     .expect("insert provider");
 
     let model_pk = ModelPk::generate();
-    sqlx::query(
-        "INSERT INTO models (model_pk, canonical_id) VALUES (?, 'gpt-4o')",
-    )
-    .bind(model_pk.to_string())
-    .execute(&pool)
-    .await
-    .expect("insert model");
+    sqlx::query("INSERT INTO models (model_pk, canonical_id) VALUES (?, 'gpt-4o')")
+        .bind(model_pk.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert model");
 
     sqlx::query(
         "INSERT INTO upstream_keys (id, provider_id, label, secret_enc, secret_last4, priority, master_key_id, created_at) VALUES (?, ?, 'uk', X'00', '1234', 100, 'mk_test', 1000)",
@@ -240,12 +238,11 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
     flush_data_queues(&pool, &writer.queues).await;
 
     // 3. Assertions: response_link, usage_rollups_5min, and usage_events must be persisted!
-    let link_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM response_links WHERE response_id = 'resp-test-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count response_links");
+    let link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_links WHERE response_id = 'resp-test-1'")
+            .fetch_one(&pool)
+            .await
+            .expect("count response_links");
     assert_eq!(link_count, 1, "response_link must be persisted in SQLite");
 
     let rollup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_rollups_5min")
@@ -257,11 +254,10 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
         "usage_rollups_5min must be persisted in SQLite"
     );
 
-    let event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM usage_events WHERE id = 'ue-writer-test-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count usage_events");
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE id = 'ue-writer-test-1'")
+            .fetch_one(&pool)
+            .await
+            .expect("count usage_events");
     assert_eq!(event_count, 1, "usage_events must be persisted in SQLite");
 }

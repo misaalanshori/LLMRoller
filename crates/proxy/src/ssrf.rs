@@ -34,9 +34,7 @@ pub enum SsrfError {
     Reqwest(#[from] reqwest::Error),
 }
 
-pub use llmroller_core::ssrf::{
-    extract_raw_host, is_ip_blocked, is_ipv4_blocked, is_ipv6_blocked,
-};
+pub use llmroller_core::ssrf::{extract_raw_host, is_ip_blocked, is_ipv4_blocked, is_ipv6_blocked};
 
 pub fn validate_url(url_str: &str, allow_private_network: bool) -> Result<Url, SsrfError> {
     llmroller_core::ssrf::validate_url(url_str, allow_private_network).map_err(Into::into)

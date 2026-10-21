@@ -54,8 +54,30 @@ pub fn sanitize_assistant_text(text: &str) -> String {
 
     // 2. Strict sanitization with ammonia allowlist per SRDD Section 8.2 (SEC-19)
     let tags = [
-        "p", "pre", "code", "em", "strong", "ul", "ol", "li", "blockquote", "a", "table",
-        "thead", "tbody", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "br",
+        "p",
+        "pre",
+        "code",
+        "em",
+        "strong",
+        "ul",
+        "ol",
+        "li",
+        "blockquote",
+        "a",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "br",
     ];
     let tag_set: std::collections::HashSet<&str> = tags.into_iter().collect();
 
