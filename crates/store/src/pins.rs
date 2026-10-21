@@ -126,7 +126,7 @@ pub async fn load_active_pins(
         r#"SELECT p.client_key_id, p.session_hash, p.model_pk, m.canonical_id,
                   p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at,
                   p.expires_at, p.repin_count
-           FROM pins p JOIN models m ON p.model_pk = m.id
+           FROM pins p JOIN models m ON p.model_pk = m.model_pk
            WHERE p.expires_at > ?"#,
     )
     .bind(now_ms)
@@ -160,3 +160,6 @@ pub async fn load_active_pins(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests;

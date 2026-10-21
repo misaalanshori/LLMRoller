@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Json;
@@ -1690,6 +1691,25 @@ impl Drop for StreamFinalizer {
     }
 }
 
+/// RAII counter for live SSE response bodies. The graceful-shutdown
+/// supervisor waits for this to reach zero before cutting streams (REL-1).
+#[derive(Debug)]
+pub struct ActiveStreamGuard(Arc<AtomicUsize>);
+
+impl ActiveStreamGuard {
+    #[must_use]
+    pub fn acquire(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct StreamState {
     upstream:
         std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
@@ -1697,6 +1717,8 @@ struct StreamState {
     forwarder: SseChunkForwarder,
     finalizer: Option<StreamFinalizer>,
     lifecycle: RequestLifecycle,
+    /// Held for exactly the lifetime of the response body stream.
+    _stream_guard: ActiveStreamGuard,
     done: bool,
 }
 
@@ -2606,6 +2628,7 @@ pub async fn handle_inference_request(
                     forwarder: SseChunkForwarder::new(strip_injected_usage),
                     finalizer: Some(finalizer),
                     lifecycle,
+                    _stream_guard: ActiveStreamGuard::acquire(state.open_streams.clone()),
                     done: false,
                 };
                 let metered = stream::unfold(stream_state, |mut stream_state| async move {
@@ -2951,4 +2974,24 @@ pub async fn handle_inference_request(
         response.headers_mut().insert("retry-after", value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: REL-1 — F02 open_streams tracks live SSE bodies"]
+    fn active_stream_guard_tracks_body_lifetime() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = ActiveStreamGuard::acquire(counter.clone());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        {
+            let _second = ActiveStreamGuard::acquire(counter.clone());
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
 }

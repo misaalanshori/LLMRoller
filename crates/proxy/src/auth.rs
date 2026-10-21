@@ -36,6 +36,8 @@ pub struct ProxyAuthState {
     pub ip_failures: Arc<Mutex<HashMap<IpAddr, Vec<i64>>>>,
     pub trusted_proxies: Vec<String>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of live SSE response bodies, drained during graceful shutdown (REL-1).
+    pub open_streams: Arc<std::sync::atomic::AtomicUsize>,
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
     pub pin_store: Arc<llmroller_core::pins::PinStore>,
     pub runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
@@ -69,6 +71,7 @@ impl ProxyAuthState {
             ip_failures: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxies,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            open_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
             pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
             runtime_state: Arc::new(llmroller_core::runtime_state::RuntimeState::new()),

@@ -346,7 +346,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
 
     // 8. Preload unexpired confirmed pins
     let pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
-    if let Ok(active_pins) = llmroller_store::pins::load_active_pins(&pool, clock.now_ms()).await {
+    let active_pins = llmroller_store::pins::load_active_pins(&pool, clock.now_ms())
+        .await
+        .map_err(|error| CliFailure::new(13, format!("cannot preload session pins: {error}")))?;
+    {
         for pin in active_pins {
             use llmroller_core::eligibility::CandidatePoolTier;
             let tier = match pin.pool_tier {
@@ -406,6 +409,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         trusted_proxies_vec.clone(),
     );
     proxy_auth_state.is_ready = is_ready.clone();
+    proxy_auth_state.open_streams = open_streams.clone();
     proxy_auth_state.pin_store = pin_store.clone();
     proxy_auth_state.runtime_state = runtime_state.clone();
     proxy_auth_state.writer = Some(writer_handle.clone());
