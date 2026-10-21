@@ -407,7 +407,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         require_tls,
         trusted_proxies: trusted_proxies_vec.clone(),
     };
-    let auth_state = llmroller_admin::AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = llmroller_admin::AuthAppState::new(pool.clone(), auth_config);
+    auth_state.master_key = Some(master_key.clone());
+    auth_state.master_key_id = master_key_id.clone();
     let setup_state = llmroller_admin::SetupAppState {
         pool: pool.clone(),
         expected_token: setup_token,

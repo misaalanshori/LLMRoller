@@ -408,6 +408,10 @@ pub struct AuthAppState {
     pub clock: Arc<dyn Clock>,
     pub entropy: Arc<dyn EntropySource>,
     pub argon2_semaphore: Arc<Semaphore>,
+    /// Master key used to open sealed TOTP secrets during login.
+    pub master_key: Option<llmroller_store::crypto::MasterKey>,
+    /// Identifier of the active master key, bound into the TOTP AAD.
+    pub master_key_id: String,
 }
 
 impl std::fmt::Debug for AuthAppState {
@@ -431,6 +435,45 @@ impl AuthAppState {
             clock: Arc::new(SystemClock::new()),
             entropy: Arc::new(OsEntropy::new()),
             argon2_semaphore: Arc::new(Semaphore::new(parallelism)),
+            master_key: None,
+            master_key_id: String::new(),
+        }
+    }
+
+    /// Verify a login TOTP or single-use recovery code, advancing replay state.
+    async fn verify_totp_code(
+        &self,
+        user_id: llmroller_core::ids::UserId,
+        code: &str,
+        now_ms: i64,
+    ) -> Result<bool, AuthError> {
+        let master_key = self.master_key.clone().ok_or(AuthError::Internal)?;
+        let instance_id: Vec<u8> =
+            sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AuthError::Internal)?
+                .unwrap_or_else(|| vec![0_u8; 16]);
+        let instance_id: [u8; 16] = instance_id.try_into().unwrap_or([0_u8; 16]);
+        let sealer = llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+            master_key,
+            instance_id,
+            Arc::new(OsEntropy::new()),
+        );
+        match llmroller_store::users::verify_login_totp(
+            &self.pool,
+            user_id,
+            code,
+            &sealer,
+            &self.master_key_id,
+            now_ms,
+        )
+        .await
+        {
+            Ok(_) => Ok(true),
+            Err(llmroller_store::users::UserError::InvalidTotp)
+            | Err(llmroller_store::users::UserError::TotpReplay) => Ok(false),
+            Err(_) => Err(AuthError::Internal),
         }
     }
 }
@@ -710,13 +753,22 @@ async fn post_login(
         return Err(AuthError::InvalidCredentials);
     }
 
-    // 5. Tier-3 penalty check or TOTP enforcement
-    if limiter_outcome == LimiterOutcome::EnforceTotpOrDelay {
-        if !record.user.totp_enabled {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        } else if payload.totp_code.is_none() {
+    // 5. Enforce TOTP 2FA whenever the account has it enabled (AUTH-9, SEC-4)
+    if record.user.totp_enabled {
+        let Some(code) = payload.totp_code.as_deref().map(str::trim) else {
+            return Err(AuthError::TotpRequired);
+        };
+        if code.is_empty() {
             return Err(AuthError::TotpRequired);
         }
+        if !state.verify_totp_code(record.user.id, code, now_ms).await? {
+            state
+                .limiter
+                .record_failure(&payload.username, client_ip, now_ms);
+            return Err(AuthError::InvalidCredentials);
+        }
+    } else if limiter_outcome == LimiterOutcome::EnforceTotpOrDelay {
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     // Record login success in rate limiter

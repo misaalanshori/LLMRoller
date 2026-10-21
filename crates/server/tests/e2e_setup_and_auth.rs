@@ -462,3 +462,188 @@ async fn test_browser_web_flow_setup_login_and_redirects() {
         "/login"
     );
 }
+
+/// Spec: AUTH-9, SEC-4
+/// Login must require a valid TOTP (or unused recovery code) whenever 2FA is enabled,
+/// and replaying the same code in the same time step must be rejected.
+#[tokio::test]
+async fn login_requires_totp_and_rejects_replayed_codes() {
+    use llmroller_core::rbac::{SystemSeal, SystemTask};
+    use llmroller_core::seams::ExposeSecret as _;
+    use llmroller_store::crypto::XChaCha20Poly1305Sealer;
+    use llmroller_store::users::{
+        NewUser, confirm_totp, create_user, enroll_totp, find_login_record_by_id,
+    };
+
+    let (_dir, pool, setup_state, mut auth_state) = setup_test_env().await;
+    let master_key = llmroller_store::crypto::MasterKey::from_bytes([0x55; 32]);
+    let instance = llmroller_store::instance::load_or_initialize(
+        &pool,
+        "key-0",
+        &master_key,
+        Arc::new(llmroller_core::seams::OsEntropy),
+        1,
+    )
+    .await
+    .expect("load instance");
+    llmroller_store::settings::seed_defaults(&pool, None, 1)
+        .await
+        .expect("seed settings");
+    auth_state.master_key = Some(master_key.clone());
+    auth_state.master_key_id = "key-0".to_string();
+
+    let admin = create_user(
+        &pool,
+        &ActorScope::system(SystemTask::Writer, SystemSeal::store()),
+        NewUser {
+            username: "admin_totp",
+            password: "Password12345!#",
+            role: Role::Admin,
+            must_change_password: false,
+        },
+        &DeterministicRng::new(11),
+        1,
+    )
+    .await
+    .expect("admin user");
+
+    let sealer = XChaCha20Poly1305Sealer::new(
+        master_key.clone(),
+        instance.instance_id,
+        Arc::new(llmroller_core::seams::OsEntropy),
+    );
+    let admin_actor = ActorScope::user(admin.id, Role::Admin);
+    let enrollment = enroll_totp(
+        &pool,
+        &admin_actor,
+        &sealer,
+        "key-0",
+        &DeterministicRng::new(22),
+    )
+    .await
+    .expect("enroll totp");
+    let secret = totp_rs::Secret::try_from_base32(enrollment.secret_base32.expose_secret())
+        .expect("base32 secret");
+    #[allow(deprecated)]
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.as_bytes().to_vec(),
+    )
+    .expect("totp");
+    let code = totp.generate_current().to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    confirm_totp(&pool, &admin_actor, &code, &sealer, "key-0", now_ms)
+        .await
+        .expect("confirm totp");
+
+    let app = control_plane_router(setup_state, auth_state.clone());
+
+    let page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/login")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("login page");
+    assert_eq!(page.status(), StatusCode::OK);
+    let cookie = page
+        .headers()
+        .get("set-cookie")
+        .expect("csrf cookie")
+        .to_str()
+        .expect("str")
+        .to_string();
+    let csrf = page
+        .headers()
+        .get("x-csrf-token")
+        .expect("csrf token")
+        .to_str()
+        .expect("str")
+        .to_string();
+
+    let post_login = |body: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "text/html")
+            .header("cookie", cookie.clone())
+            .body(Body::from(body))
+            .expect("request")
+    };
+
+    let missing = app
+        .clone()
+        .oneshot(post_login(format!(
+            "username=admin_totp&password=Password12345!%23&csrf_token={csrf}"
+        )))
+        .await
+        .expect("missing totp");
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    // Confirmation consumed the current step; use the next step for login.
+    let fresh_code = totp
+        .generate((u64::try_from(now_ms).unwrap_or(0) / 1000) + 30)
+        .to_string();
+    let accepted = app
+        .clone()
+        .oneshot(post_login(format!(
+            "username=admin_totp&password=Password12345!%23&totp_code={fresh_code}&csrf_token={csrf}"
+        )))
+        .await
+        .expect("totp login");
+    let accepted_status = accepted.status();
+    let accepted_body = http_body_util::BodyExt::collect(accepted.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(
+        accepted_status,
+        StatusCode::SEE_OTHER,
+        "body: {}",
+        String::from_utf8_lossy(&accepted_body)
+    );
+
+    let replayed = app
+        .clone()
+        .oneshot(post_login(format!(
+            "username=admin_totp&password=Password12345!%23&totp_code={fresh_code}&csrf_token={csrf}"
+        )))
+        .await
+        .expect("replay");
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+
+    // Recovery codes are single use.
+    let recovery = enrollment.recovery_codes[0].expose_secret().to_string();
+    let unlocked = app
+        .clone()
+        .oneshot(post_login(format!(
+            "username=admin_totp&password=Password12345!%23&totp_code={recovery}&csrf_token={csrf}"
+        )))
+        .await
+        .expect("recovery login");
+    assert_eq!(unlocked.status(), StatusCode::SEE_OTHER);
+    let reused = app
+        .clone()
+        .oneshot(post_login(format!(
+            "username=admin_totp&password=Password12345!%23&totp_code={recovery}&csrf_token={csrf}"
+        )))
+        .await
+        .expect("recovery replay");
+    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+
+    // Silence unused-import style warnings for the record lookup helper.
+    let record = find_login_record_by_id(&pool, admin.id)
+        .await
+        .expect("record");
+    assert!(record.user.totp_enabled);
+}
