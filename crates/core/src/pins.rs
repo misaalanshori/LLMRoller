@@ -111,40 +111,45 @@ impl PinStore {
     {
         let now = clock.now_ms();
 
-        let entry_arc = match self.entries.get(pin_key) {
-            Some(arc) => Arc::clone(&arc),
-            None => {
-                if self.entries.len() >= self.max_active_pins {
-                    // Capacity overflow -> route unpinned without inserting into PinStore (RTE-10)
-                    let (k, tier) = select_fn(&[])?;
-                    return Some(PinTicket {
-                        upstream_key_id: k,
-                        generation: 1,
-                        outcome: PinOutcome::UnpinnedCapacity,
-                        pool_tier: tier,
-                    });
-                }
-
+        let entry_arc = if let Some(arc) = self.entries.get(pin_key) {
+            Arc::clone(&arc)
+        } else {
+            if self.entries.len() >= self.max_active_pins {
+                // Capacity overflow -> route unpinned without inserting into PinStore (RTE-10)
                 let (k, tier) = select_fn(&[])?;
-                let entry = PinEntry {
-                    state: PinState::Provisional,
-                    upstream_key_id: k,
-                    generation: 1,
-                    pool_tier: tier,
-                    created_ms: now,
-                    last_used_ms: now,
-                    expires_ms: now + 50_000,
-                    repin_count: 0,
-                    tried_this_generation: Vec::new(),
-                };
-                let arc = Arc::new(Mutex::new(entry));
-                self.entries.insert(pin_key.clone(), Arc::clone(&arc));
                 return Some(PinTicket {
                     upstream_key_id: k,
                     generation: 1,
-                    outcome: PinOutcome::NewPin,
+                    outcome: PinOutcome::UnpinnedCapacity,
                     pool_tier: tier,
                 });
+            }
+
+            use dashmap::mapref::entry::Entry;
+            match self.entries.entry(pin_key.clone()) {
+                Entry::Occupied(occ) => Arc::clone(occ.get()),
+                Entry::Vacant(vac) => {
+                    let (k, tier) = select_fn(&[])?;
+                    let entry = PinEntry {
+                        state: PinState::Provisional,
+                        upstream_key_id: k,
+                        generation: 1,
+                        pool_tier: tier,
+                        created_ms: now,
+                        last_used_ms: now,
+                        expires_ms: now + 50_000,
+                        repin_count: 0,
+                        tried_this_generation: Vec::new(),
+                    };
+                    let arc = Arc::new(Mutex::new(entry));
+                    vac.insert(Arc::clone(&arc));
+                    return Some(PinTicket {
+                        upstream_key_id: k,
+                        generation: 1,
+                        outcome: PinOutcome::NewPin,
+                        pool_tier: tier,
+                    });
+                }
             }
         };
 
@@ -164,6 +169,7 @@ impl PinStore {
                     entry.upstream_key_id = k_new;
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
+                    entry.tried_this_generation.clear();
                     entry.expires_ms = now + 50_000;
                     Some(PinTicket {
                         upstream_key_id: k_new,
@@ -189,6 +195,7 @@ impl PinStore {
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
                     entry.repin_count += 1;
+                    entry.tried_this_generation.clear();
                     entry.state = PinState::Provisional;
                     entry.expires_ms = now + 50_000;
                     return Some(PinTicket {
@@ -204,6 +211,7 @@ impl PinStore {
                     entry.upstream_key_id = k_new;
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
+                    entry.tried_this_generation.clear();
                     entry.state = PinState::Provisional;
                     entry.expires_ms = now + 50_000;
                     Some(PinTicket {
@@ -226,6 +234,7 @@ impl PinStore {
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
                     entry.repin_count += 1;
+                    entry.tried_this_generation.clear();
                     entry.state = PinState::Provisional;
                     entry.expires_ms = now + 50_000;
                     Some(PinTicket {
@@ -255,6 +264,7 @@ impl PinStore {
                 entry.state = PinState::Confirmed;
                 entry.last_used_ms = now_ms;
                 entry.expires_ms = now_ms + pin_ttl_ms;
+                entry.tried_this_generation.clear();
                 return true;
             }
         }
@@ -326,6 +336,7 @@ impl PinStore {
             let mut entry = entry_arc.lock();
             entry.upstream_key_id = new_key_id;
             entry.generation += 1;
+            entry.tried_this_generation.clear();
             entry.last_used_ms = now_ms;
         }
     }

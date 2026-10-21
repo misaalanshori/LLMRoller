@@ -74,6 +74,60 @@ fn test_concurrent_turn1_and_first_valid_frame_confirmation() {
     assert!(confirmed_count.load(Ordering::SeqCst) >= 1);
 }
 
+#[doc = "Spec: RTE-7, Spec: RTE-8"]
+#[test]
+fn test_turn1_absent_slot_coalesces_single_selection() {
+    let store = Arc::new(PinStore::new(10_000));
+    let clock = Arc::new(FakeClock::new(1_000_000_000_000));
+
+    let client_key_id = ClientKeyId::generate();
+    let pin_key = PinKey {
+        client_key_id,
+        canonical_id: "test-model-concurrent".to_string(),
+        session_hash: "sess-hash-concurrent-1".to_string(),
+    };
+
+    let k1 = UpstreamKeyId::generate();
+    let select_counter = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let st = Arc::clone(&store);
+        let clk = Arc::clone(&clock);
+        let pk = pin_key.clone();
+        let counter = Arc::clone(&select_counter);
+        handles.push(std::thread::spawn(move || {
+            let ticket = st.acquire(
+                &pk,
+                &*clk,
+                86_400_000,
+                false,
+                300,
+                RoutingScope::PersonalFirst,
+                None,
+                |_| true,
+                |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Some((k1, CandidatePoolTier::Own))
+                },
+            );
+            assert!(ticket.is_some());
+            assert_eq!(ticket.expect("ticket must exist").upstream_key_id, k1);
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("join");
+    }
+
+    assert_eq!(
+        select_counter.load(Ordering::SeqCst),
+        1,
+        "select_fn must be called exactly once across 50 concurrent Turn-1 callers on absent slot"
+    );
+}
+
 #[doc = "Spec: RTE-2, RTE-7, RTE-8, RTE-10, RTE-11, CLK-2"]
 #[test]
 fn test_concurrent_failover_coalescing_and_loser_adoption() {
