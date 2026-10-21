@@ -18,6 +18,11 @@ path = "src/lib.rs"
 name = "llmroller"
 path = "src/main.rs"
 
+[[bench]]
+name = "proxy_latency"
+path = "../../benches/proxy_latency.rs"
+harness = false
+
 [lints]
 workspace = true
 

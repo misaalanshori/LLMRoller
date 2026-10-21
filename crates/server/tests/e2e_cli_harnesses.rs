@@ -255,4 +255,35 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         metrics_text.contains("endpoint="),
         "metrics must include endpoint label, got: {metrics_text}"
     );
+
+    // 6. Network sandbox and zero-telemetry egress check (PRIV-1)
+    // Assert that outbound proxy connections reject unconfigured private addresses,
+    // AWS metadata endpoints, and non-HTTPS external hosts without allow_private_network
+    use llmroller_proxy::ssrf::{is_ip_blocked, validate_url};
+    use std::net::IpAddr;
+
+    // Zero telemetry: AWS metadata (169.254.169.254) is blocked
+    let aws_metadata: IpAddr = "169.254.169.254".parse().expect("parsed");
+    assert!(
+        is_ip_blocked(aws_metadata, false),
+        "metadata service must be blocked (PRIV-1)"
+    );
+
+    // Loopback (127.0.0.1) is blocked for outbound egress
+    let loopback: IpAddr = "127.0.0.1".parse().expect("parsed");
+    assert!(
+        is_ip_blocked(loopback, false),
+        "loopback egress must be blocked (PRIV-1)"
+    );
+
+    // Non-configured plain HTTP URLs are rejected at validation time
+    assert!(
+        validate_url("http://telemetry.example.com", false).is_err(),
+        "plain HTTP telemetry egress must be rejected (PRIV-1)"
+    );
+    // Configured HTTPS provider URL is allowed
+    assert!(
+        validate_url("https://openrouter.ai/api/v1", false).is_ok(),
+        "configured provider origin must be permitted"
+    );
 }
