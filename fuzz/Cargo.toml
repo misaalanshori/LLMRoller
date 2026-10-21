@@ -1,0 +1,55 @@
+[package]
+name = "llmroller-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+llmroller-core = { path = "../crates/core" }
+llmroller-proto = { path = "../crates/proto" }
+llmroller-proxy = { path = "../crates/proxy" }
+llmroller-store = { path = "../crates/store" }
+bytes = "1.12.1"
+http = "1.4.0"
+serde_json = "1.0.154"
+
+[[bin]]
+name = "body_edit"
+path = "fuzz_targets/body_edit.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_frame"
+path = "fuzz_targets/sse_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_tap"
+path = "fuzz_targets/sse_tap.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "step8_fingerprint"
+path = "fuzz_targets/step8_fingerprint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trace_tap"
+path = "fuzz_targets/trace_tap.rs"
+test = false
+doc = false

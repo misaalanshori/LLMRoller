@@ -1,0 +1,86 @@
+name: release
+
+# Spec: ./docs/srdd/22. SRDD - Deployment and Containers.md#224-release-packaging-multi-arch-artifacts-and-sbom
+# Requirements: POR-1, SEC-10, SEC-11
+# Phase: ./docs/bigbang/big-bang-phases-7.md#75-sub-phase-75
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: verify-release-package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.0"
+
+      - name: Run verification script
+        run: bash scripts/verify_release_package.sh
+
+  build-binaries:
+    name: build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            packages: ""
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            packages: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            packages: gcc-aarch64-linux-gnu
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            packages: gcc-aarch64-linux-gnu musl-tools
+          - target: aarch64-apple-darwin
+            os: macos-14
+            packages: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux' && matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99.0"
+          targets: ${{ matrix.target }}
+
+      - name: Build static release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin llmroller
+        env:
+          LLMROLLER_BUILD_GIT_SHA: ${{ github.sha }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
+        with:
+          name: llmroller-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/llmroller*

@@ -12,7 +12,7 @@ use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 /// Fuzz target testing body scanner and editor over arbitrary byte streams.
 #[doc = "Spec: API-4, TRN-1, TRN-2"]
 pub fn fuzz_body_edit(data: &[u8]) {
-    if let Ok(scan) = scan_top_level(data) {
+    if let Ok(_scan) = scan_top_level(data) {
         let b = Bytes::copy_from_slice(data);
         let _ = edit_body(
             b,
