@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 default-run = "llmroller"
+publish = false
 
 [lib]
 path = "src/lib.rs"

@@ -28,6 +28,7 @@ license = "MIT OR Apache-2.0"
 authors = ["LLMRoller contributors"]
 repository = "https://github.com/llmroller/llmroller"
 homepage = "https://github.com/llmroller/llmroller"
+publish = false
 
 [workspace.dependencies]
 # Domain and protocol

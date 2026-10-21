@@ -29,6 +29,7 @@ allow = [
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 deny = [
     { name = "openssl-sys", reason = "OpenSSL C bindings break static musl builds; use rustls." },
