@@ -21,11 +21,26 @@ use llmroller_store::users::reset_admin;
 const DATA_DIR_ENV: &str = "LLMROLLER_DATA_DIR";
 const DEFAULT_DATA_DIR: &str = "/var/lib/llmroller";
 
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let sha = option_env!("LLMROLLER_BUILD_GIT_SHA")
+            .or(option_env!("GIT_SHA"))
+            .unwrap_or("dev");
+        format!(
+            "{} ({}, schema {})",
+            env!("CARGO_PKG_VERSION"),
+            sha,
+            llmroller_store::migrations::SCHEMA_VERSION
+        )
+    })
+}
+
 /// Top-level `llmroller` command.
 #[derive(Debug, Parser)]
 #[command(
     name = "llmroller",
-    version,
+    version = version_string(),
     about = "LLMRoller proxy server and offline maintenance tools"
 )]
 pub(crate) struct Cli {
@@ -47,6 +62,8 @@ pub(crate) enum Command {
     Healthcheck(HealthcheckArgs),
     /// Create a crash-safe atomic backup of the database (REL-6).
     Backup(BackupArgs),
+    /// Generate a 32-byte cryptographically secure master key (SEC-2).
+    GenerateMasterKey,
 }
 
 /// Arguments for `llmroller backup`.
@@ -128,7 +145,22 @@ pub(crate) async fn main() -> ExitCode {
         Command::VerifyAuditLog(args) => run_verify_audit_log(args).await,
         Command::Healthcheck(args) => run_healthcheck(args).await,
         Command::Backup(args) => run_backup_cmd(args).await,
+        Command::GenerateMasterKey => run_generate_master_key(),
     }
+}
+
+fn run_generate_master_key() -> ExitCode {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use llmroller_core::seams::{EntropySource, OsEntropy};
+    use zeroize::Zeroize;
+
+    let mut key = [0_u8; 32];
+    OsEntropy.fill_bytes(&mut key);
+    let encoded = BASE64.encode(key);
+    key.zeroize();
+    println!("{encoded}");
+    ExitCode::SUCCESS
 }
 
 async fn run_backup_cmd(args: BackupArgs) -> ExitCode {
@@ -544,6 +576,16 @@ mod tests {
                 assert!(args.json);
             }
             _ => panic!("expected VerifyAuditLog"),
+        }
+    }
+
+    #[test]
+    #[doc = "Spec: SEC-2"]
+    fn generate_master_key_parses_without_arguments() {
+        let cli = Cli::try_parse_from(["llmroller", "generate-master-key"]).expect("valid CLI");
+        match cli.command {
+            Command::GenerateMasterKey => {}
+            _ => panic!("expected GenerateMasterKey"),
         }
     }
 }
