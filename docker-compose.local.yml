@@ -1,0 +1,39 @@
+name: llmroller-local
+
+services:
+  llmroller:
+    image: llmroller:local
+    container_name: llmroller
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${LLMROLLER_DATA_PORT:-8082}:8080"
+      - "0.0.0.0:${LLMROLLER_ADMIN_PORT:-8081}:8081"
+      - "0.0.0.0:${LLMROLLER_METRICS_PORT:-9090}:9090"
+    environment:
+      LLMROLLER_MASTER_KEY: ${LLMROLLER_MASTER_KEY:-roX8K+bTpNNjcu1LcVd1eZxHZbgLipLlQlAY5YC1hyA=}
+      LLMROLLER_MASTER_KEY_ID: mk_local
+      LLMROLLER_DATA_DIR: /var/lib/llmroller
+      LLMROLLER_LISTEN: 0.0.0.0:8080
+      LLMROLLER_ADMIN_LISTEN: 0.0.0.0:8081
+      LLMROLLER_METRICS_LISTEN: 0.0.0.0:9090
+      LLMROLLER_TRUSTED_PROXIES: 127.0.0.1/32,100.64.0.0/10,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12
+      LLMROLLER_REQUIRE_TLS: "false"
+      LLMROLLER_DEFAULT_ROUTING_STRATEGY: smooth_weighted_rr
+      LLMROLLER_LOG: info,llmroller=info
+    command:
+      - "serve"
+      - "--listen"
+      - "0.0.0.0:8080"
+      - "--admin-listen"
+      - "0.0.0.0:8081"
+      - "--metrics-listen"
+      - "0.0.0.0:9090"
+      - "--dev-insecure-cookies"
+    volumes:
+      - ./data:/var/lib/llmroller
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/llmroller", "healthcheck", "--url", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
