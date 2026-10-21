@@ -847,7 +847,7 @@ pub async fn post_response_cancel(
 
 /// One fully-resolved routing candidate built exclusively from the immutable snapshot.
 #[derive(Debug, Clone)]
-struct RouteCandidate {
+pub(crate) struct RouteCandidate {
     upstream_key_id: UpstreamKeyId,
     provider_id: ProviderId,
     model_pk: ModelPk,
@@ -869,6 +869,14 @@ impl RouteCandidate {
         }
     }
 
+    pub(crate) fn upstream_key_id(&self) -> UpstreamKeyId {
+        self.upstream_key_id
+    }
+
+    pub(crate) fn priority(&self) -> i64 {
+        self.priority
+    }
+
     fn pool_tier(&self) -> PoolTier {
         match self.pool_tier {
             CandidatePoolTier::Own => PoolTier::Own,
@@ -885,7 +893,7 @@ fn now_ms() -> i64 {
 }
 
 /// Parse a client key routing scope, failing closed to the safest default.
-fn parse_scope(scope: &str) -> RoutingScope {
+pub(crate) fn parse_scope(scope: &str) -> RoutingScope {
     scope.parse().unwrap_or_default()
 }
 
@@ -899,12 +907,34 @@ fn route_healthy(route: &SnapshotModelRoute, now: i64) -> bool {
 }
 
 /// Collect every route for a model visible to the caller, strictly classified by tier.
-fn collect_candidates(
+pub(crate) fn collect_candidates(
     snapshot: &ConfigSnapshot,
     model: &SnapshotModel,
     caller: &ClientKeyRecord,
     scope: RoutingScope,
     now: i64,
+) -> Vec<RouteCandidate> {
+    collect_routes(snapshot, model, caller, scope, now, true)
+}
+
+/// Collect caller-visible routes regardless of transient health (`C1`..`C5` only).
+pub(crate) fn collect_visible_candidates(
+    snapshot: &ConfigSnapshot,
+    model: &SnapshotModel,
+    caller: &ClientKeyRecord,
+    scope: RoutingScope,
+    now: i64,
+) -> Vec<RouteCandidate> {
+    collect_routes(snapshot, model, caller, scope, now, false)
+}
+
+fn collect_routes(
+    snapshot: &ConfigSnapshot,
+    model: &SnapshotModel,
+    caller: &ClientKeyRecord,
+    scope: RoutingScope,
+    now: i64,
+    require_healthy: bool,
 ) -> Vec<RouteCandidate> {
     let Some(routes) = snapshot.routes_by_model.get(&model.id) else {
         return Vec::new();
@@ -937,7 +967,7 @@ fn collect_candidates(
         if !scope.allows_tier(candidate_tier_as_pool(tier)) {
             continue;
         }
-        if !route_healthy(route, now) {
+        if require_healthy && !route_healthy(route, now) {
             continue;
         }
 

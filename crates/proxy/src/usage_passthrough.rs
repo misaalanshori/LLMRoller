@@ -6,7 +6,9 @@ use axum::Json;
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use llmroller_core::seams::ExposeSecret as _;
+use llmroller_core::accumulators::BudgetScopeId;
+use llmroller_core::seams::{Clock as _, ExposeSecret as _, SystemClock};
+use llmroller_core::snapshot::{ConfigSnapshot, UpstreamKeyRecord};
 use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -14,16 +16,159 @@ use std::sync::Arc;
 
 use crate::auth::ProxyAuthState;
 use llmroller_core::client_key::ClientKeyRecord;
+use llmroller_core::windows::BudgetCounter as _;
 
 #[derive(Debug, Deserialize)]
 pub struct UsageQueryParams {
     pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub upstream_key_id: Option<String>,
     pub fresh: Option<String>,
+}
+
+fn not_found(key_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "code": "not_found_error",
+                "message": format!("upstream key '{key_id}' not found")
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Whether the caller may inspect usage for this upstream key (SEC-12).
+fn accessible_key<'a>(
+    snapshot: &'a ConfigSnapshot,
+    key_id: &llmroller_core::ids::UpstreamKeyId,
+    caller: &ClientKeyRecord,
+) -> Option<&'a UpstreamKeyRecord> {
+    let key = snapshot.upstream_keys.get(key_id)?;
+    let provider = snapshot.providers.get(&key.provider_id)?;
+    match provider.ownership_scope {
+        llmroller_core::rbac::OwnershipScope::Global => Some(key),
+        llmroller_core::rbac::OwnershipScope::Personal => {
+            (provider.owner_user_id == Some(caller.owner_user_id)).then_some(key)
+        }
+    }
+}
+
+/// Resolve the upstream key whose windows a usage response should describe.
+/// Requested upstream key or model identifier that is not visible to the caller.
+struct UsageKeyNotFound(String);
+
+fn resolve_usage_key(
+    snapshot: &ConfigSnapshot,
+    caller: &ClientKeyRecord,
+    params: &UsageQueryParams,
+    now: i64,
+) -> Result<Option<llmroller_core::ids::UpstreamKeyId>, UsageKeyNotFound> {
+    if let Some(raw) = &params.upstream_key_id {
+        let Ok(key_id) = llmroller_core::ids::UpstreamKeyId::parse(raw) else {
+            return Err(UsageKeyNotFound(raw.clone()));
+        };
+        return match accessible_key(snapshot, &key_id, caller) {
+            Some(key) => Ok(Some(key.id)),
+            None => Err(UsageKeyNotFound(raw.clone())),
+        };
+    }
+
+    let scope = crate::orchestrator::parse_scope(&caller.routing_scope);
+    if let Some(raw_model) = &params.model {
+        let model = snapshot
+            .resolve_model(raw_model)
+            .map_err(|_| UsageKeyNotFound(raw_model.clone()))?;
+        if let Some(allowed) = &caller.allowed_models
+            && !allowed.iter().any(|entry| entry == &model.canonical_id)
+        {
+            return Err(UsageKeyNotFound(raw_model.clone()));
+        }
+        let mut candidates =
+            crate::orchestrator::collect_candidates(snapshot, model, caller, scope, now);
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority()));
+        return Ok(candidates
+            .first()
+            .map(|candidate| candidate.upstream_key_id()));
+    }
+
+    // Default: the caller's highest-priority route across every visible model.
+    let mut best: Option<(i64, llmroller_core::ids::UpstreamKeyId)> = None;
+    for model in snapshot.models.values() {
+        if model.exposed == Some(false) {
+            continue;
+        }
+        if let Some(allowed) = &caller.allowed_models
+            && !allowed.iter().any(|entry| entry == &model.canonical_id)
+        {
+            continue;
+        }
+        if snapshot
+            .user_route_prefs
+            .get(&(caller.owner_user_id, model.id))
+            .is_some_and(|preference| !preference.enabled)
+        {
+            continue;
+        }
+        for candidate in
+            crate::orchestrator::collect_candidates(snapshot, model, caller, scope, now)
+        {
+            if best.is_none_or(|(priority, _)| candidate.priority() > priority) {
+                best = Some((candidate.priority(), candidate.upstream_key_id()));
+            }
+        }
+    }
+    Ok(best.map(|(_, key_id)| key_id))
+}
+
+/// Build live budget-window gauges for one upstream key.
+fn usage_windows(
+    state: &ProxyAuthState,
+    snapshot: &ConfigSnapshot,
+    key_id: Option<llmroller_core::ids::UpstreamKeyId>,
+    now: i64,
+) -> Vec<serde_json::Value> {
+    let Some(key_id) = key_id else {
+        return Vec::new();
+    };
+    let windows: &[llmroller_core::snapshot::SnapshotBudgetWindow] = snapshot
+        .budget_windows
+        .get(&key_id)
+        .map_or(&[], Vec::as_slice);
+    windows
+        .iter()
+        .filter_map(|window| {
+            let counter = state.runtime_state.window_counter(&window.id)?;
+            let used = counter.effective_used(now);
+            let limit = counter.limit_micro_usd();
+            let used_percent = if limit > 0 {
+                (used as f64) * 100.0 / (limit as f64)
+            } else {
+                0.0
+            };
+            let status = if limit > 0 && used >= limit {
+                "exhausted"
+            } else if limit > 0 && used.saturating_mul(100) >= limit.saturating_mul(90) {
+                "warning"
+            } else {
+                "ok"
+            };
+            Some(serde_json::json!({
+                "id": window.id,
+                "kind": window.window_kind,
+                "status": status,
+                "used_percent": used_percent,
+                "used_micro_usd": used,
+                "limit_micro_usd": limit
+            }))
+        })
+        .collect()
 }
 
 /// Handler for GET /v1/usage (USG-7).
 pub async fn get_v1_usage_handler(
-    State(_state): State<ProxyAuthState>,
+    State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     Query(params): Query<UsageQueryParams>,
     Extension(client_key): Extension<ClientKeyRecord>,
@@ -49,40 +194,89 @@ pub async fn get_v1_usage_handler(
     let (sess_id, _step) =
         llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
 
+    let now = SystemClock::new().now_ms();
+    let snapshot = state.snapshot.load();
+    let target_key = match resolve_usage_key(&snapshot, &client_key, &params, now) {
+        Ok(key) => key,
+        Err(UsageKeyNotFound(requested)) => return not_found(&requested),
+    };
+    let used_micro = state
+        .runtime_state
+        .accumulators
+        .usage_for(&BudgetScopeId::ClientKey(client_key.id), now);
+    let windows = usage_windows(&state, &snapshot, target_key, now);
+
     (
         StatusCode::OK,
         [("x-llmroller-usage-stale-ms", "0")],
         Json(serde_json::json!({
+            "object": "usage_snapshot",
+            "source": if target_key.is_some() { "local" } else { "none" },
+            "fetched_at": now,
+            "stale": false,
             "client_key_prefix": client_key.prefix,
             "session_id": sess_id,
-            "windows": [
-                {
-                    "kind": "5h",
-                    "status": "ok",
-                    "used_percent": 15.0,
-                    "resets_at": 1792400000000i64
-                }
-            ],
-            "balance_micro_usd": 85_000_000
+            "upstream_key_id": target_key.map(|key| key.to_string()),
+            "windows": windows,
+            "credits": serde_json::Value::Null,
+            "client_key_allowance": {
+                "monthly_cap_micro_usd": client_key.budget_micro_usd_month,
+                "used_this_month_micro_usd": used_micro
+            }
         })),
     )
         .into_response()
 }
 
-/// Handler for GET /v1/key (USG-7).
+/// Handler for GET /v1/key and GET /v1/auth/key (USG-7).
 pub async fn get_v1_key_handler(
-    State(_state): State<ProxyAuthState>,
+    State(state): State<ProxyAuthState>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
+    let now = SystemClock::new().now_ms();
+    let used_micro = state
+        .runtime_state
+        .accumulators
+        .usage_for(&BudgetScopeId::ClientKey(client_key.id), now);
+    let usage_usd = (used_micro as f64) / 1_000_000.0;
+    let limit_usd = client_key
+        .budget_micro_usd_month
+        .map(|cap| (cap as f64) / 1_000_000.0);
+    let limit_remaining_usd = limit_usd.map(|limit| (limit - usage_usd).max(0.0));
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            "object": "client_key_info",
             "id": client_key.id.to_string(),
+            "client_key_id": client_key.id.to_string(),
             "label": client_key.label,
             "prefix": client_key.prefix,
+            "routing_scope": client_key.routing_scope,
             "rate_limit_rpm": client_key.rate_limit_rpm,
             "budget_micro_usd_month": client_key.budget_micro_usd_month,
-            "used_this_month_micro_usd": 0
+            "monthly_cap_micro_usd": client_key.budget_micro_usd_month,
+            "used_this_month_micro_usd": used_micro,
+            "data": {
+                "label": client_key.prefix,
+                "usage": usage_usd,
+                "usage_daily": serde_json::Value::Null,
+                "usage_weekly": serde_json::Value::Null,
+                "usage_monthly": usage_usd,
+                "limit": limit_usd,
+                "limit_remaining": limit_remaining_usd,
+                "limit_reset": serde_json::Value::Null,
+                "is_free_tier": false,
+                "rate_limit": {
+                    "requests": client_key.rate_limit_rpm.unwrap_or(0),
+                    "interval": "1m"
+                },
+                "llmroller": {
+                    "used_this_month_micro_usd": used_micro,
+                    "monthly_cap_micro_usd": client_key.budget_micro_usd_month,
+                    "routing_scope": client_key.routing_scope
+                }
+            }
         })),
     )
         .into_response()

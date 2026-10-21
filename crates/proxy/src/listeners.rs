@@ -5,7 +5,6 @@
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#22-sub-phase-22-client-key-llr_-auth-rotation-grace-model-request-gates-g1g6-and-listeners
 
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use axum::extract::{Extension, State};
@@ -14,11 +13,11 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use sqlx::{Row as _, SqlitePool};
 
 use crate::auth::{ProxyAuthState, client_key_auth_middleware};
 use crate::metrics::metrics_handler;
 use llmroller_core::client_key::ClientKeyRecord;
+use llmroller_core::seams::Clock as _;
 
 /// Build the data plane router serving `/v1/*`, `/healthz`, and `/readyz`.
 pub fn data_plane_router(state: ProxyAuthState) -> Router {
@@ -56,6 +55,10 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             get(crate::usage_passthrough::get_v1_usage_handler),
         )
         .route("/v1/key", get(crate::usage_passthrough::get_v1_key_handler))
+        .route(
+            "/v1/auth/key",
+            get(crate::usage_passthrough::get_v1_key_handler),
+        )
         .route(
             "/v1/usage/raw",
             get(crate::usage_passthrough::get_v1_usage_raw_handler),
@@ -97,83 +100,84 @@ async fn readyz_handler(State(state): State<ProxyAuthState>) -> Response {
     }
 }
 
-struct ExposedModelDto {
-    id: String,
-    display_name: Option<String>,
-    available: bool,
-    aliases: Vec<String>,
-}
+/// Canonical models paired with their display name and route availability.
+type VisibleModels = (Vec<(String, Option<String>, bool)>, Vec<(String, String)>);
 
-async fn fetch_models_for_client_key(
-    pool: &SqlitePool,
+/// Project the caller-visible models and aliases from the immutable snapshot (`MDL-7`).
+fn visible_models(
+    snapshot: &llmroller_core::snapshot::ConfigSnapshot,
     client_key: &ClientKeyRecord,
-) -> Result<(Vec<ExposedModelDto>, Vec<(String, String)>), sqlx::Error> {
-    let rows = sqlx::query(
-        r#"SELECT m.model_pk, m.canonical_id, m.display_name, m.exposed,
-                  (SELECT COUNT(*) FROM model_routes mr
-                   JOIN upstream_keys k ON mr.upstream_key_id = k.id
-                   WHERE mr.model_pk = m.model_pk AND mr.status = 'active' AND k.enabled = 1) as active_route_count
-           FROM models m
-           WHERE m.exposed IS NOT 0"#,
-    )
-    .fetch_all(pool)
-    .await?;
+    now: i64,
+) -> VisibleModels {
+    use std::collections::HashSet;
 
-    let aliases_rows = sqlx::query(
-        r#"SELECT ma.alias, m.canonical_id
-           FROM model_aliases ma
-           JOIN models m ON ma.model_pk = m.model_pk
-           WHERE ma.confirmed = 1 AND m.exposed IS NOT 0"#,
-    )
-    .fetch_all(pool)
-    .await?;
+    let scope = crate::orchestrator::parse_scope(&client_key.routing_scope);
+    let mut visible: Vec<(String, Option<String>, bool)> = Vec::new();
+    let mut visible_ids = HashSet::new();
 
-    let mut model_aliases_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut alias_pairs = Vec::new();
-    for a in aliases_rows {
-        let alias: String = a.try_get("alias")?;
-        let canonical_id: String = a.try_get("canonical_id")?;
+    for model in snapshot.models.values() {
+        if model.exposed == Some(false) {
+            continue;
+        }
         if let Some(allowed) = &client_key.allowed_models
-            && !allowed.contains(&alias)
-            && !allowed.contains(&canonical_id)
+            && !allowed.iter().any(|entry| entry == &model.canonical_id)
         {
             continue;
         }
-        model_aliases_map
-            .entry(canonical_id.clone())
-            .or_default()
-            .push(alias.clone());
-        alias_pairs.push((alias, canonical_id));
-    }
-
-    let mut out = Vec::new();
-    for r in rows {
-        let canonical_id: String = r.try_get("canonical_id")?;
-        if let Some(allowed) = &client_key.allowed_models
-            && !allowed.contains(&canonical_id)
+        // `C4`: a disabled per-user route preference hides the model.
+        if snapshot
+            .user_route_prefs
+            .get(&(client_key.owner_user_id, model.id))
+            .is_some_and(|preference| !preference.enabled)
         {
             continue;
         }
-        let active_route_count: i64 = r.try_get("active_route_count")?;
-        let exposed: Option<i64> = r.try_get("exposed")?;
-        let display_name: Option<String> = r.try_get("display_name")?;
 
-        let available = active_route_count > 0;
-        // If exposed is NULL (automatic), only include if available
-        if exposed.is_none() && !available {
+        let has_routes = snapshot
+            .routes_by_model
+            .get(&model.id)
+            .is_some_and(|routes| !routes.is_empty());
+        let reachable = crate::orchestrator::collect_visible_candidates(
+            snapshot, model, client_key, scope, now,
+        );
+        // Models whose every route is invisible to this caller are omitted; exposed
+        // models with no route at all remain listed as `available: false` (MDL-7).
+        if has_routes && reachable.is_empty() {
             continue;
         }
-
-        let aliases = model_aliases_map.remove(&canonical_id).unwrap_or_default();
-        out.push(ExposedModelDto {
-            id: canonical_id,
-            display_name,
+        let available =
+            !crate::orchestrator::collect_candidates(snapshot, model, client_key, scope, now)
+                .is_empty();
+        visible_ids.insert(model.id);
+        visible.push((
+            model.canonical_id.clone(),
+            model.display_name.clone(),
             available,
-            aliases,
-        });
+        ));
     }
 
-    Ok((out, alias_pairs))
+    visible.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut aliases = Vec::new();
+    for (alias, model_pk) in snapshot.aliases.iter() {
+        if !visible_ids.contains(model_pk) {
+            continue;
+        }
+        let Some(model) = snapshot.models.get(model_pk) else {
+            continue;
+        };
+        if let Some(allowed) = &client_key.allowed_models
+            && !allowed
+                .iter()
+                .any(|entry| entry == alias || entry == &model.canonical_id)
+        {
+            continue;
+        }
+        aliases.push((alias.clone(), model.canonical_id.clone()));
+    }
+    aliases.sort();
+
+    (visible, aliases)
 }
 
 async fn v1_models_handler(
@@ -181,71 +185,70 @@ async fn v1_models_handler(
     headers: HeaderMap,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    let models_result = fetch_models_for_client_key(&state.pool, &client_key).await;
-    match models_result {
-        Ok((models, aliases)) => {
-            if headers.contains_key("anthropic-version") {
-                let items: Vec<serde_json::Value> = models
-                    .into_iter()
-                    .filter(|m| m.available)
-                    .map(|m| {
-                        serde_json::json!({
-                            "type": "model",
-                            "id": m.id,
-                            "display_name": m.display_name.unwrap_or(m.id),
-                            "created_at": "2026-01-01T00:00:00Z"
-                        })
-                    })
-                    .collect();
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "data": items,
-                        "has_more": false,
-                        "first_id": null,
-                        "last_id": null
-                    })),
-                )
-                    .into_response()
-            } else {
-                let mut data = Vec::new();
-                for m in models {
-                    data.push(serde_json::json!({
-                        "id": m.id,
-                        "object": "model",
-                        "created": 1700000000,
-                        "owned_by": "llmroller",
-                        "llmroller": {
-                            "available": m.available,
-                            "aliases": m.aliases
-                        }
-                    }));
-                }
-                for (alias, canonical) in aliases {
-                    data.push(serde_json::json!({
-                        "id": alias,
-                        "object": "model",
-                        "created": 1700000000,
-                        "owned_by": "llmroller",
-                        "llmroller": {
-                            "alias_of": canonical
-                        }
-                    }));
-                }
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "object": "list",
-                        "data": data
-                    })),
-                )
-                    .into_response()
-            }
-        }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "failed to list models" })),
+    let snapshot = state.snapshot.load();
+    let now = llmroller_core::seams::SystemClock::new().now_ms();
+    let (models, aliases) = visible_models(&snapshot, &client_key, now);
+
+    if headers.contains_key("anthropic-version") {
+        let items: Vec<serde_json::Value> = models
+            .into_iter()
+            .map(|(id, display_name, _)| {
+                let display_name = display_name.unwrap_or_else(|| id.clone());
+                serde_json::json!({
+                    "type": "model",
+                    "id": id,
+                    "display_name": display_name,
+                    "created_at": "2026-01-01T00:00:00Z"
+                })
+            })
+            .collect();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "data": items,
+                "has_more": false,
+                "first_id": null,
+                "last_id": null
+            })),
         )
-            .into_response(),
+            .into_response();
     }
+
+    let mut data = Vec::new();
+    for (id, _, available) in models {
+        let model_aliases: Vec<&str> = aliases
+            .iter()
+            .filter(|(_, canonical)| canonical == &id)
+            .map(|(alias, _)| alias.as_str())
+            .collect();
+        data.push(serde_json::json!({
+            "id": id,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "llmroller",
+            "llmroller": {
+                "available": available,
+                "aliases": model_aliases
+            }
+        }));
+    }
+    for (alias, canonical) in aliases {
+        data.push(serde_json::json!({
+            "id": alias,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "llmroller",
+            "llmroller": {
+                "alias_of": canonical
+            }
+        }));
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "object": "list",
+            "data": data
+        })),
+    )
+        .into_response()
 }
