@@ -71,6 +71,7 @@ fi
 echo "Checking governance gates..."
 cargo xtask doc-consistency
 cargo xtask docs-bundle --check
+cargo xtask traceability --milestone M6
 
 echo "=== All release package checks passed successfully (POR-1, REL-1, RTE-14, SEC-10, SEC-11) ==="
 exit 0

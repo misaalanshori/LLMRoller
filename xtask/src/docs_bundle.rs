@@ -107,6 +107,15 @@ pub(crate) fn doc_consistency(root: &Path, registry: &Registry) -> Result<(), St
                 ));
             }
         }
+        for test_path in &requirement.tests {
+            let full_path = root.join(test_path);
+            if !full_path.exists() {
+                errors.push(format!(
+                    "{} references test path {} which does not exist on disk",
+                    requirement.id, test_path
+                ));
+            }
+        }
     }
 
     let documented_ids = documented_requirement_ids(&srdd_text, &bigbang_text);

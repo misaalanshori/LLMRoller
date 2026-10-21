@@ -79,6 +79,15 @@ jobs:
         env:
           LLMROLLER_BUILD_GIT_SHA: ${{ github.sha }}
 
+      - name: Generate SHA-256 checksums
+        run: |
+          cd target/${{ matrix.target }}/release
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum llmroller* > SHA256SUMS
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 llmroller* > SHA256SUMS
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
         with:

@@ -21,4 +21,3 @@ responses_compact = false
 chat_stream = "inject"
 
 [aliases]
-"deepseek-v4-flash" = "deepseek-v4.1-flash"
