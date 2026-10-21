@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 
 use crate::accumulators::MonthlyAccumulatorRegistry;
 use crate::breaker::{OriginBreaker, OriginKey, OriginProbeGuard};
-use crate::health::{CredentialStrikeVerifier, StrikeResult};
+use crate::health::{CredentialStrikeVerifier, RouteProtocolBlocks, StrikeResult};
 use crate::ids::{ClientKeyId, ModelPk, UpstreamKeyId};
 use crate::session::ConstantSessionDetector;
 use crate::snapshot::{CacheInvalidationEvent, ConfigSnapshot, SnapshotBudgetWindow};
@@ -244,6 +244,8 @@ pub struct RuntimeState {
     pub strike_verifier: CredentialStrikeVerifier,
     /// Keys with a credential verification probe already in flight (API-8).
     pub credential_probes_in_flight: DashMap<UpstreamKeyId, ()>,
+    /// `(upstream key, model, protocol)` blocks written by `PlanRestricted` errors (API-8).
+    pub route_protocol_blocks: RouteProtocolBlocks,
     pub load_tracker: Arc<LoadTracker>,
     pub selectors: RouteSelectorSet,
     pub window_counters: DashMap<String, Arc<AtomicBudgetCounter>>,
@@ -283,6 +285,7 @@ impl RuntimeState {
             origin_breakers: DashMap::new(),
             strike_verifier: CredentialStrikeVerifier::new(),
             credential_probes_in_flight: DashMap::new(),
+            route_protocol_blocks: RouteProtocolBlocks::new(),
             load_tracker: Arc::new(LoadTracker::new()),
             selectors: RouteSelectorSet::default(),
             window_counters: DashMap::new(),
@@ -430,6 +433,50 @@ impl RuntimeState {
         self.key_health
             .get(&key_id)
             .is_none_or(|entry| entry.is_routable(now_ms))
+    }
+
+    /// Block one `(key, model, protocol)` route until the next discovery refresh (API-8).
+    pub fn block_route_protocol(
+        &self,
+        key_id: UpstreamKeyId,
+        model_pk: ModelPk,
+        protocol: &str,
+        until_ms: i64,
+    ) {
+        self.route_protocol_blocks
+            .block_protocol(key_id, model_pk, protocol, until_ms);
+        self.health.bump_version();
+    }
+
+    /// Whether a `(key, model, protocol)` route is blocked by a prior `PlanRestricted` (C5).
+    #[must_use]
+    pub fn is_route_protocol_blocked(
+        &self,
+        key_id: UpstreamKeyId,
+        model_pk: ModelPk,
+        protocol: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.route_protocol_blocks
+            .is_blocked(key_id, model_pk, protocol, now_ms)
+    }
+
+    /// Exhaust a key's upstream quota window without recording a credential strike.
+    pub fn record_quota_exhausted(
+        &self,
+        key_id: UpstreamKeyId,
+        retry_after_ms: Option<i64>,
+        now_ms: i64,
+    ) {
+        let until = now_ms.saturating_add(retry_after_ms.unwrap_or(300_000));
+        let mut entry = self.key_health.entry(key_id).or_default();
+        entry.exhausted_until_ms = Some(
+            entry
+                .exhausted_until_ms
+                .map_or(until, |existing| existing.max(until)),
+        );
+        drop(entry);
+        self.health.bump_version();
     }
 
     /// Whether the origin breaker would admit a new attempt (C7, non-claiming).

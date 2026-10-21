@@ -30,14 +30,26 @@ pub struct ResponseLink {
 #[derive(Debug, Clone)]
 pub enum TryOutcome {
     Success,
-    RequestRejected { status: StatusCode, body: Bytes },
-    Unclassified403 { body: Bytes },
-    RateLimited { retry_after_secs: Option<u64> },
-    QuotaExhausted { retry_after_secs: Option<u64> },
+    RequestRejected {
+        status: StatusCode,
+        body: Bytes,
+    },
+    Unclassified403 {
+        body: Bytes,
+    },
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
+    QuotaExhausted {
+        retry_after_secs: Option<u64>,
+    },
     PlanRestricted,
     BreakerOpen,
     WaitTimeout,
     HostFailure,
+    /// A local prerequisite failed closed (for example AEAD unseal or a missing
+    /// snapshot record) before any upstream request could be dispatched.
+    Unavailable,
 }
 
 /// Selects the terminal error when all failover tries have failed (Section 10.5.3).
@@ -66,7 +78,21 @@ pub fn select_terminal_error(
         }
     }
 
-    // 2. Else if all tries ended in {http_429, QuotaExhausted, PlanRestricted, breaker_open}
+    // 2. Local fail-closed prerequisites never reached an upstream, so no upstream
+    // status or body can be forwarded; surface an operator-visible 503.
+    if outcomes
+        .iter()
+        .any(|o| matches!(o, TryOutcome::Unavailable))
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            None,
+            None,
+        );
+    }
+
+    // 3. Else if all tries ended in {http_429, QuotaExhausted, PlanRestricted, breaker_open}
     let all_rate_or_quota = outcomes.iter().all(|o| {
         matches!(
             o,

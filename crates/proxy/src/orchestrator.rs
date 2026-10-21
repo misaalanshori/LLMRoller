@@ -44,7 +44,9 @@ use llmroller_core::snapshot::{
 };
 use llmroller_core::strategy::{RouteId, RoutingStrategy, WrrGroupKey};
 use llmroller_core::windows::{Reservation, estimate_reservation_cost_micro_usd};
-use llmroller_proto::adapters::{EndpointKind, get_adapter};
+use llmroller_proto::adapters::{
+    EndpointKind, ErrorClass, classify_error_with_classifiers, get_adapter,
+};
 use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
@@ -60,11 +62,21 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::ProxyAuthState;
+use crate::failover::{TryOutcome, select_terminal_error};
 use crate::forward::{PreFirstFrameBuffer, SseChunkForwarder};
 use crate::lifecycle::{RequestLifecycle, Termination};
 
 /// Maximum upstream tries per request; mirrors the `usage_attempts.attempt_no` bound.
 const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+
+/// Maximum bytes retained from an upstream error body for classification and passthrough.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Size of the body prefix passed to the ordered error classifier (Section 10.5).
+const ERROR_CLASSIFY_BYTES: usize = 8 * 1024;
+
+/// Fallback lifetime of a `PlanRestricted` route block until the next `/models` refresh.
+const PROTOCOL_BLOCK_MS: i64 = 6 * 60 * 60 * 1_000;
 
 /// Maximum idle time while waiting for an upstream chunk.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -310,7 +322,14 @@ fn hard_route_checks(
     });
 
     let c5 = route.is_some_and(|route| {
-        route.protocols.iter().any(|value| value == protocol) && route_healthy(route, now)
+        route.protocols.iter().any(|value| value == protocol)
+            && route_healthy(route, now)
+            && !runtime.is_route_protocol_blocked(
+                route.upstream_key_id,
+                route.model_pk,
+                protocol,
+                now,
+            )
     });
 
     let c6 = key.is_some_and(|key| runtime.is_key_routable(key.id, now))
@@ -696,6 +715,12 @@ pub async fn post_messages_count_tokens(
                         })
                     })
                     .is_some()
+                    && !state.runtime_state.is_route_protocol_blocked(
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        "messages",
+                        now,
+                    )
             })
             .collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
@@ -1303,6 +1328,7 @@ fn eligibility_route(
     candidate: &RouteCandidate,
     model: &SnapshotModel,
     caller: &ClientKeyRecord,
+    protocol: &str,
     now: i64,
 ) -> EligibilityRoute {
     let provider = snapshot
@@ -1371,7 +1397,15 @@ fn eligibility_route(
             route.status
         }),
         protocols: route.map_or_else(Vec::new, |route| route.protocols.clone()),
-        protocol_blocked: route.is_some_and(|route| !route_healthy(route, now)),
+        protocol_blocked: route.is_some_and(|route| {
+            !route_healthy(route, now)
+                || runtime.is_route_protocol_blocked(
+                    candidate.upstream_key_id,
+                    candidate.model_pk,
+                    protocol,
+                    now,
+                )
+        }),
         key_health_ok: runtime.is_key_routable(candidate.upstream_key_id, now),
         route_health_ok: route.is_some_and(|route| route_healthy(route, now)),
         breaker_closed: runtime.is_origin_admitted(
@@ -1573,6 +1607,49 @@ fn session_pin_key(
 }
 
 /// Extract a `Retry-After` delay in milliseconds from an upstream response.
+/// Read at most [`MAX_ERROR_BODY_BYTES`] from a non-success upstream response.
+async fn read_bounded_error_body(response: reqwest::Response) -> Bytes {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::with_capacity(ERROR_CLASSIFY_BYTES);
+    while let Some(Ok(chunk)) = stream.next().await {
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(buffer.len());
+        if remaining == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if buffer.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    Bytes::from(buffer)
+}
+
+/// Return a classified upstream error body verbatim with the filtered response headers.
+fn upstream_error_response(
+    status: StatusCode,
+    upstream_headers: &HeaderMap,
+    body: Bytes,
+    candidate: &RouteCandidate,
+    request_id: &str,
+) -> Response {
+    let headers_out = llmroller_proto::headers::apply_response_header_pipeline(
+        upstream_headers,
+        candidate.pool_tier(),
+        false,
+        request_id,
+        &candidate.config.response_header_allow,
+    );
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers_out {
+        if let Some(name) = name {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn retry_after_ms(headers: &HeaderMap) -> Option<i64> {
     headers
         .get("retry-after")
@@ -2255,6 +2332,7 @@ pub async fn handle_inference_request(
                     candidate,
                     &model,
                     &caller,
+                    protocol,
                     now,
                 )
             })
@@ -2459,7 +2537,7 @@ pub async fn handle_inference_request(
     let mut tried: Vec<UpstreamKeyId> = Vec::new();
 
     let mut attempts: Vec<UsageAttemptRecord> = Vec::new();
-    let mut last_status = StatusCode::BAD_GATEWAY;
+    let mut try_outcomes: Vec<TryOutcome> = Vec::new();
     let mut last_retry_after_ms: Option<i64> = None;
     let mut last_cap_error: Option<GateG7Error> = None;
     let mut failovers = 0_i64;
@@ -2496,11 +2574,13 @@ pub async fn handle_inference_request(
             .get(&candidate.upstream_key_id)
             .cloned()
         else {
+            try_outcomes.push(TryOutcome::Unavailable);
             continue;
         };
         let secret = match unseal_upstream_key(&state, &snapshot, &key) {
             Ok(secret) => secret,
             Err(()) => {
+                try_outcomes.push(TryOutcome::Unavailable);
                 attempts.push(attempt_record(
                     request_id,
                     attempt_no as i64,
@@ -2512,7 +2592,6 @@ pub async fn handle_inference_request(
                     0,
                     "none",
                 ));
-                last_status = StatusCode::SERVICE_UNAVAILABLE;
                 continue;
             }
         };
@@ -2554,8 +2633,10 @@ pub async fn handle_inference_request(
                     0,
                     "none",
                 ));
-                last_status = StatusCode::TOO_MANY_REQUESTS;
                 last_cap_error = Some(error);
+                try_outcomes.push(TryOutcome::RateLimited {
+                    retry_after_secs: Some(1),
+                });
                 continue;
             }
         };
@@ -2579,7 +2660,9 @@ pub async fn handle_inference_request(
                     0,
                     "none",
                 ));
-                last_status = StatusCode::TOO_MANY_REQUESTS;
+                try_outcomes.push(TryOutcome::RateLimited {
+                    retry_after_secs: Some(1),
+                });
                 continue;
             }
         };
@@ -2597,7 +2680,7 @@ pub async fn handle_inference_request(
                 0,
                 "none",
             ));
-            last_status = StatusCode::BAD_GATEWAY;
+            try_outcomes.push(TryOutcome::HostFailure);
             continue;
         }
         let client = state.select_http_client(candidate.allow_private_network);
@@ -2605,7 +2688,7 @@ pub async fn handle_inference_request(
         // Claim this origin for the attempt. The guard releases a half-open probe
         // slot if the attempt is cancelled before recording an outcome (REL-5).
         let Some(_origin_permit) = state.runtime_state.acquire_origin_permit(&origin, now) else {
-            last_status = StatusCode::SERVICE_UNAVAILABLE;
+            try_outcomes.push(TryOutcome::BreakerOpen);
             continue;
         };
 
@@ -2678,50 +2761,196 @@ pub async fn handle_inference_request(
                     pin_ticket = Some(replacement);
                 }
                 failovers += 1;
-                last_status = StatusCode::BAD_GATEWAY;
+                try_outcomes.push(TryOutcome::HostFailure);
                 continue;
             }
         };
 
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS
-            || status == StatusCode::UNAUTHORIZED
-            || status == StatusCode::PAYMENT_REQUIRED
-            || status == StatusCode::FORBIDDEN
-            || status.is_server_error()
-        {
-            last_status = status;
+        if !status.is_success() {
             last_retry_after_ms = retry_after_ms(response.headers());
-            let outcome = llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
-            let strike = state.runtime_state.record_upstream_failure(
-                &origin,
-                candidate.upstream_key_id,
-                caller.id,
-                outcome,
-                last_retry_after_ms,
-                now,
+            let upstream_headers = response.headers().clone();
+            let error_body = read_bounded_error_body(response).await;
+            let classify_prefix = &error_body[..error_body.len().min(ERROR_CLASSIFY_BYTES)];
+            let class = classify_error_with_classifiers(
+                status.as_u16(),
+                classify_prefix,
+                Some(&candidate.config.error_classifiers),
             );
-            if strike == Some(StrikeResult::ProbeRequired) {
-                spawn_credential_probe(
-                    &state,
-                    &candidate.base_url,
-                    candidate.allow_private_network,
-                    &secret,
-                    candidate.upstream_key_id,
-                );
+            let retry_after_secs =
+                last_retry_after_ms.map(|delay| u64::try_from((delay / 1000).max(1)).unwrap_or(1));
+
+            match class {
+                ErrorClass::RequestRejected | ErrorClass::Unclassified403 => {
+                    if class == ErrorClass::Unclassified403 {
+                        crate::metrics::record_unclassified_403(&candidate.provider_id.to_string());
+                    }
+                    // The upstream response is forwarded verbatim with zero health
+                    // effect; moderation 403s must never quarantine or fail over.
+                    let outcome =
+                        llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
+                    if matches!(status.as_u16(), 401..=403)
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                    {
+                        attempts.push(attempt_record(
+                            request_id,
+                            attempt_no as i64,
+                            now,
+                            candidate.upstream_key_id,
+                            outcome,
+                            Some(status.as_u16()),
+                            body.len(),
+                            0,
+                            "none",
+                        ));
+                    }
+                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    return upstream_error_response(
+                        status,
+                        &upstream_headers,
+                        error_body,
+                        &candidate,
+                        &request_id.to_string(),
+                    );
+                }
+                ErrorClass::PlanRestricted => {
+                    state.runtime_state.block_route_protocol(
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        now.saturating_add(PROTOCOL_BLOCK_MS),
+                    );
+                    try_outcomes.push(TryOutcome::PlanRestricted);
+                    attempts.push(attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        llmroller_core::usage::AttemptOutcome::Http403,
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    ));
+                }
+                ErrorClass::QuotaExhausted => {
+                    state.runtime_state.record_quota_exhausted(
+                        candidate.upstream_key_id,
+                        last_retry_after_ms,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::QuotaExhausted { retry_after_secs });
+                    attempts.push(attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    ));
+                }
+                ErrorClass::CredentialInvalid => {
+                    let outcome = if status == StatusCode::UNAUTHORIZED {
+                        llmroller_core::usage::AttemptOutcome::Http401
+                    } else {
+                        llmroller_core::usage::AttemptOutcome::Http403
+                    };
+                    let strike = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        outcome,
+                        last_retry_after_ms,
+                        now,
+                    );
+                    if strike == Some(StrikeResult::ProbeRequired) {
+                        spawn_credential_probe(
+                            &state,
+                            &candidate.base_url,
+                            candidate.allow_private_network,
+                            &secret,
+                            candidate.upstream_key_id,
+                        );
+                    }
+                    try_outcomes.push(TryOutcome::HostFailure);
+                    attempts.push(attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    ));
+                }
+                ErrorClass::Other(_) if status == StatusCode::TOO_MANY_REQUESTS => {
+                    let outcome = llmroller_core::usage::AttemptOutcome::Http429;
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        outcome,
+                        last_retry_after_ms,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::RateLimited { retry_after_secs });
+                    attempts.push(attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    ));
+                }
+                ErrorClass::Other(_) if status.is_server_error() => {
+                    let outcome = llmroller_core::usage::AttemptOutcome::Http5xx;
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        outcome,
+                        last_retry_after_ms,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::HostFailure);
+                    let (charged_micro_usd, charge_basis) =
+                        failure_charge(outcome, attempt_estimate);
+                    attempts.push(attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        charged_micro_usd,
+                        charge_basis,
+                    ));
+                }
+                ErrorClass::Other(_) => {
+                    // Non-retryable status (for example 405 or a redirect): pass it
+                    // through without health effects or failover.
+                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    return upstream_error_response(
+                        status,
+                        &upstream_headers,
+                        error_body,
+                        &candidate,
+                        &request_id.to_string(),
+                    );
+                }
             }
-            let (charged_micro_usd, charge_basis) = failure_charge(outcome, attempt_estimate);
-            attempts.push(attempt_record(
-                request_id,
-                attempt_no as i64,
-                now,
-                candidate.upstream_key_id,
-                outcome,
-                Some(status.as_u16()),
-                body.len(),
-                charged_micro_usd,
-                charge_basis,
-            ));
+
             if let Some(replacement) = note_pre_first_byte_failure(
                 &state,
                 pin_key.as_ref(),
@@ -2820,7 +3049,7 @@ pub async fn handle_inference_request(
                         pin_ticket = Some(replacement);
                     }
                     failovers += 1;
-                    last_status = StatusCode::BAD_GATEWAY;
+                    try_outcomes.push(TryOutcome::HostFailure);
                     continue;
                 }
 
@@ -3050,7 +3279,7 @@ pub async fn handle_inference_request(
                     "none",
                 ));
                 failovers += 1;
-                last_status = StatusCode::BAD_GATEWAY;
+                try_outcomes.push(TryOutcome::HostFailure);
                 continue;
             }
         };
@@ -3227,7 +3456,14 @@ pub async fn handle_inference_request(
         return gate_error_response(&error);
     }
 
-    crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+    let (terminal_status, terminal_code, terminal_retry_after, terminal_body) =
+        select_terminal_error(&try_outcomes);
+    let status_class = if terminal_status.is_client_error() {
+        "4xx"
+    } else {
+        "5xx"
+    };
+    crate::metrics::record_request_metric(endpoint_str, status_class, "error");
     if let Some(writer) = &state.writer {
         let usage = UsageContext {
             request_id,
@@ -3243,15 +3479,11 @@ pub async fn handle_inference_request(
             session_hash: None,
             pin_outcome: None,
             failovers,
-            error_code: Some(if last_status == StatusCode::TOO_MANY_REQUESTS {
-                "upstream_rate_limited".to_string()
-            } else {
-                "upstream_error".to_string()
-            }),
+            error_code: Some(terminal_code.to_string()),
         };
         let event = usage.event(
             now,
-            last_status.as_u16(),
+            terminal_status.as_u16(),
             is_streaming,
             true,
             Termination::UpstreamTruncated.as_str(),
@@ -3267,17 +3499,33 @@ pub async fn handle_inference_request(
             .enqueue(event, std::mem::take(&mut attempts));
     }
 
-    let mut response = (
-        last_status,
-        Json(serde_json::json!({
-            "error": {
-                "code": if last_status == StatusCode::TOO_MANY_REQUESTS { "upstream_rate_limited" } else { "upstream_error" },
-                "message": "all upstream attempts failed"
-            }
-        })),
-    )
-        .into_response();
-    if let Some(delay) = last_retry_after_ms
+    let mut response = terminal_body.map_or_else(
+        || {
+            (
+                terminal_status,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": terminal_code,
+                        "message": "all upstream attempts failed"
+                    }
+                })),
+            )
+                .into_response()
+        },
+        |body| {
+            (
+                terminal_status,
+                [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                body,
+            )
+                .into_response()
+        },
+    );
+    if let Some(secs) = terminal_retry_after {
+        if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+            response.headers_mut().insert("retry-after", value);
+        }
+    } else if let Some(delay) = last_retry_after_ms
         && let Ok(value) = HeaderValue::from_str(&(delay / 1000).max(1).to_string())
     {
         response.headers_mut().insert("retry-after", value);

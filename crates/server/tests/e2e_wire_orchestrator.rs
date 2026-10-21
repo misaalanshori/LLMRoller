@@ -63,6 +63,78 @@ fn record_request(state: &MockUpstreamState, path: &'static str, headers: &Heade
         });
 }
 
+fn configured_upstream_error(headers: &HeaderMap) -> Option<Response> {
+    let secret = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+
+    if headers.contains_key("x-fail-moderation") {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "content_filter",
+                        "message": "Prompt blocked by moderation"
+                    }
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if headers.contains_key("x-fail-plan") || secret == "sk-plan" {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "upgrade_required",
+                        "message": "not available on your plan"
+                    }
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if secret.starts_with("sk-quota") {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "insufficient_quota",
+                    "message": "exceeded your current quota"
+                }
+            })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from_static("7"));
+        return Some(response);
+    }
+    if secret == "sk-503" {
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "upstream unavailable" })),
+            )
+                .into_response(),
+        );
+    }
+    if secret == "sk-401" {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": { "code": "invalid_api_key" } })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn mock_chat_handler(
     State(state): State<MockUpstreamState>,
     headers: HeaderMap,
@@ -70,6 +142,10 @@ async fn mock_chat_handler(
 ) -> Response {
     state.chat_calls.fetch_add(1, Ordering::SeqCst);
     record_request(&state, "/chat/completions", &headers, &body);
+
+    if let Some(response) = configured_upstream_error(&headers) {
+        return response;
+    }
 
     if headers.contains_key("x-fail-429") {
         return (
@@ -681,6 +757,87 @@ async fn seed_single_global_route(
     token
 }
 
+/// Seeds one global provider, model and one active route per `(secret, priority)` pair.
+async fn seed_global_route_with_secrets(
+    pool: &sqlx::SqlitePool,
+    master_key: &MasterKey,
+    mock_addr: SocketAddr,
+    secrets: &[(&str, i64)],
+    config_json: &str,
+) -> String {
+    let entropy = OsEntropy;
+    seed_base(pool, master_key).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let (_user_id, token) =
+        seed_user_with_client_key(&mut tx, "f03_err_user", None, &entropy).await;
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+
+    let provider = create_provider_tx(
+        &mut tx,
+        &system_actor,
+        NewProvider {
+            name: format!(
+                "Mock Error Provider {}",
+                llmroller_core::ids::ProviderId::generate()
+            ),
+            kind: ProviderKind::Custom,
+            base_url: format!("http://{}", mock_addr),
+            config_json: config_json.to_string(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: true,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("create provider");
+
+    let model_pk = ModelPk::generate();
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed, routing_strategy) \
+         VALUES (?, 'gpt-4o', 1, 'naive_rr')",
+    )
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model");
+
+    for (secret, priority) in secrets {
+        let upstream_key = create_upstream_key_tx(
+            &mut tx,
+            &system_actor,
+            master_key,
+            "key-0",
+            Arc::new(OsEntropy),
+            NewUpstreamKey {
+                provider_id: provider.id,
+                label: format!("Mock Error Key {secret}"),
+                secret: secret_string(*secret),
+                priority: Some(*priority),
+                strict_tier: Some(1),
+                enabled: Some(true),
+            },
+            1000,
+        )
+        .await
+        .expect("create upstream key");
+        sqlx::query(
+            "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+             VALUES (?, ?, 'gpt-4o', '[\"chat\",\"responses\",\"messages\"]', 'active', 1000)",
+        )
+        .bind(upstream_key.id.to_string())
+        .bind(model_pk.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert route");
+    }
+
+    tx.commit().await.expect("commit");
+    token
+}
+
 fn latest_request(mock_state: &MockUpstreamState, path: &str) -> RecordedRequest {
     mock_state
         .recorded
@@ -901,4 +1058,207 @@ async fn test_messages_auth_scheme_uses_configured_x_api_key() {
         Some(&b"2023-06-01"[..]),
         "native Anthropic Messages requests require anthropic-version"
     );
+}
+
+fn chat_request_with_header(token: &str, name: &'static str, value: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(name, value)
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("request")
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 — F03 moderation 403 is returned verbatim without failover"]
+async fn test_moderation_403_does_not_fail_over_or_forward_as_credential_error() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_moderation.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE5; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-moderate", 1), ("sk-ok", 2)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let response = app
+        .oneshot(chat_request_with_header(&token, "x-fail-moderation", "1"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("moderation"),
+        "the upstream moderation body must be forwarded verbatim: {text}"
+    );
+    assert_eq!(
+        mock_state.chat_calls.load(Ordering::SeqCst),
+        1,
+        "a RequestRejected 403 must never fail over to another key"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 — F03 moderation 403 leaves key health untouched"]
+async fn test_moderation_403_does_not_quarantine_key() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(
+        &dir.path().join("f03_moderation_health.db"),
+        PoolRole::Writer,
+    )
+    .await
+    .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE6; 32]);
+    let token =
+        seed_global_route_with_secrets(&pool, &master_key, mock_addr, &[("sk-moderate", 1)], "{}")
+            .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let rejected = app
+        .clone()
+        .oneshot(chat_request_with_header(&token, "x-fail-moderation", "1"))
+        .await
+        .expect("response");
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let recovered = app.oneshot(chat_request(&token)).await.expect("response");
+    assert_eq!(
+        recovered.status(),
+        StatusCode::OK,
+        "a content-moderation 403 must not quarantine the upstream key"
+    );
+    assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 — F03 PlanRestricted blocks only that key/model/protocol route"]
+async fn test_plan_restricted_blocks_route_until_next_discovery() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_plan.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE7; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-plan", 1), ("sk-ok", 2)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let first = app
+        .clone()
+        .oneshot(chat_request(&token))
+        .await
+        .expect("response");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        mock_state.chat_calls.load(Ordering::SeqCst),
+        2,
+        "PlanRestricted must fail over to the next candidate"
+    );
+
+    let second = app.oneshot(chat_request(&token)).await.expect("response");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        mock_state.chat_calls.load(Ordering::SeqCst),
+        3,
+        "the blocked (key, model, protocol) route must be skipped after PlanRestricted"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 — F03 terminal selector is used for mixed failures"]
+async fn test_mixed_quota_and_server_failure_returns_terminal_502() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_terminal_mixed.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE8; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-quota", 1), ("sk-503", 2)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let response = app.oneshot(chat_request(&token)).await.expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["error"]["code"], "upstream_unreachable");
+    assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[doc = "Spec: API-8 — F03 all-quota failures select 429 with Retry-After"]
+async fn test_all_quota_failures_return_429_with_retry_after() {
+    let (mock_addr, _mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_terminal_quota.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE9; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-quota", 1), ("sk-quota-2", 2)],
+        "{}",
+    )
+    .await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let response = app.oneshot(chat_request(&token)).await.expect("response");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .map(|value| value.to_str().expect("retry-after")),
+        Some("7")
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["error"]["code"], "upstream_rate_limited");
 }

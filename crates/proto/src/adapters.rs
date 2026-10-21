@@ -9,6 +9,8 @@
 
 use llmroller_core::provider::ProviderKind;
 
+pub use llmroller_core::provider::ErrorClassifiers;
+
 use crate::body_edit::ChatStreamMode;
 use crate::headers::UaPolicy;
 
@@ -60,40 +62,6 @@ const PLAN_RESTRICTED_SUBSTRINGS: [&str; 2] = ["upgrade_required", "not availabl
 
 const CREDENTIAL_INVALID_SUBSTRINGS: [&str; 3] =
     ["invalid_api_key", "invalid x-api-key", "unauthorized"];
-
-/// Per-provider error-classification overrides configured in `providers.config_json` (PRV-3).
-///
-/// Substrings are matched case-insensitively against the first 8 KiB of the upstream body
-/// and are evaluated before the built-in preset patterns.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ErrorClassifiers {
-    #[serde(default)]
-    pub quota_exhausted_substrings: Vec<String>,
-    #[serde(default)]
-    pub request_rejected_substrings: Vec<String>,
-    #[serde(default)]
-    pub plan_restricted_substrings: Vec<String>,
-    #[serde(default)]
-    pub credential_invalid_substrings: Vec<String>,
-}
-
-impl ErrorClassifiers {
-    /// Extract `error_classifiers` from a provider `config_json` document, if present.
-    #[must_use]
-    pub fn from_provider_config(config_json: &str) -> Self {
-        serde_json::from_str::<serde_json::Value>(config_json)
-            .ok()
-            .and_then(|value| value.get("error_classifiers").cloned())
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default()
-    }
-
-    fn matches(list: &[String], body: &str) -> bool {
-        list.iter()
-            .map(|sub| sub.to_ascii_lowercase())
-            .any(|sub| !sub.is_empty() && body.contains(&sub))
-    }
-}
 
 /// Classify an upstream error response against the five ordered classes per Section 10.5.2.
 #[must_use]

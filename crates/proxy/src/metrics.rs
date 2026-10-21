@@ -53,6 +53,16 @@ pub fn record_request_metric(
     metrics::counter!("llmroller_requests_total", "endpoint" => endpoint, "status_class" => status_class, "outcome" => outcome).increment(1);
 }
 
+/// Record an upstream 403 that did not match any classified error pattern (API-8).
+pub fn record_unclassified_403(provider_id: &str) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!(
+        "llmroller_upstream_unclassified_403_total",
+        "provider_id" => provider_id.to_owned()
+    )
+    .increment(1);
+}
+
 /// Errors returned when metric labels violate the closed allowlist.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MetricLabelError {

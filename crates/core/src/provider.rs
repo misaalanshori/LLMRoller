@@ -181,6 +181,43 @@ pub enum UaPolicySetting {
     Reject,
 }
 
+/// Per-provider error-classification overrides configured in `providers.config_json`
+/// (`PRV-3`, `API-8`).
+///
+/// Substrings are matched case-insensitively against the first 8 KiB of the upstream
+/// body and are evaluated before the built-in preset patterns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorClassifiers {
+    #[serde(default)]
+    pub quota_exhausted_substrings: Vec<String>,
+    #[serde(default)]
+    pub request_rejected_substrings: Vec<String>,
+    #[serde(default)]
+    pub plan_restricted_substrings: Vec<String>,
+    #[serde(default)]
+    pub credential_invalid_substrings: Vec<String>,
+}
+
+impl ErrorClassifiers {
+    /// Extract `error_classifiers` from a provider `config_json` document, if present.
+    #[must_use]
+    pub fn from_provider_config(config_json: &str) -> Self {
+        serde_json::from_str::<serde_json::Value>(config_json)
+            .ok()
+            .and_then(|value| value.get("error_classifiers").cloned())
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether any configured substring appears in an already-lowercased body.
+    #[must_use]
+    pub fn matches(list: &[String], body_lowercase: &str) -> bool {
+        list.iter()
+            .map(|sub| sub.to_ascii_lowercase())
+            .any(|sub| !sub.is_empty() && body_lowercase.contains(&sub))
+    }
+}
+
 /// Parsed `providers.config_json` projection used by the data plane (`PRV-3`).
 ///
 /// Unknown keys are preserved by the database but ignored here so older or newer
@@ -206,6 +243,8 @@ pub struct ProviderConfig {
     pub response_header_allow: Vec<String>,
     #[serde(default)]
     pub ua_policy: Option<UaPolicySetting>,
+    #[serde(default)]
+    pub error_classifiers: ErrorClassifiers,
 }
 
 impl ProviderConfig {
