@@ -93,6 +93,8 @@ clap = { version = "4.6.7", features = ["derive"] }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 askama = "0.16.1"
+ammonia = "4.2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # Testing
 proptest = "1.10.0"

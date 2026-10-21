@@ -26,6 +26,8 @@ serde_json.workspace = true
 sha2.workspace = true
 ulid.workspace = true
 zeroize.workspace = true
+ammonia.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

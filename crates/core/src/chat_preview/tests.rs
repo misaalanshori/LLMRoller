@@ -113,7 +113,7 @@ fn test_timeline_reconstruction_with_lcp_and_decryption_cap() {
     assert!(capped_timeline[1].has_load_more_placeholder);
 }
 
-#[doc = "Spec: TRC-5"]
+#[doc = "Spec: TRC-5, Spec: TRC-6, Spec: SEC-19"]
 #[test]
 fn test_xss_escaping_and_sanitization() {
     let malicious = "<script>alert(1)</script><img src=x onerror=alert(1)>";
@@ -124,5 +124,32 @@ fn test_xss_escaping_and_sanitization() {
 
     let sanitized = sanitize_assistant_text(malicious);
     assert!(!sanitized.contains("<script"));
-    assert!(sanitized.contains("&lt;script&gt;"));
+    assert!(!sanitized.contains("<img"));
+
+    // XSS bypass attempts that bypass naive substring checks
+    let svg_xss = "<svg/onmouseover=alert(1)>";
+    let img_xss = "<img src=x onerror =alert(1)>";
+    let js_link = "[click](javascript:alert(1))";
+    let js_a_tag = "<a href=\"javascript:alert(1)\">click</a>";
+
+    let sanitized_svg = sanitize_assistant_text(svg_xss);
+    assert!(!sanitized_svg.contains("<svg"), "svg tag should be stripped or escaped");
+
+    let sanitized_img = sanitize_assistant_text(img_xss);
+    assert!(!sanitized_img.contains("<img"), "img tag should be stripped");
+    assert!(!sanitized_img.contains("onerror"), "onerror with whitespace should be stripped");
+
+    let sanitized_link = sanitize_assistant_text(js_link);
+    assert!(!sanitized_link.contains("javascript:"), "javascript: link scheme should be stripped");
+
+    let sanitized_a = sanitize_assistant_text(js_a_tag);
+    assert!(!sanitized_a.contains("javascript:"), "javascript: scheme in a tag should be stripped");
+
+    // Safe Markdown is preserved and converted to safe HTML tags
+    let safe_md = "**bold text** and `code span` and [safe link](https://example.com)";
+    let sanitized_safe = sanitize_assistant_text(safe_md);
+    assert!(sanitized_safe.contains("<strong>bold text</strong>"));
+    assert!(sanitized_safe.contains("<code>code span</code>"));
+    assert!(sanitized_safe.contains("<a href=\"https://example.com\""));
+    assert!(sanitized_safe.contains("rel=\"noopener noreferrer nofollow\""));
 }

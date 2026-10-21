@@ -47,17 +47,25 @@ pub fn escape_html(input: &str) -> String {
 
 /// Neutralizes malicious HTML/JS tags from assistant markdown while preserving clean markup (SEC-19).
 pub fn sanitize_assistant_text(text: &str) -> String {
-    // Strip script, iframe, and dangerous event handlers
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("<script")
-        || lower.contains("<iframe")
-        || lower.contains("onerror=")
-        || lower.contains("onload=")
-    {
-        escape_html(text)
-    } else {
-        text.to_string()
-    }
+    // 1. Render Markdown with pulldown-cmark with raw HTML tags disabled
+    let parser = pulldown_cmark::Parser::new(text);
+    let mut html_output = String::new();
+    pulldown_cmark::html::push_html(&mut html_output, parser);
+
+    // 2. Strict sanitization with ammonia allowlist per SRDD Section 8.2 (SEC-19)
+    let tags = [
+        "p", "pre", "code", "em", "strong", "ul", "ol", "li", "blockquote", "a", "table",
+        "thead", "tbody", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "br",
+    ];
+    let tag_set: std::collections::HashSet<&str> = tags.into_iter().collect();
+
+    let mut builder = ammonia::Builder::new();
+    builder
+        .tags(tag_set)
+        .link_rel(Some("noopener noreferrer nofollow"))
+        .url_schemes(["https", "http", "mailto"].into_iter().collect());
+
+    builder.clean(&html_output).to_string()
 }
 
 /// Single reconstructed message in the session preview timeline.
