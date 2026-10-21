@@ -32,6 +32,7 @@ pub struct ShutdownSupervisor {
     pub pool: SqlitePool,
     pub drain_grace_duration: Duration,
     pub drain_timeout_duration: Duration,
+    pub writer: Option<llmroller_store::writer::WriterHandle>,
 }
 
 impl ShutdownSupervisor {
@@ -51,7 +52,15 @@ impl ShutdownSupervisor {
             pool,
             drain_grace_duration,
             drain_timeout_duration,
+            writer: None,
         }
+    }
+
+    /// Attach the writer whose queues must be flushed before the final checkpoint.
+    #[must_use]
+    pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
+        self.writer = Some(writer);
+        self
     }
 
     /// Execute the complete 8-step graceful shutdown sequence.
@@ -65,6 +74,7 @@ impl ShutdownSupervisor {
         }
 
         // Step 2: Stop accepting new TCP connections (signaled via is_ready)
+        self.shutdown_notify.notify_waiters();
 
         // Step 3: Wait for in-flight streams to complete naturally up to drain_timeout
         let start = Instant::now();
@@ -80,17 +90,30 @@ impl ShutdownSupervisor {
             self.shutdown_notify.notify_waiters();
         }
 
-        // Step 5: Stop background tasks
+        // Step 5: Background tasks observe the drain flag and stop scheduling work.
 
-        // Step 6: Wait for sealer queue (min(10s, remaining budget))
+        // Step 6: Trace sealing is synchronous inside the pool; allow in-flight seals
+        // to finish within the remaining drain budget (sealer write-through is immediate).
 
-        // Step 7: Drain writer queues
+        // Step 7: Drain the writer's durable/rollup/raw queues before checkpointing (REL-1).
+        let mut flush_failed = false;
+        if let Some(writer) = &self.writer {
+            let flushed = tokio::time::timeout(
+                Duration::from_secs(5),
+                llmroller_store::writer::flush_data_queues(&self.pool, &writer.queues),
+            )
+            .await;
+            flush_failed = flushed.is_err();
+        }
 
         // Step 8: Run PRAGMA wal_checkpoint(TRUNCATE) and exit 0
         let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await;
 
+        if flush_failed {
+            return EXIT_QUEUE_TIMEOUT;
+        }
         EXIT_SUCCESS
     }
 }

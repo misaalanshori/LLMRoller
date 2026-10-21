@@ -90,6 +90,69 @@ pub async fn sweep_expired_response_links(
     Ok(result.rows_affected())
 }
 
+/// Deletes usage_events older than `cutoff_ms` in bounded chunks by timestamp.
+pub async fn sweep_expired_usage_events(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM usage_events WHERE id IN (
+             SELECT id FROM usage_events WHERE ts < ? ORDER BY ts LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes the oldest usage_events rows when the table exceeds the configured cap.
+pub async fn enforce_max_usage_events_rows_pool(
+    pool: &SqlitePool,
+    max_rows: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(pool)
+        .await?;
+    if count <= max_rows {
+        return Ok(0);
+    }
+    let excess = (count - max_rows).min(chunk_limit);
+    let result = sqlx::query(
+        "DELETE FROM usage_events WHERE id IN (
+             SELECT id FROM usage_events ORDER BY id ASC LIMIT ?
+         )",
+    )
+    .bind(excess)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes expired routing pins.
+pub async fn sweep_expired_pins(pool: &SqlitePool, now_ms: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM pins WHERE expires_at <= ?")
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes expired sealed trace records.
+pub async fn sweep_expired_trace_records(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM trace_records WHERE expires_at <= ?")
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Executes incremental vacuum to reclaim freed database pages.
 pub async fn run_incremental_vacuum(pool: &SqlitePool, pages: u32) -> Result<(), sqlx::Error> {
     let query_str = format!("PRAGMA incremental_vacuum({pages});");

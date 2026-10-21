@@ -550,6 +550,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let stop_rx_bg = stop_tx.subscribe();
     let bg_pool = pool.clone();
     let bg_ready = is_ready.clone();
+    let bg_snapshot = shared_snapshot.clone();
+    let bg_pin_store = pin_store.clone();
+    let wal_path = format!("{}-wal", database.display());
     let _bg_jobs = tokio::spawn(async move {
         let wal_supervisor = llmroller_store::checkpoint::WalCheckpointSupervisor::new(bg_ready);
         let mut stop_rx = stop_rx_bg;
@@ -557,13 +560,24 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         while !*stop_rx.borrow_and_update() {
             tokio::select! {
                 _ = interval.tick() => {
-                    let _ = wal_supervisor.run_checkpoint(&bg_pool, 0).await;
+                    let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+                    let _ = wal_supervisor.run_checkpoint(&bg_pool, wal_bytes).await;
                     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
                     if let Ok(mut tx) = bg_pool.begin().await {
                         let _ = llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await;
                         let _ = llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await;
                         let _ = tx.commit().await;
                     }
+                    let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
+                    bg_pin_store.sweep(now_ms);
+                    let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
+                    let snapshot = bg_snapshot.load();
+                    let retention_days = snapshot.settings.usage_events_retention_days.max(1);
+                    let max_rows = snapshot.settings.usage_events_max_rows.max(1);
+                    let cutoff = now_ms - retention_days.saturating_mul(86_400_000);
+                    let _ = llmroller_store::retention::sweep_expired_usage_events(&bg_pool, cutoff, 5_000).await;
+                    let _ = llmroller_store::retention::enforce_max_usage_events_rows_pool(&bg_pool, max_rows, 5_000).await;
+                    let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
                 }
                 _ = stop_rx.changed() => break,
             }
@@ -580,7 +594,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         pool.clone(),
         Duration::from_millis(500),
         Duration::from_secs(5),
-    );
+    )
+    .with_writer(writer_handle.clone());
     let exit_code = shutdown_sup.execute_graceful_shutdown().await;
 
     let _ = stop_tx.send(true);
