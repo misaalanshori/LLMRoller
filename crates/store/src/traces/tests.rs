@@ -265,3 +265,57 @@ fn test_sealer_pool_bounded_queue_and_drop_on_full() {
     );
     assert!(pool.dropped_jobs_count.load(Ordering::SeqCst) >= 1);
 }
+
+/// Spec: REL-1, PERF-5; graceful shutdown must quiesce accepted seal jobs.
+#[tokio::test]
+async fn test_sealer_pool_flush_drains_accepted_jobs_and_closes_submissions() {
+    let (_dir, _db_pool, sealer, user_id) = setup_traces_test_db().await;
+    let (pool, results) = SealerPool::new(sealer);
+    let job = SealJob {
+        master_key_id: "key-0".to_string(),
+        usage_event_id: "event-flush".to_string(),
+        request_id: RequestId::generate(),
+        ts: 1000,
+        owner_user_id: user_id,
+        client_key_id: ClientKeyId::generate(),
+        session_hash: "session-flush".to_string(),
+        thread_id: "main".to_string(),
+        canonical_id: "m".to_string(),
+        protocol: "chat".to_string(),
+        truncated_content: false,
+        turn_trace: StoredTurnTraceV2 {
+            v: 2,
+            request_skeleton: serde_json::json!({}),
+            block_refs: vec![],
+            response: serde_json::json!({}),
+            response_raw: None,
+            truncation: None,
+        },
+        blocks: vec![],
+        expires_at: 1000,
+    };
+
+    for _ in 0..3 {
+        assert!(pool.try_submit(job.clone()), "accepted submission");
+    }
+
+    let collector = std::thread::spawn(move || {
+        let mut sealed = 0;
+        while sealed < 3 {
+            match results.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(_) => sealed += 1,
+                Err(_) => break,
+            }
+        }
+        sealed
+    });
+
+    assert!(
+        pool.flush(std::time::Duration::from_secs(5)).await,
+        "flush must observe a quiescent pool"
+    );
+    assert_eq!(collector.join().expect("collector"), 3);
+    assert!(!pool.try_submit(job), "flush must close submissions");
+    assert_eq!(pool.in_flight(), 0);
+    assert!(pool.dropped_jobs_count.load(Ordering::SeqCst) >= 1);
+}

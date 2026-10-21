@@ -125,6 +125,8 @@ pub fn seal_turn_sync(
 pub struct SealerPool {
     tx: SyncSender<SealJob>,
     pub dropped_jobs_count: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    accepting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for SealerPool {
@@ -143,11 +145,14 @@ impl SealerPool {
         let (job_tx, job_rx) = sync_channel::<SealJob>(64);
         let (res_tx, res_rx) = sync_channel::<SealedTurnResult>(64);
         let job_rx_arc = Arc::new(std::sync::Mutex::new(job_rx));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         for _ in 0..2 {
             let rx_clone = Arc::clone(&job_rx_arc);
             let sealer_clone = Arc::clone(&sealer);
             let res_tx_clone = res_tx.clone();
+            let in_flight_clone = Arc::clone(&in_flight);
 
             std::thread::Builder::new()
                 .name("llmroller-sealer".to_string())
@@ -159,6 +164,7 @@ impl SealerPool {
                         if let Ok(sealed_res) = seal_turn_sync(&job, &sealer_clone) {
                             let _ = res_tx_clone.send(sealed_res);
                         }
+                        in_flight_clone.fetch_sub(1, Ordering::AcqRel);
                     }
                 })
                 .expect("spawn sealer thread");
@@ -168,6 +174,8 @@ impl SealerPool {
             Self {
                 tx: job_tx,
                 dropped_jobs_count: AtomicUsize::new(0),
+                in_flight,
+                accepting,
             },
             res_rx,
         )
@@ -175,13 +183,45 @@ impl SealerPool {
 
     /// Submits a seal job using non-blocking try_send (never delaying inference) (PERF-5).
     pub fn try_submit(&self, job: SealJob) -> bool {
+        if !self.accepting.load(Ordering::Acquire) {
+            self.dropped_jobs_count.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         match self.tx.try_send(job) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
                 self.dropped_jobs_count.fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
+    }
+
+    /// Stop accepting new jobs so the pool can reach a quiescent state.
+    pub fn begin_drain(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    /// Number of submitted jobs that have not finished sealing yet.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Wait up to `timeout` for every accepted seal job to finish.
+    ///
+    /// Returns `true` when the pool quiesced, `false` when the timeout elapsed.
+    pub async fn flush(&self, timeout: std::time::Duration) -> bool {
+        self.begin_drain();
+        let deadline = std::time::Instant::now() + timeout;
+        while self.in_flight() > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
     }
 }
 

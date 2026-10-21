@@ -8,6 +8,7 @@ pub mod budgets;
 pub mod checkpoint;
 pub mod client_keys;
 pub mod crypto;
+pub mod health;
 pub mod instance;
 pub mod migrations;
 pub mod models;

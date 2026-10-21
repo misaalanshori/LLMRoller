@@ -33,6 +33,9 @@ pub struct ShutdownSupervisor {
     pub drain_grace_duration: Duration,
     pub drain_timeout_duration: Duration,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
+    pub background_stop: Option<watch::Sender<bool>>,
+    pub sealer_pool: Option<Arc<llmroller_store::traces::SealerPool>>,
+    pub runtime_state: Option<Arc<llmroller_core::runtime_state::RuntimeState>>,
 }
 
 impl ShutdownSupervisor {
@@ -53,6 +56,9 @@ impl ShutdownSupervisor {
             drain_grace_duration,
             drain_timeout_duration,
             writer: None,
+            background_stop: None,
+            sealer_pool: None,
+            runtime_state: None,
         }
     }
 
@@ -60,6 +66,33 @@ impl ShutdownSupervisor {
     #[must_use]
     pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Attach the background-job stop channel so step 5 can cancel supervisors.
+    #[must_use]
+    pub fn with_background_stop(mut self, stop: watch::Sender<bool>) -> Self {
+        self.background_stop = Some(stop);
+        self
+    }
+
+    /// Attach the trace sealer pool so step 6 can drain accepted jobs.
+    #[must_use]
+    pub fn with_sealer_pool(
+        mut self,
+        sealer_pool: Arc<llmroller_store::traces::SealerPool>,
+    ) -> Self {
+        self.sealer_pool = Some(sealer_pool);
+        self
+    }
+
+    /// Attach runtime state so step 7 can persist the latest key-health projection.
+    #[must_use]
+    pub fn with_runtime_state(
+        mut self,
+        runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
+    ) -> Self {
+        self.runtime_state = Some(runtime_state);
         self
     }
 
@@ -91,27 +124,58 @@ impl ShutdownSupervisor {
         }
 
         // Step 5: Background tasks observe the drain flag and stop scheduling work.
+        if let Some(stop) = &self.background_stop {
+            let _ = stop.send(true);
+        }
 
-        // Step 6: Trace sealing is synchronous inside the pool; allow in-flight seals
-        // to finish within the remaining drain budget (sealer write-through is immediate).
+        // Step 6: Close trace-sealer submissions and await accepted seal jobs.
+        let mut sealer_failed = false;
+        if let Some(sealer_pool) = &self.sealer_pool {
+            sealer_failed = !sealer_pool.flush(Duration::from_secs(2)).await;
+        }
 
-        // Step 7: Drain the writer's durable/rollup/raw queues before checkpointing (REL-1).
+        // Step 7: Persist key health and drain the writer's queues before checkpointing (REL-1).
         let mut flush_failed = false;
+        if let Some(runtime_state) = &self.runtime_state {
+            let entries: Vec<(
+                llmroller_core::ids::UpstreamKeyId,
+                llmroller_core::runtime_state::KeyHealthEntry,
+            )> = runtime_state
+                .key_health
+                .iter()
+                .map(|entry| (*entry.key(), entry.value().clone()))
+                .collect();
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis() as i64);
+            if llmroller_store::health::persist_key_health(&self.pool, &entries, now_ms)
+                .await
+                .is_err()
+            {
+                flush_failed = true;
+            }
+        }
         if let Some(writer) = &self.writer {
             let flushed = tokio::time::timeout(
                 Duration::from_secs(5),
                 llmroller_store::writer::flush_data_queues(&self.pool, &writer.queues),
             )
             .await;
-            flush_failed = flushed.is_err();
+            if flushed.is_err() {
+                flush_failed = true;
+            }
         }
 
-        // Step 8: Run PRAGMA wal_checkpoint(TRUNCATE) and exit 0
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        // Step 8: Run PRAGMA wal_checkpoint(TRUNCATE) and exit 0.
+        if sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
-            .await;
+            .await
+            .is_err()
+        {
+            flush_failed = true;
+        }
 
-        if flush_failed {
+        if sealer_failed || flush_failed {
             return EXIT_QUEUE_TIMEOUT;
         }
         EXIT_SUCCESS
@@ -195,5 +259,42 @@ impl JobSupervisor {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec: REL-1; steps 1, 2, 5 and 8 must run in order and report a clean drain.
+    #[tokio::test]
+    async fn shutdown_broadcasts_background_stop_and_completes() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        let ready = Arc::new(AtomicBool::new(true));
+        let streams = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        let supervisor = ShutdownSupervisor::new(
+            ready.clone(),
+            streams.clone(),
+            notify.clone(),
+            pool,
+            Duration::ZERO,
+            Duration::from_millis(10),
+        )
+        .with_background_stop(stop_tx);
+
+        let observer = tokio::spawn(async move {
+            let _ = stop_rx.changed().await;
+            *stop_rx.borrow()
+        });
+
+        let exit_code = supervisor.execute_graceful_shutdown().await;
+        assert_eq!(exit_code, EXIT_SUCCESS);
+        assert!(!ready.load(Ordering::SeqCst), "readiness must flip to 503");
+        assert!(observer.await.expect("observer"), "step 5 must broadcast stop");
     }
 }

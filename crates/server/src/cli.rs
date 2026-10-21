@@ -435,7 +435,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         instance_state.instance_id,
         entropy.clone(),
     ));
-    let (_sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
+    let (sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
+    let sealer_pool = std::sync::Arc::new(sealer_pool);
     let trace_pool = pool.clone();
     let trace_master_key_id = master_key_id.clone();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -596,7 +597,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         Duration::from_millis(500),
         Duration::from_secs(5),
     )
-    .with_writer(writer_handle.clone());
+    .with_writer(writer_handle.clone())
+    .with_background_stop(stop_tx.clone())
+    .with_sealer_pool(sealer_pool.clone())
+    .with_runtime_state(runtime_state.clone());
     let exit_code = shutdown_sup.execute_graceful_shutdown().await;
 
     let _ = stop_tx.send(true);
