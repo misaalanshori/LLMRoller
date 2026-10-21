@@ -182,6 +182,7 @@ pub async fn revoke_provider_share_tx(
     owner_user_id: &UserId,
     now_ms: i64,
 ) -> Result<(), ShareError> {
+    let share = get_provider_share_tx(tx, share_id).await?;
     let share_str = share_id.to_string();
     let owner_str = owner_user_id.to_string();
 
@@ -198,6 +199,24 @@ pub async fn revoke_provider_share_tx(
     if rows_affected == 0 {
         return Err(ShareError::NotFound);
     }
+
+    // Delete grantee user_route_preferences per SHR-5
+    if let Some(ref key_id) = share.upstream_key_id {
+        sqlx::query("DELETE FROM user_route_preferences WHERE user_id = ? AND upstream_key_id = ?")
+            .bind(share.grantee_user_id.to_string())
+            .bind(key_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+    } else {
+        sqlx::query(
+            "DELETE FROM user_route_preferences WHERE user_id = ? AND upstream_key_id IN (SELECT id FROM upstream_keys WHERE provider_id = ?)",
+        )
+        .bind(share.grantee_user_id.to_string())
+        .bind(share.provider_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    }
+
     Ok(())
 }
 

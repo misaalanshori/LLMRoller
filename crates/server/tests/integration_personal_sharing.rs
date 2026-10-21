@@ -310,10 +310,42 @@ async fn test_personal_provider_and_key_sharing_lifecycle() {
 
     let mut tx = pool.begin().await.expect("begin tx 2");
 
-    // 7. Revoking share marks it revoked_at and enabled = 0 (SHR-5)
+    let model_pk = llmroller_core::ids::ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id) VALUES (?, 'deepseek-v4.1-flash')")
+        .bind(model_pk.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model");
+
+    // Insert Bob's route preference on the shared key
+    sqlx::query(
+        "INSERT INTO user_route_preferences (user_id, upstream_key_id, model_pk, priority_override, enabled)
+         VALUES (?, ?, ?, 500, 1)",
+    )
+    .bind(bob_id.to_string())
+    .bind(key.id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert bob route preference");
+
+    // 7. Revoking share marks it revoked_at, enabled = 0, and deletes grantee's user_route_preferences (SHR-5)
     revoke_provider_share_tx(&mut tx, &share.share_id, &alice_id, 7000)
         .await
         .expect("revoke share");
+
+    let pref_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_route_preferences WHERE user_id = ? AND upstream_key_id = ?",
+    )
+    .bind(bob_id.to_string())
+    .bind(key.id.to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count route preferences");
+    assert_eq!(
+        pref_count, 0,
+        "Grantee user_route_preferences must be deleted on share revocation (SHR-5)"
+    );
 
     let revoked_cfg = get_provider_share_tx(&mut tx, &share.share_id)
         .await
