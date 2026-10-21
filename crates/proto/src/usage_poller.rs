@@ -104,10 +104,23 @@ fn parse_resets_at_value(
     reset_in_sec.map(|sec| now_ms + sec.saturating_mul(1000))
 }
 
+/// Normalize provider window labels to the canonical `upstream_window_kind`
+/// values enforced by `budget_windows` (`5h`, `7d`, `1mo`).
+#[must_use]
+pub fn canonical_window_kind(kind: &str) -> &str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "5h" | "rolling" | "rolling5h" | "rolling_5h" | "rolling-5h" => "5h",
+        "7d" | "weekly" | "week" | "1w" => "7d",
+        "1mo" | "monthly" | "month" | "30d" => "1mo",
+        _ => kind.trim(),
+    }
+}
+
 fn parse_window_obj(kind: &str, obj: &serde_json::Value, now_ms: i64) -> SanitizedWindow {
     let used_percent = obj
         .get("usedPercent")
         .or_else(|| obj.get("used_percent"))
+        .or_else(|| obj.get("percent"))
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0)
         .clamp(0.0, 100.0);
@@ -142,7 +155,7 @@ fn parse_window_obj(kind: &str, obj: &serde_json::Value, now_ms: i64) -> Sanitiz
             .and_then(serde_json::Value::as_i64)
     };
     SanitizedWindow {
-        kind: kind.to_string(),
+        kind: canonical_window_kind(kind).to_string(),
         status,
         used_percent,
         resets_at,
@@ -179,11 +192,7 @@ pub fn parse_raw_usage_to_sanitized(
                 .map(str::to_string);
             let mut windows = Vec::new();
             if let Some(usage) = raw_json.get("usage").and_then(serde_json::Value::as_object) {
-                for (field, label) in [
-                    ("rolling", "rolling_5h"),
-                    ("weekly", "weekly"),
-                    ("monthly", "monthly"),
-                ] {
+                for (field, label) in [("rolling", "5h"), ("weekly", "7d"), ("monthly", "1mo")] {
                     if let Some(window) = usage.get(field) {
                         windows.push(parse_window_obj(label, window, now_ms));
                     }
@@ -219,7 +228,7 @@ pub fn parse_raw_usage_to_sanitized(
                 .and_then(serde_json::Value::as_object)
                 .and_then(|limits| limits.get("rolling5h"))
             {
-                windows.push(parse_window_obj("rolling_5h", window, now_ms));
+                windows.push(parse_window_obj("5h", window, now_ms));
             }
             if windows.is_empty()
                 && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())
@@ -275,7 +284,7 @@ pub fn parse_raw_usage_to_sanitized(
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or_else(|| (limit_usd - usage_usd).max(0.0));
             let mut windows = vec![parse_window_obj(
-                "monthly",
+                "1mo",
                 &serde_json::json!({ "used_percent": used_pct }),
                 now_ms,
             )];
@@ -310,10 +319,11 @@ mod tests {
         let parsed = parse_raw_usage_to_sanitized(ProviderKind::OpencodeGo, &raw).expect("parsed");
         assert_eq!(parsed.plan_name.as_deref(), Some("pro"));
         assert_eq!(parsed.windows.len(), 3);
-        assert_eq!(parsed.windows[0].kind, "rolling_5h");
+        assert_eq!(parsed.windows[0].kind, "5h");
+        assert_eq!(parsed.windows[0].used_percent, 82.5);
         assert_eq!(parsed.windows[0].status, "warning");
         assert_eq!(parsed.windows[0].resets_at, Some(1_792_403_600_000));
-        assert_eq!(parsed.windows[1].kind, "weekly");
+        assert_eq!(parsed.windows[1].kind, "7d");
         assert_eq!(parsed.windows[1].resets_at, Some(1_792_886_400_000));
         assert_eq!(parsed.windows[2].status, "exhausted");
         let serialized = serde_json::to_string(&parsed).expect("json");
@@ -333,7 +343,7 @@ mod tests {
         });
         let parsed = parse_raw_usage_to_sanitized(ProviderKind::CommandCode, &raw).expect("parsed");
         assert_eq!(parsed.balance_micro_usd, Some(12_500_000));
-        assert_eq!(parsed.windows[0].kind, "rolling_5h");
+        assert_eq!(parsed.windows[0].kind, "5h");
         assert_eq!(parsed.windows[0].resets_at, Some(1_792_584_000_000));
         let serialized = serde_json::to_string(&parsed).expect("json");
         assert!(!serialized.contains("secret@example.com"));
@@ -347,7 +357,29 @@ mod tests {
         });
         let parsed = parse_raw_usage_to_sanitized(ProviderKind::Openrouter, &raw).expect("parsed");
         assert_eq!(parsed.balance_micro_usd, Some(87_500_000));
-        assert_eq!(parsed.windows[0].kind, "monthly");
+        assert_eq!(parsed.windows[0].kind, "1mo");
         assert!((parsed.windows[0].used_percent - 12.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[doc = "Spec: USG-4, USG-5 — F10 canonical window kinds"]
+    fn normalizes_legacy_window_labels_to_schema_values() {
+        assert_eq!(canonical_window_kind("rolling_5h"), "5h");
+        assert_eq!(canonical_window_kind("weekly"), "7d");
+        assert_eq!(canonical_window_kind("monthly"), "1mo");
+        assert_eq!(canonical_window_kind("5h"), "5h");
+
+        // The `windows[]` fallback must not leak provider-native labels into the
+        // schema-constrained `upstream_window_kind` column.
+        let raw = serde_json::json!({
+            "windows": [
+                {"kind": "rolling_5h", "percent": 33.0},
+                {"kind": "Month", "usedPercent": 5.0}
+            ]
+        });
+        let parsed = parse_raw_usage_to_sanitized(ProviderKind::OpencodeGo, &raw).expect("parsed");
+        assert_eq!(parsed.windows[0].kind, "5h");
+        assert_eq!(parsed.windows[0].used_percent, 33.0);
+        assert_eq!(parsed.windows[1].kind, "1mo");
     }
 }

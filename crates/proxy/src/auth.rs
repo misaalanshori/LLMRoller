@@ -44,6 +44,7 @@ pub struct ProxyAuthState {
     pub writer: Option<llmroller_store::writer::WriterHandle>,
     pub master_key: Option<llmroller_store::crypto::MasterKey>,
     pub master_key_id: Option<String>,
+    pub instance_id: Option<[u8; 16]>,
     pub sealer_pool: Option<Arc<llmroller_store::traces::SealerPool>>,
     pub http_client_public: reqwest::Client,
     pub http_client_private_allowed: reqwest::Client,
@@ -78,6 +79,7 @@ impl ProxyAuthState {
             writer: None,
             master_key: None,
             master_key_id: None,
+            instance_id: None,
             sealer_pool: None,
             http_client_public: crate::ssrf::create_guarded_client(false)
                 .expect("the public HTTP client requires a working TLS backend"),

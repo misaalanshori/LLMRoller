@@ -10,14 +10,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use llmroller_core::ids::UpstreamKeyId;
-use llmroller_core::runtime_state::{KeyHealthEntry, RuntimeState};
+use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::seams::{Clock as _, ExposeSecret as _};
 use llmroller_core::snapshot::{ConfigSnapshot, UpstreamKeyRecord};
-use llmroller_core::windows::{BudgetCounter as _, UpstreamObservation};
 use llmroller_proto::usage_poller::{KeyPollerState, UsagePoller, parse_raw_usage_to_sanitized};
 use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sealer};
 use llmroller_store::usage_snapshots::{NewUsageSnapshot, insert_usage_snapshot_tx};
-use llmroller_store::writer::WriterHandle;
 use sqlx::SqlitePool;
 
 const TICK: Duration = Duration::from_secs(15);
@@ -27,7 +25,6 @@ pub struct UsagePollerDeps {
     pub pool: SqlitePool,
     pub snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     pub runtime_state: Arc<RuntimeState>,
-    pub writer: WriterHandle,
     pub master_key: MasterKey,
     pub master_key_id: String,
     pub instance_id: [u8; 16],
@@ -40,7 +37,6 @@ impl std::fmt::Debug for UsagePollerDeps {
             .field("pool", &self.pool)
             .field("snapshot", &self.snapshot)
             .field("runtime_state", &self.runtime_state)
-            .field("writer", &self.writer)
             .field("master_key", &"<redacted>")
             .field("master_key_id", &self.master_key_id)
             .field("instance_id", &self.instance_id)
@@ -84,7 +80,6 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                     .unwrap_or_default();
                 let pool = deps.pool.clone();
                 let runtime_state = deps.runtime_state.clone();
-                let writer = deps.writer.clone();
                 let sealer = XChaCha20Poly1305Sealer::new(
                     deps.master_key.clone(),
                     deps.instance_id,
@@ -97,7 +92,6 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                     if let Err(error) = poll_key(
                         &pool,
                         &runtime_state,
-                        &writer,
                         &sealer,
                         &master_key_id,
                         &key,
@@ -134,7 +128,6 @@ fn usage_endpoint(config_json: &str) -> Option<String> {
 async fn poll_key(
     pool: &SqlitePool,
     runtime_state: &RuntimeState,
-    writer: &WriterHandle,
     sealer: &XChaCha20Poly1305Sealer,
     master_key_id: &str,
     key: &UpstreamKeyRecord,
@@ -211,68 +204,26 @@ async fn poll_key(
     .map_err(|error| error.to_string())?;
     tx.commit().await.map_err(|error| error.to_string())?;
 
-    reconcile(
-        runtime_state,
+    let observations: Vec<llmroller_core::runtime_state::UpstreamWindowObservation> = parsed
+        .windows
+        .iter()
+        .map(
+            |window| llmroller_core::runtime_state::UpstreamWindowObservation {
+                kind: window.kind.clone(),
+                used_percent: window.used_percent,
+                resets_at: window.resets_at,
+            },
+        )
+        .collect();
+    runtime_state.reconcile_upstream_usage(key.id, budget_windows, &observations, now_ms);
+    runtime_state.publish_upstream_snapshot(
         key.id,
-        budget_windows,
-        &parsed.windows,
-        now_ms,
+        serde_json::json!({
+            "fetched_at": now_ms,
+            "sanitized": parsed,
+        }),
     );
-    let _ = writer;
     Ok(())
-}
-
-fn reconcile(
-    runtime_state: &RuntimeState,
-    key_id: UpstreamKeyId,
-    budget_windows: &[llmroller_core::snapshot::SnapshotBudgetWindow],
-    windows: &[llmroller_proto::usage_poller::SanitizedWindow],
-    now_ms: i64,
-) {
-    for configured in budget_windows {
-        let Some(remote) = windows
-            .iter()
-            .find(|window| kind_matches(&window.kind, &local_window_kind(configured)))
-        else {
-            continue;
-        };
-        let Some(counter) = runtime_state.window_counter(&configured.id) else {
-            continue;
-        };
-        if remote.used_percent >= 100.0 {
-            runtime_state.key_health.insert(
-                key_id,
-                KeyHealthEntry {
-                    exhausted_until_ms: remote.resets_at,
-                    ..KeyHealthEntry::default()
-                },
-            );
-        }
-        let used_micro_usd =
-            (counter.limit_micro_usd() as f64 * remote.used_percent / 100.0).round() as i64;
-        let local_at_observation = counter.effective_used(now_ms);
-        *counter.observation.write() = Some(UpstreamObservation {
-            used_micro_usd,
-            observed_at_ms: now_ms,
-            local_at_observation,
-            resets_at_ms: remote.resets_at,
-        });
-    }
-}
-
-fn local_window_kind(window: &llmroller_core::snapshot::SnapshotBudgetWindow) -> String {
-    match window.period_ms {
-        None => "monthly".to_string(),
-        Some(period) if period <= 6 * 3_600_000 => "rolling_5h".to_string(),
-        Some(period) if period <= 8 * 86_400_000 => "weekly".to_string(),
-        Some(_) => "monthly".to_string(),
-    }
-}
-
-fn kind_matches(remote: &str, local: &str) -> bool {
-    let remote = remote.to_ascii_lowercase();
-    let local = local.to_ascii_lowercase();
-    remote.contains(&local) || local.contains(&remote)
 }
 
 #[cfg(test)]
@@ -312,8 +263,17 @@ mod tests {
             limit_micro_usd: 10_000_000,
             reserve_pct: 0,
         };
+        // A previous credential rejection must survive the reconciliation pass.
+        runtime.key_health.insert(
+            key_id,
+            llmroller_core::runtime_state::KeyHealthEntry {
+                healthy: false,
+                quarantine_reason: Some("credential_rejected".to_string()),
+                ..llmroller_core::runtime_state::KeyHealthEntry::default()
+            },
+        );
         let remote = llmroller_proto::usage_poller::SanitizedWindow {
-            kind: "rolling_5h".to_string(),
+            kind: "5h".to_string(),
             status: "exhausted".to_string(),
             used_percent: 100.0,
             resets_at: Some(1_000),
@@ -322,16 +282,28 @@ mod tests {
             remaining_micro_usd: None,
             reset_in_sec: None,
         };
-        reconcile(&runtime, key_id, &[window], &[remote], 500);
+        runtime.reconcile_upstream_usage(
+            key_id,
+            &[window],
+            &[llmroller_core::runtime_state::UpstreamWindowObservation {
+                kind: remote.kind,
+                used_percent: remote.used_percent,
+                resets_at: remote.resets_at,
+            }],
+            500,
+        );
         let observation = counter.observation.read().expect("observation");
         assert_eq!(observation.used_micro_usd, 10_000_000);
         assert_eq!(observation.resets_at_ms, Some(1_000));
+        let health = runtime.key_health.get(&key_id).expect("health entry");
+        assert_eq!(health.exhausted_until_ms, Some(1_000));
+        assert!(
+            !health.healthy,
+            "usage reconciliation must not un-quarantine a key"
+        );
         assert_eq!(
-            runtime
-                .key_health
-                .get(&key_id)
-                .and_then(|entry| entry.exhausted_until_ms),
-            Some(1_000)
+            health.quarantine_reason.as_deref(),
+            Some("credential_rejected")
         );
     }
 }

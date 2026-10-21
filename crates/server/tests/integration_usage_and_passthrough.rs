@@ -3,6 +3,7 @@
 //! Spec: Section 2.4, Section 6.3, Section 6.8, Section 6.9, Section 8.2, Section 13.3, Section 13.4,
 //! Requirements: PRV-6, API-1, USG-4, USG-5, USG-6, USG-7, USG-8, SEC-18.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -10,14 +11,18 @@ use tempfile::tempdir;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
 use llmroller_core::ids::{UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
-use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
-use llmroller_core::seams::OsEntropy;
+use llmroller_core::rbac::{ActorScope, OwnershipScope, Role, SystemSeal, SystemTask};
+use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_string};
 use llmroller_core::windows::UpstreamObservation;
 use llmroller_proto::usage_poller::{KeyPollerState, UsagePoller, parse_raw_usage_to_sanitized};
 use llmroller_proxy::auth::ProxyAuthState;
@@ -28,6 +33,9 @@ use llmroller_store::crypto::{MasterKey, XChaCha20Poly1305Sealer};
 use llmroller_store::instance::load_or_initialize;
 use llmroller_store::migrations::migrate;
 use llmroller_store::pool::{Role as PoolRole, open_pool};
+use llmroller_store::providers::{
+    NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
+};
 use llmroller_store::settings::seed_defaults;
 use llmroller_store::usage_snapshots::{NewUsageSnapshot, insert_usage_snapshot_tx};
 use llmroller_store::users::{NewUser, create_user};
@@ -467,4 +475,321 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
         json_bob_raw.get("raw_field").is_none(),
         "Non-owner must NOT see raw_json fields on Global/Shared keys (USG-8, SEC-18)"
     );
+}
+
+#[derive(Clone, Default)]
+struct MockUsageState {
+    calls: Arc<AtomicUsize>,
+}
+
+async fn mock_usage_handler(State(state): State<MockUsageState>) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": {
+                "label": "pro",
+                "limit": 10.0,
+                "usage": 2.5,
+                "limit_remaining": 7.5
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn spawn_mock_usage() -> (SocketAddr, MockUsageState) {
+    let state = MockUsageState::default();
+    let app = Router::new()
+        .route("/usage", get(mock_usage_handler))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock usage listener");
+    let addr = listener.local_addr().expect("mock usage addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, state)
+}
+
+#[doc = "Spec: USG-7, USG-8, SEC-9, SEC-18"]
+#[tokio::test]
+async fn test_usage_fresh_roles_stale_header_and_missing_snapshot_404() {
+    let (_dir, pool, sealer, master_key, user_id) = setup_passthrough_test_db().await;
+    let (mock_addr, mock_state) = spawn_mock_usage().await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let user_actor = ActorScope::user(user_id, Role::User);
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+
+    let client_key = create_client_key_tx(
+        &mut tx,
+        &user_actor,
+        user_id,
+        NewClientKey {
+            label: "Live Usage Key".to_string(),
+            allowed_models: None,
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &OsEntropy,
+        1000,
+    )
+    .await
+    .expect("client key");
+    let client_token = client_key.raw_token.expose_secret().to_string();
+
+    let personal_provider = create_provider_tx(
+        &mut tx,
+        &user_actor,
+        NewProvider {
+            name: "Personal Live Usage".to_string(),
+            kind: ProviderKind::Openrouter,
+            base_url: format!("http://{mock_addr}"),
+            config_json: r#"{"usage_endpoint":"/usage"}"#.to_string(),
+            ownership_scope: OwnershipScope::Personal,
+            owner_user_id: Some(user_id),
+            usage_url_cross_origin_ack: false,
+            allow_private_network: true,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("personal provider");
+
+    let personal_key = create_upstream_key_tx(
+        &mut tx,
+        &user_actor,
+        &master_key,
+        "key-0",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: personal_provider.id,
+            label: "Personal Live Key".to_string(),
+            secret: secret_string("sk-live-usage"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1000,
+    )
+    .await
+    .expect("personal key");
+
+    let no_snapshot_key = create_upstream_key_tx(
+        &mut tx,
+        &user_actor,
+        &master_key,
+        "key-0",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: personal_provider.id,
+            label: "Personal No Snapshot".to_string(),
+            secret: secret_string("sk-no-snapshot"),
+            priority: Some(90),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1001,
+    )
+    .await
+    .expect("no-snapshot key");
+
+    let global_provider = create_provider_tx(
+        &mut tx,
+        &system_actor,
+        NewProvider {
+            name: "Global Live Usage".to_string(),
+            kind: ProviderKind::Openrouter,
+            base_url: "https://global.example".to_string(),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("global provider");
+
+    let global_key = create_upstream_key_tx(
+        &mut tx,
+        &system_actor,
+        &master_key,
+        "key-0",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: global_provider.id,
+            label: "Global Live Key".to_string(),
+            secret: secret_string("sk-global-usage"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1000,
+    )
+    .await
+    .expect("global key");
+
+    let global_sanitized =
+        r#"{"status":"ok","windows":[{"kind":"monthly","status":"ok","used_percent":20.0}]}"#;
+    insert_usage_snapshot_tx(
+        &mut tx,
+        &sealer,
+        NewUsageSnapshot {
+            key_id: &global_key.id,
+            now_ms: 1000,
+            http_status: 200,
+            plan_name: Some("global"),
+            windows_json: "[]",
+            balance_micro_usd: None,
+            master_key_id: "key-0",
+            sanitized_json: global_sanitized,
+            raw_json_bytes: b"{\"raw_field\":\"global_hidden\"}",
+        },
+    )
+    .await
+    .expect("global snapshot");
+    tx.commit().await.expect("commit");
+
+    let snapshot = load_initial_snapshot(&pool).await.expect("snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![])
+        .with_master_key(master_key);
+    auth_state
+        .is_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = data_plane_router(auth_state);
+
+    // Own personal key: fresh=1 performs exactly one live fetch.
+    let personal_uri = format!("/v1/usage?upstream_key_id={}&fresh=1", personal_key.id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&personal_uri)
+                .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let stale_header = response
+        .headers()
+        .get("x-llmroller-usage-stale-ms")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .expect("stale header is always present");
+    assert_eq!(stale_header, "0");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["source"], "upstream");
+    assert_eq!(json["stale"], false);
+    assert_eq!(json["upstream_key_id"], personal_key.id.to_string());
+    assert_eq!(json["source_provider_usage"]["data"]["usage"], 2.5);
+    assert_eq!(
+        json["pinned_route"]["upstream_key_id"],
+        personal_key.id.to_string()
+    );
+    assert_eq!(mock_state.calls.load(Ordering::SeqCst), 1);
+
+    // A second fresh request inside the 10 s gate must not hit upstream again.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&personal_uri)
+                .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock_state.calls.load(Ordering::SeqCst), 1);
+
+    // Global key: fresh=1 is ignored for a standard user, cached sanitized data is served.
+    let global_uri = format!("/v1/usage?upstream_key_id={}&fresh=1", global_key.id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&global_uri)
+                .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock_state.calls.load(Ordering::SeqCst),
+        1,
+        "global fresh requests must not trigger upstream polling"
+    );
+    let stale_ms = response
+        .headers()
+        .get("x-llmroller-usage-stale-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .expect("numeric stale header");
+    assert!(stale_ms > 60_000, "old snapshot must be reported stale");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        json["source_provider_usage"]["windows"][0]["used_percent"],
+        20.0
+    );
+    assert!(json["source_provider_usage"].get("raw_field").is_none());
+
+    // Stored-only endpoint: no snapshot for this key means 404, not an empty success.
+    let raw_missing = format!("/v1/usage/raw?upstream_key_id={}", no_snapshot_key.id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&raw_missing)
+                .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Inaccessible/nonexistent key is 404, not 403 (no existence oracle).
+    let inaccessible = format!(
+        "/v1/usage/raw?upstream_key_id={}",
+        UpstreamKeyId::generate()
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(&inaccessible)
+                .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

@@ -20,7 +20,7 @@ use crate::strategy::{
     RoutingStrategy, UniformRandomSelector, WeightedRandomSelector, WrrGroupKey,
 };
 use crate::usage::AttemptOutcome;
-use crate::windows::AtomicBudgetCounter;
+use crate::windows::{AtomicBudgetCounter, BudgetCounter as _};
 use crate::wrr::{SmoothWeightedRrSelector, WeightedRrSelector};
 
 /// Monotonic health version tracker for upstream keys and routes.
@@ -67,6 +67,38 @@ impl Default for KeyHealthEntry {
             quarantine_reason: None,
         }
     }
+}
+
+/// Normalized remote window observation used for reconciliation (USG-5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpstreamWindowObservation {
+    pub kind: String,
+    pub used_percent: f64,
+    pub resets_at: Option<i64>,
+}
+
+/// Canonical `upstream_window_kind` label for a configured budget window.
+fn local_window_kind(window: &SnapshotBudgetWindow) -> &'static str {
+    match window.period_ms {
+        None => "1mo",
+        Some(period) if period <= 6 * 3_600_000 => "5h",
+        Some(period) if period <= 8 * 86_400_000 => "7d",
+        Some(_) => "1mo",
+    }
+}
+
+/// Normalize provider-native window labels to the canonical schema values.
+fn canonical_kind(kind: &str) -> &str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "5h" | "rolling" | "rolling5h" | "rolling_5h" | "rolling-5h" => "5h",
+        "7d" | "weekly" | "week" | "1w" => "7d",
+        "1mo" | "monthly" | "month" | "30d" => "1mo",
+        _ => kind.trim(),
+    }
+}
+
+fn kind_matches(remote: &str, local: &str) -> bool {
+    canonical_kind(remote) == canonical_kind(local)
 }
 
 impl KeyHealthEntry {
@@ -198,6 +230,10 @@ pub struct RuntimeState {
     pub load_tracker: Arc<LoadTracker>,
     pub selectors: RouteSelectorSet,
     pub window_counters: DashMap<String, Arc<AtomicBudgetCounter>>,
+    /// Latest allow-listed upstream `/usage` snapshot per key (USG-4, USG-7).
+    pub upstream_snapshots: DashMap<UpstreamKeyId, Arc<serde_json::Value>>,
+    /// Last on-demand fresh poll start per key for the 10 s single-flight gate.
+    pub last_fresh_poll_ts: DashMap<UpstreamKeyId, i64>,
     pub accumulators: Arc<MonthlyAccumulatorRegistry>,
     pub constant_session_detector: Arc<ConstantSessionDetector>,
 }
@@ -231,6 +267,8 @@ impl RuntimeState {
             load_tracker: Arc::new(LoadTracker::new()),
             selectors: RouteSelectorSet::default(),
             window_counters: DashMap::new(),
+            upstream_snapshots: DashMap::new(),
+            last_fresh_poll_ts: DashMap::new(),
             accumulators: Arc::new(MonthlyAccumulatorRegistry::new()),
             constant_session_detector: Arc::new(ConstantSessionDetector::new()),
         }
@@ -267,6 +305,79 @@ impl RuntimeState {
         self.window_counters
             .get(window_id)
             .map(|entry| entry.clone())
+    }
+
+    /// Publish the latest allow-listed upstream usage snapshot for a key.
+    pub fn publish_upstream_snapshot(&self, key_id: UpstreamKeyId, snapshot: serde_json::Value) {
+        self.upstream_snapshots.insert(key_id, Arc::new(snapshot));
+    }
+
+    /// Read the latest allow-listed upstream usage snapshot for a key.
+    #[must_use]
+    pub fn upstream_snapshot(&self, key_id: UpstreamKeyId) -> Option<Arc<serde_json::Value>> {
+        self.upstream_snapshots
+            .get(&key_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Claim the 10 s on-demand poll slot for a key. Returns `false` while another
+    /// fresh poll is recent or in flight (USG-7 single-flight).
+    pub fn try_begin_fresh_poll(
+        &self,
+        key_id: UpstreamKeyId,
+        now_ms: i64,
+        min_interval_ms: i64,
+    ) -> bool {
+        let mut last = self.last_fresh_poll_ts.entry(key_id).or_insert(0);
+        if *last > 0 && now_ms.saturating_sub(*last) < min_interval_ms {
+            return false;
+        }
+        *last = now_ms;
+        true
+    }
+
+    /// Reconcile normalized upstream window observations into local counters and
+    /// key health, using the elapsed-time decay projection (USG-5, USG-6).
+    pub fn reconcile_upstream_usage(
+        &self,
+        key_id: UpstreamKeyId,
+        budget_windows: &[SnapshotBudgetWindow],
+        windows: &[UpstreamWindowObservation],
+        now_ms: i64,
+    ) {
+        for configured in budget_windows {
+            let local_kind = local_window_kind(configured);
+            let Some(remote) = windows
+                .iter()
+                .find(|window| kind_matches(&window.kind, local_kind))
+            else {
+                continue;
+            };
+            let Some(counter) = self.window_counter(&configured.id) else {
+                continue;
+            };
+            if remote.used_percent >= 100.0 {
+                // Mutate in place: overwriting the entry would silently clear a
+                // quarantine, cooldown, or credential strike counter (USG-5).
+                let mut entry = self.key_health.entry(key_id).or_default();
+                if let Some(incoming) = remote.resets_at {
+                    entry.exhausted_until_ms = Some(
+                        entry
+                            .exhausted_until_ms
+                            .map_or(incoming, |existing| existing.max(incoming)),
+                    );
+                }
+            }
+            let used_micro_usd =
+                (counter.limit_micro_usd() as f64 * remote.used_percent / 100.0).round() as i64;
+            let local_at_observation = counter.effective_used(now_ms);
+            *counter.observation.write() = Some(crate::windows::UpstreamObservation {
+                used_micro_usd,
+                observed_at_ms: now_ms,
+                local_at_observation,
+                resets_at_ms: remote.resets_at,
+            });
+        }
     }
 
     /// Mark a key unroutable after an AEAD or credential failure.

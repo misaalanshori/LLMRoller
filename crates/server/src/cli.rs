@@ -415,6 +415,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.writer = Some(writer_handle.clone());
     proxy_auth_state.master_key = Some(master_key.clone());
     proxy_auth_state.master_key_id = Some(master_key_id.clone());
+    proxy_auth_state.instance_id = Some(instance_state.instance_id);
     proxy_auth_state.sealer_pool = Some(sealer_pool.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
 
@@ -491,7 +492,6 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             pool: pool.clone(),
             snapshot: shared_snapshot.clone(),
             runtime_state: runtime_state.clone(),
-            writer: writer_handle.clone(),
             master_key: master_key.clone(),
             master_key_id: master_key_id.clone(),
             instance_id: instance_state.instance_id,
