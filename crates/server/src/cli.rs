@@ -186,7 +186,7 @@ async fn backup_command(args: BackupArgs) -> Result<serde_json::Value, CliFailur
             format!("database not found: {}", database.display()),
         ));
     }
-    let pool = open_pool(&database, Role::Reader)
+    let pool = open_pool(&database, Role::cli_read_write())
         .await
         .map_err(|e| CliFailure::new(13, format!("cannot open database: {e}")))?;
 
@@ -194,9 +194,8 @@ async fn backup_command(args: BackupArgs) -> Result<serde_json::Value, CliFailur
         llmroller_server::backup::run_backup(&pool, &args.out, args.overwrite, &master_key_id)
             .await
             .map_err(|e| match e {
-                llmroller_server::backup::BackupError::AlreadyExists => {
-                    CliFailure::new(2, e.to_string())
-                }
+                llmroller_server::backup::BackupError::AlreadyExists
+                | llmroller_server::backup::BackupError::Io(_) => CliFailure::new(6, e.to_string()),
                 _ => CliFailure::new(13, e.to_string()),
             })?;
 

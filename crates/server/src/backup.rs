@@ -50,6 +50,19 @@ pub async fn run_backup(
         let _ = file.sync_all();
     }
 
+    // Verify PRAGMA integrity_check before commit (REL-6)
+    let tmp_pool =
+        llmroller_store::pool::open_pool(&tmp_path, llmroller_store::pool::Role::Reader).await?;
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_one(&tmp_pool)
+        .await?;
+    tmp_pool.close().await;
+
+    if integrity != "ok" {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(BackupError::IntegrityCheckFailed);
+    }
+
     // Atomic rename to destination
     fs::rename(&tmp_path, out_path)?;
 

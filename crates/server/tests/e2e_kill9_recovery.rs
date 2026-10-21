@@ -156,3 +156,53 @@ async fn test_atomic_backup_cli_and_overwrite_guards() {
     assert_eq!(fetched.session_hash, "crash-hash");
     read_tx.commit().await.expect("commit read tx");
 }
+
+#[doc = "Spec: REL-6"]
+#[tokio::test]
+async fn test_backup_cli_exit_codes_and_integrity() {
+    let (dir, _pool, _master_key, _user_id) = setup_recovery_test_db().await;
+    let data_dir = dir.path();
+    let backup_dest = data_dir.join("cli_backup.db");
+
+    // 1. First backup succeeds with exit code 0
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
+        .arg("backup")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--out")
+        .arg(&backup_dest)
+        .output()
+        .await
+        .expect("run llmroller backup");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(backup_dest.exists());
+
+    // 2. Second backup without --overwrite fails with exit code 6 (REL-6, Section 5.5.1)
+    let output2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
+        .arg("backup")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--out")
+        .arg(&backup_dest)
+        .output()
+        .await
+        .expect("run llmroller backup collision");
+    assert_eq!(
+        output2.status.code(),
+        Some(6),
+        "backup collision must return exit code 6 per Section 5.5.1"
+    );
+
+    // 3. Second backup with --overwrite succeeds with exit code 0
+    let output3 = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
+        .arg("backup")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--out")
+        .arg(&backup_dest)
+        .arg("--overwrite")
+        .output()
+        .await
+        .expect("run llmroller backup overwrite");
+    assert_eq!(output3.status.code(), Some(0));
+}
