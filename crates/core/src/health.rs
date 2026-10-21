@@ -112,6 +112,13 @@ impl RouteProtocolBlocks {
         lock.get(&(key, model, protocol.to_string()))
             .is_some_and(|until| now_ms < *until)
     }
+
+    /// Clear every protocol block for a key after a successful `/models` refresh (API-8).
+    pub fn clear_key(&self, key: UpstreamKeyId) {
+        self.blocks
+            .write()
+            .retain(|(blocked_key, _, _), _| *blocked_key != key);
+    }
 }
 
 /// In-memory table for unsupported auxiliary endpoints (Section 10.5.2).

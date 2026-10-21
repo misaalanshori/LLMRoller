@@ -448,6 +448,12 @@ impl RuntimeState {
         self.health.bump_version();
     }
 
+    /// Clear a key's protocol blocks after a successful `/models` refresh (API-8).
+    pub fn clear_route_protocol_blocks(&self, key_id: UpstreamKeyId) {
+        self.route_protocol_blocks.clear_key(key_id);
+        self.health.bump_version();
+    }
+
     /// Whether a `(key, model, protocol)` route is blocked by a prior `PlanRestricted` (C5).
     #[must_use]
     pub fn is_route_protocol_blocked(

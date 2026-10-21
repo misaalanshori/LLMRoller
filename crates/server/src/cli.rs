@@ -445,6 +445,17 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_handle.notification_sender(),
         reloader_handle.version_receiver(),
     );
+    let (discovery_tx, _discovery_task) =
+        llmroller_server::discovery_poller::start_discovery_poller(
+            llmroller_server::discovery_poller::DiscoveryPollerDeps {
+                pool: pool.clone(),
+                writer: writer_handle.clone(),
+                runtime_state: runtime_state.clone(),
+                master_key: master_key.clone(),
+                instance_id: instance_state.instance_id,
+            },
+        );
+    api_state.discovery_tx = Some(discovery_tx);
     let trace_pool = pool.clone();
     let trace_master_key_id = master_key_id.clone();
     let runtime_handle = tokio::runtime::Handle::current();

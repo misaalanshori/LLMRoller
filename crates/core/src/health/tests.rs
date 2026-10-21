@@ -61,6 +61,13 @@ fn test_route_protocol_blocks_and_aux_endpoints() {
     // After expiry, "messages" becomes unblocked:
     assert!(!proto_blocks.is_blocked(key, model, "messages", t0 + 3_600_001));
 
+    // A successful /models refresh clears every protocol for the key (API-8).
+    proto_blocks.block_protocol(key, model, "messages", t0 + 3_600_000);
+    proto_blocks.block_protocol(key, model, "chat", t0 + 3_600_000);
+    proto_blocks.clear_key(key);
+    assert!(!proto_blocks.is_blocked(key, model, "messages", t0 + 1000));
+    assert!(!proto_blocks.is_blocked(key, model, "chat", t0 + 1000));
+
     // Auxiliary endpoints (e.g. count_tokens 404 for 6 hours)
     let aux = AuxUnsupported::new();
     assert!(!aux.is_unsupported(key, "count_tokens", t0));

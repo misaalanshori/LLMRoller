@@ -50,6 +50,9 @@ pub struct ApiAppState {
     pub published_version: Option<tokio::sync::watch::Receiver<i64>>,
     /// Instance audit HMAC key used for the canonical `audit_log` hash chain.
     pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
+    /// Background `/models` discovery worker trigger (MDL-1).
+    pub discovery_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<llmroller_proto::discovery::DiscoveryTarget>>,
 }
 
 impl ApiAppState {
@@ -63,6 +66,7 @@ impl ApiAppState {
             reloader_tx: None,
             published_version: None,
             audit_hmac_key: None,
+            discovery_tx: None,
         }
     }
 
@@ -74,6 +78,16 @@ impl ApiAppState {
     ) {
         self.reloader_tx = Some(reloader_tx);
         self.published_version = Some(published_version);
+    }
+
+    /// Queue a `/models` discovery refresh, or a no-op when no worker is attached (MDL-1).
+    pub fn trigger_discovery(&self, target: llmroller_proto::discovery::DiscoveryTarget) {
+        let Some(discovery_tx) = &self.discovery_tx else {
+            return;
+        };
+        if discovery_tx.send(target).is_err() {
+            tracing::warn!(?target, "model discovery worker is not running");
+        }
     }
 
     /// Commit barrier: bump `config_version` through the writer and await publication.
@@ -468,6 +482,7 @@ async fn post_user_provider_key(
     )
     .await
     .map_err(map_provider_error)?;
+    state.trigger_discovery(llmroller_proto::discovery::DiscoveryTarget::Key(key.id));
     Ok((StatusCode::CREATED, Json(key)))
 }
 
@@ -674,6 +689,7 @@ async fn post_admin_provider_key(
     )
     .await
     .map_err(map_provider_error)?;
+    state.trigger_discovery(llmroller_proto::discovery::DiscoveryTarget::Key(key.id));
     Ok((StatusCode::CREATED, Json(key)))
 }
 
@@ -2012,6 +2028,18 @@ async fn get_admin_models_handler(
         "models": models,
         "aliases": aliases,
     })))
+}
+
+async fn post_admin_models_refresh_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    state.trigger_discovery(llmroller_proto::discovery::DiscoveryTarget::AllEnabled);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "queued" })),
+    ))
 }
 
 async fn post_admin_model_alias_handler(
@@ -4060,6 +4088,10 @@ pub fn router(state: ApiAppState) -> Router {
             patch(patch_admin_user_handler).delete(delete_admin_user_handler),
         )
         .route("/admin/api/models", get(get_admin_models_handler))
+        .route(
+            "/admin/api/models/refresh",
+            post(post_admin_models_refresh_handler),
+        )
         .route("/admin/api/models/{id}", patch(patch_admin_model_handler))
         .route(
             "/admin/api/models/{id}/aliases",
