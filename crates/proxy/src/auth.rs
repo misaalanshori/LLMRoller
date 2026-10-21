@@ -88,6 +88,12 @@ impl ProxyAuthState {
         self
     }
 
+    #[must_use]
+    pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
     /// Record an authentication failure for rate limiting and flush to auth_failure_counters table.
     pub async fn record_failure(&self, ip: IpAddr, reason: &'static str, now_ms: i64) {
         // In-memory 60s sliding window

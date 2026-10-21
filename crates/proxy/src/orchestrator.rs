@@ -54,6 +54,9 @@ use crate::auth::ProxyAuthState;
 use crate::forward::{PreFirstFrameBuffer, SseChunkForwarder};
 use crate::lifecycle::{RequestLifecycle, Termination};
 
+/// Maximum upstream tries per request; mirrors the `usage_attempts.attempt_no` bound.
+const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+
 /// Maximum idle time while waiting for an upstream chunk.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -398,6 +401,7 @@ struct RouteCandidate {
     base_url: String,
     allow_private_network: bool,
     pool_tier: CandidatePoolTier,
+    ownership_scope: llmroller_core::rbac::OwnershipScope,
     priority: i64,
     provider_kind: ProviderKind,
     share_id: Option<ShareId>,
@@ -501,6 +505,7 @@ fn collect_candidates(
             base_url: provider.base_url.clone(),
             allow_private_network: provider.allow_private_network,
             pool_tier: tier,
+            ownership_scope: provider.ownership_scope,
             priority: route
                 .priority_override
                 .unwrap_or(key.priority)
@@ -525,6 +530,27 @@ const fn candidate_tier_as_pool(tier: CandidatePoolTier) -> PoolTier {
         CandidatePoolTier::Shared => PoolTier::Shared,
         CandidatePoolTier::Global => PoolTier::Global,
         CandidatePoolTier::Blended => PoolTier::Blended,
+    }
+}
+
+/// Persisted `usage_events.provider_scope` label for a candidate.
+const fn provider_scope_label(candidate: &RouteCandidate) -> &'static str {
+    match (candidate.ownership_scope, candidate.share_id.is_some()) {
+        (llmroller_core::rbac::OwnershipScope::Global, _) => "global",
+        (llmroller_core::rbac::OwnershipScope::Personal, true) => "shared",
+        (llmroller_core::rbac::OwnershipScope::Personal, false) => "personal",
+    }
+}
+
+/// Estimated input charge recorded on post-write failures (USG-1).
+const fn failure_charge(
+    outcome: llmroller_core::usage::AttemptOutcome,
+    estimate: i64,
+) -> (i64, &'static str) {
+    use llmroller_core::usage::AttemptOutcome;
+    match outcome {
+        AttemptOutcome::Http5xx | AttemptOutcome::ErrorFrame => (estimate, "estimated_input"),
+        _ => (0, "none"),
     }
 }
 
@@ -861,15 +887,16 @@ struct UsageContext {
     client_key_id: ClientKeyId,
     owner_user_id: UserId,
     canonical_model: String,
-    upstream_key_id: String,
-    provider_id: String,
-    provider_scope: String,
+    upstream_key_id: Option<String>,
+    provider_id: Option<String>,
+    provider_scope: Option<String>,
     share_id: Option<String>,
     upstream_model_id: String,
     endpoint_str: String,
     session_hash: Option<String>,
     pin_outcome: Option<String>,
     failovers: i64,
+    error_code: Option<String>,
 }
 
 impl UsageContext {
@@ -893,9 +920,9 @@ impl UsageContext {
             request_id: self.request_id,
             client_key_id: self.client_key_id,
             owner_user_id: self.owner_user_id,
-            upstream_key_id: Some(self.upstream_key_id.clone()),
-            provider_id: Some(self.provider_id.clone()),
-            provider_scope: Some(self.provider_scope.clone()),
+            upstream_key_id: self.upstream_key_id.clone(),
+            provider_id: self.provider_id.clone(),
+            provider_scope: self.provider_scope.clone(),
             share_id: self.share_id.clone(),
             canonical_id: Some(self.canonical_model.clone()),
             upstream_model_id: Some(self.upstream_model_id.clone()),
@@ -918,7 +945,7 @@ impl UsageContext {
             ttfb_ms,
             pin_outcome: self.pin_outcome.clone(),
             failovers: self.failovers,
-            error_code: None,
+            error_code: self.error_code.clone(),
         }
     }
 }
@@ -953,6 +980,8 @@ fn attempt_record(
 struct StreamFinalizer {
     state: ProxyAuthState,
     usage: UsageContext,
+    attempt_key_id: UpstreamKeyId,
+    http_status: u16,
     tap: SseUsageTap,
     reservation: Option<Reservation>,
     client_guard: Option<MonthReservationGuard>,
@@ -996,23 +1025,20 @@ impl StreamFinalizer {
 
         self.attempts.push(attempt_record(
             self.usage.request_id,
-            0,
+            self.attempts.len() as i64 + 1,
             finished_ms,
-            self.usage
-                .upstream_key_id
-                .parse::<UpstreamKeyId>()
-                .unwrap_or_else(|_| UpstreamKeyId::generate()),
+            self.attempt_key_id,
             llmroller_core::usage::AttemptOutcome::Served,
-            Some(200),
+            Some(self.http_status),
             0,
             cost.cost_micro_usd,
-            cost.cost_source.as_str(),
+            "actual",
         ));
 
         if let Some(writer) = &self.state.writer {
             let event = self.usage.event(
                 finished_ms,
-                200,
+                self.http_status,
                 true,
                 termination.is_incomplete(),
                 termination.as_str(),
@@ -1421,6 +1447,9 @@ pub async fn handle_inference_request(
     let mut attempt_no: usize = 0;
 
     loop {
+        if attempt_no >= MAX_UPSTREAM_ATTEMPTS {
+            break;
+        }
         let candidate = if let Some(candidate) = pinned_order.pop() {
             candidate
         } else {
@@ -1623,6 +1652,7 @@ pub async fn handle_inference_request(
                 last_retry_after_ms,
                 now,
             );
+            let (charged_micro_usd, charge_basis) = failure_charge(outcome, attempt_estimate);
             attempts.push(attempt_record(
                 request_id,
                 attempt_no as i64,
@@ -1631,8 +1661,8 @@ pub async fn handle_inference_request(
                 outcome,
                 Some(status.as_u16()),
                 body.len(),
-                0,
-                "none",
+                charged_micro_usd,
+                charge_basis,
             ));
             if let Some(replacement) = note_pre_first_byte_failure(
                 &state,
@@ -1702,16 +1732,20 @@ pub async fn handle_inference_request(
                         None,
                         now,
                     );
+                    let (charged_micro_usd, charge_basis) = failure_charge(
+                        llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                        attempt_estimate,
+                    );
                     attempts.push(attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                        Some(200),
+                        Some(status.as_u16()),
                         body.len(),
-                        0,
-                        "none",
+                        charged_micro_usd,
+                        charge_basis,
                     ));
                     if let Some(replacement) = note_pre_first_byte_failure(
                         &state,
@@ -1751,9 +1785,9 @@ pub async fn handle_inference_request(
                     client_key_id: caller.id,
                     owner_user_id: caller.owner_user_id,
                     canonical_model: model.canonical_id.clone(),
-                    upstream_key_id: candidate.upstream_key_id.to_string(),
-                    provider_id: candidate.provider_id.to_string(),
-                    provider_scope: candidate.pool_tier().to_string(),
+                    upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                    provider_id: Some(candidate.provider_id.to_string()),
+                    provider_scope: Some(provider_scope_label(&candidate).to_string()),
                     share_id: candidate.share_id.map(|share| share.to_string()),
                     upstream_model_id: candidate.upstream_model_id.clone(),
                     endpoint_str: endpoint_str.to_string(),
@@ -1762,10 +1796,13 @@ pub async fn handle_inference_request(
                         .as_ref()
                         .map(|ticket| ticket.outcome.as_str().to_string()),
                     failovers,
+                    error_code: None,
                 };
                 let finalizer = StreamFinalizer {
                     state: state.clone(),
                     usage,
+                    attempt_key_id: candidate.upstream_key_id,
+                    http_status: status.as_u16(),
                     tap,
                     reservation,
                     client_guard: client_guard.take(),
@@ -1986,7 +2023,7 @@ pub async fn handle_inference_request(
             Some(status_value.as_u16()),
             body.len(),
             cost.cost_micro_usd,
-            cost.cost_source.as_str(),
+            "actual",
         ));
 
         if let Some(writer) = &state.writer {
@@ -1995,9 +2032,9 @@ pub async fn handle_inference_request(
                 client_key_id: caller.id,
                 owner_user_id: caller.owner_user_id,
                 canonical_model: model.canonical_id.clone(),
-                upstream_key_id: candidate.upstream_key_id.to_string(),
-                provider_id: candidate.provider_id.to_string(),
-                provider_scope: candidate.pool_tier().to_string(),
+                upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                provider_id: Some(candidate.provider_id.to_string()),
+                provider_scope: Some(provider_scope_label(&candidate).to_string()),
                 share_id: candidate.share_id.map(|share| share.to_string()),
                 upstream_model_id: candidate.upstream_model_id.clone(),
                 endpoint_str: endpoint_str.to_string(),
@@ -2006,6 +2043,7 @@ pub async fn handle_inference_request(
                     .as_ref()
                     .map(|ticket| ticket.outcome.as_str().to_string()),
                 failovers,
+                error_code: None,
             };
             let event = usage.event(
                 now,
@@ -2044,22 +2082,27 @@ pub async fn handle_inference_request(
             client_key_id: caller.id,
             owner_user_id: caller.owner_user_id,
             canonical_model: model.canonical_id.clone(),
-            upstream_key_id: String::new(),
-            provider_id: String::new(),
-            provider_scope: String::new(),
+            upstream_key_id: None,
+            provider_id: None,
+            provider_scope: Some("none".to_string()),
             share_id: None,
             upstream_model_id: model.canonical_id.clone(),
             endpoint_str: endpoint_str.to_string(),
             session_hash: None,
             pin_outcome: None,
             failovers,
+            error_code: Some(if last_status == StatusCode::TOO_MANY_REQUESTS {
+                "upstream_rate_limited".to_string()
+            } else {
+                "upstream_error".to_string()
+            }),
         };
         let event = usage.event(
             now,
             last_status.as_u16(),
             is_streaming,
             true,
-            "upstream_error",
+            Termination::UpstreamTruncated.as_str(),
             &llmroller_proto::json_usage::ExtractedUsage::default(),
             0,
             CostSource::EstimatedIncomplete,
