@@ -70,6 +70,18 @@ impl ReloaderHandle {
         self.shared_snapshot.clone()
     }
 
+    /// Clone the reloader notification sender for control-plane publication.
+    #[must_use]
+    pub fn notification_sender(&self) -> mpsc::Sender<ReloadNotification> {
+        self.reloader_tx.clone()
+    }
+
+    /// Clone the published-version watch receiver.
+    #[must_use]
+    pub fn version_receiver(&self) -> watch::Receiver<i64> {
+        self.published_version_rx.clone()
+    }
+
     /// Request a reload notification directly.
     pub async fn request_reload(
         &self,

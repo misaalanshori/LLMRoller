@@ -7,15 +7,17 @@
 //! Spec: ./docs/srdd/9. SRDD - Data Model.md#933-closed-runtime-settings-registry
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#20-sub-phase-20-minimal-control-plane-json-crud-for-providers-keys-client-keys-and-settings
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Html;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope};
 use llmroller_core::seams::secret_string;
+use llmroller_core::snapshot::ConfigDomain;
 use llmroller_store::client_keys::{
     ClientKey, ClientKeyError, ClientKeyPatch, NewClientKey, create_client_key, delete_client_key,
     list_client_keys, patch_client_key,
@@ -42,6 +44,12 @@ pub struct ApiAppState {
     pub master_key: MasterKey,
     pub master_key_id: String,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
+    /// Reloader input channel, used to publish committed control-plane changes.
+    pub reloader_tx: Option<tokio::sync::mpsc::Sender<llmroller_store::writer::ReloadNotification>>,
+    /// Published config versions, used to enforce the read-your-writes barrier.
+    pub published_version: Option<tokio::sync::watch::Receiver<i64>>,
+    /// Instance audit HMAC key used for the canonical `audit_log` hash chain.
+    pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
 }
 
 impl ApiAppState {
@@ -52,8 +60,125 @@ impl ApiAppState {
             master_key,
             master_key_id,
             writer: None,
+            reloader_tx: None,
+            published_version: None,
+            audit_hmac_key: None,
         }
     }
+
+    /// Attach the Reloader notification channel and version watch.
+    pub fn attach_reloader(
+        &mut self,
+        reloader_tx: tokio::sync::mpsc::Sender<llmroller_store::writer::ReloadNotification>,
+        published_version: tokio::sync::watch::Receiver<i64>,
+    ) {
+        self.reloader_tx = Some(reloader_tx);
+        self.published_version = Some(published_version);
+    }
+
+    /// Commit barrier: bump `config_version` through the writer and await publication.
+    async fn publish_control_change(&self, domains: Vec<ConfigDomain>) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let result = writer
+            .execute_control(domains, Vec::new(), NoopControlOp)
+            .await;
+        let Ok(version) = result else {
+            tracing::error!("control-plane version bump failed: {result:?}");
+            return;
+        };
+        let Some(rx) = &self.published_version else {
+            return;
+        };
+        let mut rx = rx.clone();
+        if *rx.borrow_and_update() >= version {
+            return;
+        }
+        let wait = async {
+            while rx.changed().await.is_ok() {
+                if *rx.borrow_and_update() >= version {
+                    return;
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_millis(2_000), wait)
+            .await
+            .is_err()
+        {
+            tracing::warn!("reloader did not publish version {version} within 2s");
+        }
+    }
+}
+
+/// A no-op writer job used solely to serialize a config-version bump.
+struct NoopControlOp;
+
+impl llmroller_store::writer::ControlOp for NoopControlOp {
+    fn call<'a>(
+        self: Box<Self>,
+        _tx: &'a mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), llmroller_store::writer::WriterError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
+    if path.contains("/providers") || path.contains("/keys") || path.contains("/upstream-keys") {
+        vec![ConfigDomain::Providers, ConfigDomain::UpstreamKeys]
+    } else if path.contains("/client-keys") {
+        vec![ConfigDomain::ClientKeys]
+    } else if path.contains("/models") || path.contains("/aliases") || path.contains("/routes") {
+        vec![ConfigDomain::Models]
+    } else if path.contains("/shares") {
+        vec![ConfigDomain::Shares]
+    } else if path.contains("/prices") {
+        vec![ConfigDomain::Prices]
+    } else if path.contains("/settings") || path.contains("/traceability") {
+        vec![ConfigDomain::Settings]
+    } else if path.contains("/users") {
+        vec![ConfigDomain::Users]
+    } else if path.contains("/traces") || path.contains("/sessions") {
+        vec![ConfigDomain::Traceability]
+    } else {
+        // Unknown mutation domain: force a full snapshot rebuild to stay correct.
+        Vec::new()
+    }
+}
+
+/// Publish a config version after every successful control-plane mutation so that
+/// revocations and edits are visible to the next request (`REL-4`).
+async fn control_mutation_barrier(
+    State(state): State<ApiAppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_mutation = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let path = request.uri().path().to_string();
+    let domains = domains_for_path(&path);
+    let response = next.run(request).await;
+    if is_mutation && response.status().is_success() {
+        state.publish_control_change(domains).await;
+        let _ = append_audit_entry_helper(
+            &state,
+            chrono_like_now_ms(),
+            None,
+            "control.mutation",
+            "http_path",
+            Some(&path),
+        )
+        .await;
+    }
+    response
 }
 
 /// Helper to validate session and CSRF for JSON endpoints.
@@ -634,7 +759,7 @@ async fn put_admin_traceability_handler(
     {
         let new_cutoff = now_ms - payload.retention_days * 86_400_000;
         let affected_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM trace_records WHERE created_at < ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM trace_records WHERE ts < ?")
                 .bind(new_cutoff)
                 .fetch_one(&state.auth.pool)
                 .await
@@ -782,10 +907,127 @@ async fn post_admin_prices_sync_handler(
         })));
     }
 
+    let url = settings.price_sync_catalog_url.url.trim();
+    llmroller_core::ssrf::validate_url(url, false)
+        .map_err(|_| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid catalog URL"))?;
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let catalog: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?
+        .error_for_status()
+        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?
+        .json()
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?;
+
+    let mut model_costs: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+    if let Some(providers) = catalog.as_object() {
+        for provider in providers.values() {
+            let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+            for (model_id, model) in models {
+                let Some(cost) = model.get("cost") else {
+                    continue;
+                };
+                let read = |key: &str| cost.get(key).and_then(serde_json::Value::as_f64);
+                model_costs.entry(model_id.clone()).or_insert((
+                    read("input").unwrap_or(0.0),
+                    read("output").unwrap_or(0.0),
+                    read("cache_read").unwrap_or(0.0),
+                    read("cache_write").unwrap_or(0.0),
+                ));
+            }
+        }
+    }
+
+    use sqlx::Row as _;
+    let routes = sqlx::query(
+        "SELECT k.provider_id, p.kind, r.upstream_model_id
+         FROM model_routes r
+         JOIN upstream_keys k ON r.upstream_key_id = k.id
+         JOIN providers p ON k.provider_id = p.id",
+    )
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut synced = 0_usize;
+    let mut seen = std::collections::HashSet::new();
+    for route in routes {
+        let provider_id: String = route.try_get("provider_id").unwrap_or_default();
+        let kind: String = route.try_get("kind").unwrap_or_default();
+        let model_id: String = route.try_get("upstream_model_id").unwrap_or_default();
+        if !seen.insert((provider_id.clone(), kind.clone(), model_id.clone())) {
+            continue;
+        }
+        let Some(&(input, output, cache_read, cache_write)) = model_costs.get(&model_id) else {
+            continue;
+        };
+        let manual: Option<String> = sqlx::query_scalar(
+            "SELECT source FROM prices WHERE provider_id = ? AND provider_kind = ? AND upstream_model_id = ?",
+        )
+        .bind(&provider_id)
+        .bind(&kind)
+        .bind(&model_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if manual.as_deref() == Some("manual") {
+            continue;
+        }
+        let micro = |usd_per_mtok: f64| (usd_per_mtok * 1_000_000.0).round() as i64;
+        llmroller_store::prices::upsert_price_tx(
+            &mut tx,
+            llmroller_store::prices::UpsertPriceParams {
+                provider_id,
+                provider_kind: kind,
+                upstream_model_id: model_id,
+                rates: llmroller_core::pricing::Rates {
+                    input_per_mtok_micro_usd: micro(input),
+                    output_per_mtok_micro_usd: micro(output),
+                    cache_read_per_mtok_micro_usd: micro(cache_read),
+                    cache_write_per_mtok_micro_usd: micro(cache_write),
+                },
+                tiers: Vec::new(),
+                schedules: Vec::new(),
+                source: "synced".to_string(),
+                now_ms: chrono_like_now_ms(),
+            },
+        )
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        synced += 1;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
     Ok(Json(serde_json::json!({
         "synced": true,
+        "prices_synced": synced,
         "imported_aliases": 0
     })))
+}
+
+fn chrono_like_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 async fn get_user_client_key_sessions_handler(
@@ -1115,8 +1357,9 @@ async fn get_session_preview_internal(
     }
 
     let pin_rows = sqlx::query(
-        "SELECT p.upstream_key_id, p.canonical_id, p.pool_tier, k.label as key_label
+        "SELECT p.upstream_key_id, m.canonical_id, p.pool_tier, k.label as key_label
          FROM pins p
+         LEFT JOIN models m ON p.model_pk = m.model_pk
          LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
          WHERE p.session_hash = ?",
     )
@@ -1300,43 +1543,35 @@ async fn append_audit_entry_helper(
     target_type: &str,
     target_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    use llmroller_core::seams::ExposeSecret as _;
+
     let audit_id = llmroller_core::ids::RequestId::generate().to_string();
-    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM audit_log")
-        .fetch_one(&state.auth.pool)
-        .await
-        .unwrap_or(0);
-    let prev_hash: String = if max_seq == 0 {
-        "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-    } else {
-        sqlx::query_scalar("SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1")
-            .fetch_one(&state.auth.pool)
-            .await
-            .unwrap_or_else(|_| {
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-            })
-    };
-    let seq = max_seq + 1;
-    let computed_hash = llmroller_store::crypto::sha256_hex(
-        format!("{seq}:{prev_hash}:{action}:{}", target_id.unwrap_or("")).as_bytes(),
-    );
+    // Production always provides the instance audit key; tests without one derive a
+    // deterministic fallback so the hash chain remains well-formed.
+    let fallback = llmroller_store::crypto::sha256_hex(state.master_key.as_bytes());
+    let key: &[u8] = state
+        .audit_hmac_key
+        .as_ref()
+        .map_or(fallback.as_bytes(), |secret| secret.expose_secret());
 
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (seq, id, ts, actor_user_id, ip_addr, action, target_type, target_id, payload_json, hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)",
+    let mut tx = state.auth.pool.begin().await?;
+    llmroller_store::audit::append(
+        &mut tx,
+        key,
+        llmroller_store::audit::AuditEntry {
+            id: &audit_id,
+            ts: now_ms,
+            actor_user_id,
+            ip_addr: None,
+            action,
+            target_type,
+            target_id,
+            detail_json: Some("{}"),
+        },
     )
-    .bind(seq)
-    .bind(&audit_id)
-    .bind(now_ms)
-    .bind(actor_user_id)
-    .bind("127.0.0.1")
-    .bind(action)
-    .bind(target_type)
-    .bind(target_id)
-    .bind(computed_hash)
-    .execute(&state.auth.pool)
-    .await;
-
-    Ok(())
+    .await
+    .map_err(|_| sqlx::Error::Protocol("audit append failed".to_string()))?;
+    tx.commit().await
 }
 
 // ---------------------------------------------------------------------------
@@ -1903,7 +2138,7 @@ async fn get_admin_overview_telemetry_handler(
     let retention_days = settings.traceability_config.retention_days;
 
     let daily_requests: i64 =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE created_at >= ?")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE ts >= ?")
             .bind(now_ms - 86400 * 1000)
             .fetch_one(&state.auth.pool)
             .await
@@ -1956,7 +2191,7 @@ async fn get_admin_audit_log_handler(
 
     use sqlx::Row as _;
     let rows = sqlx::query(
-        "SELECT seq, ts, actor_user_id, action, target_type, target_id, payload_json FROM audit_log ORDER BY seq DESC LIMIT 100"
+        "SELECT seq, ts, actor_user_id, action, target_type, target_id, detail_json, hash AS hash_hex FROM audit_log ORDER BY seq DESC LIMIT 100"
     )
     .fetch_all(&state.auth.pool)
     .await
@@ -1971,7 +2206,9 @@ async fn get_admin_audit_log_handler(
             "action": r.try_get::<String, _>("action").unwrap_or_default(),
             "target_type": r.try_get::<String, _>("target_type").unwrap_or_default(),
             "target_id": r.try_get::<Option<String>, _>("target_id").unwrap_or_default(),
-            "payload_json": r.try_get::<String, _>("payload_json").unwrap_or_default(),
+            "payload_json": r.try_get::<String, _>("detail_json").unwrap_or_default(),
+            "detail_json": r.try_get::<String, _>("detail_json").unwrap_or_default(),
+            "hash": r.try_get::<String, _>("hash_hex").unwrap_or_default(),
         }));
     }
 
@@ -2436,9 +2673,12 @@ async fn post_test_upstream_key_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, true).await?;
 
+    use llmroller_core::seams::ExposeSecret as _;
+    use llmroller_store::crypto::SecretSealer as _;
     use sqlx::Row as _;
     let key = sqlx::query(
-        "SELECT k.id, k.owner_user_id, p.ownership_scope, p.base_url, p.kind
+        "SELECT k.id, k.owner_user_id, k.secret_enc, k.master_key_id, p.id AS provider_id,
+                p.ownership_scope, p.base_url, p.kind, p.allow_private_network
          FROM upstream_keys k
          JOIN providers p ON k.provider_id = p.id
          WHERE k.id = ?",
@@ -2461,10 +2701,90 @@ async fn post_test_upstream_key_handler(
         }
     }
 
+    let secret_enc: Vec<u8> = key.try_get("secret_enc").unwrap_or_default();
+    let key_master_key_id: String = key.try_get("master_key_id").unwrap_or_default();
+    let provider_id: String = key.try_get("provider_id").unwrap_or_default();
+    let base_url: String = key.try_get("base_url").unwrap_or_default();
+    let allow_private: bool = key.try_get::<i64, _>("allow_private_network").unwrap_or(0) != 0;
+
+    let instance_id_vec: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+            .fetch_optional(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .unwrap_or_else(|| vec![0_u8; 16]);
+    let instance_id: [u8; 16] = instance_id_vec.try_into().unwrap_or([0_u8; 16]);
+    let sealer = llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        state.master_key.clone(),
+        instance_id,
+        std::sync::Arc::new(llmroller_core::seams::OsEntropy),
+    );
+    let key_id_text = id.to_string();
+    let secret = sealer
+        .open(
+            "upstream_key",
+            &[
+                key_master_key_id.as_bytes(),
+                key_id_text.as_bytes(),
+                provider_id.as_bytes(),
+            ],
+            &secret_enc,
+        )
+        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot open key"))?;
+    let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
+
+    let target = format!("{}/models", base_url.trim_end_matches('/'));
+    if llmroller_core::ssrf::validate_url(&target, allow_private).is_err() {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider URL is not allowed",
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let started = std::time::Instant::now();
+    let response = client
+        .get(&target)
+        .header("authorization", format!("Bearer {secret}"))
+        .send()
+        .await;
+    let latency_ms = started.elapsed().as_millis() as i64;
+
+    let (status, http_status, message) = match response {
+        Ok(resp) if resp.status().is_success() => (
+            "ok",
+            Some(i64::from(resp.status().as_u16())),
+            "Key validated successfully",
+        ),
+        Ok(resp) => {
+            let code = i64::from(resp.status().as_u16());
+            let message = match resp.status().as_u16() {
+                401 | 403 => "Upstream rejected the credential",
+                429 => "Upstream rate limited the probe",
+                _ => "Upstream probe failed",
+            };
+            ("error", Some(code), message)
+        }
+        Err(_) => ("error", None, "Upstream unreachable"),
+    };
+
+    let health = if status == "ok" { "healthy" } else { "invalid" };
+    let _ = sqlx::query("UPDATE upstream_keys SET health = ? WHERE id = ?")
+        .bind(health)
+        .bind(&key_id_text)
+        .execute(&state.auth.pool)
+        .await;
+
     Ok(Json(serde_json::json!({
-        "status": "ok",
-        "message": "Key validated successfully",
-        "key_id": id.to_string()
+        "status": status,
+        "http_status": http_status,
+        "latency_ms": latency_ms,
+        "message": message,
+        "key_id": key_id_text,
     })))
 }
 
@@ -3500,7 +3820,7 @@ async fn get_partial_admin_audit_handler(
 
     use sqlx::Row as _;
     let rows = sqlx::query(
-        "SELECT seq, ts, actor_user_id, action, target_type, target_id, payload_json
+        "SELECT seq, ts, actor_user_id, action, target_type, target_id, detail_json
          FROM audit_log ORDER BY seq DESC LIMIT 100",
     )
     .fetch_all(&state.auth.pool)
@@ -3535,7 +3855,7 @@ async fn get_partial_admin_audit_handler(
             let short = if tid.len() > 8 { &tid[..8] } else { &tid };
             format!("{target_type} ({short})")
         });
-        let payload: String = r.try_get("payload_json").unwrap_or_default();
+        let payload: String = r.try_get("detail_json").unwrap_or_default();
 
         html.push_str(&format!(
             "<tr>\
@@ -3787,5 +4107,9 @@ pub fn router(state: ApiAppState) -> Router {
             "/admin/api/prices/sync",
             post(post_admin_prices_sync_handler),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            control_mutation_barrier,
+        ))
         .with_state(state)
 }

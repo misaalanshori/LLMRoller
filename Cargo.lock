@@ -1583,6 +1583,7 @@ dependencies = [
  "llmroller-proto",
  "llmroller-store",
  "parking_lot",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",

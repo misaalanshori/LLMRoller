@@ -23,6 +23,7 @@ llmroller-core = { path = "../core" }
 llmroller-proto = { path = "../proto" }
 llmroller-store = { path = "../store" }
 parking_lot.workspace = true
+reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

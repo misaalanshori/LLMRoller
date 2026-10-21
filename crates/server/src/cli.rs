@@ -233,7 +233,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     // 4. Load or initialize instance meta and instance secrets
     let clock = Arc::new(SystemClock::new());
     let entropy = Arc::new(OsEntropy::new());
-    let _instance_state = load_or_initialize(
+    let instance_state = load_or_initialize(
         &pool,
         &master_key_id,
         &master_key,
@@ -272,7 +272,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let shared_snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(initial_snapshot));
 
     let runtime_state = Arc::new(llmroller_core::runtime_state::RuntimeState::new());
-    let (_reloader_handle, _reloader_task) = start_reloader(
+    let (reloader_handle, _reloader_task) = start_reloader(
         pool.clone(),
         shared_snapshot.clone(),
         runtime_state.clone(),
@@ -420,6 +420,11 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let mut api_state =
         llmroller_admin::ApiAppState::new(auth_state.clone(), master_key.clone(), master_key_id);
     api_state.writer = Some(writer_handle.clone());
+    api_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
+    api_state.attach_reloader(
+        reloader_handle.notification_sender(),
+        reloader_handle.version_receiver(),
+    );
     let admin_router =
         llmroller_admin::control_plane_router_full(setup_state, auth_state, api_state);
     let metrics_router = llmroller_proxy::listeners::metrics_router();
