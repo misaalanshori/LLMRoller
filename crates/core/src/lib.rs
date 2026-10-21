@@ -21,6 +21,7 @@ pub mod session;
 pub mod settings;
 pub mod shares;
 pub mod snapshot;
+pub mod ssrf;
 pub mod strategy;
 pub mod trace_config;
 pub mod windows;

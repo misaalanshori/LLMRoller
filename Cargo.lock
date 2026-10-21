@@ -1611,7 +1611,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "thiserror",
  "ulid",
+ "url",
  "zeroize",
 ]
 
@@ -1703,8 +1705,8 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "hmac",
+ "indexmap",
  "llmroller-core",
- "llmroller-proxy",
  "parking_lot",
  "secrecy",
  "serde",

@@ -19,8 +19,8 @@ base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+indexmap.workspace = true
 llmroller-core = { path = "../core" }
-llmroller-proxy = { path = "../proxy" }
 parking_lot.workspace = true
 secrecy.workspace = true
 serde.workspace = true

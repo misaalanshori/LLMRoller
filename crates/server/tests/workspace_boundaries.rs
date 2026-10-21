@@ -146,6 +146,23 @@ fn core_has_no_io_or_runtime_dependency_edges() {
             "crates/core must not depend on workspace member {internal} (MNT-2)"
         );
     }
+
+    let store = metadata["packages"]
+        .as_array()
+        .expect("metadata packages")
+        .iter()
+        .find(|package| package["name"] == "llmroller-store")
+        .expect("llmroller-store package");
+    let store_deps: Vec<&str> = store["dependencies"]
+        .as_array()
+        .expect("store dependencies")
+        .iter()
+        .filter_map(|dep| dep["name"].as_str())
+        .collect();
+    assert!(
+        !store_deps.contains(&"llmroller-proxy"),
+        "crates/store must not depend on crates/proxy (MNT-2)"
+    );
 }
 
 #[test]

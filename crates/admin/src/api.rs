@@ -841,7 +841,7 @@ async fn get_user_session_preview_handler(
     Path(session_hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, false).await?;
-    let owner_id = actor.user_id().expect("user_id");
+    let owner_id = actor.user_id().ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let exists = sqlx::query(
         "SELECT 1 FROM trace_records WHERE owner_user_id = ? AND session_hash = ? LIMIT 1",

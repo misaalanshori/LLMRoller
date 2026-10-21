@@ -59,6 +59,7 @@ rand_chacha = "0.10.0"
 # Concurrency and in-memory state
 arc-swap = "1.9.3"
 dashmap = "6.1.0"
+indexmap = "2.14"
 parking_lot = "0.12.5"
 smallvec = "1.15.1"
 

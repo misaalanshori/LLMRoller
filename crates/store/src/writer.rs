@@ -11,11 +11,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use llmroller_core::snapshot::{CacheInvalidationEvent, ConfigDomain};
 use parking_lot::Mutex;
 use sqlx::{Connection as _, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::usage_writer::ThreeQueueUsageWriter;
 
 /// Maximum number of raw items retained in the bounded queue before evicting oldest per `REL-3`.
 pub const RAW_EVENTS_MAX_ITEMS: usize = 10_000;
@@ -75,13 +78,57 @@ impl std::fmt::Debug for ControlTask {
     }
 }
 
+/// Key for deduplicating in-flight durable ops.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DurableKey {
+    Pin(String),
+    ResponseLink(String),
+    HealthVersion(String),
+}
+
+/// Durable operation executed in SQLite with per-item SAVEPOINT.
+#[derive(Debug, Clone)]
+pub enum DurableOp {
+    PinUpsert {
+        client_key_id: String,
+        session_hash: String,
+        model_pk: String,
+        upstream_key_id: String,
+        pool_tier: u8,
+        created_at: i64,
+        last_used_at: i64,
+        expires_at: i64,
+    },
+    ResponseLinkUpsert(crate::pins::ResponseLinkRow),
+    HealthVersionUpdate {
+        upstream_key_id: String,
+        health: String,
+        health_until: Option<i64>,
+        health_version: i64,
+        last_error: Option<String>,
+    },
+}
+
 /// In-memory data queues backing the non-blocking data plane.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DataQueues {
-    pub durable_state: Mutex<HashMap<String, String>>,
+    pub durable_state: Mutex<IndexMap<DurableKey, DurableOp>>,
+    pub usage_writer: Arc<ThreeQueueUsageWriter>,
     pub rollups: Mutex<HashMap<String, i64>>,
     pub raw_events: Mutex<VecDeque<String>>,
     pub raw_bytes: Mutex<usize>,
+}
+
+impl Default for DataQueues {
+    fn default() -> Self {
+        Self {
+            durable_state: Mutex::new(IndexMap::new()),
+            usage_writer: Arc::new(ThreeQueueUsageWriter::new(RAW_EVENTS_MAX_ITEMS)),
+            rollups: Mutex::new(HashMap::new()),
+            raw_events: Mutex::new(VecDeque::new()),
+            raw_bytes: Mutex::new(0),
+        }
+    }
 }
 
 impl DataQueues {
@@ -245,12 +292,14 @@ async fn execute_single_control_task(
     Ok(new_version)
 }
 
-async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
+pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
     let has_durable = !queues.durable_state.lock().is_empty();
-    let has_rollups = !queues.rollups.lock().is_empty();
+    let has_usage = !queues.usage_writer.rollups_5min.lock().is_empty()
+        || !queues.usage_writer.rollups_hourly.lock().is_empty()
+        || !queues.usage_writer.raw_events.lock().is_empty();
     let has_raw = !queues.raw_events.lock().is_empty();
 
-    if !has_durable && !has_rollups && !has_raw {
+    if !has_durable && !has_usage && !has_raw {
         return;
     }
 
@@ -263,21 +312,85 @@ async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         Err(_) => return,
     };
 
-    // 1. Drain durable_state items
-    let durable_items: Vec<(String, String)> = queues.durable_state.lock().drain().collect();
-    for (k, v) in durable_items {
-        let _ = sqlx::query(
-            "INSERT OR REPLACE INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)",
-        )
-        .bind(format!("durable:{k}"))
-        .bind(v)
-        .bind(0)
-        .execute(&mut *transaction)
-        .await;
+    // 1. Drain and execute durable_state items with per-item SAVEPOINT
+    let durable_items: Vec<(DurableKey, DurableOp)> = {
+        let mut lock = queues.durable_state.lock();
+        std::mem::take(&mut *lock).into_iter().collect()
+    };
+
+    for (idx, (_key, op)) in durable_items.into_iter().enumerate() {
+        let sp_name = format!("item_{idx}");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+        let res = match op {
+            DurableOp::PinUpsert {
+                client_key_id,
+                session_hash,
+                model_pk,
+                upstream_key_id,
+                pool_tier,
+                created_at,
+                last_used_at,
+                expires_at,
+            } => {
+                sqlx::query(
+                    r#"INSERT INTO pins (
+                           client_key_id, session_hash, model_pk, upstream_key_id,
+                           pool_tier, created_at, last_used_at, expires_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (client_key_id, session_hash, model_pk) DO UPDATE SET
+                           upstream_key_id = excluded.upstream_key_id,
+                           pool_tier = excluded.pool_tier,
+                           last_used_at = excluded.last_used_at,
+                           expires_at = excluded.expires_at"#,
+                )
+                .bind(client_key_id)
+                .bind(session_hash)
+                .bind(model_pk)
+                .bind(upstream_key_id)
+                .bind(pool_tier as i64)
+                .bind(created_at)
+                .bind(last_used_at)
+                .bind(expires_at)
+                .execute(&mut *transaction)
+                .await
+                .map(|_| ())
+            }
+            DurableOp::ResponseLinkUpsert(link) => {
+                crate::pins::insert_response_link_tx(&mut transaction, &link).await
+            }
+            DurableOp::HealthVersionUpdate {
+                upstream_key_id,
+                health,
+                health_until,
+                health_version,
+                last_error,
+            } => {
+                sqlx::query(
+                    r#"UPDATE upstream_keys SET
+                           health = ?, health_until = ?, health_version = ?, last_error = ?
+                       WHERE id = ?"#,
+                )
+                .bind(health)
+                .bind(health_until)
+                .bind(health_version)
+                .bind(last_error)
+                .bind(upstream_key_id)
+                .execute(&mut *transaction)
+                .await
+                .map(|_| ())
+            }
+        };
+
+        if res.is_ok() {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+        } else {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}"))).execute(&mut *transaction).await;
+        }
     }
 
-    // 2. Drain rollups items
-    let _ = queues.rollups.lock().drain();
+    // 2. Flush usage rollups, usage_events, and usage_attempts
+    let _ = queues.usage_writer.flush_to_db(&mut transaction).await;
 
     // 3. Drain raw_events items up to batch limits
     {

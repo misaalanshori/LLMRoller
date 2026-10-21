@@ -40,7 +40,8 @@ pub async fn run_backup(
     }
 
     let tmp_str = tmp_path.to_string_lossy().replace('\\', "/");
-    let query_str = format!("VACUUM INTO '{tmp_str}';");
+    let escaped_tmp_str = tmp_str.replace('\'', "''");
+    let query_str = format!("VACUUM INTO '{escaped_tmp_str}';");
     sqlx::query(sqlx::AssertSqlSafe(query_str))
         .execute(pool)
         .await?;

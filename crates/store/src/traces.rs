@@ -139,14 +139,37 @@ impl std::fmt::Debug for SealerPool {
 }
 
 impl SealerPool {
-    pub fn new(_sealer: Arc<XChaCha20Poly1305Sealer>) -> (Self, Receiver<SealJob>) {
-        let (tx, rx) = sync_channel(64);
+    pub fn new(sealer: Arc<XChaCha20Poly1305Sealer>) -> (Self, Receiver<SealedTurnResult>) {
+        let (job_tx, job_rx) = sync_channel::<SealJob>(64);
+        let (res_tx, res_rx) = sync_channel::<SealedTurnResult>(64);
+        let job_rx_arc = Arc::new(std::sync::Mutex::new(job_rx));
+
+        for _ in 0..2 {
+            let rx_clone = Arc::clone(&job_rx_arc);
+            let sealer_clone = Arc::clone(&sealer);
+            let res_tx_clone = res_tx.clone();
+
+            std::thread::Builder::new()
+                .name("llmroller-sealer".to_string())
+                .spawn(move || {
+                    while let Ok(job) = {
+                        let rx_lock = rx_clone.lock().expect("job_rx lock");
+                        rx_lock.recv()
+                    } {
+                        if let Ok(sealed_res) = seal_turn_sync(&job, &sealer_clone) {
+                            let _ = res_tx_clone.send(sealed_res);
+                        }
+                    }
+                })
+                .expect("spawn sealer thread");
+        }
+
         (
             Self {
-                tx,
+                tx: job_tx,
                 dropped_jobs_count: AtomicUsize::new(0),
             },
-            rx,
+            res_rx,
         )
     }
 
