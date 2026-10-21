@@ -412,15 +412,123 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     use axum::body::Body;
     use axum::http::{Request, header};
     use http_body_util::BodyExt as _;
+    use llmroller_core::provider::ProviderKind;
+    use llmroller_core::rbac::OwnershipScope;
+    use llmroller_core::seams::secret_string;
     use llmroller_proxy::auth::ProxyAuthState;
     use llmroller_proxy::listeners::data_plane_router;
     use llmroller_server::reloader::load_initial_snapshot;
     use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
+    use llmroller_store::providers::{
+        NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
+    };
     use tower::ServiceExt as _;
 
-    let (_dir, pool, _master_key, user_id) = setup_failover_test_db().await;
+    let mock_app = axum::Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}"#,
+                )
+            }),
+        )
+        .route(
+            "/responses",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp-1","output":"ok"}"#,
+                )
+            }),
+        )
+        .route(
+            "/messages",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"msg-1","content":[{"type":"text","text":"ok"}]}"#,
+                )
+            }),
+        )
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"input_tokens": 10}"#,
+                )
+            }),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
+    let (_dir, pool, master_key, user_id) = setup_failover_test_db().await;
     let actor = ActorScope::user(user_id, Role::User);
     let mut tx = pool.begin().await.expect("begin");
+
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+    let provider = create_provider_tx(
+        &mut tx,
+        &system_actor,
+        NewProvider {
+            name: "Mock Routing Provider".to_string(),
+            kind: ProviderKind::Custom,
+            base_url: format!("http://{}", mock_addr),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: true,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("create provider");
+
+    let upstream_key = create_upstream_key_tx(
+        &mut tx,
+        &system_actor,
+        &master_key,
+        "key-0",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: provider.id,
+            label: "Mock Upstream Key".to_string(),
+            secret: secret_string("sk-mock-routing-key"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1000,
+    )
+    .await
+    .expect("create upstream key");
+
+    let model_pk1 = ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk1.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model gpt-4o");
+
+    let model_pk2 = ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-3-5-sonnet', 1)")
+        .bind(model_pk2.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model claude");
 
     let created_key = create_client_key_tx(
         &mut tx,
@@ -441,6 +549,24 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     )
     .await
     .expect("create client key");
+
+    // Insert response_links for resp_test_1 so state-bound operations succeed
+    let link = ResponseLinkRow {
+        response_id: "resp_test_1".to_string(),
+        owner_user_id: user_id,
+        client_key_id: created_key.client_key.id,
+        upstream_key_id: upstream_key.id,
+        model_pk: model_pk1,
+        session_hash: "sess_link_1".to_string(),
+        status: "completed".to_string(),
+        store_flag: true,
+        created_at: 1000,
+        updated_at: 1000,
+        expires_at: 1000 + 86400,
+    };
+    insert_response_link_tx(&mut tx, &link)
+        .await
+        .expect("insert response link");
 
     use llmroller_core::seams::ExposeSecret as _;
     let client_key_token = created_key.raw_token.expose_secret().to_string();
@@ -529,15 +655,6 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     let resp = app.clone().oneshot(req_get).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let req_del = Request::builder()
-        .method("DELETE")
-        .uri("/v1/responses/resp_test_1")
-        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
-        .body(Body::empty())
-        .expect("req");
-    let resp = app.clone().oneshot(req_del).await.expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
-
     let req_input_items = Request::builder()
         .method("GET")
         .uri("/v1/responses/resp_test_1/input_items")
@@ -553,6 +670,15 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
         .body(Body::empty())
         .expect("req");
-    let resp = app.oneshot(req_cancel).await.expect("resp");
+    let resp = app.clone().oneshot(req_cancel).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req_del = Request::builder()
+        .method("DELETE")
+        .uri("/v1/responses/resp_test_1")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.oneshot(req_del).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
 }

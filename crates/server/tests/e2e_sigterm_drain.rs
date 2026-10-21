@@ -68,6 +68,45 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
 
     let user_actor = ActorScope::user(user.id, Role::User);
 
+    let mock_app = axum::Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}"#,
+                )
+            }),
+        )
+        .route(
+            "/responses",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp-1","output":"ok"}"#,
+                )
+            }),
+        )
+        .route(
+            "/messages",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"msg-1","content":[{"type":"text","text":"ok"}]}"#,
+                )
+            }),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
     // Create personal provider
     let provider = create_provider(
         &pool,
@@ -75,18 +114,33 @@ async fn setup_test_context() -> (tempfile::TempDir, sqlx::SqlitePool, String, U
         NewProvider {
             name: "orch_provider".to_string(),
             kind: llmroller_core::provider::ProviderKind::Custom,
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: format!("http://{}", mock_addr),
             config_json: "{}".to_string(),
             ownership_scope: OwnershipScope::Personal,
             owner_user_id: Some(user.id),
             usage_url_cross_origin_ack: false,
-            allow_private_network: false,
+            allow_private_network: true,
             enabled: true,
         },
         1,
     )
     .await
     .expect("create provider");
+
+    // Insert model into catalog
+    let model_pk = llmroller_core::ids::ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert model");
+
+    let model_pk2 = llmroller_core::ids::ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'claude-sonnet-4.6', 1)")
+        .bind(model_pk2.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert model claude");
 
     // Create upstream key
     create_upstream_key(

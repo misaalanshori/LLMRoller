@@ -72,6 +72,55 @@ async fn setup_harness_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, Master
 #[tokio::test]
 async fn test_headless_cli_harnesses_and_egress_sandbox() {
     let (_dir, pool, master_key, user_id) = setup_harness_test_db().await;
+    let mock_app = axum::Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"mock answer"}}],"usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20}}"#,
+                )
+            }),
+        )
+        .route(
+            "/responses",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"resp-1","object":"response","output":"mock output"}"#,
+                )
+            }),
+        )
+        .route(
+            "/messages",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"msg-1","type":"message","content":[{"type":"text","text":"mock message"}]}"#,
+                )
+            }),
+        )
+        .route(
+            "/messages/count_tokens",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"input_tokens": 10}"#,
+                )
+            }),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
     let mut tx = pool.begin().await.expect("begin");
 
     let actor = ActorScope::user(user_id, Role::Admin);
@@ -82,12 +131,12 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         NewProvider {
             name: "Harness Provider".to_string(),
             kind: ProviderKind::Openrouter,
-            base_url: "https://openrouter.ai/api/v1".to_string(),
+            base_url: format!("http://{}", mock_addr),
             config_json: "{}".to_string(),
             ownership_scope: llmroller_core::rbac::OwnershipScope::Global,
             owner_user_id: None,
             usage_url_cross_origin_ack: false,
-            allow_private_network: false,
+            allow_private_network: true,
             enabled: true,
         },
         1000,

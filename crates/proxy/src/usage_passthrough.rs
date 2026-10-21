@@ -89,7 +89,7 @@ pub async fn get_v1_key_handler(
 pub async fn get_v1_usage_raw_handler(
     State(state): State<ProxyAuthState>,
     Query(params): Query<UsageQueryParams>,
-    Extension(_client_key): Extension<ClientKeyRecord>,
+    Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
     if params.session_id.is_some() {
         return (
@@ -106,8 +106,14 @@ pub async fn get_v1_usage_raw_handler(
 
     use sqlx::Row as _;
     let row = sqlx::query(
-        "SELECT sanitized_json FROM upstream_usage_snapshots ORDER BY fetched_at DESC LIMIT 1",
+        r#"SELECT s.sanitized_json
+           FROM upstream_usage_snapshots s
+           JOIN upstream_keys k ON s.upstream_key_id = k.id
+           JOIN providers p ON k.provider_id = p.id
+           WHERE (p.ownership_scope = 'global' OR (p.ownership_scope = 'personal' AND p.owner_user_id = ?))
+           ORDER BY s.fetched_at DESC LIMIT 1"#,
     )
+    .bind(client_key.owner_user_id.to_string())
     .fetch_optional(&state.pool)
     .await;
 

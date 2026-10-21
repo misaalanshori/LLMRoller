@@ -26,6 +26,7 @@ hyper-util.workspace = true
 ipnet.workspace = true
 llmroller-core = { path = "../core" }
 llmroller-proto = { path = "../proto" }
+llmroller-store = { path = "../store" }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true

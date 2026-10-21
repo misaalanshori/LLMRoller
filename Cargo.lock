@@ -1649,6 +1649,7 @@ dependencies = [
  "ipnet",
  "llmroller-core",
  "llmroller-proto",
+ "llmroller-store",
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",

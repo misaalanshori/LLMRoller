@@ -40,6 +40,7 @@ pub struct ApiAppState {
     pub auth: AuthAppState,
     pub master_key: MasterKey,
     pub master_key_id: String,
+    pub writer: Option<llmroller_store::writer::WriterHandle>,
 }
 
 impl ApiAppState {
@@ -49,6 +50,7 @@ impl ApiAppState {
             auth,
             master_key,
             master_key_id,
+            writer: None,
         }
     }
 }

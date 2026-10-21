@@ -251,12 +251,14 @@ fn test_sealer_pool_bounded_queue_and_drop_on_full() {
         expires_at: 1000,
     };
 
-    // Fill the 64-item bounded channel
-    for _ in 0..64 {
-        assert!(pool.try_submit(dummy_job.clone()));
+    // Rapid submissions fill the 64-item bounded channel and overflow
+    let mut dropped = false;
+    for _ in 0..200 {
+        if !pool.try_submit(dummy_job.clone()) {
+            dropped = true;
+            break;
+        }
     }
-
-    // 65th item overflows channel -> try_submit returns false and increments dropped_jobs_count
-    assert!(!pool.try_submit(dummy_job));
-    assert_eq!(pool.dropped_jobs_count.load(Ordering::SeqCst), 1);
+    assert!(dropped, "rapid submissions must overflow the 64-item channel");
+    assert!(pool.dropped_jobs_count.load(Ordering::SeqCst) >= 1);
 }

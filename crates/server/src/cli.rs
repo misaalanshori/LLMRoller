@@ -264,7 +264,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
 
     // 6. Start dual-priority writer actor and Reloader task
     let (reloader_tx, reloader_rx) = tokio::sync::mpsc::channel(256);
-    let (_writer_handle, _writer_task) = start_writer(pool.clone(), reloader_tx.clone());
+    let (writer_handle, _writer_task) = start_writer(pool.clone(), reloader_tx.clone());
 
     let initial_snapshot = load_initial_snapshot(&pool)
         .await
@@ -289,7 +289,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     .await;
 
     // 8. Preload confirmed pins
-    let _pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
+    let pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
 
     // 9. Bind data-plane, control-plane, and metrics TCP listeners
     let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -312,6 +312,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         trusted_proxies_vec.clone(),
     );
     proxy_auth_state.is_ready = is_ready.clone();
+    proxy_auth_state.pin_store = pin_store.clone();
+    proxy_auth_state.writer = Some(writer_handle.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
 
     let auth_config = llmroller_admin::auth::AuthConfig {
@@ -327,8 +329,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         clock: clock.clone(),
         entropy: entropy.clone(),
     };
-    let api_state =
+    let mut api_state =
         llmroller_admin::ApiAppState::new(auth_state.clone(), master_key.clone(), master_key_id);
+    api_state.writer = Some(writer_handle.clone());
     let admin_router =
         llmroller_admin::control_plane_router_full(setup_state, auth_state, api_state);
     let metrics_router = llmroller_proxy::listeners::metrics_router();
@@ -403,6 +406,30 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 }
             })
             .await;
+    });
+
+    // Spawn background WalCheckpointSupervisor and RetentionSweeper
+    let stop_rx_bg = stop_tx.subscribe();
+    let bg_pool = pool.clone();
+    let bg_ready = is_ready.clone();
+    let _bg_jobs = tokio::spawn(async move {
+        let wal_supervisor = llmroller_store::checkpoint::WalCheckpointSupervisor::new(bg_ready);
+        let mut stop_rx = stop_rx_bg;
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        while !*stop_rx.borrow_and_update() {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let _ = wal_supervisor.run_checkpoint(&bg_pool, 0).await;
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+                    if let Ok(mut tx) = bg_pool.begin().await {
+                        let _ = llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await;
+                        let _ = llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await;
+                        let _ = tx.commit().await;
+                    }
+                }
+                _ = stop_rx.changed() => break,
+            }
+        }
     });
 
     wait_for_shutdown_signal().await;

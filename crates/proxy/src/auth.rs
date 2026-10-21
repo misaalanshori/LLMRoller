@@ -37,6 +37,8 @@ pub struct ProxyAuthState {
     pub trusted_proxies: Vec<String>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
+    pub pin_store: Arc<llmroller_core::pins::PinStore>,
+    pub writer: Option<llmroller_store::writer::WriterHandle>,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -62,6 +64,8 @@ impl ProxyAuthState {
             trusted_proxies,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
+            pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
+            writer: None,
         }
     }
 
