@@ -94,9 +94,12 @@ fn test_origin_breaker_thresholds_and_probe_lifecycle() {
 
     // While Open before until_ms: request is rejected
     assert!(!breaker.is_admitted(t0 + 10_000));
+    assert_eq!(breaker.try_acquire(t0 + 10_000), None);
 
-    // At or after until_ms (t0 + 19_000): transitions to HalfOpen, admits single probe
+    // At or after until_ms (t0 + 19_000): peek admits, and acquiring claims the
+    // single half-open probe slot.
     assert!(breaker.is_admitted(t0 + 19_000));
+    assert_eq!(breaker.try_acquire(t0 + 19_000), Some(true));
     assert_eq!(
         breaker.state,
         BreakerState::HalfOpen {
@@ -106,6 +109,7 @@ fn test_origin_breaker_thresholds_and_probe_lifecycle() {
 
     // Second request while probe is in flight is rejected
     assert!(!breaker.is_admitted(t0 + 19_100));
+    assert_eq!(breaker.try_acquire(t0 + 19_100), None);
 
     // Probe succeeds -> breaker returns to Closed!
     breaker.record_success(t0 + 19_500);

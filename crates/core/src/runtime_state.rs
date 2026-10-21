@@ -4,6 +4,7 @@
 //! Spec: ./docs/srdd/5. SRDD - System Architecture.md#51-high-level-architecture-diagram
 //! Spec: ./docs/srdd/21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md#215-versioned-health-synchronization-and-origin-circuit-breakers
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -11,8 +12,9 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use crate::accumulators::MonthlyAccumulatorRegistry;
-use crate::breaker::OriginBreaker;
-use crate::ids::{ModelPk, ProviderId, UpstreamKeyId};
+use crate::breaker::{OriginBreaker, OriginKey, OriginProbeGuard};
+use crate::health::{CredentialStrikeVerifier, StrikeResult};
+use crate::ids::{ClientKeyId, ModelPk, UpstreamKeyId};
 use crate::session::ConstantSessionDetector;
 use crate::snapshot::{CacheInvalidationEvent, ConfigSnapshot, SnapshotBudgetWindow};
 use crate::strategy::{
@@ -226,7 +228,11 @@ pub struct RuntimeState {
     pub reload_count: AtomicU64,
     pub applied_invalidations_count: AtomicU64,
     pub key_health: DashMap<UpstreamKeyId, KeyHealthEntry>,
-    pub origin_breakers: DashMap<ProviderId, Arc<Mutex<OriginBreaker>>>,
+    pub origin_breakers: DashMap<OriginKey, Arc<Mutex<OriginBreaker>>>,
+    /// Two-strike credential verification with an out-of-band `/models` probe (API-8).
+    pub strike_verifier: CredentialStrikeVerifier,
+    /// Keys with a credential verification probe already in flight (API-8).
+    pub credential_probes_in_flight: DashMap<UpstreamKeyId, ()>,
     pub load_tracker: Arc<LoadTracker>,
     pub selectors: RouteSelectorSet,
     pub window_counters: DashMap<String, Arc<AtomicBudgetCounter>>,
@@ -264,6 +270,8 @@ impl RuntimeState {
             applied_invalidations_count: AtomicU64::new(0),
             key_health: DashMap::new(),
             origin_breakers: DashMap::new(),
+            strike_verifier: CredentialStrikeVerifier::new(),
+            credential_probes_in_flight: DashMap::new(),
             load_tracker: Arc::new(LoadTracker::new()),
             selectors: RouteSelectorSet::default(),
             window_counters: DashMap::new(),
@@ -401,28 +409,45 @@ impl RuntimeState {
             .is_none_or(|entry| entry.is_routable(now_ms))
     }
 
-    /// Whether the provider's origin breaker admits a new attempt (C7).
-    pub fn is_origin_admitted(&self, provider_id: ProviderId, now_ms: i64) -> bool {
+    /// Whether the origin breaker would admit a new attempt (C7, non-claiming).
+    #[must_use]
+    pub fn is_origin_admitted(&self, origin: &OriginKey, now_ms: i64) -> bool {
+        self.origin_breakers
+            .get(origin)
+            .is_none_or(|breaker| breaker.lock().is_admitted(now_ms))
+    }
+
+    /// Claim admission for one upstream attempt.
+    ///
+    /// The returned guard releases the half-open probe slot if the attempt ends
+    /// without recording an outcome, preventing a permanent `HalfOpen` wedge
+    /// (REL-5, Section 21.5).
+    #[must_use]
+    pub fn acquire_origin_permit(
+        &self,
+        origin: &OriginKey,
+        now_ms: i64,
+    ) -> Option<OriginProbeGuard> {
         let breaker = self
             .origin_breakers
-            .entry(provider_id)
+            .entry(origin.clone())
             .or_insert_with(|| Arc::new(Mutex::new(OriginBreaker::new())))
             .clone();
-        let mut guard = breaker.lock();
-        guard.is_admitted(now_ms)
+        let is_probe = breaker.lock().try_acquire(now_ms)?;
+        Some(OriginProbeGuard::new(breaker, is_probe))
     }
 
     /// Record a successful upstream attempt (health + breaker + latency EWMA).
     pub fn record_upstream_success(
         &self,
-        provider_id: ProviderId,
+        origin: &OriginKey,
         key_id: UpstreamKeyId,
         route: Option<RouteId>,
         ttfb_ms: Option<u64>,
         now_ms: i64,
     ) {
         self.key_health.insert(key_id, KeyHealthEntry::default());
-        if let Some(breaker) = self.origin_breakers.get(&provider_id) {
+        if let Some(breaker) = self.origin_breakers.get(origin) {
             breaker.lock().record_success(now_ms);
         }
         if let (Some(route), Some(ttfb)) = (route, ttfb_ms) {
@@ -431,23 +456,43 @@ impl RuntimeState {
     }
 
     /// Record a failed attempt, applying cooldowns, exhaustion, and breaker state.
+    ///
+    /// Returns the credential-strike decision for `401`/`403` outcomes so the
+    /// caller can run the out-of-band `/models` verification probe (API-8).
+    #[must_use]
     pub fn record_upstream_failure(
         &self,
-        provider_id: ProviderId,
+        origin: &OriginKey,
         key_id: UpstreamKeyId,
+        client_key_id: ClientKeyId,
         outcome: AttemptOutcome,
         retry_after_ms: Option<i64>,
         now_ms: i64,
-    ) {
+    ) -> Option<StrikeResult> {
         let mut entry = self.key_health.entry(key_id).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        let mut strike = None;
         match outcome {
             AttemptOutcome::Http429 => {
                 entry.cooldown_until_ms = Some(now_ms + retry_after_ms.unwrap_or(60_000));
             }
             AttemptOutcome::Http401 | AttemptOutcome::Http403 => {
-                entry.healthy = false;
-                entry.quarantine_reason = Some("credential_rejected".to_string());
+                let decision = self
+                    .strike_verifier
+                    .record_strike(key_id, client_key_id, now_ms);
+                match decision {
+                    StrikeResult::MarkInvalid => {
+                        entry.healthy = false;
+                        entry.quarantine_reason = Some("credential_rejected".to_string());
+                    }
+                    // A single strike only cools the key down while the probe runs;
+                    // it must never quarantine a key on first sight (API-8).
+                    StrikeResult::ProbeRequired => {
+                        entry.cooldown_until_ms = Some(now_ms + 15_000);
+                    }
+                    StrikeResult::Healthy => {}
+                }
+                strike = Some(decision);
             }
             AttemptOutcome::ConnectError
             | AttemptOutcome::Http5xx
@@ -465,11 +510,50 @@ impl RuntimeState {
         ) {
             let breaker = self
                 .origin_breakers
-                .entry(provider_id)
+                .entry(origin.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(OriginBreaker::new())))
                 .clone();
             breaker.lock().record_host_failure(now_ms);
         }
+        strike
+    }
+
+    /// Claim the single-flight slot for a credential verification probe (API-8).
+    pub fn try_begin_credential_probe(&self, key_id: UpstreamKeyId) -> bool {
+        self.credential_probes_in_flight
+            .insert(key_id, ())
+            .is_none()
+    }
+
+    /// Release the single-flight credential probe slot.
+    pub fn finish_credential_probe(&self, key_id: UpstreamKeyId) {
+        self.credential_probes_in_flight.remove(&key_id);
+    }
+
+    /// Apply the result of an out-of-band `GET /models` credential probe (API-8).
+    pub fn record_credential_probe_result(
+        &self,
+        key_id: UpstreamKeyId,
+        probe_success: bool,
+    ) -> StrikeResult {
+        let decision = self
+            .strike_verifier
+            .record_probe_result(key_id, probe_success);
+        match decision {
+            StrikeResult::Healthy => {
+                if let Some(mut entry) = self.key_health.get_mut(&key_id) {
+                    entry.cooldown_until_ms = None;
+                }
+            }
+            StrikeResult::MarkInvalid => {
+                let mut entry = self.key_health.entry(key_id).or_default();
+                entry.healthy = false;
+                entry.quarantine_reason = Some("credential_rejected".to_string());
+            }
+            StrikeResult::ProbeRequired => {}
+        }
+        self.health.bump_version();
+        decision
     }
 
     /// Whether any configured hard budget window for a key is exhausted (C8 quick gate).
@@ -542,10 +626,21 @@ impl RuntimeState {
                     self.health.bump_version();
                     rebuild_windows = true;
                 }
-                CacheInvalidationEvent::ProviderChanged(provider_id) => {
-                    if !snapshot.providers.contains_key(provider_id) {
-                        self.origin_breakers.remove(provider_id);
-                    }
+                CacheInvalidationEvent::ProviderChanged(_) => {
+                    // Origin breakers are keyed by scheme/host/port, not provider id,
+                    // so drop any origin the published snapshot no longer references.
+                    let live: HashSet<OriginKey> = snapshot
+                        .providers
+                        .values()
+                        .map(|provider| {
+                            OriginKey::from_base_url(
+                                &provider.base_url,
+                                provider.allow_private_network,
+                            )
+                        })
+                        .collect();
+                    self.origin_breakers
+                        .retain(|origin, _| live.contains(origin));
                     self.health.bump_version();
                 }
                 CacheInvalidationEvent::BudgetWindowChanged(_)
@@ -712,3 +807,6 @@ mod tests {
         assert_eq!(after_reload, first);
     }
 }
+
+#[cfg(test)]
+mod f04_tests;

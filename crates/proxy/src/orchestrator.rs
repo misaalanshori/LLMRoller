@@ -21,11 +21,13 @@ use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::stream;
 use llmroller_core::accumulators::MonthReservationGuard;
+use llmroller_core::breaker::OriginKey;
 use llmroller_core::client_key::ClientKeyRecord;
 use llmroller_core::eligibility::{
     CallerContext, CandidatePoolTier, CandidateRoute as EligibilityRoute, PoolSelectionError,
     select_pool,
 };
+use llmroller_core::health::StrikeResult;
 use llmroller_core::ids::{
     ClientKeyId, ModelPk, ProviderId, RequestId, ShareId, UpstreamKeyId, UserId,
 };
@@ -313,7 +315,12 @@ fn hard_route_checks(
 
     let c6 = key.is_some_and(|key| runtime.is_key_routable(key.id, now))
         && route.is_some_and(|route| route_healthy(route, now));
-    let c7 = provider.is_some_and(|provider| runtime.is_origin_admitted(provider.id, now));
+    let c7 = provider.is_some_and(|provider| {
+        runtime.is_origin_admitted(
+            &OriginKey::from_base_url(&provider.base_url, provider.allow_private_network),
+            now,
+        )
+    });
     let c8 = key.is_some_and(|key| runtime.key_budget_admitted(key.id, now));
 
     let retry_after = {
@@ -891,6 +898,51 @@ fn now_ms() -> i64 {
     SystemClock::new().now_ms()
 }
 
+/// Interpret an out-of-band `GET /models` verification probe response (API-8).
+///
+/// Only an explicit auth rejection invalidates the key; 2xx clears the strikes.
+/// Transport errors and unrelated statuses leave the recorded strikes intact so
+/// a transient probe failure cannot quarantine a healthy key.
+fn credential_probe_verdict(status: StatusCode) -> Option<bool> {
+    if status.is_success() {
+        Some(true)
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Fire the single-flight credential verification probe for a struck key (API-8).
+fn spawn_credential_probe(
+    state: &ProxyAuthState,
+    base_url: &str,
+    allow_private_network: bool,
+    secret: &str,
+    key_id: UpstreamKeyId,
+) {
+    if !state.runtime_state.try_begin_credential_probe(key_id) {
+        return;
+    }
+    let client = state.select_http_client(allow_private_network).clone();
+    let runtime = Arc::clone(&state.runtime_state);
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let authorization = format!("Bearer {secret}");
+    tokio::spawn(async move {
+        let verdict = client
+            .get(&url)
+            .header("authorization", authorization)
+            .send()
+            .await
+            .ok()
+            .and_then(|response| credential_probe_verdict(response.status()));
+        if let Some(probe_success) = verdict {
+            runtime.record_credential_probe_result(key_id, probe_success);
+        }
+        runtime.finish_credential_probe(key_id);
+    });
+}
+
 /// Parse a client key routing scope, failing closed to the safest default.
 pub(crate) fn parse_scope(scope: &str) -> RoutingScope {
     scope.parse().unwrap_or_default()
@@ -1095,7 +1147,10 @@ fn eligibility_route(
         protocol_blocked: route.is_some_and(|route| !route_healthy(route, now)),
         key_health_ok: runtime.is_key_routable(candidate.upstream_key_id, now),
         route_health_ok: route.is_some_and(|route| route_healthy(route, now)),
-        breaker_closed: runtime.is_origin_admitted(candidate.provider_id, now),
+        breaker_closed: runtime.is_origin_admitted(
+            &OriginKey::from_base_url(&candidate.base_url, candidate.allow_private_network),
+            now,
+        ),
         user_pref_enabled: snapshot
             .user_route_prefs
             .get(&(caller.owner_user_id, model.id))
@@ -2226,6 +2281,7 @@ pub async fn handle_inference_request(
         };
         tried.push(candidate.upstream_key_id);
         attempt_no += 1;
+        let origin = OriginKey::from_base_url(&candidate.base_url, candidate.allow_private_network);
         let Some(key) = snapshot
             .upstream_keys
             .get(&candidate.upstream_key_id)
@@ -2316,6 +2372,13 @@ pub async fn handle_inference_request(
         }
         let client = state.select_http_client(candidate.allow_private_network);
 
+        // Claim this origin for the attempt. The guard releases a half-open probe
+        // slot if the attempt is cancelled before recording an outcome (REL-5).
+        let Some(_origin_permit) = state.runtime_state.acquire_origin_permit(&origin, now) else {
+            last_status = StatusCode::SERVICE_UNAVAILABLE;
+            continue;
+        };
+
         let (edited_body, strip_injected_usage) = match edit_body(
             body.clone(),
             candidate.pool_tier(),
@@ -2351,9 +2414,10 @@ pub async fn handle_inference_request(
         let response = match request_builder.send().await {
             Ok(response) => response,
             Err(_) => {
-                state.runtime_state.record_upstream_failure(
-                    candidate.provider_id,
+                let _ = state.runtime_state.record_upstream_failure(
+                    &origin,
                     candidate.upstream_key_id,
+                    caller.id,
                     llmroller_core::usage::AttemptOutcome::ConnectError,
                     None,
                     now,
@@ -2398,13 +2462,23 @@ pub async fn handle_inference_request(
             last_status = status;
             last_retry_after_ms = retry_after_ms(response.headers());
             let outcome = llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
-            state.runtime_state.record_upstream_failure(
-                candidate.provider_id,
+            let strike = state.runtime_state.record_upstream_failure(
+                &origin,
                 candidate.upstream_key_id,
+                caller.id,
                 outcome,
                 last_retry_after_ms,
                 now,
             );
+            if strike == Some(StrikeResult::ProbeRequired) {
+                spawn_credential_probe(
+                    &state,
+                    &candidate.base_url,
+                    candidate.allow_private_network,
+                    &secret,
+                    candidate.upstream_key_id,
+                );
+            }
             let (charged_micro_usd, charge_basis) = failure_charge(outcome, attempt_estimate);
             attempts.push(attempt_record(
                 request_id,
@@ -2478,9 +2552,10 @@ pub async fn handle_inference_request(
                 }
 
                 if failure {
-                    state.runtime_state.record_upstream_failure(
-                        candidate.provider_id,
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
                         candidate.upstream_key_id,
+                        caller.id,
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
                         None,
                         now,
@@ -2520,7 +2595,7 @@ pub async fn handle_inference_request(
 
                 let ttfb_ms = (now_ms() - attempt_started).max(0);
                 state.runtime_state.record_upstream_success(
-                    candidate.provider_id,
+                    &origin,
                     candidate.upstream_key_id,
                     Some(candidate.route_id()),
                     Some(ttfb_ms as u64),
@@ -2814,7 +2889,7 @@ pub async fn handle_inference_request(
         }
 
         state.runtime_state.record_upstream_success(
-            candidate.provider_id,
+            &origin,
             candidate.upstream_key_id,
             Some(candidate.route_id()),
             None,

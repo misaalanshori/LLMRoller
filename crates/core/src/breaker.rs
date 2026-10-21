@@ -2,6 +2,10 @@
 //!
 //! Spec: Section 10.5.1, Section 21.5, Requirements: REL-5, API-8.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 /// Key identifying an upstream HTTP host and port.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OriginKey {
@@ -9,6 +13,32 @@ pub struct OriginKey {
     pub host: String,
     pub port: u16,
     pub allow_private_network: bool,
+}
+
+impl OriginKey {
+    /// Derive the canonical origin for a provider base URL (REL-5).
+    ///
+    /// A URL that cannot be parsed is keyed verbatim so an unusable provider
+    /// still gets an isolated breaker instead of sharing another origin's.
+    #[must_use]
+    pub fn from_base_url(base_url: &str, allow_private_network: bool) -> Self {
+        match url::Url::parse(base_url) {
+            Ok(parsed) => Self {
+                scheme: parsed.scheme().to_ascii_lowercase(),
+                host: parsed
+                    .host_str()
+                    .map_or_else(|| base_url.to_string(), str::to_ascii_lowercase),
+                port: parsed.port_or_known_default().unwrap_or(0),
+                allow_private_network,
+            },
+            Err(_) => Self {
+                scheme: String::new(),
+                host: base_url.trim().to_string(),
+                port: 0,
+                allow_private_network,
+            },
+        }
+    }
 }
 
 /// Circuit breaker state for an upstream origin.
@@ -52,28 +82,44 @@ impl OriginBreaker {
         Self::default()
     }
 
-    /// Evaluates Check C7 for this origin. Returns true if request is admitted.
-    pub fn is_admitted(&mut self, now_ms: i64) -> bool {
+    /// Evaluates Check C7 without claiming the half-open probe slot.
+    ///
+    /// Eligibility and preflight evaluation must not mutate the breaker, so the
+    /// probe slot is only taken by [`Self::try_acquire`] immediately before an
+    /// upstream attempt.
+    #[must_use]
+    pub fn is_admitted(&self, now_ms: i64) -> bool {
         match self.state {
             BreakerState::Closed => true,
+            BreakerState::Open { until_ms } => now_ms >= until_ms,
+            BreakerState::HalfOpen { probe_in_flight } => !probe_in_flight,
+        }
+    }
+
+    /// Claims admission for one upstream attempt. Returns `Some(is_probe)` when
+    /// admitted, where `is_probe` marks the single half-open probe slot, or
+    /// `None` when the breaker rejects the attempt (C7).
+    pub fn try_acquire(&mut self, now_ms: i64) -> Option<bool> {
+        match self.state {
+            BreakerState::Closed => Some(false),
             BreakerState::Open { until_ms } => {
                 if now_ms >= until_ms {
                     self.state = BreakerState::HalfOpen {
                         probe_in_flight: true,
                     };
-                    true
+                    Some(true)
                 } else {
-                    false
+                    None
                 }
             }
-            BreakerState::HalfOpen {
-                ref mut probe_in_flight,
-            } => {
-                if *probe_in_flight {
-                    false
+            BreakerState::HalfOpen { probe_in_flight } => {
+                if probe_in_flight {
+                    None
                 } else {
-                    *probe_in_flight = true;
-                    true
+                    self.state = BreakerState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    Some(true)
                 }
             }
         }
@@ -154,5 +200,37 @@ impl OriginBreaker {
             };
         }
         &mut self.buckets[idx]
+    }
+}
+
+/// RAII permit for one admitted upstream attempt.
+///
+/// If the attempt is a half-open probe and no outcome is recorded (client
+/// disconnect, cancellation, panic, or timeout), `Drop` releases the probe slot
+/// so the origin cannot wedge in `HalfOpen` forever (REL-5, Section 21.5).
+#[derive(Debug)]
+pub struct OriginProbeGuard {
+    breaker: Arc<Mutex<OriginBreaker>>,
+    is_probe: bool,
+}
+
+impl OriginProbeGuard {
+    #[must_use]
+    pub fn new(breaker: Arc<Mutex<OriginBreaker>>, is_probe: bool) -> Self {
+        Self { breaker, is_probe }
+    }
+}
+
+impl Drop for OriginProbeGuard {
+    fn drop(&mut self) {
+        if !self.is_probe {
+            return;
+        }
+        let mut breaker = self.breaker.lock();
+        if let BreakerState::HalfOpen { probe_in_flight } = &mut breaker.state
+            && *probe_in_flight
+        {
+            *probe_in_flight = false;
+        }
     }
 }
