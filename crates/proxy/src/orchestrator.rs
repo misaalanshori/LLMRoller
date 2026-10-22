@@ -11,10 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_compression::tokio::bufread::{
+    BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder,
+};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
-use axum::http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -60,10 +63,11 @@ use llmroller_store::usage_writer::{UsageAttemptRecord, UsageEventRecord};
 use llmroller_store::writer::{DurableKey, DurableOp};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::auth::ProxyAuthState;
 use crate::failover::{TryOutcome, select_terminal_error};
-use crate::forward::{PreFirstFrameBuffer, SseChunkForwarder};
+use crate::forward::{ForwardError, PreFirstFrameBuffer, SseChunkForwarder, decompress_chunk};
 use crate::lifecycle::{RequestLifecycle, Termination};
 
 /// Maximum upstream tries per request; mirrors the `usage_attempts.attempt_no` bound.
@@ -2335,9 +2339,59 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
+fn upstream_content_encoding(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"))
+        .map(ToOwned::to_owned)
+}
+
+fn decode_upstream_body(encoding: Option<&str>, body: Bytes) -> Result<Bytes, ForwardError> {
+    match encoding {
+        Some(encoding) => decompress_chunk(encoding, &body).map(Bytes::from),
+        None => Ok(body),
+    }
+}
+
+type UpstreamByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// Decode a possibly compressed upstream body as a stateful stream so chunk boundaries
+/// never matter (TRN-3). Unsupported encodings fail the stream and trigger failover.
+fn decode_upstream_stream(
+    response: reqwest::Response,
+    encoding: Option<String>,
+) -> UpstreamByteStream {
+    let raw = response
+        .bytes_stream()
+        .map(|result| result.map_err(std::io::Error::other));
+    let Some(encoding) = encoding else {
+        return Box::pin(raw);
+    };
+    let normalized = encoding.to_ascii_lowercase();
+    let reader = StreamReader::new(raw);
+    match normalized.as_str() {
+        "gzip" => Box::pin(ReaderStream::new(GzipDecoder::new(reader))),
+        "deflate" => Box::pin(ReaderStream::new(DeflateDecoder::new(reader))),
+        "zlib" => Box::pin(ReaderStream::new(ZlibDecoder::new(reader))),
+        "br" => Box::pin(ReaderStream::new(BrotliDecoder::new(reader))),
+        "zstd" => Box::pin(ReaderStream::new(ZstdDecoder::new(reader))),
+        _ => {
+            let message = format!("unsupported content-encoding: {encoding}");
+            Box::pin(stream::once(async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                ))
+            }))
+        }
+    }
+}
+
 struct StreamState {
-    upstream:
-        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    upstream: UpstreamByteStream,
     pending: VecDeque<Bytes>,
     forwarder: SseChunkForwarder,
     finalizer: Option<StreamFinalizer>,
@@ -3257,8 +3311,9 @@ pub async fn handle_inference_request(
         if is_streaming {
             if status.is_success() {
                 let upstream_headers = response.headers().clone();
+                let content_encoding = upstream_content_encoding(&upstream_headers);
                 let mut buffer = PreFirstFrameBuffer::new(status, upstream_headers.clone());
-                let mut upstream = Box::pin(response.bytes_stream());
+                let mut upstream = decode_upstream_stream(response, content_encoding);
                 let mut tap = SseUsageTap::new(endpoint);
                 let mut first_chunk: Option<Bytes> = None;
                 let mut failure = false;
@@ -3527,7 +3582,10 @@ pub async fn handle_inference_request(
                 &request_id.to_string(),
                 &candidate.config.response_header_allow,
             );
+            let content_encoding = upstream_content_encoding(response.headers());
             let bytes = response.bytes().await.unwrap_or_default();
+            let bytes =
+                decode_upstream_body(content_encoding.as_deref(), bytes).unwrap_or_default();
             drop(reservation);
             let mut builder = Response::builder().status(status);
             for (name, value) in headers_out {
@@ -3551,6 +3609,7 @@ pub async fn handle_inference_request(
         );
         let status_value = response.status();
         let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        let content_encoding = upstream_content_encoding(response.headers());
         let body_bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -3561,6 +3620,25 @@ pub async fn handle_inference_request(
                     candidate.upstream_key_id,
                     llmroller_core::usage::AttemptOutcome::ConnectError,
                     Some(502),
+                    body.len(),
+                    0,
+                    "none",
+                ));
+                failovers += 1;
+                try_outcomes.push(TryOutcome::HostFailure);
+                continue;
+            }
+        };
+        let body_bytes = match decode_upstream_body(content_encoding.as_deref(), body_bytes) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                attempts.push(attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                    Some(status_value.as_u16()),
                     body.len(),
                     0,
                     "none",

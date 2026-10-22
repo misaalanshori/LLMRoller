@@ -65,9 +65,9 @@ smallvec = "1.15.1"
 
 # Async runtime and HTTP stack
 tokio = { version = "1.54.0", features = ["full"] }
-tokio-util = "0.7.20"
+tokio-util = { version = "0.7.20", features = ["io"] }
 futures-util = "0.3.32"
-async-compression = { version = "0.4.18", default-features = false, features = ["tokio", "gzip", "deflate", "brotli", "zstd"] }
+async-compression = { version = "0.4.18", default-features = false, features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
 flate2 = "1.1.10"
 brotli = "9.0.0"
 zstd = "0.14.3"

@@ -3,6 +3,7 @@
 //! Spec: Section 9.5, Section 13.4
 //! Requirements: API-1, MDL-7, USG-7
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,6 +15,8 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use tempfile::tempdir;
 use tower::ServiceExt as _;
 
@@ -63,6 +66,61 @@ async fn spawn_mock() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+const GZIP_SSE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-gzip\",\"object\":\"chat.completion.chunk\",",
+    "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chatcmpl-gzip\",\"object\":\"chat.completion.chunk\",",
+    "\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,",
+    "\"total_tokens\":10}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+fn gzip(payload: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(payload).expect("compress mock response");
+    encoder.finish().expect("finish gzip")
+}
+
+async fn mock_gzip_chat() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CONTENT_ENCODING, "gzip"),
+        ],
+        gzip(CHAT_JSON.as_bytes()),
+    )
+        .into_response()
+}
+
+async fn mock_gzip_sse() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CONTENT_ENCODING, "gzip"),
+        ],
+        gzip(GZIP_SSE.as_bytes()),
+    )
+        .into_response()
+}
+
+async fn spawn_gzip_mock(streaming: bool) -> SocketAddr {
+    let app = if streaming {
+        Router::new().route("/chat/completions", post(mock_gzip_sse))
+    } else {
+        Router::new().route("/chat/completions", post(mock_gzip_chat))
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gzip mock listener");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -396,6 +454,124 @@ async fn test_usage_and_key_reflect_live_monthly_spend_and_openrouter_shape() {
     let auth_json = response_json(auth_key).await;
     assert_eq!(auth_json["used_this_month_micro_usd"], 2000);
     assert_eq!(auth_json["data"]["usage"], 0.002);
+}
+
+#[tokio::test]
+#[doc = "Spec: TRN-3 — F14 non-streaming gzip is decoded for the client and usage tap"]
+async fn test_gzip_non_streaming_response_is_decoded_and_accounted() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "gzip-nonstream").await;
+    let token = create_client_key(&harness, user, "gzip-nonstream-key", None, None).await;
+    let addr = spawn_gzip_mock(false).await;
+    let provider = create_provider(
+        &harness,
+        "gzip-nonstream",
+        format!("http://{addr}"),
+        OwnershipScope::Global,
+        None,
+    )
+    .await;
+    let key = create_upstream_key(&harness, provider, "gzip-nonstream", None).await;
+    let model = insert_model(&harness, "gpt-4o").await;
+    insert_route(&harness, key, model, "gpt-4o").await;
+
+    let app = build_app(&harness).await;
+    let inference = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("inference");
+    assert_eq!(inference.status(), StatusCode::OK);
+    assert!(
+        inference.headers().get(header::CONTENT_ENCODING).is_none(),
+        "the proxy must return identity bytes after transparent decoding"
+    );
+    let body = to_bytes(inference.into_body(), usize::MAX)
+        .await
+        .expect("collect inference body");
+    let response: serde_json::Value =
+        serde_json::from_slice(&body).expect("decoded response must be JSON");
+    assert_eq!(response["usage"]["total_tokens"], 1500);
+
+    flush(&harness).await;
+    let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
+        "SELECT input_uncached_tokens, output_tokens FROM usage_events ORDER BY ts DESC LIMIT 1",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("usage event");
+    assert_eq!((input_tokens, output_tokens), (1000, 500));
+}
+
+#[tokio::test]
+#[doc = "Spec: TRN-3 — F14 gzip SSE is decoded across chunk boundaries"]
+async fn test_gzip_streaming_response_is_decoded_and_accounted() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "gzip-stream").await;
+    let token = create_client_key(&harness, user, "gzip-stream-key", None, None).await;
+    let addr = spawn_gzip_mock(true).await;
+    let provider = create_provider(
+        &harness,
+        "gzip-stream",
+        format!("http://{addr}"),
+        OwnershipScope::Global,
+        None,
+    )
+    .await;
+    let key = create_upstream_key(&harness, provider, "gzip-stream", None).await;
+    let model = insert_model(&harness, "gpt-4o").await;
+    insert_route(&harness, key, model, "gpt-4o").await;
+
+    let app = build_app(&harness).await;
+    let inference = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("inference");
+    assert_eq!(inference.status(), StatusCode::OK);
+    assert!(
+        inference.headers().get(header::CONTENT_ENCODING).is_none(),
+        "the proxy must not forward the upstream content-encoding"
+    );
+    let body = to_bytes(inference.into_body(), usize::MAX)
+        .await
+        .expect("collect inference body");
+    let text = String::from_utf8(body.to_vec()).expect("SSE must be plain text");
+    assert!(
+        text.contains("data: "),
+        "decoded SSE frames must reach the client"
+    );
+    assert!(text.contains("chat.completion.chunk"));
+    assert!(!body.starts_with(&[0x1f, 0x8b]), "gzip magic must not leak");
+
+    flush(&harness).await;
+    let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
+        "SELECT input_uncached_tokens, output_tokens FROM usage_events ORDER BY ts DESC LIMIT 1",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("usage event");
+    assert_eq!((input_tokens, output_tokens), (7, 3));
 }
 
 #[tokio::test]

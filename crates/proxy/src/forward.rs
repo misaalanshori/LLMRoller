@@ -20,6 +20,9 @@ use thiserror::Error;
 /// Maximum bytes held in pre-first-frame buffer before auto-committing per Section 10.5.3.
 pub const HOLD_BUFFER_MAX_BYTES: usize = 65_536;
 
+/// Hard ceiling for a single buffered decompression (SEC-8).
+pub const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Forwarding and stream processing errors.
 #[derive(Debug, Error)]
 pub enum ForwardError {
@@ -27,6 +30,8 @@ pub enum ForwardError {
     UpstreamError(String),
     #[error("unsupported content-encoding: {0}")]
     UnsupportedEncoding(String),
+    #[error("decompressed {label} output exceeds the {limit}-byte limit")]
+    DecompressionLimit { label: &'static str, limit: usize },
     #[error("decompression I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -160,40 +165,83 @@ impl SseChunkForwarder {
     }
 }
 
-/// Synchronous / chunk decompression helper for transparent upstream decompression fallback per Section 12.4.
-pub fn decompress_chunk(encoding: &str, compressed: &[u8]) -> Result<Vec<u8>, ForwardError> {
+/// Read at most [`MAX_DECOMPRESSED_BYTES`] from a decoder, rejecting bombs (SEC-8).
+fn read_bounded<R: io::Read>(reader: R, label: &'static str) -> Result<Vec<u8>, ForwardError> {
     use std::io::Read as _;
 
-    match encoding.to_ascii_lowercase().as_str() {
-        "gzip" => {
-            let mut decoder = flate2::read::GzDecoder::new(compressed);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(ForwardError::Io)?;
-            Ok(out)
-        }
-        "deflate" => {
-            let mut decoder = flate2::read::DeflateDecoder::new(compressed);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(ForwardError::Io)?;
-            Ok(out)
-        }
-        "zlib" => {
-            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(ForwardError::Io)?;
-            Ok(out)
-        }
-        "br" => {
-            let mut decoder = brotli::Decompressor::new(compressed, 4096);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(ForwardError::Io)?;
-            Ok(out)
-        }
+    let mut limited = reader.take((MAX_DECOMPRESSED_BYTES as u64).saturating_add(1));
+    let mut out = Vec::new();
+    limited.read_to_end(&mut out).map_err(ForwardError::Io)?;
+    if out.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(ForwardError::DecompressionLimit {
+            label,
+            limit: MAX_DECOMPRESSED_BYTES,
+        });
+    }
+    Ok(out)
+}
+
+/// Synchronous full-body decompression helper for transparent upstream decompression fallback
+/// per Section 12.4 and bounded buffering per SEC-8.
+pub fn decompress_chunk(encoding: &str, compressed: &[u8]) -> Result<Vec<u8>, ForwardError> {
+    let encoding = encoding.trim().to_ascii_lowercase();
+    match encoding.as_str() {
+        "gzip" => read_bounded(flate2::read::GzDecoder::new(compressed), "gzip"),
+        "deflate" => read_bounded(flate2::read::DeflateDecoder::new(compressed), "deflate"),
+        "zlib" => read_bounded(flate2::read::ZlibDecoder::new(compressed), "zlib"),
+        "br" => read_bounded(brotli::Decompressor::new(compressed, 4096), "brotli"),
         "zstd" => {
-            let out = zstd::decode_all(compressed).map_err(ForwardError::Io)?;
-            Ok(out)
+            let decoder = zstd::stream::read::Decoder::new(compressed).map_err(ForwardError::Io)?;
+            read_bounded(decoder, "zstd")
         }
-        "identity" => Ok(compressed.to_vec()),
+        "identity" | "" => Ok(compressed.to_vec()),
         other => Err(ForwardError::UnsupportedEncoding(other.to_owned())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    #[test]
+    #[doc = "Spec: SEC-8 - bounded decompression rejects a gzip bomb above the cap"]
+    fn decompress_chunk_rejects_gzip_bomb_above_cap() {
+        let payload = vec![0u8; MAX_DECOMPRESSED_BYTES + 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+
+        let error = decompress_chunk("gzip", &compressed).expect_err("bomb must be rejected");
+        assert!(
+            matches!(
+                error,
+                ForwardError::DecompressionLimit {
+                    label: "gzip",
+                    limit: MAX_DECOMPRESSED_BYTES
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: TRN-3 - supported encodings decode to the original identity body"]
+    fn decompress_chunk_roundtrips_gzip_and_identity() {
+        let payload = br#"{"usage":{"total_tokens":7}}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+
+        assert_eq!(
+            decompress_chunk(" GZIP ", &compressed).expect("gzip decode"),
+            payload
+        );
+        assert_eq!(
+            decompress_chunk("identity", payload).expect("identity decode"),
+            payload
+        );
     }
 }
