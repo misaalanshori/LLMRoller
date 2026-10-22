@@ -164,18 +164,26 @@ async fn test_backup_cli_exit_codes_and_integrity() {
     let data_dir = dir.path();
     let backup_dest = data_dir.join("cli_backup.db");
 
-    // 1. First backup succeeds with exit code 0
+    // 1. First backup succeeds with exit code 0 and reports the DB's active key id,
+    // not a stale LLMROLLER_MASTER_KEY_ID from the invoking environment.
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
         .arg("backup")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--out")
         .arg(&backup_dest)
+        .env("LLMROLLER_MASTER_KEY_ID", "stale-env-id")
         .output()
         .await
         .expect("run llmroller backup");
     assert_eq!(output.status.code(), Some(0));
     assert!(backup_dest.exists());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("backup JSON summary");
+    assert_eq!(
+        summary["master_key_id"], "key-0",
+        "backup must report instance_meta.active_master_key_id from the database"
+    );
 
     // 2. Second backup without --overwrite fails with exit code 6 (REL-6, Section 5.5.1)
     let output2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))

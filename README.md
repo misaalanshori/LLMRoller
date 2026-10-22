@@ -435,10 +435,14 @@ Commands:
 ```bash
 llmroller serve \
   --data-dir /var/lib/llmroller \
-  --data-listen 0.0.0.0:8080 \
-  --control-listen 127.0.0.1:8081 \
+  --listen 0.0.0.0:8080 \
+  --admin-listen 127.0.0.1:8081 \
   --metrics-listen 127.0.0.1:9090
 ```
+
+Listener values can also come from `LLMROLLER_LISTEN`, `LLMROLLER_ADMIN_LISTEN`, and
+`LLMROLLER_METRICS_LISTEN`; explicit flags take precedence over environment
+variables, which take precedence over the built-in defaults.
 
 Executes the formal 10-step startup sequence (lock acquisition, schema migration, instance secret unsealing, writer and reloader task spawning, startup budget reconstruction, and `/readyz` flip). Handles `SIGTERM` / `SIGINT` with an 8-step graceful drain and WAL checkpoint.
 
@@ -456,9 +460,12 @@ Re-encrypts all database secrets when updating master keys:
 ```bash
 export LLMROLLER_MASTER_KEY_OLD="old_base64_key=="
 export LLMROLLER_MASTER_KEY_NEW="new_base64_key=="
-export LLMROLLER_MASTER_KEY_ID="key-v2"
 
-llmroller rotate-master-key --db /var/lib/llmroller/llmroller.db
+llmroller rotate-master-key \
+  --old-key-env LLMROLLER_MASTER_KEY_OLD \
+  --new-key-env LLMROLLER_MASTER_KEY_NEW \
+  --new-key-id key-v2 \
+  --data-dir /var/lib/llmroller
 ```
 
 *State machine operates in 500-row transactions (`BEGIN IMMEDIATE`) and records progression in `instance_meta.rotation_state`. If terminated midway, rerun the command to resume.*
@@ -469,11 +476,11 @@ Audits the cryptographic HMAC chain and anchor sequence:
 
 ```bash
 # Verify integrity across the entire log
-llmroller verify-audit-log --db /var/lib/llmroller/llmroller.db
+llmroller verify-audit-log --data-dir /var/lib/llmroller
 
 # Verify against an emitted anchor log line (detects tail truncation)
 llmroller verify-audit-log \
-  --db /var/lib/llmroller/llmroller.db \
+  --data-dir /var/lib/llmroller \
   --anchor-seq 500 \
   --anchor-hash 9f83c12... \
   --json
@@ -485,9 +492,12 @@ Performs an online, non-blocking backup with directory `fsync` and PRAGMA integr
 
 ```bash
 llmroller backup \
-  --db /var/lib/llmroller/llmroller.db \
+  --data-dir /var/lib/llmroller \
   --out /var/backups/llmroller-backup.db
 ```
+
+The JSON summary reports the database's `instance_meta.active_master_key_id`;
+`LLMROLLER_MASTER_KEY_ID` does not need to be set for `backup`.
 
 *Exits with code `6` if the backup file fails SQLite integrity verification.*
 
@@ -497,12 +507,13 @@ Reset an admin account password from the host terminal when locked out:
 
 ```bash
 llmroller reset-admin \
-  --db /var/lib/llmroller/llmroller.db \
-  --username admin \
-  --password "NewSecurePassword123!"
+  --data-dir /var/lib/llmroller \
+  --username admin
 ```
 
-*Appends an `admin.break_glass` audit row to the cryptographic audit log.*
+*Generates a temporary password, prints it once to `stderr`, sets
+`must_change_password = 1`, and appends an `admin.break_glass` audit row to the
+cryptographic audit log.*
 
 ### Container Healthcheck (`healthcheck`)
 
@@ -523,14 +534,14 @@ llmroller healthcheck --url http://127.0.0.1:8080/readyz
 | :--- | :--- | :--- |
 | `LLMROLLER_MASTER_KEY` | *(None)* | Primary 256-bit base64 AEAD master key. |
 | `LLMROLLER_MASTER_KEY_FILE` | *(None)* | Path to file containing master key (trims trailing whitespace). |
-| `LLMROLLER_MASTER_KEY_ID` | `"key-0"` | Identifier for key version tracking and AAD binding. |
-| `LLMROLLER_DATA_DIR` | `"/var/lib/llmroller"` | Directory for SQLite database, WAL, and setup token. |
-| `LLMROLLER_DATABASE_PATH` | `"$DATA_DIR/llmroller.db"` | Explicit path override for SQLite database file. |
-| `LLMROLLER_DATA_LISTEN` | `"0.0.0.0:8080"` | Address and port for proxy data plane. |
-| `LLMROLLER_CONTROL_LISTEN`| `"127.0.0.1:8081"` | Address and port for Web UI and admin API. |
-| `LLMROLLER_METRICS_LISTEN`| `"127.0.0.1:9090"` | Address and port for Prometheus scraper. |
+| `LLMROLLER_MASTER_KEY_ID` | *(required)* | Identifier for key version tracking and AAD binding; missing or empty exits `3` (`SEC-2`). |
+| `LLMROLLER_DATA_DIR` | `"/var/lib/llmroller"` | Directory for SQLite database, WAL, lock file, and setup token. |
+| `LLMROLLER_LISTEN` | `"0.0.0.0:8080"` | Address and port for the proxy data plane. |
+| `LLMROLLER_ADMIN_LISTEN` | `"127.0.0.1:8081"` | Address and port for the Web UI and admin API. |
+| `LLMROLLER_METRICS_LISTEN`| `"127.0.0.1:9090"` | Address and port for the Prometheus scraper. |
 | `LLMROLLER_TRUSTED_PROXIES`| `""` | Comma-separated CIDRs of reverse proxies (e.g. `"10.0.0.0/8,172.16.0.0/12"`). |
-| `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB`| `819` | Maximum pooled memory for in-flight pre-buffered request bodies. |
+| `LLMROLLER_REQUIRE_TLS` | `false` | When `true`, rejects a non-loopback data listener without TLS or trusted proxies. |
+| `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB`| `min(1024, floor(0.40 * memory_limit_mb))` | Maximum pooled memory for in-flight pre-buffered request bodies. |
 | `RUST_LOG` | `"info"` | Tracing log level filter (`error`, `warn`, `info`, `debug`, `trace`). |
 
 ### Dynamic Runtime Settings

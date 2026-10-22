@@ -5,6 +5,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::net::TcpListener;
+use std::process::Stdio;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -114,4 +115,155 @@ async fn test_serve_cli_boots_serves_readyz_and_handles_lock_contention() {
 
     // 4. Terminate child process cleanly
     let _ = child.kill().await;
+}
+
+#[doc = "Spec: POR-1, REL-1, Section 5.6"]
+#[tokio::test]
+async fn test_serve_honors_listener_environment_and_cli_precedence() {
+    let key_b64 = BASE64.encode([0x43; 32]);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .expect("client");
+
+    let env_dir = tempdir().expect("env temp dir");
+    let env_data = format!("127.0.0.1:{}", get_available_port());
+    let env_admin = format!("127.0.0.1:{}", get_available_port());
+    let env_metrics = format!("127.0.0.1:{}", get_available_port());
+    let mut env_child = tokio::process::Command::new(llmroller_binary())
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(env_dir.path())
+        .arg("--dev-insecure-cookies")
+        .env("LLMROLLER_LISTEN", &env_data)
+        .env("LLMROLLER_ADMIN_LISTEN", &env_admin)
+        .env("LLMROLLER_METRICS_LISTEN", &env_metrics)
+        .env("LLMROLLER_MASTER_KEY", &key_b64)
+        .env("LLMROLLER_MASTER_KEY_ID", "key-env-test")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn env-configured serve");
+
+    let env_ready = format!("http://{env_data}/readyz");
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(resp) = client.get(&env_ready).send().await
+            && resp.status().is_success()
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "LLMROLLER_LISTEN must move the data listener");
+
+    client
+        .get(format!("http://{env_admin}/admin"))
+        .send()
+        .await
+        .expect("admin listener must follow LLMROLLER_ADMIN_LISTEN");
+    let env_metrics_resp = client
+        .get(format!("http://{env_metrics}/metrics"))
+        .send()
+        .await
+        .expect("metrics listener must follow LLMROLLER_METRICS_LISTEN");
+    assert!(env_metrics_resp.status().is_success());
+    let _ = env_child.kill().await;
+
+    let flag_dir = tempdir().expect("flag temp dir");
+    let flag_data = format!("127.0.0.1:{}", get_available_port());
+    let flag_admin = format!("127.0.0.1:{}", get_available_port());
+    let flag_metrics = format!("127.0.0.1:{}", get_available_port());
+    let mut flag_child = tokio::process::Command::new(llmroller_binary())
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(flag_dir.path())
+        .arg("--listen")
+        .arg(&flag_data)
+        .arg("--admin-listen")
+        .arg(&flag_admin)
+        .arg("--metrics-listen")
+        .arg(&flag_metrics)
+        .arg("--dev-insecure-cookies")
+        .env("LLMROLLER_LISTEN", "127.0.0.1:1")
+        .env("LLMROLLER_ADMIN_LISTEN", "127.0.0.1:1")
+        .env("LLMROLLER_METRICS_LISTEN", "127.0.0.1:1")
+        .env("LLMROLLER_MASTER_KEY", &key_b64)
+        .env("LLMROLLER_MASTER_KEY_ID", "key-env-test")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn flag-configured serve");
+
+    let flag_ready = format!("http://{flag_data}/readyz");
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(resp) = client.get(&flag_ready).send().await
+            && resp.status().is_success()
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(
+        ready,
+        "explicit listener flags must override LLMROLLER_* listener variables"
+    );
+    client
+        .get(format!("http://{flag_admin}/admin"))
+        .send()
+        .await
+        .expect("explicit --admin-listen must override LLMROLLER_ADMIN_LISTEN");
+    let flag_metrics_resp = client
+        .get(format!("http://{flag_metrics}/metrics"))
+        .send()
+        .await
+        .expect("explicit --metrics-listen must override LLMROLLER_METRICS_LISTEN");
+    assert!(flag_metrics_resp.status().is_success());
+    let _ = flag_child.kill().await;
+}
+
+#[doc = "Spec: SEC-2, Section 5.5.1"]
+#[tokio::test]
+async fn test_serve_fails_closed_when_master_key_id_is_missing_or_empty() {
+    let key_b64 = BASE64.encode([0x44; 32]);
+
+    for (label, value) in [("missing", None), ("empty", Some(""))] {
+        let dir = tempdir().expect("temp dir");
+        let mut command = tokio::process::Command::new(llmroller_binary());
+        command
+            .arg("serve")
+            .arg("--data-dir")
+            .arg(dir.path())
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .arg("--admin-listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .arg("--metrics-listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .env("LLMROLLER_MASTER_KEY", &key_b64)
+            .env_remove("LLMROLLER_MASTER_KEY_ID")
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(value) = value {
+            command.env("LLMROLLER_MASTER_KEY_ID", value);
+        }
+
+        let mut child = command.spawn().expect("spawn serve");
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let Ok(status) = status else {
+            let _ = child.kill().await;
+            panic!("serve started with a {label} LLMROLLER_MASTER_KEY_ID");
+        };
+        assert_eq!(
+            status.expect("serve status").code(),
+            Some(3),
+            "a {label} LLMROLLER_MASTER_KEY_ID must exit 3 per SEC-2"
+        );
+    }
 }

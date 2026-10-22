@@ -78,15 +78,19 @@ pub(crate) enum Command {
 #[derive(Debug, Args)]
 pub(crate) struct ServeArgs {
     /// Data-plane HTTP listener address.
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "LLMROLLER_LISTEN", default_value = "0.0.0.0:8080")]
     pub(crate) listen: String,
 
     /// Control-plane HTTP listener address.
-    #[arg(long, default_value = "127.0.0.1:8081")]
+    #[arg(long, env = "LLMROLLER_ADMIN_LISTEN", default_value = "127.0.0.1:8081")]
     pub(crate) admin_listen: String,
 
     /// Metrics listener address.
-    #[arg(long, default_value = "127.0.0.1:9090")]
+    #[arg(
+        long,
+        env = "LLMROLLER_METRICS_LISTEN",
+        default_value = "127.0.0.1:9090"
+    )]
     pub(crate) metrics_listen: String,
 
     /// Data directory containing `llmroller.db` and `llmroller.lock`.
@@ -218,7 +222,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         let code = u8::try_from(e.exit_code()).unwrap_or(3);
         CliFailure::new(code, e.to_string())
     })?;
-    let master_key_id = load_master_key_id_from_env().unwrap_or_else(|_| "mk_default".to_string());
+    let master_key_id = load_master_key_id_from_env().map_err(|error| {
+        let code = u8::try_from(error.exit_code()).unwrap_or(3);
+        CliFailure::new(code, error.to_string())
+    })?;
 
     // 3. Connect SQLite pool (Role::Writer) and run forward-only migrations
     let database = data_dir.join("llmroller.db");
@@ -701,7 +708,6 @@ async fn run_backup_cmd(args: BackupArgs) -> ExitCode {
 
 async fn backup_command(args: BackupArgs) -> Result<serde_json::Value, CliFailure> {
     let data_dir = resolve_data_dir(args.data_dir);
-    let master_key_id = load_master_key_id_from_env().unwrap_or_else(|_| "key-0".to_string());
     let database = data_dir.join("llmroller.db");
     if !database.exists() {
         return Err(CliFailure::new(
@@ -712,6 +718,23 @@ async fn backup_command(args: BackupArgs) -> Result<serde_json::Value, CliFailur
     let pool = open_pool(&database, Role::cli_read_write())
         .await
         .map_err(|e| CliFailure::new(13, format!("cannot open database: {e}")))?;
+
+    // REL-6: the exported summary identifies the instance's active key, not a
+    // possibly stale value inherited from the invoking shell.
+    let master_key_id: String =
+        sqlx::query_scalar("SELECT active_master_key_id FROM instance_meta WHERE singleton = 1")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| CliFailure::new(13, format!("cannot read instance metadata: {e}")))?
+            .ok_or_else(|| {
+                CliFailure::new(
+                    10,
+                    format!(
+                        "database is not an initialized LLMRoller instance: {}",
+                        database.display()
+                    ),
+                )
+            })?;
 
     let res =
         llmroller_server::backup::run_backup(&pool, &args.out, args.overwrite, &master_key_id)

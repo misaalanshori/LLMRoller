@@ -90,7 +90,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 
 # CLI and errors
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 askama = "0.16.1"
