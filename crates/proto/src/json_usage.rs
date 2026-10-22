@@ -42,6 +42,9 @@ pub fn extract_json_usage(
 
 pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
     let usage = json.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
     let prompt_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -96,7 +99,16 @@ pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsag
 }
 
 pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
-    let usage = json.get("usage")?;
+    // Non-streaming responses expose top-level `usage`; streaming terminal events
+    // (`response.completed`, `response.incomplete`, `response.failed`) nest it
+    // under `response.usage` (Section 2.5, Section 12.5).
+    let usage = json.get("usage").or_else(|| {
+        json.get("response")
+            .and_then(|response| response.get("usage"))
+    })?;
+    if !usage.is_object() {
+        return None;
+    }
     let input_tokens = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
@@ -140,6 +152,9 @@ pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<Extracte
 
 pub fn extract_messages_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
     let usage = json.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
     let input_tokens = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
@@ -156,6 +171,10 @@ pub fn extract_messages_json_usage(json: &serde_json::Value) -> Option<Extracted
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let cost_f64 = usage.get("cost").and_then(|v| v.as_f64());
     let provider_cost_micro_usd = parse_provider_cost(cost_f64);
@@ -165,7 +184,7 @@ pub fn extract_messages_json_usage(json: &serde_json::Value) -> Option<Extracted
         cache_read_tokens: cache_read,
         cache_write_tokens: cache_write,
         output_tokens,
-        reasoning_tokens: 0,
+        reasoning_tokens,
         provider_cost_micro_usd,
     })
 }

@@ -63,19 +63,19 @@ impl SseUsageTap {
                 return;
             }
 
-            // Injected usage chunk detection (choices:[] and usage:{...}) (API-5)
-            if trimmed.contains(&b"\"choices\":[]"[0])
-                && (trimmed.windows(12).any(|w| w == b"\"choices\":[]")
-                    || trimmed.windows(13).any(|w| w == b"\"choices\": []"))
-                && (trimmed.windows(7).any(|w| w == b"\"usage\"")
-                    || trimmed.windows(8).any(|w| w == b"\"usage\":"))
-            {
-                self.saw_injected_usage_chunk = true;
-            }
-
-            // Attempt JSON parse when line can carry usage or delta content
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(trimmed) {
-                self.extract_from_json(&v);
+            // Attempt JSON parse when line can carry usage or delta content.
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(trimmed) {
+                // Injected usage chunk detection (choices:[], usage:{...}) (API-5).
+                // Parse structurally so whitespace variants are still suppressed.
+                if value
+                    .get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && value.get("usage").is_some_and(serde_json::Value::is_object)
+                {
+                    self.saw_injected_usage_chunk = true;
+                }
+                self.extract_from_json(&value);
             }
         }
     }
@@ -87,64 +87,125 @@ impl SseUsageTap {
                 if let Some(u) = extract_chat_json_usage(json) {
                     self.observed_usage = Some(u);
                 }
-                // Accumulate delta text for aborted stream estimation
+                // Accumulate every output-bearing delta for aborted stream estimation.
                 if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                     for choice in choices {
-                        if let Some(delta) = choice.get("delta") {
-                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                self.accumulated_output_text_bytes += content.len();
+                        let Some(delta) = choice.get("delta") else {
+                            continue;
+                        };
+                        for field in ["content", "reasoning_content", "reasoning"] {
+                            if let Some(text) = delta.get(field).and_then(|c| c.as_str()) {
+                                self.accumulated_output_text_bytes += text.len();
                             }
-                            if let Some(reasoning) =
-                                delta.get("reasoning_content").and_then(|c| c.as_str())
-                            {
-                                self.accumulated_output_text_bytes += reasoning.len();
+                        }
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|c| c.as_array())
+                        {
+                            for tool_call in tool_calls {
+                                if let Some(arguments) = tool_call
+                                    .pointer("/function/arguments")
+                                    .and_then(|a| a.as_str())
+                                {
+                                    self.accumulated_output_text_bytes += arguments.len();
+                                }
                             }
+                        }
+                        // Legacy single-function-call shape used by some compatible APIs.
+                        if let Some(arguments) = delta
+                            .pointer("/function_call/arguments")
+                            .and_then(|a| a.as_str())
+                        {
+                            self.accumulated_output_text_bytes += arguments.len();
                         }
                     }
                 }
             }
             EndpointKind::Responses => {
-                let ev = self.current_event.as_deref().unwrap_or("");
-                let is_resp_event = ev == "response.completed"
-                    || ev == "response.created"
-                    || ev == "response.incomplete"
-                    || ev == "response.failed"
-                    || json.get("usage").is_some();
-                if is_resp_event && let Some(u) = extract_responses_json_usage(json) {
+                let event_type = self
+                    .current_event
+                    .as_deref()
+                    .or_else(|| json.get("type").and_then(|t| t.as_str()))
+                    .unwrap_or("");
+                let is_usage_event = matches!(
+                    event_type,
+                    "response.created"
+                        | "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                ) || json.get("usage").is_some()
+                    || json
+                        .get("response")
+                        .is_some_and(|response| response.get("usage").is_some());
+                if is_usage_event && let Some(u) = extract_responses_json_usage(json) {
                     self.observed_usage = Some(u);
                 }
-                // Accumulate delta output text
+                // Responses deltas (`output_text`, reasoning summary, function arguments)
+                // carry the incremental string in `delta`.
+                if let Some(delta) = json.get("delta").and_then(|d| d.as_str()) {
+                    self.accumulated_output_text_bytes += delta.len();
+                }
                 if let Some(output) = json.get("output_text").and_then(|o| o.as_str()) {
                     self.accumulated_output_text_bytes += output.len();
                 }
             }
             EndpointKind::Messages => {
-                let ev = self.current_event.as_deref().unwrap_or("");
-                if ev == "message_start" {
+                let event_type = self
+                    .current_event
+                    .as_deref()
+                    .or_else(|| json.get("type").and_then(|t| t.as_str()))
+                    .unwrap_or("");
+                if event_type == "message_start" {
                     if let Some(message) = json.get("message")
                         && let Some(u) = extract_messages_json_usage(message)
                     {
                         self.observed_usage = Some(u);
                     }
-                } else if ev == "message_delta" {
+                } else if event_type == "message_delta" {
                     if let Some(delta_usage) = json.get("usage") {
-                        let out_toks = delta_usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        if let Some(ref mut u) = self.observed_usage {
-                            u.output_tokens = out_toks;
+                        self.merge_messages_usage(delta_usage);
+                    }
+                } else if event_type == "content_block_delta"
+                    && let Some(delta) = json.get("delta")
+                {
+                    for field in ["text", "thinking", "partial_json"] {
+                        if let Some(text) = delta.get(field).and_then(|t| t.as_str()) {
+                            self.accumulated_output_text_bytes += text.len();
                         }
                     }
-                } else if ev == "content_block_delta"
-                    && let Some(delta) = json.get("delta")
-                    && let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                {
-                    self.accumulated_output_text_bytes += text.len();
                 }
             }
             _ => {}
         }
+    }
+
+    /// Merges cumulative `message_delta` usage with the last observed message usage.
+    fn merge_messages_usage(&mut self, usage: &serde_json::Value) {
+        let mut merged = self.observed_usage.unwrap_or_default();
+        if let Some(tokens) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+            merged.input_uncached_tokens = tokens;
+        }
+        if let Some(tokens) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            merged.cache_read_tokens = tokens;
+        }
+        if let Some(tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            merged.cache_write_tokens = tokens;
+        }
+        if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+            merged.output_tokens = tokens;
+        }
+        if let Some(tokens) = usage.get("reasoning_tokens").and_then(|v| v.as_i64()) {
+            merged.reasoning_tokens = tokens;
+        }
+        if let Some(cost) = usage.get("cost").and_then(|v| v.as_f64()) {
+            merged.provider_cost_micro_usd =
+                llmroller_core::pricing::parse_provider_cost(Some(cost));
+        }
+        self.observed_usage = Some(merged);
     }
 
     /// Finalizes token usage: uses observed usage if received, else estimates aborted output (USG-3).

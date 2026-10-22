@@ -171,6 +171,111 @@ fn test_aborted_stream_text_estimation() {
     assert_eq!(est2.output_tokens, 2500);
 }
 
+#[doc = "Spec: API-5, USG-1, USG-2, USG-3"]
+#[test]
+fn test_responses_sse_extracts_nested_response_completed_usage_and_delta_bytes() {
+    let mut tap = SseUsageTap::new(EndpointKind::Responses);
+
+    // Some compatible providers omit the `event:` line and only carry `type`.
+    tap.feed_chunk(
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello world\"}\n\n",
+    );
+    tap.feed_chunk(
+        b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":25,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n",
+    );
+
+    assert_eq!(tap.accumulated_output_text_bytes, 11);
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.input_uncached_tokens, 90);
+    assert_eq!(usage.cache_read_tokens, 10);
+    assert_eq!(usage.output_tokens, 25);
+    assert_eq!(usage.reasoning_tokens, 5);
+}
+
+#[doc = "Spec: API-5, USG-1, USG-2, USG-3"]
+#[test]
+fn test_responses_sse_null_usage_does_not_clobber_aborted_estimation() {
+    let mut tap = SseUsageTap::new(EndpointKind::Responses);
+    tap.feed_chunk(b"data: {\"type\":\"response.created\",\"response\":{\"usage\":null}}\n\n");
+    tap.feed_chunk(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n");
+
+    assert!(
+        tap.observed_usage.is_none(),
+        "a null usage object must not be treated as observed usage"
+    );
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.output_tokens, 2);
+}
+
+#[doc = "Spec: API-5, USG-1, USG-2, USG-3"]
+#[test]
+fn test_messages_sse_accumulates_thinking_and_input_json_and_merges_message_delta_usage() {
+    let mut tap = SseUsageTap::new(EndpointKind::Messages);
+    tap.feed_chunk(
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":80,\"output_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":10,\"reasoning_tokens\":3}}}\n\n",
+    );
+    tap.feed_chunk(
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"deep\"}}\n\n",
+    );
+    tap.feed_chunk(
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n\n",
+    );
+    assert_eq!(tap.accumulated_output_text_bytes, 4 + 12);
+
+    // message_delta carries cumulative output plus refreshed input/cache counts.
+    tap.feed_chunk(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":90,\"output_tokens\":45,\"cache_read_input_tokens\":30,\"cache_creation_input_tokens\":11}}\n\n",
+    );
+
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.input_uncached_tokens, 90);
+    assert_eq!(usage.cache_read_tokens, 30);
+    assert_eq!(usage.cache_write_tokens, 11);
+    assert_eq!(usage.output_tokens, 45);
+    assert_eq!(usage.reasoning_tokens, 3);
+
+    // Absent fields in a later message_delta preserve the last observed values.
+    tap.feed_chunk(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":46}}\n\n",
+    );
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.input_uncached_tokens, 90);
+    assert_eq!(usage.cache_read_tokens, 30);
+    assert_eq!(usage.cache_write_tokens, 11);
+    assert_eq!(usage.output_tokens, 46);
+}
+
+#[doc = "Spec: API-5, USG-1, USG-2, USG-3"]
+#[test]
+fn test_chat_sse_accumulates_tool_arguments_and_openrouter_reasoning() {
+    let mut tap = SseUsageTap::new(EndpointKind::Chat);
+    tap.feed_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\",\"reasoning\":\"think\",\"reasoning_content\":\"plan\"}}]}\n\n",
+    );
+    tap.feed_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+    );
+
+    // No upstream usage frame: estimate from every decoded output delta.
+    assert_eq!(tap.accumulated_output_text_bytes, 2 + 5 + 4 + 12);
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.output_tokens, 6);
+}
+
+#[doc = "Spec: API-5, USG-1, USG-2"]
+#[test]
+fn test_injected_usage_chunk_detection_tolerates_json_whitespace() {
+    let mut tap = SseUsageTap::new(EndpointKind::Chat);
+    tap.feed_chunk(b"data: {\"choices\" : [ ] , \"usage\" : {\"prompt_tokens\": 7, \"completion_tokens\": 2}}\n\n");
+    assert!(
+        tap.saw_injected_usage_chunk,
+        "structurally empty choices with an object usage must be detected"
+    );
+    let usage = tap.finalize_usage();
+    assert_eq!(usage.input_uncached_tokens, 7);
+    assert_eq!(usage.output_tokens, 2);
+}
+
 #[doc = "Spec: API-5, USG-1, USG-2"]
 #[test]
 fn test_openrouter_cost_parsing() {
