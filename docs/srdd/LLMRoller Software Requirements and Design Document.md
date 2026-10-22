@@ -1,7 +1,7 @@
 <!-- Generated file - edit the numbered parts -->
 # LLMRoller: Software Requirements and Design Document
 
-Version 1.3 · 20 October 2026 · Complete software requirements, architecture, pluggable routing strategy engine, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, concurrency/recovery model, Docker containerization & deployment specification, and TDD specification.
+Version 2.0 · 22 October 2026 · Complete software requirements, architecture, pluggable routing strategy engine, `/usage` pass-through, opt-in content traceability and chat preview, multi-role RBAC, machine principal service accounts, dual-stream inference & API request logs with slide-over inspection drawer, list-price vs. plan-covered cost breakdown popovers, dual-theme Web UI specification (`14.a`–`14.z`), concurrency/recovery model, Docker containerization & deployment specification, and TDD specification.
 
 
 ## 0. Introduction
@@ -23,7 +23,11 @@ Sections 1 through 8 define what the system must do, who uses it, and how securi
 | Session pinning, response-link inheritance, pluggable routing strategies (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`), and per-model priority overrides | Automatic cross-protocol request translation in the base release |
 | Local cost accounting plus source provider `/usage` polling, decaying observation reconciliation, and pass-through | Unconditional or silent prompt logging (content recording is off by default and strictly opt-in) |
 | Admin opt-in content traceability mode with content-addressed encrypted turn storage and read-only session chat preview | Automatic cross-tenant prompt inspection on shared personal keys |
-| Single static Rust binary, distroless Docker and Compose deployment profiles, SQLite in WAL mode, and an embedded HTMX web interface | External single-page JavaScript build pipelines or CDN asset dependencies |
+| Machine principal Service Accounts (`service_accounts`), up to 64 IPv4/IPv6 CIDR restrictions per service account, child API key lifecycle (`Active`, `Paused`, `Revoked`, `Expired`), and aggregated service-account KPI cards | Unscoped anonymous API access or shared plaintext bearer keys |
+| Interactive Connection Setup Wizard (protocol format cards for OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages), dynamic base URL copy widget, and One-Click Agent Setup (`Connect CLI`) | Proprietary desktop electron wrappers required for basic proxy configuration |
+| Dual-stream Logs Explorer (`Inference` request logs + `API` control-plane logs) with a 460px right-side slide-over Request Detail Inspection Drawer (`Request`, `Model`, `Tokens`, `Identity`, `Client`, `Request headers`, `Metadata`) | Unbounded retention of raw authorization headers or unredacted bearer secrets in logs |
+| Granular Usage Ledger with 5-metric Token Summary Strip, Initiator/Model/Date pill filters, subscription plan coverage badges (`Covered by <Plan> credits`), and interactive `Credit usage breakdown` popover (`Plan contribution multiplier`) | External third-party SaaS telemetry ingestion or cloud analytics trackers |
+| Dual-theme embedded HTMX Web UI (OpenCode high-contrast Dark Mode `#0d0d0d` and OpenDesign clean Light Mode `#ffffff`) with adaptive Top-Tab + Split-Pane and Collapsible Left Sidebar navigation shells | External single-page JavaScript build pipelines or CDN asset dependencies |
 
 ### 0.2 Requirement priorities and conventions
 
@@ -60,6 +64,12 @@ The terms in the table below have one fixed meaning throughout all twenty-three 
 | Upstream usage snapshot | The quota, credit, and reset-time record retrieved from a source provider's native usage or key endpoint, feeding a time-bounded `UpstreamObservation`. |
 | Content traceability mode | An admin-controlled opt-in setting that records compressed, encrypted request and response contents (prompts, reasoning, tool calls, and completions) using content-addressed blocks (`trace_blocks`) and turn records (`trace_records`). |
 | Session chat preview | A read-only dashboard view that reconstructs and renders the multi-turn conversation timeline across all traced requests sharing a pinned `session_hash`. |
+| Service account | A named machine principal (`service_accounts`, e.g., `agents`, `testing`, `bots`, `ci`) scoped to a user or organization workspace that groups multiple child client API keys, enforces shared IPv4/IPv6 CIDR allow-lists (up to 64 entries), and aggregates cost, request, and token KPIs (`CLK-6`). |
+| Paused client key | A reversible client key state (`paused_at IS NOT NULL, disabled = 1`) toggled inline via `Pause key` / `Resume key` in the Web UI that temporarily rejects data-plane calls at Gate `G2` without destroying the key record or permanently revoking its identity (`CLK-7`). |
+| Connection setup profile | The interactive two-step onboarding widget on the API Keys and Overview screens that maps a user's selected wire format (`OpenAI · Chat Completions`, `OpenAI · Responses`, or `Anthropic · Messages`) to the exact LLMRoller base URL and CLI environment snippet (`CLK-7`). |
+| Control-plane API log | An audit/telemetry record in `control_plane_logs` capturing every HTTP request to `/api/user/*` and `/admin/api/*` (`Time`, `Status`, `Method`, `Endpoint`, `User`, `Duration`), viewable in the `Logs > API` sub-tab (`AUD-2`, `USG-9`). |
+| Request inspection drawer | A 460px right-docked slide-over panel in the `Logs > Inference` view that displays complete per-request telemetry across seven sections (`Request`, `Model`, `Tokens`, `Identity`, `Client`, `Request headers`, and `Metadata`) with `<` / `>` sequential row stepping (`USG-9`). |
+| List-price cost vs. plan-covered cost | The separation between unadjusted base price-book token cost (`list_cost_micro_usd`) and effective billed/quota cost (`cost_micro_usd`) after applying a provider subscription's `plan_multiplier_bps` (e.g., `× 0.25` Design Plan contribution multiplier or `× 2.0` peak schedule), surfaced in the interactive `Credit usage breakdown` popover (`USG-10`). |
 
 ### 0.4 Document map
 
@@ -81,7 +91,33 @@ The specification is split into twenty-three numbered Markdown files (`0` throug
 | `11. SRDD - Session Identification and Hints.md` | Session identification and hints | Eight-step inbound session extraction, response-link inheritance, hashing, and outbound hints |
 | `12. SRDD - Protocol Handling and Transparent Proxying.md` | Protocol handling and transparent proxying | Request and response header policies, surgical body edits, streaming tee, and token extraction |
 | `13. SRDD - Pricing, Limits, and Source Provider Usage Engine.md` | Pricing, limits, and source provider usage engine | Price book math, generalized rolling and anchored windows, reservations, and `/usage` observation sync |
-| `14. SRDD - API and Web UI Specification.md` | API and web UI specification | Proxy routes, error envelopes, user and admin JSON APIs, and HTMX dashboard screens |
+| `14. SRDD - API and Web UI Specification.md` | API and web UI specification (Master Index) | Data-plane `/v1/*` routes, error envelopes, control-plane JSON APIs (`/api/user/*`, `/admin/api/*`), and master architecture map for sub-specifications `14.a` through `14.z` |
+| `14.a. SRDD - Web UI Design System, Dual-Theme Tokens, and Typography.md` | Web UI design system & tokens | OpenCode Dark (`#0d0d0d`) and OpenDesign Light (`#ffffff`) CSS custom properties, semantic status colors, typography, and spacing scale |
+| `14.b. SRDD - Application Shell, Dual Navigation Modes, and Workspace Switcher.md` | Application shell & navigation | Top utility bar (48px), workspace switcher (`Personal` vs `Default`/`Admin`), horizontal underline module tabs (44px), collapsible left sidebar mode, and `⌘K` command palette |
+| `14.c. SRDD - HTMX Architecture, Event Delegation, and Strict CSP Runtime.md` | HTMX & strict CSP architecture | Askama template inheritance, HTMX partial swap contracts, `hx-headers` CSRF binding, zero-inline-JS event delegation, and `script-src 'self'` enforcement |
+| `14.d. SRDD - First-Run Setup, Login, TOTP Enrollment, and Session Security UI.md` | Authentication & session UI | First-admin bootstrap `/setup`, CSRF-protected `/login`, TOTP QR enrollment & recovery codes, password rotation, and active web sessions manager |
+| `14.e. SRDD - Overview Analytics Dashboard and KPI Summary Cards.md` | Overview dashboard & KPI cards | 3-card executive KPI row (`Cost`, `Requests`, `Tokens`), date-range picker (`Last 24h`, `Last 7 days`, `Last 30 days`, `All time`), `Connect CLI`, and `A6` disk meter |
+| `14.f. SRDD - Time-Series Daily Cost and Token Histogram Charts (uPlot).md` | Daily cost & token bar charts | Segmented `Cost` / `Tokens` chart toggle, dynamic Y-axis scaling (`$0`..`$N`), daily X-axis histogram bars, hover tooltips, and zero-CDN `uPlot` configuration |
+| `14.g. SRDD - Usage by Model Breakdown Table and Provider Badges.md` | Usage by model breakdown table | Per-model table (`Model`, `Requests`, `Input`, `Cache Read`, `Cache Write`, `Output`, `Cost ↓`), `<N> models · <M> providers` badge, `[GO]`/`[OD]` icons, and `Free` pills |
+| `14.h. SRDD - Connection Setup Wizard, API Format Switcher, and One-Click Agent Setup.md` | Connection setup & format switcher | 2-step `Connection setup` card (`Chat Completions`, `Responses`, `Messages` radio cards + dynamic copyable base URL) and `One-click agent setup` modal |
+| `14.i. SRDD - Client API Keys Management, Inline Lifecycle Actions, and Rotation UI.md` | Client API keys & lifecycle UI | `My API keys` table, search by name/prefix, `● Active` / `● Paused` pills, `Permissions` (`All`/`Restricted`), and inline `Rename`, `Pause key`, `Resume key`, `Rotate`, and `Revoke` actions |
+| `14.j. SRDD - Service Accounts Directory and Machine Principal Management.md` | Service accounts directory UI | `Settings > Service Accounts` master table (`Name`, `Keys`, `Active keys`, `Created`, `IP restrictions`), search toolbar, and `+ Add Service Account` workflow |
+| `14.k. SRDD - Service Account Detail View, CIDR IP Restrictions, and Child Keys.md` | Service account detail & CIDRs | `Service Accounts > <name>` drill-down, resizable `Allowed IP addresses` textarea (up to 64 IPv4/IPv6 CIDRs), 3-card service account KPIs, and child API keys table |
+| `14.l. SRDD - Dual-Stream Logs Explorer (Inference vs Control-Plane API Logs).md` | Dual-stream logs explorer | `Logs` view with `Inference` (7-column) vs `API` (5-column) segmented switcher, semantic status dots (`200`, `429 Rejected`, `403 Rejected`), `Filter` builder, refresh, and export |
+| `14.m. SRDD - Request Detail Slide-Over Inspection Drawer.md` | Request detail inspection drawer | 460px right-docked slide-over drawer over dimmed backdrop, `<` / `>` row navigation, and 7 sections (`Request`, `Model`, `Tokens`, `Identity`, `Client`, `Request headers`, `Metadata`) |
+| `14.n. SRDD - Usage Ledger, 5-Token Summary Strip, and Initiator-Model-Date Pill Filters.md` | Granular usage ledger & strip | `Usage` screen with `All initiators`, `All models`, and date-range pill dropdowns, 5-metric token summary strip, and chronological usage records table |
+| `14.o. SRDD - Credit and Cost Breakdown Popover and Plan Coverage Multipliers.md` | Credit & cost breakdown popover | Struck-through list price (`~$0.0024~`), `Covered by <Plan> credits` badge, and floating dark `Credit usage breakdown` popover (`Plan contribution multiplier × 0.25`) |
+| `14.p. SRDD - Personal and Global Providers, Presets, and Upstream Key Cards.md` | Providers & upstream key cards | Built-in preset and custom provider forms, `ProviderConfigJson` editor, upstream key cards with live `RuntimeState` health badges, `Test`, and `Reset Health` |
+| `14.q. SRDD - Plan and Balance Dashboard, Budget Windows, and Source Usage Gauges.md` | Plan, balance & window gauges | Side-by-side local 360-bucket ring spend and `UpstreamObservation` gauges (`5h`, `7d`, `1mo`), reset countdowns, decrypted raw `/usage` JSON modal, and calibration |
+| `14.r. SRDD - Consented Personal Sharing, Outgoing Grants, and Incoming Share Acceptance UI.md` | Personal sharing & consent UI | Outgoing share creation (`allowed_models`, `max_monthly_micro_usd`, per-grantee spend) and Incoming Shares (`Shared With Me`) destination disclosure & fingerprint acceptance |
+| `14.s. SRDD - Routing Matrix, Pluggable Strategy Selector, and Per-Model Weight Overrides.md` | Routing matrix & strategy UI | Model-by-key routing matrix, `project_key` `"Global pool"` aggregation, 6-strategy `RoutingStrategy` selector, inline `priority_override` editing, and headroom scaling |
+| `14.t. SRDD - Active Sessions Pin Manager and Client-Key Recently Active Sessions Drawer.md` | Active sessions & key sessions drawer | 10s-polled `Active Sessions` pin table, constant-session warning badge, `Unpin` / `Move Pin` controls, and per-client-key `Recently Active Sessions` drawer (`TRC-9`) |
+| `14.u. SRDD - Read-Only Session Chat Preview and Turn Trace Inspector UI.md` | Session chat preview UI | Multi-turn conversation replay, live `current_pins` header badges, subagent thread selector, system/tool accordions, `<pre>` reasoning/tool blocks, and `ammonia` Markdown |
+| `14.v. SRDD - Canonical Model Catalog, Cross-Vendor Merge Review, Aliases, and Price Book UI.md` | Model catalog & price book UI | Canonical model table, `exposed` kill-switch, `pending_review` cross-vendor merge confirmation, `model_pk` merge/split modals, aliases, and tiered/scheduled price editor |
+| `14.w. SRDD - Settings Sub-Navigation Layout (General, Members, Billing, Security, Privacy).md` | Settings sub-navigation layout | Split-pane `Settings` module with 180px left vertical sidebar (`General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`) and 14-key runtime settings forms |
+| `14.x. SRDD - Audit Log Explorer, Hash-Chain Verification Status, and Deleted Users UI.md` | Audit log & chain verification UI | Hash-chained `audit_log` explorer, `audit_anchor` integrity status indicator, event detail JSON drawer, and `deleted_users` historical attribution directory |
+| `14.y. SRDD - Accessibility (WCAG 2.1 AA), Keyboard Navigation, Internationalization, and Responsive Breakpoints.md` | Accessibility, i18n & responsiveness | WCAG 2.1 AA contrast validation across Dark/Light themes, keyboard navigation (`⌘K`, `<`/`>`, `Esc`), ARIA live regions, `[EN]` locale selector, and responsive breakpoints |
+| `14.z. SRDD - Complete Web UI Component Inventory, Askama Template Map, and Declarative UI Specifications.md` | Master UI inventory & `ui-spec` map | Exhaustive component-to-template-to-handler traceability matrix and declarative `ui-spec` structural pseudocode trees for every screen, drawer, modal, and popover |
 | `15. SRDD - Technology Choices and Workspace Layout.md` | Technology choices and workspace layout | Rust crates, versions, `xtask` tooling, and multi-crate repository structure |
 | `16. SRDD - Testing Plan and TDD Governance.md` | Testing plan and TDD governance | Strict TDD, boundary rules, failure taxonomy, mocking, mutation tests, and traceability |
 | `17. SRDD - Roadmap and Milestones.md` | Roadmap and milestones | Dependency-ordered delivery milestones and exit criteria |
@@ -91,6 +127,15 @@ The specification is split into twenty-three numbered Markdown files (`0` throug
 | `21. SRDD - Concurrency, Lifecycle, and Failure-Recovery Model.md` | Concurrency, lifecycle, and failure-recovery model | Memory budgets, lock hierarchy, reloader ordering, writer durability queues, `RequestLifecycle`, and supervision |
 | `22. SRDD - Deployment and Containers.md` | Deployment and containers | Multi-stage `Dockerfile`, distroless and dev images, `docker-compose.yml` topologies, environment contract, and container healthchecks |
 | `requirements.toml` | Machine-readable requirement registry | Authoritative TOML mapping of requirement IDs to priorities, milestones, and delivering sub-phases |
+
+### 0.5 Web UI sub-specification architecture (`14.a` through `14.z`)
+
+Because LLMRoller's embedded control plane serves both human operators (`admin` and `user`) and machine-principal administrators (`service_accounts`) without an external JavaScript SPA framework, Section 14 is partitioned into a master API & Web UI specification (`14. SRDD - API and Web UI Specification.md`) and twenty-six normative sub-documents (`14.a` through `14.z`). These sub-documents specify:
+1. **Visual & Interaction Foundations (`14.a`–`14.d`)**: Dual-theme CSS custom properties (`#0d0d0d` OpenCode Dark and `#ffffff` OpenDesign Light), adaptive navigation shells (Top Horizontal Module Bar with Split-Pane Settings vs. Collapsible Left Sidebar), strict-CSP HTMX partial swap contracts, and authentication/TOTP/session security flows.
+2. **Executive Analytics & Onboarding (`14.e`–`14.h`)**: The `Overview` dashboard, 3-card KPI summaries, `Daily Cost` / `Tokens` segmented `uPlot` bar histograms, `Usage by Model` breakdown tables with provider badges, and the interactive 2-step `Connection setup` format switcher (`Chat Completions`, `Responses`, `Messages`) with `One-click agent setup`.
+3. **IAM, Service Accounts & Client Key Lifecycle (`14.i`–`14.k`)**: The `My API keys` table with inline `Rename`, `Pause key` / `Resume key`, `Rotate`, and `Revoke` controls, the `Settings > Service Accounts` directory, and the `Service Accounts > <name>` drill-down view with 64-entry IPv4/IPv6 CIDR allow-lists and child key roll-ups.
+4. **Telemetry, Dual-Stream Logs & Cost Attribution (`14.l`–`14.o`)**: The `Logs` explorer with `Inference` (7-column) vs. `API` (5-column) segmented streams, the 460px right-docked Request Detail Inspection Drawer, the `Usage` ledger with 5-metric Token Summary Strip and pill filters, and the interactive `Credit usage breakdown` popover (`Plan contribution multiplier`).
+5. **Providers, Quotas, Sharing, Routing & Traceability (`14.p`–`14.z`)**: Provider & key cards, `Plan & balance` dual window gauges, consented personal sharing, the `Routing Matrix` with 6 pluggable strategies, `Active Sessions` & per-key `Recently Active Sessions` drawers, `Session Chat Preview`, `Model Catalog & Price Book`, `Settings`, `Audit Log`, WCAG 2.1 AA accessibility, and the master `ui-spec` component inventory.
 
 ## 1. Summary
 
@@ -123,6 +168,17 @@ The system design rests on nine engineering decisions that govern every module i
 | Opt-in content traceability | Record prompts, reasoning, tool calls, and responses when enabled by an admin using content-addressed blocks (`trace_blocks`) and a bounded two-thread compression pool, and render a read-only session chat preview in the dashboard. |
 | Zero-dependency operations | Ship one static Rust binary with an embedded HTMX web interface and one SQLite database in WAL mode. |
 | Strict TDD and mutation testing | Develop all controlled logic under Red-Green-Refactor discipline with full requirement-to-test traceability (`cargo xtask traceability`) and automated mutation testing via [cargo-mutants](https://mutants.rs/). |
+
+| Machine principal service accounts and inline key lifecycle | Group CI, bot, and multi-agent client keys under named Service Accounts (`service_accounts`) with shared IPv4/IPv6 CIDR restrictions (up to 64 CIDRs) and roll-up KPIs (`Cost`, `Requests`, `Tokens`), while supporting instant inline `Pause key` / `Resume key`, `Rename`, and protocol-aware `Connection setup` base URL switching (`CLK-6`, `CLK-7`). |
+| Dual-stream logs explorer and slide-over request inspection | Provide a unified `Logs` explorer with a segmented toggle between `Inference` requests (7-column table) and `API` control-plane requests (5-column table), backed by a 460px right-docked Request Detail Inspection Drawer showing TTFT, stop reason, token breakdown, service account/key identity, session hash, user agent, and sanitized request headers (`USG-9`, `AUD-2`). |
+| List-price vs. plan-covered cost attribution and dual-theme UI | Track both unadjusted model list-price cost (`list_cost_micro_usd`) and effective plan-multiplied cost (`cost_micro_usd` with `plan_multiplier_bps`) so the `Usage` ledger renders struck-through list prices (`~$0.0024~`), `Covered by <Plan> credits` badges, and an interactive `Credit usage breakdown` popover inside a zero-CDN Askama + HTMX interface supporting both OpenCode Dark (`#0d0d0d`) and OpenDesign Light (`#ffffff`) themes (`USG-10`, `UI-5`, `UI-6`). |
+
+### 1.4 End-to-end operator and developer experience
+
+LLMRoller unifies high-throughput Rust proxy engineering with a self-contained, zero-CDN web console that adapts to both individual power users and multi-user engineering teams:
+- **Zero-friction onboarding (`Connection setup` & `Connect CLI`)**: Developers select their coding agent's wire protocol (`OpenAI · Chat Completions`, `OpenAI · Responses`, or `Anthropic · Messages`), copy the protocol-matched base URL (`https://<host>/v1` or `https://<host>`), and launch pre-filled CLI setup snippets for Claude Code, Codex CLI, opencode, and Hermes Agent (`CLK-7`, `Section 14.h`).
+- **Machine principal isolation (`Service Accounts`)**: Automation keys for CI pipelines and bots are organized under named Service Accounts (`agents`, `testing`, `bots`, `ci`) with account-wide IPv4/IPv6 CIDR restrictions (up to 64 CIDRs), aggregated `Cost` / `Requests` / `Tokens` KPI cards, and instant per-key `Pause key` / `Resume key` controls (`CLK-6`, `CLK-7`, `Section 14.j`, `Section 14.k`).
+- **Wire-level observability without privacy compromise (`Logs` & `Usage`)**: Operators inspect every inference and console API call in the Dual-Stream `Logs` explorer, drill into a 460px slide-over Request Detail Drawer (TTFT, stop reason, tokens, identity, session, user-agent, and sanitized headers), and verify subscription credit multipliers (`× 0.25` contribution multiplier or `× 2.0` peak schedule) via the interactive `Credit usage breakdown` popover (`USG-9`, `USG-10`, `Section 14.l`–`14.o`).
 
 ## 2. Research findings
 
@@ -194,9 +250,21 @@ Each inference protocol places token usage in a different event or JSON object d
 | Anthropic Messages (`messages`) | `usage.input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` | `message_start` carries input and cache token counts; `message_delta` carries cumulative output tokens ([Anthropic Messages reference](https://abacus.ai/help/developer-platform/route-llm/anthropic-messages)). |
 | OpenRouter extension | `usage.cost` and `usage.cost_details` | Included in the final usage object on every stream ([OpenRouter usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting)). |
 
+
+### 2.5.1 Empirical UI and telemetry patterns from OpenCode Console and OpenDesign AMR Console
+
+Direct inspection of production provider consoles on 22 October 2026 established four high-value operational and developer-experience patterns that LLMRoller incorporates natively into its control plane:
+
+| Reference source | Observed UI component & workflow | Telemetry / state attributes captured | Integration in LLMRoller (`Section 14.a`–`14.z`) |
+| --- | --- | --- | --- |
+| OpenCode Console (`Settings > Service accounts`, Images 1–2) | Two-level IAM hierarchy: a master `Service Accounts` directory (`Name`, `Keys`, `Active keys`, `Created`, `IP restrictions`) drilling down into `Service Accounts > <name>` with an `Allowed IP addresses` textarea (up to 64 IPv4/IPv6 addresses or CIDRs), 3 KPI cards (`Cost`, `Requests`, `Tokens`), and a child `API Keys` table (`Key` name + monospace prefix, `Permissions`: `All` vs `Restricted`, `Status`: `Active`, `Last used`, `Expires`). | Per-service-account CIDR allow-lists inherited by all child keys; roll-up cost/request/token counters filtered by time window (`All time`, `Last 7 days`, `Last 30 days`); derived permission scope (`All` vs `Restricted`). | `service_accounts` table (`Section 9.1`), Gate `G4` service-account CIDR inheritance (`Section 10.0`), and `14.j` / `14.k` UI specifications (`CLK-6`). |
+| OpenCode Console (`Overview`, Images 3–4, 8–9) | Centered analytics container (`980px`) with `Connect CLI` and date-range picker (`Last 7 days`, `All time`), 3 KPI summary cards (`Cost`, `Requests`, `Tokens`), a `Daily Cost` vertical bar chart with a segmented `Cost` \| `Tokens` pill toggle and dashed Y-axis gridlines (`$0`..`$7`), and a `Usage by Model` table with `<N> models · <M> providers` badge, monochrome provider badges (`[GO]`), `Free` model badges, and columns `Model`, `Requests`, `Input`, `Cache Read`, `Cache Write`, `Output`, `Cost ↓`. | Daily bucketed spend and token series; per-model aggregated requests, uncached input, cache read, cache write (`-` when zero), output tokens, and descending cost sort (`<$0.01` for sub-cent spend, `$0.00` for free models). | `Overview` dashboard (`14.e`), `uPlot` bar chart toggle (`14.f`), and `Usage by Model` breakdown table (`14.g`, `UI-6`). |
+| OpenCode Console (`Logs`, Images 5–7, 10) | Full-width `Logs` explorer (`1140px`) with a segmented `Inference` \| `API` toggle, `Filter` button, date range picker, refresh (`↻`), and export (`↓`). Clicking any `Inference` row dims the background table and opens a 460px right-docked slide-over drawer with sticky `<` / `>` sequential row navigation and 7 sections: `Request` (`Request ID` + copy, `HTTP status`, `Stop reason`, `Endpoint`, `Method`, `Streaming`, `Protocol`, `Product`, `Time to first token`), `Model`, `Tokens` (`Input`, `Output`, `Reasoning`, `Cache read`, `Cost`), `Identity` (`Service account`, `Key`), `Client` (`Session`, `User agent`, `Location`), `Request headers` (bordered key-value table), and `Metadata`. | Dual-stream separation of `/v1/*` inference calls (`usage_events`) and `/api/*` console calls (`control_plane_logs`); sanitized non-secret request headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`); `stop_reason` and `ttfb_ms`. | `control_plane_logs` table (`Section 9.1`), extended `usage_events` telemetry columns, `14.l` Dual-Stream Logs Explorer, and `14.m` Request Detail Inspection Drawer (`USG-9`, `AUD-2`). |
+| OpenDesign AMR Console (`API keys` & `Usage`, Images 1–4) | Collapsible left-sidebar light-mode workspace featuring: (1) a 2-step `Connection setup` card (`1. Which API format does your tool use?` with selectable cards for `OpenAI Chat Completions`, `OpenAI Responses`, and `Anthropic Messages`; `2. Copy the API base URL for this format` with dynamic URL and `Copy URL` button) plus `One-click agent setup`; (2) `My API keys` table with `● Active` / `● Paused` badges and inline `Rename`, `Pause key` / `Resume key`, and `Revoke` pill buttons; (3) `Usage` ledger with `All initiators`, `All models`, and `Last 30 days` / `Last 7 days` pill filters, a 5-metric token summary strip (`Total`, `Input`, `Output`, `Cache read`, `Cache write`), struck-through list cost `~$0.0024~ (i)` with `Covered by Design Plan credits`, and a dark floating `Credit usage breakdown` popover showing per-token-type rates, `Model list-price subtotal`, `Plan contribution multiplier (× 0.25)`, and `Actual Plan credits used ($0.0006)`. | Reversible key pause (`paused_at`), protocol-specific base URL routing (`/v1` vs root), list-price vs. plan-multiplied cost accounting (`list_cost_micro_usd`, `plan_multiplier_bps`, `billing_coverage_mode`). | `14.h` Connection Setup Wizard, `14.i` Client Keys Inline Actions (`CLK-7`), `14.n` Usage Ledger & 5-Token Strip, and `14.o` Credit Breakdown Popover (`USG-10`). |
+
 ### 2.6 Summary of findings that drive the architecture
 
-Eleven empirical findings shape the requirements and design in the remaining sections.
+Fifteen empirical findings shape the requirements and design in the remaining sections.
 
 | Finding ID | Topic | Architectural implication |
 | --- | --- | --- |
@@ -211,6 +279,10 @@ Eleven empirical findings shape the requirements and design in the remaining sec
 | F9 | Multi-user key isolation | Teams share pooled global keys while individuals also bring personal subscriptions or share a personal key with a teammate. The router enforces strict ownership and share scopes. |
 | F10 | Supply-chain hardening | Gateways hold high-value credentials and are prime targets, as shown by the [March 2026 LiteLLM PyPI compromise](https://docs.litellm.ai/blog/security-update-march-2026). LLMRoller ships as a minimal, audited Rust binary. |
 | F11 | Session-pinned chat reconstruction | Because agents send a stable session ID per conversation, opt-in recording of request and SSE response turns lets the dashboard render a read-only chat preview per session. |
+| F12 | Machine principal service accounts and CIDR inheritance | Teams run multiple headless coding agents (`agents`, `ci`, `bots`, `testing`) that share network egress CIDRs and budgets. Grouping keys under Service Accounts with shared 64-entry IPv4/IPv6 CIDR allow-lists and roll-up KPIs avoids duplicating IP rules across dozens of keys (`CLK-6`). |
+| F13 | Reversible client key pause and protocol-aware base URLs | Developers frequently pause a key during debugging (`● Paused`) without wanting to revoke it and break configured scripts, and need protocol-specific base URLs (`OpenAI Chat Completions`, `OpenAI Responses`, `Anthropic Messages`) surfaced directly above their key list (`CLK-7`). |
+| F14 | Dual-stream inference vs. control-plane log inspection | Operators troubleshooting `429 Rejected` or `403 Rejected` errors need a slide-over request inspector showing TTFT, stop reason, token breakdown, session ID, user-agent, and sanitized HTTP headers alongside a separate `API` control-plane request log stream (`USG-9`, `AUD-2`). |
+| F15 | List-price vs. plan-covered cost attribution | Coding plans apply promotional or tier multipliers (such as OpenDesign's `× 0.25` contribution multiplier or Command Code's `× 2.0` weekday peak schedule). Recording both `list_cost_micro_usd` and `plan_multiplier_bps` lets the UI show struck-through list prices alongside actual plan credits consumed in an interactive breakdown popover (`USG-10`). |
 
 ## 3. Goals, non-goals, and assumptions
 
@@ -218,7 +290,7 @@ This section establishes the operational goals, explicit version 1.0 boundaries,
 
 ### 3.1 Goals
 
-LLMRoller pursues nine measurable engineering goals in version 1.0.
+LLMRoller pursues twelve measurable engineering goals in version 1.0.
 
 | ID | Goal | Success measure |
 | --- | --- | --- |
@@ -231,6 +303,9 @@ LLMRoller pursues nine measurable engineering goals in version 1.0.
 | G7 | Operate as a single, low-overhead static Rust binary with an embedded web interface. | Idle memory stays under 50 MB, and p99 proxy overhead before first upstream byte stays under 5 ms at 500 req/s. |
 | G8 | Enforce strict Test-Driven Development and mutation testing across all controlled logic. | Every requirement maps to automated tests in `requirements.toml`, and `cargo-mutants` reports zero unannotated surviving mutants in core routing and protocol crates. |
 | G9 | Support admin opt-in content traceability and a read-only session chat preview. | When enabled by an admin, traced sessions store deduplicated content-addressed blocks and render prompts, reasoning, tool calls, and responses in chronological `(ts, request_id)` order with zero XSS risk. |
+| G10 | Provide first-class machine principal Service Accounts and reversible client key lifecycle controls. | Users and admins can group client keys under named Service Accounts with up to 64 inherited IPv4/IPv6 CIDR rules and roll-up KPIs, and can pause or resume individual client keys within 1 s via `Reloader` without losing session pins (`CLK-6`, `CLK-7`). |
+| G11 | Deliver full-fidelity dual-stream request logging (`Inference` and `API`) and slide-over request inspection with zero credential leakage. | Every proxied inference request and control-plane API call is inspectable in the `Logs` explorer and 460px Request Detail Drawer (including TTFT, stop reason, client user-agent, and sanitized request headers) with zero occurrences of raw bearer keys or cookies (`USG-9`, `AUD-2`, `SEC-6`). |
+| G12 | Surface transparent list-price vs. plan-covered cost attribution across a dual-theme (Dark/Light) zero-CDN Web UI. | Every usage record tracks both base list-price cost and effective plan-multiplied cost (`Credit usage breakdown` popover), rendered at `< 15 ms` server template latency with zero external network asset dependencies (`USG-10`, `UI-5`, `UI-6`). |
 
 ### 3.2 Non-goals for version 1.0
 
@@ -258,7 +333,19 @@ The design relies on six operational assumptions listed in the table below.
 | A3 | Configurable client base URL | Every target client tool (Claude Code, Codex CLI, opencode, Hermes, and standard OpenAI or Anthropic SDKs) lets the user configure a custom base URL and API key. |
 | A4 | TLS endpoint handling | Production deployments handle HTTPS either at an upstream reverse proxy (Caddy, nginx, or Traefik) listed in `LLMROLLER_TRUSTED_PROXIES` with response buffering off, or via LLMRoller's built-in `rustls` listener (`LLMROLLER_TLS_CERT` and `LLMROLLER_TLS_KEY`). |
 | A5 | Rust toolchain and runtime | The project compiles with a pinned stable Rust toolchain (Rust 2024 edition) and runs on Linux (`x86_64` and `aarch64`) and macOS without external runtime dependencies. |
-| A6 | Disk capacity budget | The data directory provides at least `daily_requests * retention_days * 600 B * 1.3` bytes for raw `usage_events` (default 30-day retention capped at 50,000,000 rows) plus `usage_rollups_5min`, `usage_rollups_hourly`, and opt-in `trace_records` and `trace_blocks` storage; the web UI displays projected disk usage. |
+| A6 | Disk capacity budget | The data directory provides at least `daily_requests * retention_days * 750 B * 1.3` bytes for raw `usage_events` (including sanitized `request_headers_json` and `list_cost_micro_usd`, default 30-day retention capped at 50,000,000 rows) plus `control_plane_logs` (30-day retention), `usage_rollups_5min`, `usage_rollups_hourly`, and opt-in `trace_records` and `trace_blocks` storage; the web UI displays projected disk usage. |
+
+### 3.4 UI performance and ergonomics targets
+
+The embedded control plane in `crates/admin` enforces five quantitative UX and resource targets across all screens specified in `Section 14.a` through `14.z`:
+
+| Target ID | Metric | Normative bound |
+| --- | --- | --- |
+| `UX-1` | Server-side Askama HTML + HTMX partial response latency (against 8-reader SQLite pool) | `<= 5 ms` at p50 and `<= 15 ms` at p95 for `Overview`, `Logs`, `Usage`, `Service Accounts`, and `Request Detail Drawer` partials |
+| `UX-2` | Static asset bundle footprint (compiled into binary via `rust-embed`) | `<= 180 KiB` total uncompressed across `/static/app.css`, `/static/app.js`, `/static/htmx.min.js`, `/static/uPlot.iife.min.js`, and inline SVG icons |
+| `UX-3` | Cumulative Layout Shift (`CLS`) during HTMX partial swaps and `uPlot` bar rendering | `0.00` (fixed-height chart containers `240px`, skeleton table rows, and docked `460px` slide-over drawer overlay) |
+| `UX-4` | Contrast ratio across both Dark (`#0d0d0d`) and Light (`#ffffff`) themes | `>= 4.5:1` for all body and muted metadata text; `>= 7.0:1` for primary headings, KPI figures, and active status badges |
+| `UX-5` | Client key lifecycle and Service Account CIDR propagation latency | `<= 1,000 ms` from `Pause key`, `Resume key`, `Revoke`, or `Save IP restrictions` HTTP 200 response to active enforcement in `ConfigSnapshot` |
 
 ## 4. Users, roles, and provider ownership
 
@@ -310,7 +397,9 @@ The control plane enforces strict authorization checks on every HTTP handler and
 | Poll or view source provider `/usage` for an upstream key | Yes (all global and personal keys, including live `?fresh=1`) | Yes (own personal keys including live `?fresh=1`, plus cached sanitized window status on keys shared with them) | Via `GET /v1/usage`, `GET /v1/usage/raw`, and `GET /v1/key` (scoped) |
 | Manage canonical model exposure (`auto`, `forced_on`, `forced_off`), merges, splits, and aliases | Yes | Read-only view of catalog; can enable or disable models on own personal and shared routes | No |
 | Set per-model priority overrides on routes | Yes (global routes and own personal routes) | Yes (own personal and shared routes only via `user_route_preferences`; cannot override weights on global routes) | No |
-| Create, rotate, restrict, or revoke client keys (`llr_...`) | Yes (own keys and any user's keys) | Yes (own client keys only) | Uses key for bearer auth |
+| Create, manage, and set CIDR allow-lists (up to 64 IPv4/IPv6 CIDRs) on Service Accounts (`service_accounts`) | Yes (global/default workspace service accounts, own personal service accounts, and admin override on any user's service accounts) | Yes (own personal service accounts only; receives HTTP 404 on other users' service accounts) | Authenticates via child `llr_...` key |
+| Create, rename, pause, resume, rotate, restrict, or revoke client keys (`llr_...`) | Yes (own keys, service account keys, and any user's keys) | Yes (own personal and own service-account client keys only) | Uses key for bearer auth |
+| Inspect Dual-Stream Logs (`Inference` & `API` control-plane logs), Request Detail Drawer, and `Credit usage breakdown` popovers | Yes (all instance inference and API logs, with `project_key` full admin view) | Yes (strictly scoped to own client keys, own service accounts, and own `/api/user/*` calls, with `project_key` redaction on global/shared keys) | No |
 | View usage dashboard, time series, and CSV or JSON exports | Yes (instance-wide and filtered by any user, key, provider, or model) | Yes (strictly scoped to own client keys and traffic served by own personal keys) | Via `GET /v1/usage` for own client key |
 | View active pins, recently active sessions per client key, or unpin/move pins | Yes (all pins and per-client-key recently active sessions with live pinned provider and upstream key via `/admin/api/pins`, `/admin/api/users/{id}/pins`, and `/admin/api/client-keys/{id}/sessions`) | Yes (pins and recently active sessions belonging to own client keys via `/api/user/pins` and `/api/user/client-keys/{id}/sessions`, with live pinned provider and `project_key`-redacted upstream key) | Implicit via requests (and current session pin via `GET /v1/usage`) |
 | Enable, scope, or purge content traceability mode | Yes (instance-wide and scoped targets; lowering retention takes `"confirm_purge": true`) | No (read-only visibility into whether traceability is active on own traffic) | No |
@@ -377,6 +466,18 @@ When Grantee `B` routes a request through Grantor `A`'s personal key, the usage 
 | Grantor `A` (key owner) | Sees the total tokens and cost consumed on their personal upstream key, plus a per-grantee breakdown showing how much Grantee `B` consumed against the share grant (`SHR-6`). Grantor `A` never sees Grantee `B`'s client key labels, session hashes, or recorded chat transcripts inside LLMRoller (`TRC-8`). |
 | Grantee `B` (share recipient) | Sees the provider kind, `base_url` host, and upstream key label before accepting the share, and sees all requests made by `B`'s own client keys (`shared: <owner_username>/<key_label>`) along with `B`'s remaining monthly share allowance. Grantee `B` never sees Grantor `A`'s own usage, other grantees' usage, account-identifying response headers (`Section 12.1.1` / Section 12.1.1), or raw `/usage` account metadata (`SEC-18`). |
 
+### 4.7 Machine principals: Service Accounts and child API key inheritance (`CLK-6`, `CLK-7`)
+
+Human developers and administrators often run headless coding agents, CI pipelines, and automated evaluation harnesses (`agents`, `testing`, `bots`, `ci`). Rather than mixing automation credentials with personal interactive keys or repeating CIDR rules on every key, LLMRoller models machine principals as **Service Accounts** (`service_accounts`):
+
+| Service account property | Ownership & inheritance rules |
+| --- | --- |
+| Workspace & owner scope (`owner_user_id`, `workspace_scope`) | Every `service_accounts` row is owned by a `users.id` (`owner_user_id`) and tagged with `workspace_scope IN ('personal', 'global')`. Standard users create `'personal'` service accounts visible only in their Personal Workspace (`P Personal`). Admins can create both `'personal'` service accounts and instance-wide `'global'` service accounts (`D Default` / Admin Console). |
+| Account-level IP restrictions (`allowed_cidrs`) | Each service account stores an optional JSON array of up to 64 IPv4/IPv6 addresses or CIDR blocks (configured via a comma- or newline-separated textarea in `Settings > Service accounts > <name>`). Leaving the field blank sets status to `IP restrictions: Unrestricted`. When populated, every child `client_keys` row attached to that `service_account_id` inherits the service account's CIDR allow-list at Request Gate `G4` (if the child key also defines its own `allowed_cidrs`, both the service account allow-list and the key allow-list must admit the client IP). |
+| Child API keys and derived `Permissions` status | A service account can hold zero or more child `client_keys` (`service_account_id = service_accounts.id`). In the Service Account Detail table and `My API keys` table, each key displays a derived `Permissions` badge: `All` when `allowed_models IS NULL AND rate_limit_rpm IS NULL AND budget_micro_usd_month IS NULL AND routing_scope == 'inherit'`, or `Restricted` when any model, rate, budget, or scope restriction is configured. |
+| Reversible `Paused` vs. `Active` lifecycle | Any client key (personal or service-account) can be toggled between `● Active` (`disabled = 0, paused_at IS NULL`) and `● Paused` (`disabled = 1, paused_at = now_ms`) via inline `Pause key` / `Resume key` actions (`POST /api/user/client-keys/{id}/pause` and `/resume`). Pausing a key updates `ConfigSnapshot` within 1 s via `Reloader` so Gate `G2` rejects new calls with HTTP 401 (`client_key_paused`), while preserving existing `PinStore` entries until their natural TTL expiry so resuming the key restores warm session cache locality. |
+| Aggregated Service Account KPIs | The Service Account Detail View (`Service Accounts > <name>`) aggregates `Cost` (`$`), `Requests`, and `Tokens` across all child keys belonging to `service_account_id` over the selected time range (`Last 24h`, `Last 7 days`, `Last 30 days`, `All time`) using `usage_rollups_hourly`. |
+
 ## 5. System architecture
 
 LLMRoller runs as one Rust process made of six internal subsystems. These subsystems share an atomic in-memory configuration snapshot (`ArcSwap<ConfigSnapshot>`), a mutex-guarded in-memory pin store (`PinStore`), and one SQLite database in Write-Ahead Logging (WAL) mode.
@@ -412,7 +513,7 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |                     |                                     ^                 |
 |                     v (Control queue + 3 Data queues)     | (Reloader task) |
 |  +----------------------- Storage & Background Jobs ---------------------+  |
-|  |  - SQLite (WAL mode): 31 tables, dual-queue batching writer actor     |  |
+|  |  - SQLite (WAL mode): 33 tables, dual-queue batching writer actor    |  |
 |  |  - 2-Thread OS Trace Sealer Pool (crossbeam bounded(64) + zstd bulk)  |  |
 |  |  - Supervised Jobs: Model Discovery, Single-Flight /usage Poller,     |  |
 |  |          Price Sync, 5-Min & Hourly Rollups, Retention & Checkpointer |  |
@@ -420,8 +521,9 @@ Client agents (Claude Code, Codex CLI, opencode, Hermes, SDKs)
 |                                       ^                                     |
 |  +------------------- Control Plane Listener (127.0.0.1:8081) -----------+  |
 |  |  - Admin UI & API (/admin/*): Setup, Users, Global Providers, Catalog |  |
-|  |  - User UI & API (/app/*, /api/user/*): Personal Providers, Shares,   |  |
-|  |    Client Keys, Personal Routing Overrides, Scoped Usage & Pins       |  |
+|  |  - User UI & API (/app/*, /api/user/*): Overview, Dual-Stream Logs,   |  |
+|  |    Request Detail Drawer, Usage Ledger & Breakdown Popover, Service   |  |
+|  |    Accounts, Connection Setup, Client Keys, Providers, Shares & Pins  |  |
 |  |  - Metrics Listener (127.0.0.1:9090): Bounded Prometheus /metrics     |  |
 |  +-----------------------------------------------------------------------+  |
 +=============================================================================+
@@ -449,7 +551,7 @@ Every inference request on `/v1/chat/completions`, `/v1/responses`, or `/v1/mess
 
 | Step | Stage | Action taken |
 | --- | --- | --- |
-| 1 | Buffer body and evaluate request gates (`G1`..`G5`) | Read the request body up to `LLMROLLER_MAX_BODY_MB` into a shared `Bytes` buffer, acquire pre-first-byte memory permits from `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (up to `2,000 ms` queue wait, else `503 gateway_busy`), and evaluate gates `G1` (hash match including rotation grace), `G2` (key active), `G3` (owner active), `G4` (CIDR), and `G5` (RPM bucket). Failed `G1`..`G3` checks record in `auth_failure_counters` rather than `usage_events`. |
+| 1 | Buffer body and evaluate request gates (`G1`..`G5`) | Read the request body up to `LLMROLLER_MAX_BODY_MB` into a shared `Bytes` buffer, acquire pre-first-byte memory permits from `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (up to `2,000 ms` queue wait, else `503 gateway_busy`), and evaluate gates `G1` (hash match including rotation grace), `G2` (key active and not paused via `paused_at`, and parent `service_account` not disabled), `G3` (owner active), `G4` (CIDR check against inherited `service_accounts.allowed_cidrs` and `client_key.allowed_cidrs`), and `G5` (RPM bucket). Failed `G1`..`G3` checks record in `auth_failure_counters` rather than `usage_events`. |
 | 2 | Validate JSON envelope (`WIRE`) | Identify the endpoint kind (`Inference`, `Auxiliary`, or `StateBound`) and wire protocol (`chat`, `responses`, or `messages`), scan top-level JSON spans rejecting duplicate keys (`400 invalid_request_error`), non-UTF-8 or BOM prefixes, and type-confused `model` or `stream` fields. |
 | 3 | Resolve canonical model and evaluate gates (`G6`, `G7`) | Normalize the requested model string, resolve through confirmed `model_aliases`, `model_redirects`, `models`, or unambiguous raw `upstream_model_id` to `model_pk`, and evaluate `G6` (`client_key.allowed_models`) and `G7` (client-key monthly accumulator reservation, returning `429 client_key_budget_exhausted` on exhaustion). |
 | 4 | Resolve session identity and routing constraint | Run `resolve_session_and_constraint` (Section 11.1.2): for `responses` requests with `previous_response_id` (or `/v1/responses/{id}/*`), look up `response_links` in `moka` or the SQLite read pool, verify `owner_user_id`, inherit `link.session_hash`, and set `RoutingConstraint::HardKey(link.upstream_key_id)`; otherwise extract the session ID via the eight-step precedence order and compute `session_hash`. |
@@ -458,13 +560,13 @@ Every inference request on `/v1/chat/completions`, `/v1/responses`, or `/v1/mess
 | 7 | Build and send outbound request | Strip client credentials and (on `Shared` and `Global` tiers) all recognized client session carriers, inject the decrypted upstream credential and provider affinity hint, apply surgical JSON edits with `serde_json` string escaping, and connect through `GuardedConnector`. |
 | 8 | Hold pre-first-frame bytes and classify failures | Hold upstream status, headers, and up to `64 KiB` of initial bytes until the first valid non-comment frame is verified. If a failover-eligible failure occurs before commit (and constraint is not `HardKey`), record a `usage_attempts` item, update key/route health or `OriginBreaker`, and call `PinStore::pre_first_byte_failure` (adopting the leader's key if a concurrent turn already advanced `generation`) for up to two retries within `failover_wall_clock_budget_ms` (`60 s`). |
 | 9 | Commit response, confirm pin, and stream | Upon verifying the first valid frame, release the preflight body budget permit, call `PinStore::first_valid_frame(ticket)` to promote the pin to `Confirmed` and enqueue a durable `pins` upsert (plus a durable `response_links` row on `response.created`), apply the response-header policy (Section 12.1.1), flush the held bytes, and stream chunks to the client while running inline `SseUsageTap` and bounded `TraceTap`. |
-| 10 | Finalize via `RequestLifecycle` guard | When the stream completes or aborts (`Completed`, `UpstreamTruncated`, `ClientGone`, `IdleTimeout`, or `ShutdownCut`), `RequestLifecycle::drop` computes actual or estimated cost, updates window rings and monthly accumulators before releasing the in-flight reservation, enqueues `usage_events`, `usage_attempts`, and 5-minute/hourly rollup deltas, and submits any finished turn to the 2-thread trace sealer pool. |
+| 10 | Finalize via `RequestLifecycle` guard | When the stream completes or aborts (`Completed`, `UpstreamTruncated`, `ClientGone`, `IdleTimeout`, or `ShutdownCut`), `RequestLifecycle::drop` computes both unadjusted `list_cost_micro_usd` and effective `cost_micro_usd` (with `plan_multiplier_bps` and `billing_coverage_mode`), extracts normalized `stop_reason` and sanitized `request_headers_json`, updates window rings and monthly accumulators before releasing the in-flight reservation, enqueues `usage_events`, `usage_attempts`, and 5-minute/hourly rollup deltas, and submits any finished turn to the 2-thread trace sealer pool. |
 
 ### 5.4 Hot-path state, `Reloader` ordering, and listener isolation
 
 To keep p99 routing latency under 5 ms, the inference hot path never queries SQLite. Only `GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, `GET /v1/auth/key`, and `response_links` cache misses may query the 8-connection read pool.
 
-Static configuration tables compile into an immutable `ConfigSnapshot` made of per-domain `Arc` slices. These slices cover `users`, `providers`, `upstream_keys`, `client_keys_by_hash`, `models`, `aliases`, `redirects`, `routes`, `shares_by_grantee`, `user_route_prefs`, `prices`, `budget_windows`, `settings`, and `traceability`. A single background `Reloader` task owns snapshot publication:
+Static configuration tables compile into an immutable `ConfigSnapshot` made of per-domain `Arc` slices. These slices cover `users`, `service_accounts`, `providers`, `upstream_keys`, `client_keys_by_hash`, `models`, `aliases`, `redirects`, `routes`, `shares_by_grantee`, `user_route_prefs`, `prices`, `budget_windows`, `settings`, and `traceability`. A single background `Reloader` task owns snapshot publication:
 1. Whenever the writer commits a control-plane transaction that mutates configuration tables, it increments `instance_meta.config_version` in that same transaction and sends a `ReloadRequest { min_version, changed_domains, invalidations }` to the reloader.
 2. The reloader coalesces pending requests, reads `config_version` in one read transaction, rebuilds changed domain `Arc` slices, and stores the new snapshot when `v > published.version`.
 3. Immediately after the `ArcSwap` store, the reloader applies all coalesced `CacheInvalidationEvent` items to `PinStore`, `WrrState`, and `RuntimeState`. It then notifies awaiting control-plane HTTP handlers so revocations take effect before HTTP 2xx returns.
@@ -569,6 +671,12 @@ LLMRoller separates static bootstrap parameters from dynamic runtime policies. S
 | `LLMROLLER_MEMORY_LIMIT_MB` | Integer `256..=65536` (auto-detected from cgroup v2 `memory.max` or `2048`) | Explicit container memory ceiling in MiB used to size `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` and the `256 MiB` trace accumulator cap (`PERF-3`, `Section 22.3`). |
 | `LLMROLLER_LOG` | Filter string (`"info,llmroller=info"`) | Structured JSON log level filter passed to `tracing_subscriber::EnvFilter` (`OBS-1`). |
 
+### 5.7 Control-plane request telemetry and dual-theme UI pipeline
+
+Every authenticated HTTP request handled by the control plane (`127.0.0.1:8081`) passes through a lightweight telemetry and theme-context middleware stack in `crates/admin`:
+1. **Theme & Shell Context Resolution**: The middleware reads the authenticated user's `ui_theme` (`dark`, `light`, `system`), `ui_nav_layout` (`top_tabs`, `sidebar`), `ui_locale` (`en`), and active workspace (`personal` vs. `global`/`admin`) from `ConfigSnapshot.users[user_id]` (with cookie override `llmroller_ui_prefs`) and injects them into `BaseTemplate` so every full-page load renders with zero flash of unstyled content (FOUC).
+2. **Non-Blocking Control-Plane API Logger (`AUD-2`, `USG-9`)**: When any `/api/user/*` or `/admin/api/*` handler completes, the response middleware constructs a `ControlPlaneLogItem { id: Ulid::new(), ts: now_ms, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent }` and enqueues it via `try_send` to the writer's `raw_events` queue. These rows populate the `Logs > API` sub-tab (`Section 14.l`) without adding disk latency to control-plane responses.
+
 ## 6. Functional requirements
 
 This section specifies all functional requirements for LLMRoller version 1.0. Every requirement has a unique ID, a priority (`P0`, `P1`, or `P2`), and a clear pass or fail condition linked to Section 16 and `requirements.toml`.
@@ -640,6 +748,8 @@ Client keys authenticate coding agents to the data plane and carry user-defined 
 | CLK-3 | P0 | Each client key must have a configurable `routing_scope` policy (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, or `global_only`, defaulting to `inherit` which resolves to `users.default_routing_scope`, default `personal_first`) that governs how the router orders the `Own`, `Shared`, and `Global` upstream key tiers. |
 | CLK-4 | P0 | Revoking or disabling a client key must clear `prev_key_hash`, update `ArcSwap<ConfigSnapshot>` via the reloader before the HTTP response returns (within 1 s), purge its pins, and reject later data-plane calls with HTTP 401. |
 | CLK-5 | P1 | Each client key should support an optional request-per-minute rate limit (`G5`, returning 429), a monthly micro-USD budget cap (`G7`, returning 429 `client_key_budget_exhausted` with `Retry-After` until next UTC month), and an optional CIDR IP allow list (`G4`, returning 403). |
+| CLK-6 | P0 | Users (for their Personal Workspace) and admins (for both Personal and Default/Global workspaces) must be able to create, search, rename, and delete machine principal **Service Accounts** (`service_accounts`), configure up to 64 comma- or newline-separated IPv4/IPv6 addresses or CIDRs (`allowed_cidrs`) that automatically apply to every child key in Gate `G4`, view aggregated service-account KPI cards (`Cost`, `Requests`, `Tokens`) filterable by time range, and manage child API keys under each service account (`Section 14.j`, `Section 14.k`). |
+| CLK-7 | P0 | The Client Keys management surface must support reversible inline **Pause key** (`POST /api/user/client-keys/{id}/pause`, setting `paused_at = now_ms` and `disabled = 1` without deleting active pins) and **Resume key** (`POST /api/user/client-keys/{id}/resume`), inline `Rename`, search by name or prefix, derived `Permissions` badges (`All` vs `Restricted`), and an interactive **Connection Setup** card (`1. Which API format does your tool use?` radio cards for OpenAI `Chat Completions`, OpenAI `Responses`, and Anthropic `Messages`; `2. Copy the API base URL for this format` with dynamic URL switching) plus a **One-Click Agent Setup** (`Connect CLI`) wizard (`Section 14.h`, `Section 14.i`). |
 
 ### 6.6 Model catalog and discovery (MDL)
 
@@ -706,6 +816,8 @@ The usage and budget subsystem combines local token and cost accounting with liv
 | USG-7 | P0 | The data plane must serve `GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, and `GET /v1/auth/key` authenticated by a client key, resolving session context exclusively from request headers (`x-llmroller-session-id` or precedence rows 1 through 6; `?session_id=` query strings are rejected with HTTP 400). `?fresh=1` triggers a live poll only when the caller is the key owner (`Own` tier) or an admin; `/v1/usage/raw` always serves the latest stored snapshot. |
 | USG-8 | P0 | To protect multi-tenant privacy on `GET /v1/usage` and `/v1/usage/raw`, a standard user's client key receives decrypted `raw_json` only for the user's own `personal` upstream keys; for `Shared` and `Global` keys, responses return only allow-list `sanitized_json` (`SEC-18`). |
 | LIM-1 | P0 | Admins (for global keys) and users (for own personal keys) must be able to configure `rolling` (`1 h` to `31 d` in 360-bucket rings), `anchored_fixed`, `anchored_calendar_month` (with day-of-month clamping across short months), and `anchored_provider` budget windows in micro-USD on each upstream key and route, with a configurable admission reserve (`0..=50%`, default `2%`), cache-aware in-flight reservations (`try_reserve`), and window-instance-bound manual calibration adjustments (`budget_adjustments`). |
+| USG-9 | P0 | The system must provide a **Dual-Stream Logs Explorer** (`Logs` screen with segmented `Inference` \| `API` toggle, multi-facet `Filter`, date range selector, refresh `↻`, and CSV/JSON export `↓`) and a **460px Right-Side Slide-Over Request Detail Inspection Drawer**. Clicking any `Inference` log row must open the drawer over a dimmed backdrop with sequential `<` / `>` row navigation and display 7 structured telemetry sections: `Request` (`Request ID` with copy, `HTTP status`, normalized `Stop reason`, `Endpoint`, `Method`, `Streaming`, `Protocol`, `Product`/`Pool tier`, `Time to first token`), `Model` (`Model`, `project_key`-redacted `Provider`), `Tokens` (`Input`, `Output`, `Reasoning`, `Cache read`, `Cache write`, `Cost`), `Identity` (`Service account` name/ID, `Key` name/ID), `Client` (`Session` hash/token, `User agent`, `Location`/`Client IP`), `Request headers` (bordered key-value table of sanitized non-secret headers), and `Metadata` (`Section 14.l`, `Section 14.m`). |
+| USG-10 | P0 | Every `usage_events` row must record both unadjusted base `list_cost_micro_usd` and effective `cost_micro_usd` alongside `plan_multiplier_bps` and `billing_coverage_mode` (`subscription_plan`, `pay_as_you_go`, `shared_grant`, `free_tier`). The **Usage Ledger** (`Usage` screen) must provide `All initiators`, `All models`, and date-range pill filters, a 5-metric **Token Summary Strip** (`Total tokens`, `Input tokens`, `Output tokens`, `Cache read tokens`, `Cache write tokens`), and a `Credits used` / `Cost` column displaying struck-through list prices (`~$0.0024~`), `Covered by <Plan> credits` badges, and an interactive **`Credit usage breakdown` Popover** (`Input (excluding cache)`, `Output`, `Cache read`, `Cache write` token counts, per-MTok prices, `Model list-price subtotal`, `Plan contribution multiplier`, and `Actual Plan credits used`, `Section 14.n`, `Section 14.o`). |
 
 ### 6.10 Content traceability mode and session chat preview (TRC)
 
@@ -734,6 +846,9 @@ The web UI and audit subsystem provide full self-service and administrative visi
 | UI-3 | P0 | All HTML templates, CSS, HTMX (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`), and chart scripts (`uPlot`) must be compiled into the Rust binary with zero external CDN requests and zero `hx-on:*` or `js:` attributes. |
 | UI-4 | P0 | When content traceability mode is active (or historical trace rows exist for a session), the Client Keys (Recently Active Sessions drawer), Active Sessions, and Usage Explorer screens must display each session's live pinned provider and upstream key (`project_key`-redacted) right now, a "View Requests" filter link, and a "Preview Chat" action that opens the read-only Session Chat Preview for that `session_hash`, plus a persistent global banner whenever traceability is enabled. |
 | AUD-1 | P0 | Every state-changing action by an `admin`, `user`, or `SystemTask` (plus admin chat-trace views, deduplicated to one `trace.viewed` row per `(admin, session_hash)` per 30 minutes) must append an HMAC-SHA256 hash-chained row (`seq`, `prev_hash`, `hash`) to `audit_log` inside the same transaction without logging secrets, and emit an `audit_anchor` structured log line to `stdout` every 100 rows and at least hourly. |
+| UI-5 | P0 | The embedded web UI must implement a **Dual-Theme Design System** supporting both high-contrast OpenCode Dark Mode (`#0d0d0d` canvas, `#141414` elevated surfaces, `#262626` subtle borders) and OpenDesign Light Mode (`#ffffff` canvas, `#f9fafb` surfaces, `#e5e7eb` borders) with user-selectable theme (`dark`, `light`, `system`) and navigation layout (`top_tabs` horizontal module bar with split-pane `Settings` sidebar `General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`, or `sidebar` collapsible left navigation shell), workspace switcher (`Personal` vs `Default`/`Admin`), and `⌘K` command search (`Section 14.a`, `Section 14.b`, `Section 14.w`). |
+| UI-6 | P0 | The **Overview Analytics Dashboard** (`Overview` screen) must render a 3-card KPI summary row (`Cost`, `Requests`, `Tokens`), a `Daily Cost` time-series vertical bar chart (`uPlot`) with a segmented `Cost` \| `Tokens` metric toggle and dynamic Y-axis gridlines, and a sortable `Usage by Model` breakdown table displaying a `<N> models · <M> providers` summary badge, monochrome provider badges (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`), `Free` tier badges, and columns `Model`, `Requests`, `Input`, `Cache Read`, `Cache Write`, `Output`, and `Cost ↓` (`Section 14.e`, `Section 14.f`, `Section 14.g`). |
+| AUD-2 | P0 | Every authenticated HTTP request to the control plane (`/api/user/*` and `/admin/api/*`) must be recorded non-blockingly in `control_plane_logs` (`ts`, `status`, `method`, `path`, `actor_user_id`, `workspace_scope`, `latency_ms`, `ip_addr`, `user_agent`, retained for 30 days) and exposed in the `Logs > API` sub-tab (`Time`, `Status`, `Endpoint`, `User`, `Duration`) with status/method/path filtering, refresh (`↻`), and CSV/JSON export (`Section 14.l`). |
 
 ## 7. Non-functional requirements
 
@@ -759,7 +874,7 @@ Reliability requirements govern crash recovery, graceful shutdown, fault isolati
 | --- | --- | --- | --- |
 | REL-1 | P0 | On `SIGTERM` or `SIGINT`, the server must run the eight-step shutdown sequence (Section 5.5.3): flip `/readyz` to 503 for `drain_grace_secs` (`5 s`), stop accepting new connections, allow open SSE streams up to `drain_timeout_secs` (`60 s`) to finish, cancel remaining streams with `Termination::ShutdownCut`, flush sealer and writer queues, run `PRAGMA wal_checkpoint(TRUNCATE)`, and exit `0` (or `11` on queue timeout). | Integration test sending `SIGTERM` mid-stream |
 | REL-2 | P0 | (a) Every confirmed pin, `response_links` row, persisted health transition (`exhausted`/`invalid`), and 5-minute or hourly rollup delta must be committed to SQLite within 1 s of the event under normal load. (b) An unexpected process kill (`SIGKILL`) loses zero committed transactions. (c) Under default `LLMROLLER_SQLITE_SYNCHRONOUS=NORMAL`, an OS crash or host power loss may lose transactions committed since the last WAL sync; operators needing power-loss durability set `LLMROLLER_SQLITE_SYNCHRONOUS=FULL`. | Crash-recovery integration test sending `SIGKILL` 1.2 s after pin confirmation, `response.created`, and request completion |
-| REL-3 | P0 | A slow or locked SQLite writer must never block or fail an inference request, and data-plane batches must never starve control-plane transactions (the writer drains `Control` commands between every `4 MiB` / 200-item data batch). Data-plane writes use three separate queues: (1) `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, capped at 500,000 keys; on full, stops confirming new pins to disk and flips `/readyz` to 503 without dropping queued ops), (2) `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>` for additive 5-minute and hourly rollup coalescing), and (3) `raw_events` (`Mutex<VecDeque<RawItem>>` capped at 10,000 items and `64 MiB`, evicting the oldest raw event, `usage_attempts`, or trace item after its cost is already folded into `rollups` and incrementing `llmroller_usage_dropped_total{kind}`). | Fault-injection test stalling the SQLite writer task while firing 10,500 requests and concurrent share revocations |
+| REL-3 | P0 | A slow or locked SQLite writer must never block or fail an inference request, and data-plane batches must never starve control-plane transactions (the writer drains `Control` commands between every `4 MiB` / 200-item data batch). Data-plane writes use three separate queues: (1) `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, capped at 500,000 keys; on full, stops confirming new pins to disk and flips `/readyz` to 503 without dropping queued ops), (2) `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>` for additive 5-minute and hourly rollup coalescing), and (3) `raw_events` (`Mutex<VecDeque<RawItem>>` capped at 10,000 items and `64 MiB`, evicting the oldest raw event, `usage_attempts`, `control_plane_logs`, or trace item after its cost is already folded into `rollups` and incrementing `llmroller_usage_dropped_total{kind}`). Control-plane HTML partial renders (`Overview`, `Logs`, `Usage`, `Service Accounts`, and `Request Detail Drawer`) must complete in `<= 15 ms` at p95 against the 8-connection SQLite read pool. | Fault-injection test stalling the SQLite writer task while firing 10,500 requests and concurrent share revocations |
 | REL-4 | P0 | All control-plane changes (new keys, shares, priority overrides, disabled routes, budget rules) must be published by the single `Reloader` task in monotonic `instance_meta.config_version` order (applying `CacheInvalidationEvent` purges after the `ArcSwap` store) and take effect within 1 s without restarting the process. | Concurrent mutation and revocation ordering test |
 | REL-5 | P0 | One failing provider or upstream key must not slow down requests routed to healthy providers. Outbound HTTP connection pools and `OriginBreaker` state machines (Section 10.5.1) are isolated per upstream origin `OriginKey { scheme, host, port, allow_private_network }`. | Fault-injection test blackholing one upstream origin |
 | REL-6 | P1 | The CLI command `llmroller backup --out <path> [--overwrite]` must write a consistent online snapshot to `<path>.tmp`, `fsync` the file, verify `PRAGMA integrity_check`, atomically rename to `<path>`, `fsync` the parent directory, and output JSON including `master_key_id`. | CLI integration test during concurrent write load |
@@ -787,6 +902,12 @@ Operational quality attributes keep the binary portable, auditable, observable, 
 | OBS-1 | P0 | Every request must receive a unique ULID in `x-llmroller-request-id`, emitted in structured JSON logs and recorded in `usage_events`. Prometheus metrics at `/metrics` must enforce a closed label allow-list (`provider_kind`, `provider_id`, `protocol`, `endpoint`, `status_class`, `outcome`, `strategy`, `job`, `reason`, and a bounded top-50 `model_bucket` with others grouped as `"other"`), strictly forbidding high-cardinality or tenant-identifying labels (`client_key_id`, `user_id`, `username`, key labels, `session_hash`, or unbounded model IDs). | Integration and metric-registry label allow-list tests |
 | PRIV-1 | P0 | LLMRoller must emit zero telemetry, analytics, or crash reports to third parties. Outbound network connections may go only to configured provider hosts and, when explicitly enabled by an admin, the configured price-book catalog URL. | Network sandbox egress test |
 
+### 7.5 Control-plane UI responsiveness and asset determinism
+
+All interactive components specified in `Section 14.a` through `14.z`—including the `Overview` `Daily Cost` / `Tokens` bar chart toggle, the `Logs` `Inference` / `API` stream switcher, the 460px Request Detail Inspection Drawer, the `Usage` 5-token summary strip and `Credit usage breakdown` popover, and the `Service Accounts` CIDR editor—execute without external runtime dependencies:
+1. **Zero external network calls (`PRIV-1`, `UI-3`)**: Every stylesheet, script, font stack (`system-ui`, `ui-monospace`), and provider badge icon (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`) is served from memory via `rust-embed` with immutable SHA-256 `ETag` caching.
+2. **Bounded read queries (`REL-3`)**: Every dashboard table (`Usage by Model`, `Logs > Inference`, `Logs > API`, `Usage` ledger, `Service Accounts`, and `My API keys`) uses indexed SQLite queries capped at `<= 50` rows per UI page (`<= 5,000` rows per CSV/JSON export batch) so control-plane browsing never delays data-plane WAL checkpoints.
+
 ## 8. Security and privacy
 
 Warning: Do not expose the control-plane listener (`LLMROLLER_ADMIN_LISTEN`) to an untrusted network without TLS. Bind it to `127.0.0.1` or place it behind an authenticated reverse proxy that handles TLS and is listed in `LLMROLLER_TRUSTED_PROXIES`.
@@ -795,7 +916,7 @@ LLMRoller holds high-value upstream credentials across global and personal accou
 
 ### 8.1 Threat model
 
-Fifteen concrete threats drive the security controls in LLMRoller.
+Seventeen concrete threats drive the security controls in LLMRoller.
 
 | ID | Threat description | Primary mitigations |
 | --- | --- | --- |
@@ -814,6 +935,8 @@ Fifteen concrete threats drive the security controls in LLMRoller.
 | T13 | Grantee B abuses a shared personal key from Grantor A to extract A's raw API key, read A's account headers, or read A's raw `/usage` metadata; or Grantor A pushes an unconsented share pointing to an attacker-controlled relay to capture B's prompts. | `SHR-3`, `SHR-4`, `USG-8`, `SEC-16`, `SEC-18` |
 | T14 | An attacker tampers with or truncates the tail of SQLite `audit_log` rows to hide unauthorized configuration or share changes. | `AUD-1`, `SEC-13` |
 | T15 | An attacker with disk access, a Grantor on a shared key, or a crafted model response reads sensitive prompts in `trace_records`/`trace_blocks` or triggers XSS in the chat preview UI. | `TRC-8`, `SEC-19`, `SEC-5` |
+| T16 | A compromised CI runner or leaked service-account child key attempts to call the proxy from an unauthorized IP address, or an operator submits malformed/excessive CIDRs on a service account. | `CLK-6`, `SEC-12`, `G4` |
+| T17 | Sensitive headers (`Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, proxy auth) leak into `usage_events.request_headers_json` or `control_plane_logs` and are viewed in the `Logs` Request Detail Drawer. | `SEC-6`, `USG-9`, `AUD-2` |
 
 ### 8.2 Security requirements (SEC)
 
@@ -826,8 +949,8 @@ Every security requirement is mandatory (`P0`) for version 1.0.
 | SEC-3 | P0 | Client keys (`llr_...`) must contain 256 bits of cryptographic randomness (`OsRng`), be stored solely as SHA-256 digests (`key_hash` and optional grace `prev_key_hash`), and be verified in constant time (`subtle::ConstantTimeEq`). |
 | SEC-4 | P0 | User and admin passwords must be hashed with `Argon2id` with parameters `m >= 19456 KiB`, `t >= 2`, `p = 1`, and a 128-bit random salt stored in the PHC string so stronger parameters remain verifiable ([OWASP Password Storage Cheat Sheet](https://www.google.com/search?q=https%3A%2F%2Fcheatsheetseries.owasp.org%2Fcheatsheets%2FPassword_Storage_Cheat_Sheet.html)). |
 | SEC-5 | P0 | The control plane must refuse to start on a non-loopback plain-HTTP address unless `LLMROLLER_TRUSTED_PROXIES` is configured (exit `2`). Web session cookies must use `__Host-llmroller_session` (or `llmroller_session` only when `--dev-insecure-cookies` is set), `HttpOnly`, `Secure`, `SameSite=Strict`, 12-hour idle expiry, and 7-day absolute expiry. Each login generates a random 256-bit CSRF token stored as `web_sessions.csrf_hash = SHA-256(token)`, delivered in `<meta name="csrf-token">` and validated in constant time against `x-csrf-token` on every `POST`, `PUT`, `PATCH`, or `DELETE` request (`GET /login` sets a 10-minute `__Host-llmroller_login_csrf` cookie paired with `x-csrf-token` and an `Origin` header check on `POST /api/auth/login`). All HTML responses must set `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`, with `htmx.config.includeIndicatorStyles = false`, `allowEval = false`, and `allowScriptTags = false`. |
-| SEC-6 | P0 | Application logs, error bodies, and panic hooks must redact `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, `secret`, and request or response payloads (truncating and scrubbing any echoed `sk-*`/`llr_*` tokens in upstream error strings), and CSV exports must prefix cells starting with `=`, `+`, `-`, `@`, `	`, or `
-` with `'` to prevent formula injection. Automated canary tests must verify that a planted secret string never appears in stdout, stderr, or database error columns. |
+| SEC-6 | P0 | Application logs, error bodies, panic hooks, `usage_events.request_headers_json` (displayed in the `Logs` Request Detail Drawer), and `control_plane_logs` must strictly redact and exclude `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, `proxy-authorization`, `secret`, and request or response payloads (retaining only safe allow-listed diagnostic headers such as `content-length`, `content-type`, `user-agent`, `accept`, `anthropic-version`, `anthropic-beta`, `openai-beta`, and tenant-salted/redacted `x-opencode-session` / `x-session-*` headers, and scrubbing any echoed `sk-*`/`llr_*`/`oc_sk_*` tokens in error strings). CSV exports must prefix cells starting with `=`, `+`, `-`, `@`, `	`, or `
+` with `'` to prevent formula injection. Automated canary tests must verify that a planted secret string never appears in stdout, stderr, `request_headers_json`, `control_plane_logs`, or database error columns. |
 | SEC-7 | P0 | Outbound connections must use `GuardedConnector` (`crates/proxy::ssrf`), which disables environment proxies, enforces TLS 1.2+ with `rustls` (permitting `http://` only when an admin sets `allow_private_network = 1`), disables HTTP redirects (`redirect::Policy::none()`), sends an upstream key only to its provider's `base_url` origin (or preset `allowed_usage_origins`, or personal `usage_url_cross_origin_ack` which forbids sharing), and validates **every connected socket IP** (for both DNS hostnames and IP-literal URLs, unwrapping IPv4-mapped IPv6 `::ffff:0:0/96` and 6to4 `2002::/16`) against all special-purpose ranges (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`, `255.255.255.255/32`, `::/128`, `::1/128`, `64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23`, `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`) unless `allow_private_network = 1`. |
 | SEC-8 | P0 | The server must enforce configurable resource limits: max request body size (`LLMROLLER_MAX_BODY_MB`, default `32 MiB`, `<= budget / 4`), global pre-first-byte body budget (`LLMROLLER_PREFLIGHT_BODY_BUDGET_MB`, default `min(1024, floor(0.40 * memory_limit_mb))`, `2,000 ms` queue wait), max `/models` or `/usage` response size (`2 MiB`, max `1,000` models per provider refresh), per-user personal resource quotas (`20` providers, `50` upstream keys, `2,000` personal-origin canonical models), max header block (`64 KiB`), and the normative timeout table in Section 10.5.2. |
 | SEC-9 | P0 | The control plane (`LLMROLLER_ADMIN_LISTEN`) and metrics listener (`LLMROLLER_METRICS_LISTEN`) must bind to `127.0.0.1` by default, separate from the data-plane listener (`0.0.0.0:8080`). When `LLMROLLER_LISTEN` is non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES`, startup must log an error every 10 minutes and set `llmroller_plaintext_data_plane = 1` (or exit `2` when `LLMROLLER_REQUIRE_TLS=true`). |
@@ -838,7 +961,7 @@ Every security requirement is mandatory (`P0`) for version 1.0.
 | SEC-14 | P0 | All in-memory secret strings (master key, `instance_secrets`, decrypted upstream API keys, raw client tokens, CSRF tokens) must be wrapped in `secrecy::SecretString` or `SecretBox<[u8]>` with `ZeroizeOnDrop`. |
 | SEC-15 | P0 | The HTTP edge must reject requests containing both `Content-Length` and `Transfer-Encoding`, multiple `Host` headers, non-ASCII control characters in header values, or duplicate top-level JSON keys with HTTP 400, and must strip all hop-by-hop headers and `Set-Cookie` headers in both directions (Section 12.1 and Section 12.1.1). |
 | SEC-16 | P0 | When routing through a `Shared` or `Global` upstream key, LLMRoller must strip every recognized client session header and body field (except `x-claude-code-agent-id` and `x-claude-code-parent-agent-id`) and write only the provider's configured affinity fields with the tenant-salted token `llr_<base32(HMAC(session_hmac_secret, "affinity.v1 " \|\| owner_user_id \|\| " " \|\| raw_session_id))[0..26]>`. Shares need explicit grantee acceptance matching `providers.share_config_fingerprint` (and admin approval for `custom` providers) so any change to a personal provider's routing-relevant config suspends active shares until re-accepted. |
-| SEC-17 | P0 | Every repository method in `crates/store` and handler in `crates/admin` that accesses providers, upstream keys, shares, routes, client keys, pins, or usage must take an `&ActorScope` parameter and enforce SQL-level `WHERE` predicates scoping rows to `owner_user_id` or `grantee_user_id` whenever `actor` is `ActorScope::User { role: Role::User, .. }`. |
+| SEC-17 | P0 | Every repository method in `crates/store` and handler in `crates/admin` that accesses providers, upstream keys, shares, routes, service accounts, client keys, pins, usage events, or control-plane API logs must take an `&ActorScope` parameter and enforce SQL-level `WHERE` predicates scoping rows to `owner_user_id` or `grantee_user_id` whenever `actor` is `ActorScope::User { role: Role::User, .. }`. |
 | SEC-18 | P0 | `upstream_usage_snapshots.raw_json_enc` must be sealed at rest with `XChaCha20-Poly1305` (domain `usage_raw`). Upstream `/usage` pass-through responses (`GET /v1/usage`, `GET /v1/usage/raw`, `GET /v1/key`, and `/api/user/upstream-keys/{id}/usage`) and inference response headers (Section 12.1.1) must strip all provider account identifiers whenever the caller is not the personal key owner or an `admin`. |
 | SEC-19 | P0 | All recorded `trace_blocks.payload_enc` (domain `trace_block`) and `trace_records.payload_enc` (domain `trace_record`) blobs must be compressed with `zstd` and encrypted at rest using `XChaCha20-Poly1305` with canonical length-prefixed `AAD` (Section 9.2.2). In the Session Chat Preview, assistant Markdown must be rendered with `pulldown-cmark` (raw HTML disabled) and sanitized with `ammonia` (`rel="noopener noreferrer nofollow"`, `https:`/`http:` links only), while reasoning, user text, tool arguments, tool results, and raw JSON must be rendered as Askama auto-escaped text inside `<pre>`. |
 
@@ -848,11 +971,19 @@ LLMRoller is built for data minimization. It never stores prompt text, system in
 
 Aside from stripping session carriers on pooled keys, LLMRoller forwards non-credential headers unchanged. Privacy headers such as Command Code's `x-cmd-zdr: 1` zero-data-retention header therefore reach the upstream provider intact. Operators and users who share keys must review each provider's terms of service on pooled access (tracked as Risk `R1` in Section 18).
 
+### 8.4 Diagnostic header allow-listing and Service Account CIDR guardrails
+
+To power the `Request headers` section of the `Logs` Request Detail Drawer (`OpenCode/Image 5`, `USG-9`) without risking credential exposure (`T17`, `SEC-6`), `crates/proto::headers::extract_safe_diagnostic_headers` enforces a strict lowercase allow-list before constructing `usage_events.request_headers_json`:
+- **Permitted header keys**: `content-length`, `content-type`, `accept`, `user-agent`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `originator`, `x-cmd-zdr`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, and the outbound/redacted session affinity header (`x-opencode-session`, `x-session-id`, `x-session-affinity`).
+- **Unconditionally forbidden header keys**: `authorization`, `x-api-key`, `proxy-authorization`, `cookie`, `set-cookie`, `x-csrf-token`, and any header whose value matches `(sk-[A-Za-z0-9_-]{8,}|llr_[A-Za-z0-9_-]{8,}|oc_sk_[A-Za-z0-9_-]{8,})`.
+
+Similarly, when an operator or user saves `Allowed IP addresses` on a Service Account (`PUT /api/user/service-accounts/{id}/ip-restrictions` or `PUT /admin/api/service-accounts/{id}/ip-restrictions`, `CLK-6`), the handler parses comma- and newline-separated tokens, rejects any list exceeding `64` entries with HTTP 422 (`too_many_cidrs`), validates each entry as a canonical IPv4/IPv6 address or CIDR prefix via `ipnet::IpNet`, and logs `service_account.ip_restrictions_updated` in `audit_log`.
+
 ## 9. Data model
 
 LLMRoller stores all persistent state in a single SQLite database running in Write-Ahead Logging (`WAL`) mode with incremental auto-vacuum (`PRAGMA auto_vacuum = INCREMENTAL`) and foreign-key enforcement (`PRAGMA foreign_keys = ON`). All monetary amounts are stored as 64-bit signed integers representing micro-USD (`1 USD = 1,000,000 micro_usd`) to avoid floating-point rounding errors. All timestamps are 64-bit integers in UTC epoch milliseconds, and primary keys use 26-character ULIDs or composite keys.
 
-### 9.1 Per-connection pragma builder and complete 31-table SQLite DDL schema
+### 9.1 Per-connection pragma builder and complete 33-table SQLite DDL schema
 
 SQLite pragmas such as `foreign_keys`, `busy_timeout`, `query_only`, `synchronous`, and `temp_store` apply per connection rather than in database DDL. Every connection across the writer, the 8 readers, and all CLI commands is therefore built through `crates/store::pool::connect_options(role: Role)`.
 
@@ -868,7 +999,7 @@ SQLite pragmas such as `foreign_keys`, `busy_timeout`, `query_only`, `synchronou
 
 Migration `0001` runs `PRAGMA auto_vacuum = INCREMENTAL;` first on an empty database (plus `VACUUM;` if needed). At startup, `serve` asserts `PRAGMA auto_vacuum == 2` and exits with code `13` otherwise.
 
-The SQLite schema has 31 tables (plus triggers and partial unique indexes) across five logical domains. These domains cover instance metadata and accounts, providers and sharing, models and pricing, session pins and response links, and usage, traces, and operations.
+The SQLite schema has 33 tables (plus triggers and partial unique indexes) across five logical domains, including `service_accounts` for machine principals (`CLK-6`) and `control_plane_logs` for console API telemetry (`AUD-2`, `USG-9`). These domains cover instance metadata and accounts, providers and sharing, models and pricing, session pins and response links, and usage, traces, and operations.
 
 ```sql
 -- 0. Schema Version, Instance Metadata, and Sealed Instance Secrets
@@ -912,6 +1043,9 @@ CREATE TABLE users (
   global_budget_micro_usd_month INTEGER,
   default_routing_scope TEXT NOT NULL DEFAULT 'personal_first'
     CHECK (default_routing_scope IN ('personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
+  ui_theme TEXT NOT NULL DEFAULT 'dark' CHECK (ui_theme IN ('dark', 'light', 'system')),
+  ui_nav_layout TEXT NOT NULL DEFAULT 'top_tabs' CHECK (ui_nav_layout IN ('top_tabs', 'sidebar')),
+  ui_locale TEXT NOT NULL DEFAULT 'en',
   disabled INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   last_login_at INTEGER
@@ -936,9 +1070,24 @@ CREATE TABLE web_sessions (
 CREATE INDEX idx_web_sessions_user ON web_sessions(user_id);
 CREATE INDEX idx_web_sessions_expires ON web_sessions(expires_at);
 
+CREATE TABLE service_accounts (
+  id TEXT PRIMARY KEY, -- 26-char ULID (displayed with svcacct_<ULID> subtext in UI)
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_scope TEXT NOT NULL DEFAULT 'personal' CHECK (workspace_scope IN ('personal', 'global')),
+  name TEXT NOT NULL,
+  description TEXT,
+  allowed_cidrs TEXT, -- JSON array of up to 64 IPv4/IPv6 addresses or CIDRs, or NULL for Unrestricted
+  disabled INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_service_accounts_owner ON service_accounts(owner_user_id);
+CREATE UNIQUE INDEX uq_service_accounts_owner_name ON service_accounts(owner_user_id, workspace_scope, name);
+
 CREATE TABLE client_keys (
   id TEXT PRIMARY KEY,
   owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service_account_id TEXT REFERENCES service_accounts(id) ON DELETE CASCADE,
   label TEXT NOT NULL,
   prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
@@ -949,17 +1098,19 @@ CREATE TABLE client_keys (
   allowed_models TEXT, -- JSON array of canonical_id strings, or NULL for all accessible models
   rate_limit_rpm INTEGER,
   budget_micro_usd_month INTEGER,
-  allowed_cidrs TEXT, -- JSON array of CIDR strings, or NULL
+  allowed_cidrs TEXT, -- JSON array of CIDR strings, or NULL (inherits service_accounts.allowed_cidrs when attached)
   constant_session_flagged_at INTEGER,
   constant_session_mode TEXT NOT NULL DEFAULT 'flag'
     CHECK (constant_session_mode IN ('flag', 'fingerprint_generic_ids')),
   disabled INTEGER NOT NULL DEFAULT 0,
+  paused_at INTEGER, -- Non-null when paused via inline 'Pause key' action (CLK-7)
   revoked_at INTEGER,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
   last_used_at INTEGER
 );
 CREATE INDEX idx_client_keys_owner ON client_keys(owner_user_id);
+CREATE INDEX idx_client_keys_service_account ON client_keys(service_account_id);
 CREATE UNIQUE INDEX uq_client_keys_prev_hash ON client_keys(prev_key_hash)
   WHERE prev_key_hash IS NOT NULL;
 
@@ -1259,11 +1410,21 @@ CREATE TABLE usage_events (
   cache_write_tokens INTEGER,
   output_tokens INTEGER,
   reasoning_tokens INTEGER,
+  list_cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+  plan_multiplier_bps INTEGER NOT NULL DEFAULT 10000,
+  billing_coverage_mode TEXT NOT NULL DEFAULT 'pay_as_you_go'
+    CHECK (billing_coverage_mode IN ('subscription_plan', 'pay_as_you_go', 'shared_grant', 'free_tier')),
   cost_micro_usd INTEGER NOT NULL,
   cost_source TEXT NOT NULL
     CHECK (cost_source IN ('provider', 'price_book', 'fallback_rate', 'estimated_incomplete', 'estimated_attempt')),
   latency_ms INTEGER,
   ttfb_ms INTEGER,
+  stop_reason TEXT,
+  service_account_id TEXT,
+  client_user_agent TEXT,
+  client_location TEXT,
+  request_headers_json TEXT, -- Sanitized allow-list request headers JSON for Request Detail Drawer (SEC-6, USG-9)
+  metadata_json TEXT, -- Optional sanitized request metadata JSON for Request Detail Drawer (USG-9)
   pin_outcome TEXT
     CHECK (pin_outcome IN ('new_pin', 'followed', 'repin', 'repin_recovery', 'unpinned_stateless', 'unpinned_capacity', 'response_link')),
   failovers INTEGER NOT NULL DEFAULT 0,
@@ -1272,6 +1433,8 @@ CREATE TABLE usage_events (
 CREATE INDEX idx_usage_ts ON usage_events(ts);
 CREATE INDEX idx_usage_owner_ts ON usage_events(owner_user_id, ts);
 CREATE INDEX idx_usage_client_key_ts ON usage_events(client_key_id, ts);
+CREATE INDEX idx_usage_service_account_ts ON usage_events(service_account_id, ts)
+  WHERE service_account_id IS NOT NULL;
 CREATE INDEX idx_usage_client_key_session_ts ON usage_events(client_key_id, session_hash, ts DESC)
   WHERE session_hash IS NOT NULL;
 
@@ -1389,6 +1552,22 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX idx_audit_ts ON audit_log(ts DESC);
 CREATE INDEX idx_audit_actor ON audit_log(actor_user_id, ts DESC);
+
+CREATE TABLE control_plane_logs (
+  id TEXT PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  workspace_scope TEXT NOT NULL DEFAULT 'personal' CHECK (workspace_scope IN ('personal', 'global')),
+  method TEXT NOT NULL CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE')),
+  path TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  ip_addr TEXT,
+  user_agent TEXT
+);
+CREATE INDEX idx_cp_logs_ts ON control_plane_logs(ts DESC);
+CREATE INDEX idx_cp_logs_actor_ts ON control_plane_logs(actor_user_id, ts DESC);
 
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,
@@ -1567,6 +1746,51 @@ The `settings` table enforces a closed 14-key registry. Any unknown key or out-o
 | `unpriced_fallback_rates` | Object `{input, output, cache_read, cache_write}` | `{"input":3000000,"output":15000000,"cache_read":300000,"cache_write":3750000}` | Fallback micro-USD per MTok rates charged whenever no `prices` row matches (`USG-3`). |
 | `traceability_config` | Object `{enabled, match, retention_days 1..=90, auto_disable_at}` | `{"enabled":false,"match":{"user_ids":[],"client_key_ids":[],"models":[]},"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
 
+### 9.4 Service accounts, control-plane logs, and cost-breakdown query patterns
+
+#### 9.4.1 Service Account directory and detail roll-up queries (`CLK-6`)
+
+The `Settings > Service accounts` directory (`Section 14.j`) and `Service Accounts > <name>` detail view (`Section 14.k`) execute two indexed read queries against `service_accounts`, `client_keys`, and `usage_rollups_hourly`:
+
+```sql
+-- 1. Service Accounts Directory Table (14.j):
+SELECT
+  sa.id,
+  sa.name,
+  sa.allowed_cidrs,
+  sa.created_at,
+  COUNT(ck.id) FILTER (WHERE ck.revoked_at IS NULL) AS total_keys,
+  COUNT(ck.id) FILTER (
+    WHERE ck.revoked_at IS NULL
+      AND ck.disabled = 0
+      AND ck.paused_at IS NULL
+      AND (ck.expires_at IS NULL OR ck.expires_at > :now_ms)
+  ) AS active_keys
+FROM service_accounts sa
+LEFT JOIN client_keys ck ON ck.service_account_id = sa.id
+WHERE sa.owner_user_id = :owner_user_id
+  AND sa.workspace_scope = :workspace_scope
+  AND (:search_query IS NULL OR sa.name LIKE '%' || :search_query || '%')
+GROUP BY sa.id
+ORDER BY sa.created_at ASC, sa.id ASC;
+
+-- 2. Service Account KPI Summary Cards (Cost, Requests, Tokens) (14.k):
+SELECT
+  COALESCE(SUM(r.cost_micro_usd), 0) AS total_cost_micro_usd,
+  COALESCE(SUM(r.requests), 0) AS total_requests,
+  COALESCE(SUM(
+    r.input_uncached_tokens + r.cache_read_tokens + r.cache_write_tokens + r.output_tokens
+  ), 0) AS total_tokens
+FROM usage_rollups_hourly r
+JOIN client_keys ck ON ck.id = r.client_key_id
+WHERE ck.service_account_id = :service_account_id
+  AND (:since_hour_ms IS NULL OR r.hour_ms >= :since_hour_ms);
+```
+
+#### 9.4.2 Usage Ledger 5-token summary strip and per-model breakdown queries (`UI-6`, `USG-10`)
+
+The `Overview` `Usage by Model` table (`Section 14.g`) and the `Usage` Ledger 5-metric Token Summary Strip (`Section 14.n`) aggregate directly over `usage_rollups_hourly` for any selected window (`Last 7 days`, `Last 30 days`, `All time`), while individual row inspection in the `Credit usage breakdown` popover (`Section 14.o`) and Request Detail Drawer (`Section 14.m`) reads the indexed `usage_events` row by `id` or `request_id`.
+
 ## 10. Routing design
 
 The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It evaluates request gates (`G1` through `G7`), resolves the session and routing constraint, and checks candidate eligibility (`C1` through `C8`). It then selects routes through the pluggable `RouteSelector` strategy engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`) and manages single-flight pinning and pre-first-valid-frame failover.
@@ -1578,9 +1802,9 @@ Before inspecting candidate routes, every request on `/v1/*` (except `/healthz` 
 | Gate | Predicate (must hold) | Failure response |
 | --- | --- | --- |
 | `G1` | Bearer or `x-api-key` token hashes (`SHA-256`) in constant time to a known `client_keys` row in `ConfigSnapshot` via either `key_hash` (`HashRole::Current`) or `prev_key_hash` with `now_ms < prev_key_expires_at` (`HashRole::Previous`) | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
-| `G2` | `client_key.disabled == 0 AND client_key.revoked_at IS NULL AND (client_key.expires_at IS NULL OR client_key.expires_at > now_ms)` | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
+| `G2` | `client_key.disabled == 0 AND client_key.paused_at IS NULL AND client_key.revoked_at IS NULL AND (client_key.expires_at IS NULL OR client_key.expires_at > now_ms)` and (when `client_key.service_account_id = Some(sa_id)`) `service_accounts[sa_id].disabled == 0` | HTTP 401 `authentication_error` (`code = "client_key_paused"` when `paused_at IS NOT NULL`, else `"invalid_client_key"`; increments `auth_failure_counters`) |
 | `G3` | Owner account `users[client_key.owner_user_id].disabled == 0` | HTTP 401 `authentication_error` (increments `auth_failure_counters`) |
-| `G4` | `client_key.allowed_cidrs IS NULL` or the resolved client IP (after `LLMROLLER_TRUSTED_PROXIES` extraction) falls inside at least one allowed CIDR | HTTP 403 `permission_error` |
+| `G4` | Resolved client IP (after `LLMROLLER_TRUSTED_PROXIES` extraction) satisfies both: (a) if `client_key.service_account_id = Some(sa_id)` and `service_accounts[sa_id].allowed_cidrs` is non-empty, client IP falls inside at least one service-account CIDR (`CLK-6`); and (b) if `client_key.allowed_cidrs` is non-empty, client IP falls inside at least one key-level CIDR (`CLK-5`) | HTTP 403 `permission_error` (`code = "ip_restricted"`, recorded in `usage_events` with `status = 403, error_code = 'inference_failed'` for `Logs` inspection) |
 | `G5` | `client_key.rate_limit_rpm IS NULL` or the client key's token bucket admits one token at `now_ms` | HTTP 429 `rate_limit_error` with `Retry-After` set to seconds until next token |
 | `G6` | For endpoints carrying a `model`, the model resolves to a known `model_pk` (`canonical_id = M`, returning 409 on ambiguous raw ID) and `client_key.allowed_models IS NULL OR M in client_key.allowed_models` | HTTP 404 `model_not_found` if `M` is unknown, else HTTP 403 `permission_error` |
 | `G7` | For `EndpointKind::Inference`, `client_key.budget_micro_usd_month IS NULL` or the client key's UTC monthly accumulator admits the request reservation | HTTP 429 `rate_limit_error` with `code = "client_key_budget_exhausted"` and `Retry-After` set to seconds until next UTC month |
@@ -1986,6 +2210,53 @@ When one key's `/models` list has multiple raw IDs with the same normalized slug
 
 When an admin merges model `a` into `b` (`POST /admin/api/models/merge`), the writer runs one transaction over `model_pk`. It repoints `model_routes`, `user_route_preferences`, `budget_windows`, `pins`, `response_links`, and `model_aliases`, deletes `a` from `models`, and inserts `model_redirects(a.canonical_id -> b.model_pk)`.
 
+### 10.7 Service Account CIDR inheritance and Client Key Pause semantics (`CLK-6`, `CLK-7`)
+
+When evaluating Request Gates `G2` and `G4` in `crates/core::eligibility::evaluate_request_gates`, the router resolves the caller's `ClientKeySnapshot` and optional parent `ServiceAccountSnapshot` (`service_account_id: Option<ServiceAccountId>`):
+
+```rust
+pub struct ServiceAccountSnapshot {
+    pub id: ServiceAccountId,
+    pub owner_user_id: UserId,
+    pub workspace_scope: WorkspaceScope, // Personal | Global
+    pub name: Arc<str>,
+    pub allowed_cidrs: Arc<[IpNet]>,     // Up to 64 IPv4/IPv6 networks
+    pub disabled: bool,
+}
+
+pub fn check_g2_and_g4(
+    key: &ClientKeySnapshot,
+    sa: Option<&ServiceAccountSnapshot>,
+    client_ip: IpAddr,
+    now_ms: i64,
+) -> Result<(), GateError> {
+    if key.revoked_at.is_some() || key.expires_at.is_some_and(|exp| exp <= now_ms) {
+        return Err(GateError::Unauthorized("invalid_client_key"));
+    }
+    if key.paused_at.is_some() || key.disabled {
+        return Err(GateError::Unauthorized("client_key_paused"));
+    }
+    if let Some(sa_snap) = sa {
+        if sa_snap.disabled {
+            return Err(GateError::Unauthorized("service_account_disabled"));
+        }
+        if !sa_snap.allowed_cidrs.is_empty()
+            && !sa_snap.allowed_cidrs.iter().any(|net| net.contains(&client_ip))
+        {
+            return Err(GateError::Forbidden("service_account_ip_restricted"));
+        }
+    }
+    if !key.allowed_cidrs.is_empty()
+        && !key.allowed_cidrs.iter().any(|net| net.contains(&client_ip))
+    {
+        return Err(GateError::Forbidden("client_key_ip_restricted"));
+    }
+    Ok(())
+}
+```
+
+Unlike permanent revocation (`DELETE /api/user/client-keys/{id}`), pausing a client key (`POST /api/user/client-keys/{id}/pause`) does **not** emit `CacheInvalidationEvent::ClientKeyRevoked`. Active session pins in `PinStore` for that key remain intact until their natural sliding TTL expires (`pin_ttl_secs`), so clicking `Resume key` (`POST /api/user/client-keys/{id}/resume`) immediately restores routing to the same warm upstream key.
+
 ## 11. Session identification and hints
 
 Coding agents and upstream providers use different session headers and body fields. LLMRoller therefore separates inbound session extraction and response-link inheritance from outbound affinity hint injection.
@@ -2083,6 +2354,17 @@ The table below lists the default session hint profile for each built-in provide
 | `command_code` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | [Command Code](https://www.google.com/search?q=https%3A%2F%2Fcommandcode.ai%2Fdocs%2Fprovider) documents no custom header; forwarding standard headers and `prompt_cache_key` preserves upstream cache hints. |
 | `open_design_amr` | `x-session-affinity: <affinity_id>`, `x-session-id: <affinity_id>` | `prompt_cache_key: "<affinity_id>"` on `chat` and `responses` | Same default as Command Code. |
 | `custom` | Configurable header list (default `x-session-id`, `x-session-affinity`) | Configurable (`off`, `prompt_cache_key`, or `session_id`) | Allows operators and users to match Fireworks, DeepInfra, vLLM Router, or LiteLLM upstream requirements. |
+
+### 11.3 Session & client environment telemetry in the Request Detail Drawer (`USG-9`)
+
+When an engineer inspects a request in the `Logs` slide-over Request Detail Drawer (`Section 14.m`), the `Client` and `Request headers` sections surface the session and harness telemetry captured at Step 1 through Step 8 without violating tenant isolation:
+
+| Drawer field | Source & privacy formatting rule | Example rendered value (`OpenCode/Image 5`) |
+| --- | --- | --- |
+| `Client > Session` | For `Own` personal keys or when the viewer owns the `client_key_id`, displays the outbound affinity token or truncated session identifier (`1792266230924-65bbf89a` or `llr_<26-char-base32>`); for admin cross-tenant views without traceability, displays `session_hash`. | `1792266230924-65bbf89a` |
+| `Client > User agent` | Extracted verbatim from the inbound `user-agent` header (truncated to 256 printable ASCII bytes) and stored in `usage_events.client_user_agent`. | `lca/0.6.0 (linux; x86_64; abi-0.6)` |
+| `Client > Location` | Derived from trusted reverse-proxy geo headers (`cf-ipcountry`, `x-geo-city`, `x-geo-country`) when present from `LLMROLLER_TRUSTED_PROXIES`, or formatted client subnet (`203.0.113.0/24`). | `Singapore, SG` |
+| `Request headers` grid | 2-column key-value table of allow-listed inbound headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`, `x-claude-code-session-id`, `anthropic-version`, `openai-beta`) stored in `usage_events.request_headers_json` with all credentials (`authorization`, `x-api-key`, `cookie`) unconditionally stripped (`SEC-6`). | `content-length: 242031`, `content-type: application/json`, `user-agent: lca/0.6.0 (linux; x86_64; abi-0.6)`, `x-opencode-session: 1792266230924-65bbf89a` |
 
 ## 12. Protocol handling and transparent proxying
 
@@ -2189,6 +2471,7 @@ Every routed request is owned by a `RequestLifecycle` struct wrapped inside the 
 | `output_tokens` | `usage.completion_tokens` (includes reasoning) | `usage.output_tokens` (includes reasoning) | Last observed `output_tokens` across `message_start` and `message_delta` |
 | `reasoning_tokens` | `coalesce(usage.completion_tokens_details.reasoning_tokens, 0)` | `coalesce(usage.output_tokens_details.reasoning_tokens, 0)` | Upstream numeric reasoning token field when present, else `0` (included in `output_tokens`) |
 | `provider_cost_micro_usd` | `(usage.cost * 1_000_000.0).round() as i64` (half away from zero) when `usage.cost` is a finite `f64` in `[0.0, 1000.0]`; out-of-range values are ignored and logged | Same validation and rounding rule | Same validation and rounding rule |
+| `stop_reason` (`USG-9`) | Last non-null `choices[0].finish_reason` (`"stop"`, `"length"`, `"tool_calls"`, `"content_filter"`) | `response.status` or `response.incomplete_details.reason` (`"completed"` normalized to `"stop"`, `"max_output_tokens"` -> `"length"`) | `message_delta.delta.stop_reason` (`"end_turn"`, `"max_tokens"`, `"stop_sequence"`, `"tool_use"`) |
 
 ### 12.6 Content-addressed trace storage and Session Chat Preview reconstruction
 
@@ -2368,6 +2651,15 @@ Operators and standard users often start troubleshooting from an LLMRoller clien
 }
 ```
 
+### 12.7 Request Detail Drawer telemetry extraction (`USG-9`)
+
+To populate the 7-section slide-over Request Detail Inspection Drawer (`Section 14.m`, `OpenCode/Image 5` & `Image 6`) for every row in `Logs > Inference`, the proxy edge and `SseUsageTap` capture five structured metadata fields on every `UsageEvent` without buffering full prompt payloads:
+1. **Protocol display slug**: Maps internal `Protocol::{Chat, Responses, Messages}` to canonical wire labels (`"openai-chat"`, `"openai-responses"`, `"anthropic-messages"`).
+2. **Product / Pool tier label**: Maps the selected route's provider preset or tier (`"go"` for OpenCode Go, `"goat"` for Command Code GOAT, `"amr"` for OpenDesign AMR, `"openrouter"` for OpenRouter, or `"own"` / `"shared"` / `"global"`).
+3. **Time to first token (`ttfb_ms`)**: Measured in milliseconds from completion of the outbound HTTP request write until the first valid non-comment response frame is verified (`1.82 s` rendered in the drawer when `ttfb_ms = 1820`).
+4. **Sanitized `request_headers_json`**: Built by `extract_safe_diagnostic_headers(req.headers())`, storing a sorted JSON object of safe diagnostic headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`, `anthropic-version`, `openai-beta`) capped at `4 KiB`.
+5. **Top-level `metadata_json`**: When the inbound JSON request contains a top-level `"metadata"` object, its string key-value pairs (up to `16` keys, `2 KiB` total, scrubbed of any secret patterns per `SEC-6`) are serialized into `usage_events.metadata_json`; otherwise the drawer renders `None recorded.`.
+
 ## 13. Pricing, limits, and source provider usage engine
 
 LLMRoller combines local micro-USD pricing and window budgets with single-flight `/usage` polling, time-bounded observation projections, and sanitized `/usage` pass-through.
@@ -2409,6 +2701,38 @@ fn estimate_input_tokens(body: &[u8]) -> i64 {
 ```
 
 For an aborted stream (`incomplete = 1`), observed token fields from `SseUsageTap` are kept. Missing input tokens use `estimate_input_tokens(body)` and missing output tokens use `div_ceil(decoded_text_bytes, 4)` over decoded text deltas. In `usage_attempts`, failed tries with outcome in `{'http_5xx', 'wait_timeout', 'error_frame'}` charge `estimated_input = div_ceil(estimate_input_tokens(body) * rate_in, 1_000_000)` against that key's windows and caps.
+
+
+#### 13.1.2 List-price subtotal vs. plan-covered credits and `Plan contribution multiplier` (`USG-10`)
+
+Subscription coding plans (such as OpenDesign AMR, OpenCode Go, and Command Code GOAT) often apply a plan contribution multiplier (for example, `× 0.25` where `$0.0024` of list-price token usage consumes only `$0.0006` of plan credits, or `× 2.0` during weekday peak windows) and cover calls via subscription credits rather than deducting from a pay-as-you-go wallet (`OpenDesign/Image 1` & `Image 4`).
+
+To provide complete transparency in the `Usage` ledger and the interactive **`Credit usage breakdown`** popover (`Section 14.o`), `crates/core::pricing::compute_detailed_cost` computes four line-item subtotals in micro-USD along with the unadjusted list-price subtotal and effective plan-multiplied cost:
+
+```text
+cost_input_uncached_micro_usd = div_ceil(input_uncached_tokens * rate_in,          1_000_000)
+cost_output_micro_usd         = div_ceil(output_tokens         * rate_out,         1_000_000)
+cost_cache_read_micro_usd     = div_ceil(cache_read_tokens     * rate_cache_read,  1_000_000)
+cost_cache_write_micro_usd    = div_ceil(cache_write_tokens    * rate_cache_write, 1_000_000)
+
+list_cost_micro_usd =
+    cost_input_uncached_micro_usd
+  + cost_output_micro_usd
+  + cost_cache_read_micro_usd
+  + cost_cache_write_micro_usd
+
+// Effective multiplier in basis points (10_000 bps = 1.00x; 2_500 bps = 0.25x; 20_000 bps = 2.00x):
+plan_multiplier_bps = div_round(10_000 * schedule_or_plan_multiplier_num, schedule_or_plan_multiplier_den)
+
+actual_cost_micro_usd = div_ceil(list_cost_micro_usd * plan_multiplier_bps, 10_000)
+```
+
+| `usage_events` field | Meaning and UI rendering in `Usage` Ledger & `Credit usage breakdown` popover |
+| --- | --- |
+| `list_cost_micro_usd` | Unadjusted `Model list-price subtotal` (`$0.0024` in `OpenDesign/Image 4`). When `billing_coverage_mode == 'subscription_plan'`, rendered with a horizontal strikethrough (`~$0.0024~`) in the `Credits used` table cell next to the `(i)` breakdown trigger icon. |
+| `plan_multiplier_bps` | Basis-point multiplier (`2500` -> `× 0.25`, `10000` -> `× 1.00`, `20000` -> `× 2.00`). Displayed as `Plan contribution multiplier (i) × 0.25` in the breakdown popover whenever `plan_multiplier_bps != 10000` or when a subscription plan is active. |
+| `cost_micro_usd` | `Actual Plan credits used` (`$0.0006` in `OpenDesign/Image 4`), posted to the upstream key's budget window rings and monthly accumulators. |
+| `billing_coverage_mode` | `'subscription_plan'` (renders emerald subtitle `Covered by <Provider Plan> credits` and popover footer `"This call uses <Plan> credits and does not deduct from your pay-as-you-go balance."`), `'shared_grant'` (`Covered by shared grant`), `'free_tier'` (`Free tier · $0.00`), or `'pay_as_you_go'` (`Pay-as-you-go balance`). |
 
 ### 13.2 Generalized budget windows, decaying observations, and startup rebuild
 
@@ -2495,9 +2819,69 @@ Coding agents and IDE status bars query LLMRoller for quota status using their `
 | `GET /v1/key`, `GET /v1/auth/key` | Returns an [OpenRouter-compatible](https://www.google.com/search?q=https%3A%2F%2Fopenrouter.ai%2Fdocs%2Fapi_reference%2Flimits) `{ "data": { "label", "usage", "usage_daily", "usage_weekly", "usage_monthly", "limit", "limit_remaining", "limit_reset", "is_free_tier", "llmroller": { ... } } }` payload. |
 | `GET /v1/usage/raw` (optional `?upstream_key_id=<id>` plus session headers) | Always serves the latest **stored** snapshot from `upstream_usage_snapshots` (never triggering a live upstream fetch), returning its stored `http_status` and decrypted `raw_json` (for `Own` personal keys and admins) or `sanitized_json` (for `Shared` and `Global` keys). |
 
+### 13.5 Credit usage breakdown popover payload contract (`USG-10`)
+
+When a user hovers or clicks the `(i)` info icon in the `Credits used` column of the `Usage` ledger (`Section 14.n`, `Section 14.o`, `OpenDesign/Image 4`), the UI renders the **`Credit usage breakdown`** popover from `GET /api/user/usage/events/{id}/breakdown` (or inline `data-breakdown` attributes pre-rendered on the table row):
+
+```json
+{
+  "usage_event_id": "01J9X8EV...",
+  "canonical_model": "deepseek-v4.1-flash",
+  "provider_name": "OpenDesign AMR",
+  "plan_name": "Design Plan",
+  "billing_coverage_mode": "subscription_plan",
+  "currency": "USD",
+  "line_items": [
+    {
+      "type_label": "Input (excluding cache)",
+      "tokens": 762,
+      "price_per_mtok_micro_usd": 300000,
+      "price_formatted": "$0.3000",
+      "cost_micro_usd": 229,
+      "cost_formatted": "$0.0002"
+    },
+    {
+      "type_label": "Output",
+      "tokens": 69,
+      "price_per_mtok_micro_usd": 1200000,
+      "price_formatted": "$1.2000",
+      "cost_micro_usd": 83,
+      "cost_formatted": "< $0.0001"
+    },
+    {
+      "type_label": "Cache read",
+      "tokens": 347648,
+      "price_per_mtok_micro_usd": 6000,
+      "price_formatted": "$0.0060",
+      "cost_micro_usd": 2086,
+      "cost_formatted": "$0.0021"
+    },
+    {
+      "type_label": "Cache write",
+      "tokens": 0,
+      "price_per_mtok_micro_usd": 300000,
+      "price_formatted": "$0.3000",
+      "cost_micro_usd": 0,
+      "cost_formatted": "$0.0000"
+    }
+  ],
+  "list_cost_micro_usd": 2398,
+  "list_cost_formatted": "$0.0024",
+  "plan_multiplier_bps": 2500,
+  "plan_multiplier_formatted": "× 0.25",
+  "actual_cost_micro_usd": 600,
+  "actual_cost_formatted": "$0.0006",
+  "footer_note": "This call uses Design Plan credits and does not deduct from your pay-as-you-go balance."
+}
+```
+
 ## 14. API and web UI specification
 
-LLMRoller exposes three HTTP surfaces. The data plane (`/v1/*`) serves coding agents. The user control plane (`/app/*`, `/api/user/*`) serves personal resources, and the admin control plane (`/admin/*`, `/admin/api/*`) serves instance administration.
+LLMRoller exposes three HTTP surfaces. The data plane (`/v1/*`) serves coding agents. The user control plane (`/app/*`, `/api/user/*`) serves personal resources, machine principal service accounts, and scoped telemetry. The admin control plane (`/admin/*`, `/admin/api/*`) serves instance administration, global provider pools, model catalog governance, and full-cluster observability.
+
+Because the Web UI and Control-Plane API cover both self-service developer workflows and multi-tenant enterprise governance without relying on external single-page JavaScript frameworks, Section 14 is structured as:
+1. **Master Data-Plane & Control-Plane API Specification (`14.1`–`14.3` in this file)**, defining every HTTP route, error envelope, authentication contract, and high-level screen map.
+2. **Twenty-Six Detailed Web UI Sub-Specifications (`14.a` through `14.z`)**, specifying the dual-theme design system (`#0d0d0d` OpenCode Dark and `#ffffff` OpenDesign Light), adaptive navigation shells, Askama + HTMX partial contracts, `uPlot` charts, slide-over drawers, cost-breakdown popovers, state machines, and declarative `ui-spec` component trees.
 
 ### 14.1 Data plane API (`/v1`)
 
@@ -2511,29 +2895,29 @@ All `/v1/*` routes except `/healthz` and `/readyz` authenticate using a client k
 | `POST /v1/responses/compact` | `Inference` | OpenAI Responses compaction | Routes via `HardKey` when `previous_response_id` is present, else via `PinnedPreferred` or `Free`. |
 | `POST /v1/messages` | `Inference` | Anthropic Messages (`messages`) | Routes to an eligible upstream key supporting `messages`. Supports JSON and SSE (`stream: true`). |
 | `POST /v1/messages/count_tokens` | `Auxiliary` | Anthropic token counting | Skips budget check `C8`; routes to the pinned or eligible `messages` key (or returns local 404 `not_found_error` if unsupported on all eligible keys). |
-| `GET /v1/models` | Metadata | Model discovery | Returns canonical models passing `C1`..`C5` (plus confirmed aliases) in OpenAI list shape, or in Anthropic list shape when `anthropic-version` is sent.Produces metrics only (no `usage_events` row). |
+| `GET /v1/models` | Metadata | Model discovery | Returns canonical models passing `C1`..`C5` (plus confirmed aliases) in OpenAI list shape, or in Anthropic list shape when `anthropic-version` is sent. Produces metrics only (no `usage_events` row). |
 | `GET /v1/usage` | Metadata | Unified and pass-through usage | Extracts session from headers only (rejects `?session_id=` with 400); returns client key usage, window gauges, and role-scoped `source_provider_usage` (`USG-7`). |
 | `GET /v1/key`, `GET /v1/auth/key` | Metadata | OpenRouter-compatible key usage | Returns OpenRouter key usage format plus LLMRoller pool metadata (`USG-7`). |
 | `GET /v1/usage/raw` | Metadata | Stored upstream `/usage` snapshot | Serves the latest stored `upstream_usage_snapshots` payload (`raw_json` for `Own`/admin; `sanitized_json` for `Shared`/`Global`). |
 | `GET /healthz`, `GET /readyz` | Probe | Process liveness and readiness | `/healthz` returns 200 when alive; `/readyz` returns 200 when startup preload is complete, not draining, WAL `< 1 GiB`, `durable_state` not full, and not `SQLITE_FULL` (503 otherwise). |
 
-#### 14.1.1 Client configuration examples
+#### 14.1.1 Client configuration examples and protocol-specific base URLs (`CLK-7`, `Section 14.h`)
 
-Standard coding agents connect to LLMRoller by setting their base URL and API key environment variables, following the patterns documented by [Claude Code](https://www.google.com/search?q=https%3A%2F%2Fcode.claude.com%2Fdocs%2Fen%2Fllm-gateway-connect) and [OpenCode](https://www.google.com/search?q=https%3A%2F%2Fopencode.ai%2Fdocs%2Fgo):
+Standard coding agents connect to LLMRoller by selecting their API wire format in the `Connection setup` card (`Section 14.h`) and copying the corresponding base URL and API key environment variables, following the patterns documented by [Claude Code](https://code.claude.com/docs/en/llm-gateway-connect) and [OpenCode](https://opencode.ai/docs/go):
 
 ```bash
-# 1. Claude Code (Anthropic Messages wire, base URL without /v1)
-export ANTHROPIC_BASE_URL="https://llmroller.internal.example.com"
-export ANTHROPIC_AUTH_TOKEN="llr_7f9a..."
+# 1. OpenAI · Chat Completions (Recommended for DeepSeek Harness, OpenCode, and Hermes Agent)
+export OPENAI_BASE_URL="https://llmroller.internal.example.com/v1"
+export OPENAI_API_KEY="llr_7f9a..."
 
-# 2. Codex CLI (OpenAI Responses or Chat Completions wire, base URL with /v1)
+# 2. OpenAI · Responses (Recommended for Codex CLI)
 # In ~/.codex/config.toml:
 # base_url = "https://llmroller.internal.example.com/v1"
 export OPENAI_API_KEY="llr_7f9a..."
 
-# 3. opencode (@ai-sdk/openai-compatible provider)
-# baseURL: "https://llmroller.internal.example.com/v1"
-# apiKey:  "llr_7f9a..."
+# 3. Anthropic · Messages (Recommended for Claude Code, base URL without /v1)
+export ANTHROPIC_BASE_URL="https://llmroller.internal.example.com"
+export ANTHROPIC_AUTH_TOKEN="llr_7f9a..."
 ```
 
 #### 14.1.2 Proxy error envelopes and status codes
@@ -2543,8 +2927,8 @@ Errors generated by LLMRoller itself use the caller's protocol envelope: `{"erro
 | HTTP status | Envelope `type` / `code` | Trigger condition | `Retry-After` header |
 | --- | --- | --- | --- |
 | 400 | `invalid_request_error` / `invalid_request` | Malformed JSON, non-UTF-8 or BOM prefix, non-object top level, trailing bytes, duplicate top-level JSON key, type-confused `model`/`stream`, `?session_id=` query parameter on `/v1/usage*`, invalid header bytes (`SEC-15`), or rejected `User-Agent` (`ua_policy = reject`). | Omitted |
-| 401 | `authentication_error` / `invalid_client_key` | Missing, malformed, disabled, expired, or revoked client key (`G1`, `G2`), or disabled owner account (`G3`). | Omitted |
-| 403 | `permission_error` / `permission_denied` | Client IP outside `client_key.allowed_cidrs` (`G4`), requested model excluded by `client_key.allowed_models` (`G6`), or `HardKey` (`previous_response_id`) references a key whose share was revoked or disabled. | Omitted |
+| 401 | `authentication_error` / `invalid_client_key`, `client_key_paused`, or `service_account_disabled` | Missing, malformed, disabled, paused (`paused_at IS NOT NULL`), expired, or revoked client key (`G1`, `G2`), disabled parent service account, or disabled owner account (`G3`). | Omitted |
+| 403 | `permission_error` / `permission_denied`, `service_account_ip_restricted`, or `client_key_ip_restricted` | Client IP outside inherited `service_accounts.allowed_cidrs` or `client_key.allowed_cidrs` (`G4`), requested model excluded by `client_key.allowed_models` (`G6`), or `HardKey` (`previous_response_id`) references a key whose share was revoked or disabled. | Omitted |
 | 404 | `not_found_error` / `model_not_found` or `response_not_found` | Unknown model (`model_not_found`), or unknown / cross-tenant `response_id` (`response_not_found`). | Omitted |
 | 405 / 415 | `invalid_request_error` / `method_not_allowed` or `unsupported_media_type` | Unsupported HTTP method (`405`) or missing/non-JSON `Content-Type` on POST routes (`415`). | Omitted |
 | 409 | `invalid_request_error` / `ambiguous_model_id` | Client requested a raw `upstream_model_id` that maps to more than one accessible canonical model. | Omitted |
@@ -2556,7 +2940,7 @@ Errors generated by LLMRoller itself use the caller's protocol envelope: `{"erro
 
 ### 14.2 Control plane JSON API (`/api/user` and `/admin/api`)
 
-All control-plane endpoints authenticate via the `__Host-llmroller_session` cookie and validate the per-session random `x-csrf-token` on mutating methods (`POST /api/auth/login` validates `__Host-llmroller_login_csrf` against `x-csrf-token` plus `Origin`). Identifiers that may contain `/` (`upstream_model_id` and `alias`) travel in JSON bodies or query parameters so `%2F`-decoding proxies never break routing.
+All control-plane endpoints authenticate via the `__Host-llmroller_session` cookie and validate the per-session random `x-csrf-token` on mutating methods (`POST /api/auth/login` validates `__Host-llmroller_login_csrf` against `x-csrf-token` plus `Origin`). Every authenticated control-plane call is also logged non-blockingly in `control_plane_logs` (`AUD-2`, `USG-9`). Identifiers that may contain `/` (`upstream_model_id` and `alias`) travel in JSON bodies or query parameters so `%2F`-decoding proxies never break routing.
 
 #### 14.2.1 Self-service user API (`/api/user/*` for `user` and `admin` roles)
 
@@ -2564,16 +2948,18 @@ Every `/api/user/*` endpoint scopes queries to `actor.user_id`, returns HTTP 404
 
 | Resource group | Endpoints and methods |
 | --- | --- |
-| Authentication and profile | `POST /api/auth/login` (validates `__Host-llmroller_login_csrf` + `Origin`), `POST /api/auth/logout`, `GET /api/auth/me`, `POST /api/user/password`, `POST /api/user/totp/enroll`, `POST /api/user/totp/verify`, `POST /api/user/totp/disable`, `DELETE /api/user/web-sessions/{id_hash}` |
+| Authentication, profile & UI preferences | `POST /api/auth/login` (validates `__Host-llmroller_login_csrf` + `Origin`), `POST /api/auth/logout`, `GET /api/auth/me`, `PATCH /api/user/preferences` (`ui_theme`: `dark\|light\|system`, `ui_nav_layout`: `top_tabs\|sidebar`, `ui_locale`: `en`, `default_routing_scope`, `UI-5`), `POST /api/user/password`, `POST /api/user/totp/enroll`, `POST /api/user/totp/verify`, `POST /api/user/totp/disable`, `DELETE /api/user/web-sessions/{id_hash}` |
+| Service accounts (`CLK-6`, `14.j`, `14.k`) | `GET /api/user/service-accounts?q=` (lists service accounts with total/active key counts and CIDR status), `POST /api/user/service-accounts`, `GET /api/user/service-accounts/{id}?range=` (returns detail view, 3 KPI cards `Cost`, `Requests`, `Tokens`, CIDR list, and child keys), `PATCH /api/user/service-accounts/{id}`, `PUT /api/user/service-accounts/{id}/ip-restrictions` (validates up to 64 IPv4/IPv6 addresses or CIDRs), `DELETE /api/user/service-accounts/{id}`, `POST /api/user/service-accounts/{id}/keys` (provisions child `client_key`) |
+| Client keys & lifecycle (`CLK-1`..`CLK-7`, `14.h`, `14.i`) | `GET /api/user/client-keys?q=&service_account_id=`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}` (inline `Rename`, `routing_scope`, `constant_session_mode`, `allowed_models`, `rate_limit_rpm`, `budget_micro_usd_month`, `allowed_cidrs`), `POST /api/user/client-keys/{id}/pause` (`paused_at = now_ms`), `POST /api/user/client-keys/{id}/resume` (`paused_at = NULL`), `POST /api/user/client-keys/{id}/rotate` (accepts `grace_period_secs` `0..=86400`, default `300`), `DELETE /api/user/client-keys/{id}` (`Revoke`), `GET /api/user/client-keys/{id}/sessions?since_ms=&after=&limit=50` (`TRC-9`), `GET /api/user/connection-setup?format=chat\|responses\|messages` (`CLK-7`) |
 | Personal providers & pricing | `GET /api/user/providers`, `POST /api/user/providers` (`ownership_scope = 'personal'`), `PATCH /api/user/providers/{id}` (recomputes `share_config_fingerprint`), `DELETE /api/user/providers/{id}`, `PUT /api/user/providers/{id}/prices` (body carries `upstream_model_id`, rates, `tiers_json`, `schedule_json`) |
 | Personal upstream keys | `GET /api/user/providers/{id}/keys`, `POST /api/user/providers/{id}/keys`, `PATCH /api/user/upstream-keys/{id}`, `DELETE /api/user/upstream-keys/{id}`, `POST /api/user/upstream-keys/{id}/test`, `POST /api/user/upstream-keys/{id}/reset-health` (bumps `health_version` in `RuntimeState` first), `PUT /api/user/upstream-keys/{id}/windows`, `POST /api/user/upstream-keys/{id}/calibrate` |
 | Source `/usage` inspection | `GET /api/user/upstream-keys/{id}/usage` (returns latest snapshot + history, decrypted `raw_json` for own keys, `sanitized_json` for shared keys), `POST /api/user/upstream-keys/{id}/usage/refresh` (owner only, 10 s min interval) |
 | Personal provider sharing | `GET /api/user/shares/outgoing`, `POST /api/user/shares` (returns 409 `share_overlap` on provider/key overlap or if `usage_url_cross_origin_ack = 1`), `PATCH /api/user/shares/{id}`, `DELETE /api/user/shares/{id}` (also deletes grantee `user_route_preferences`), `GET /api/user/shares/incoming`, `POST /api/user/shares/{id}/accept` (grantee only; body must echo `config_fingerprint`) |
 | Personal route overrides | `GET /api/user/routes?model=`, `PUT /api/user/routes/{upstream_key_id}/{canonical_id}` (sets `user_route_preferences.priority_override` and `enabled` on own or accepted shared routes) |
-| Client keys & recent sessions | `GET /api/user/client-keys`, `POST /api/user/client-keys` (returns raw `llr_...` once), `PATCH /api/user/client-keys/{id}` (including `routing_scope` and `constant_session_mode`), `POST /api/user/client-keys/{id}/rotate` (accepts `grace_period_secs` `0..=86400`, default `300`), `DELETE /api/user/client-keys/{id}`, `GET /api/user/client-keys/{id}/sessions?since_ms=&after=&limit=50` (lists recently active sessions from that client key with logged request stats, trace counts, and live `PinStore` provider and `project_key`-redacted upstream key bindings right now, `TRC-9`) |
 | Active session pins | `GET /api/user/pins?client_key_id=` (returns live `PinStore` pins with provider name/kind and `project_key`-redacted upstream key), `DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`, `POST /api/user/pins/move` (validates `C1`..`C8` on target key before calling `PinStore::admin_move`) |
 | Session chat preview (read-only) | `GET /api/user/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (reconstructed timeline for caller's own session), `GET /api/user/traces/{request_id}` (single turn trace and reconstructed raw JSON) |
-| Scoped usage analytics | `GET /api/user/usage/summary`, `GET /api/user/usage/timeseries`, `GET /api/user/usage/breakdown`, `GET /api/user/usage/events` (paged `<= 5,000` rows per read tx), `GET /api/user/usage/export.csv` |
+| Dual-stream logs & request drawer (`USG-9`, `AUD-2`, `14.l`, `14.m`) | `GET /api/user/request-logs?stream=inference\|api&range=&status=&model=&initiator=&after=&limit=50` (returns chronologically ordered `Inference` or `API` control-plane logs), `GET /api/user/request-logs/{id}` (returns full 7-section Request Detail Drawer payload including `prev_id` and `next_id` cursor links) |
+| Scoped usage analytics & cost breakdown (`UI-6`, `USG-10`, `14.e`–`14.g`, `14.n`–`14.o`) | `GET /api/user/usage/summary?range=`, `GET /api/user/usage/timeseries?range=&metric=cost\|tokens`, `GET /api/user/usage/breakdown?range=&sort=cost_desc`, `GET /api/user/usage/events?initiator=&model=&range=&after=&limit=50` (returns 5-token summary strip + paged usage ledger rows), `GET /api/user/usage/events/{id}/breakdown` (returns `Credit usage breakdown` popover payload), `GET /api/user/usage/export.csv` |
 | Scoped audit log | `GET /api/user/audit` (events where `actor_user_id == me` or target belongs to `me`) |
 
 #### 14.2.2 Instance administration API (`/admin/api/*` for `admin` role only)
@@ -2583,31 +2969,2110 @@ Every `/admin/api/*` endpoint rejects non-admin callers with HTTP 403.
 | Resource group | Endpoints and methods |
 | --- | --- |
 | First-run setup (`users == 0`) | `GET /setup`, `GET /admin/api/setup/status`, `POST /admin/api/setup` (all three return HTTP 404 permanently once any user exists per `AUTH-3`) |
-| User, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `DELETE /admin/api/client-keys/{id}`, `GET /admin/api/client-keys/{id}/sessions?since_ms=&after=&limit=50` (lists recently active sessions for any client key with logged request stats, trace counts, and live pinned provider and upstream key right now, `TRC-9`) |
+| User, service account, key, and session management | `GET /admin/api/users`, `POST /admin/api/users`, `PATCH /admin/api/users/{id}` (enforces in-tx `last_admin` guard; disabling a user emits `CacheInvalidationEvent::OwnerDisabled`), `DELETE /admin/api/users/{id}?confirm=<username>` (enforces `last_admin` guard and records `deleted_users`), `POST /admin/api/users/{id}/reset-password`, `POST /admin/api/users/{id}/totp/reset`, `DELETE /admin/api/users/{id}/web-sessions`, `GET /admin/api/service-accounts`, `POST /admin/api/service-accounts`, `GET /admin/api/service-accounts/{id}`, `PUT /admin/api/service-accounts/{id}/ip-restrictions`, `DELETE /admin/api/service-accounts/{id}`, `GET /admin/api/users/{id}/client-keys`, `POST /admin/api/users/{id}/client-keys`, `POST /admin/api/client-keys/{id}/pause`, `POST /admin/api/client-keys/{id}/resume`, `DELETE /admin/api/client-keys/{id}`, `GET /admin/api/client-keys/{id}/sessions?since_ms=&after=&limit=50` (`TRC-9`) |
 | Admin override on user resources | `GET /admin/api/users/{id}/providers`, `PATCH /admin/api/providers/{id}`, `DELETE /admin/api/providers/{id}`, `GET /admin/api/users/{id}/shares`, `DELETE /admin/api/shares/{id}`, `POST /admin/api/shares/{id}/approve` (approves `custom` provider share), `GET /admin/api/users/{id}/pins` (every action logs `target_type` and owner `user_id` in `audit_log`) |
 | Global providers and keys | `GET /admin/api/providers`, `POST /admin/api/providers` (`ownership_scope = 'global'`), `POST /admin/api/providers/{id}/keys`, `PATCH /admin/api/upstream-keys/{id}`, `DELETE /admin/api/upstream-keys/{id}`, `POST /admin/api/upstream-keys/{id}/test`, `POST /admin/api/upstream-keys/{id}/reset-health`, `GET /admin/api/upstream-keys/{id}/usage`, `POST /admin/api/upstream-keys/{id}/usage/refresh`, `PUT /admin/api/upstream-keys/{id}/windows`, `POST /admin/api/upstream-keys/{id}/calibrate` |
 | Model catalog and price book | `GET /admin/api/models` (includes `merge_state`, `origin`, and `routing_strategy` filters), `PATCH /admin/api/models/{canonical_id}` (`exposed`, `distribution`, `routing_strategy`), `POST /admin/api/models/{canonical_id}/confirm-merge`, `POST /admin/api/models/refresh`, `POST /admin/api/models/merge`, `POST /admin/api/models/split`, `PUT /admin/api/model-aliases` (body `{alias, canonical_id}`), `DELETE /admin/api/model-aliases?alias=<urlencoded>`, `GET /admin/api/prices`, `PUT /admin/api/prices` (body carries `{provider_id, provider_kind, upstream_model_id, ...}`), `POST /admin/api/prices/sync` |
 | Global routing and pins | `GET /admin/api/routes`, `PATCH /admin/api/routes/{upstream_key_id}/{canonical_id}`, `GET /admin/api/pins`, `DELETE /admin/api/pins` (takes a filter or `confirm_all=true`), `POST /admin/api/pins/move` |
 | Content traceability & chat preview | `GET /admin/api/settings/traceability`, `PUT /admin/api/settings/traceability` (lowering `retention_days` returns 409 with row count unless `"confirm_purge": true`), `GET /admin/api/sessions/{session_hash}/chat?after=<ts>:<request_id>&limit=50` (logs deduplicated `trace.viewed` audit row once per 30 m), `GET /admin/api/traces/{request_id}`, `DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces` |
-| Instance usage, settings, and audit | `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown`, `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` (validates against closed 14-key registry including `default_routing_strategy`) |
+| Instance logs, usage, settings, and audit | `GET /admin/api/request-logs?stream=inference\|api`, `GET /admin/api/request-logs/{id}`, `GET /admin/api/usage/summary`, `GET /admin/api/usage/timeseries`, `GET /admin/api/usage/breakdown`, `GET /admin/api/usage/events`, `GET /admin/api/usage/events/{id}/breakdown`, `GET /admin/api/audit`, `GET /admin/api/settings`, `PATCH /admin/api/settings` (validates against closed 14-key registry including `default_routing_strategy`) |
 
-### 14.3 Web UI screens, CSP configuration, and metric definitions
+### 14.3 Web UI screens, CSP configuration, and sub-specification index (`14.a`–`14.z`)
 
 The web interface is server-rendered with Askama templates and HTMX partial updates, using zero external CDN assets. `/static/app.js` sets `htmx.config.includeIndicatorStyles = false`, `htmx.config.allowEval = false`, and `htmx.config.allowScriptTags = false` before HTMX initializes; loading-spinner CSS ships inside `/static/app.css`, and templates never use `hx-on:*` or `js:` attributes so `script-src 'self'; style-src 'self'` holds without exceptions.
 
-| Screen | Audience | Primary elements and actions |
+| Sub-Spec File | Screen or Architectural Domain | Primary Elements, Inspirations & Linked Requirements |
 | --- | --- | --- |
-| Setup & Login | Public (unauthenticated) | First-admin setup form (with setup token) when zero users exist; username, password, and TOTP login form protected by `__Host-llmroller_login_csrf` thereafter. |
-| Overview Dashboard | `user` (scoped) & `admin` (global + personal) | Range selector (24 h, 7 d, 30 d, custom); cards for total requests, tokens, micro-USD cost, cache hit rate, pin follow rate, and repin rate; projected disk usage meter (`A6`) and `"Unpriced models"` badge; stacked daily cost chart (`uPlot`); upstream key cards showing live health from `RuntimeState`, local window ring spend, and `UpstreamObservation` gauges (`5h`, `7d`, `1mo`) with reset countdowns. |
-| Personal Providers & Keys | `user` & `admin` | Add personal provider from preset or custom URL; add personal upstream keys; Test button; Refresh `/usage` button; modal showing decrypted raw source provider `/usage` JSON; configure budget windows and manual calibration. |
-| Sharing & Shared With Me | `user` & `admin` | **Outgoing Shares tab:** grant access to a personal provider or key (preventing overlapping provider/key shares), set allowed models and monthly USD cap, view per-grantee token and dollar consumption (including charged failed tries), revoke share. **Shared With Me tab:** inspect pending and accepted shares, view provider kind, `base_url` host, key label, and the explicit disclosure `"Requests you send through this share travel to the endpoint above and are visible to its operator"`, and click **Accept Share** (`POST /api/user/shares/{id}/accept`). |
-| Routing Matrix | `user` (`Own` + `Shared` + aggregated `"Global pool"` via `project_key`) & `admin` (full catalog) | Matrix of canonical models (rows) by upstream keys (columns). For standard users, all global keys are aggregated into a single `"Global pool"` column showing the combined projected share without leaking global key labels or priorities. Displays protocol chips (`chat`, `responses`, `messages`), active `routing_strategy` badge (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`, showing `100% / N` equal shares when an unweighted strategy is active), inline editable per-model `priority_override` on `Own` and `Shared` routes, effective weight, and projected percentage share. |
-| Client Keys | `user` (own) & `admin` (all) | Generate `llr_...` key (shown once in a confirmation modal), select `routing_scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), configure `constant_session_mode` (`flag` or `fingerprint_generic_ids`), restrict models, set RPM or monthly USD cap, rotate with configurable `grace_period_secs`, or revoke. Includes a **Recently Active Sessions** drawer per client key (`TRC-9`) showing each recent `session_hash`, which provider and upstream key (`project_key`-redacted) it is pinned to right now (or `"unpinned / expired"` with last-served route), logged request and traced-turn counts, **View Requests** filter link, and **Preview Chat** button. |
-| Active Sessions | `user` (own) & `admin` (all) | Live table (10 s HTMX poll) of active pins in `PinStore` filterable by `client_key_id` (with a toggle to include recently active sessions from `usage_events` whose pins expired): session hash prefix, client key, model, pinned provider name/kind and upstream key (projected via `project_key`), tier badge (`Own`, `Shared`, `Global`, `Blended`), age, logged request count, `repin_count`, constant-session warning badge, **View Requests** link, and **Preview Chat** button. Supports Unpin and Move Pin. |
-| Session Chat Preview (Read-Only) | `user` (own sessions) & `admin` (all traced sessions) | Read-only conversation replay paginated by `(ts, request_id)` cursor: header displays the originating `client_key_prefix`/`label` and live `current_pins` badges showing which provider and upstream key (`project_key`-redacted) the session is pinned to right now; timeline renders per-thread system instructions and tool schemas, user prompts, collapsible reasoning/thinking blocks, formatted tool calls and tool outputs (auto-escaped in `<pre>`), assistant Markdown sanitized via `pulldown-cmark` (raw HTML off) + `ammonia`, context-compaction dividers, per-turn telemetry chips (with `project_key` redaction), and a raw JSON inspector drawer. |
-| Usage Explorer | `user` (own) & `admin` (all) | Filter by time range, user, client key, provider scope, upstream key, model, or `cost_source` (`provider`, `price_book`, `fallback_rate`, `estimated_incomplete`, `estimated_attempt`). Paged event table (`<= 5,000` rows per read tx) with `usage_attempts` breakdown and formula-sanitized CSV or JSON export. |
-| Admin: Global Providers & Catalog | `admin` only | Manage global providers and keys, review `pending_review` cross-vendor model merges, force-expose or disable models, merge or split models over `model_pk`, edit aliases and prices, and approve `custom` provider shares. |
-| Admin: Users, Settings & Audit | `admin` only | Create, disable, or delete user accounts (`?confirm=<username>`), inspect `deleted_users`, set per-user global pool access and monthly global caps, edit the 14 validated runtime settings (including `default_routing_strategy`), and inspect the hash-chained `audit_log`. |
+| `14.a` | Design System, Dual-Theme Tokens & Typography | High-contrast OpenCode Dark (`#0d0d0d` / `#141414` / `#262626`) and OpenDesign Light (`#ffffff` / `#f9fafb` / `#e5e7eb`) token variables, semantic status dots (`#22c55e`, `#d99b26`, `#ef4444`), typography, and spacing (`UI-3`, `UI-5`). |
+| `14.b` | Application Shell, Dual Navigation & Workspace Switcher | 48px Global Top Bar (`P Personal` vs `D Default` / Admin workspace dropdown, `⌘K` search, user profile menu), 44px horizontal underline tabs (`Overview`, `Logs`, `Audit`, `Go`, `Models`, `Providers`, `Controls`, `Integrations`, `Settings`), and collapsible left sidebar (`UI-1`, `UI-5`). |
+| `14.c` | HTMX Architecture, Event Delegation & Strict CSP | Askama base/partial inheritance, HTMX swap rules, `hx-headers` CSRF binding, zero-inline-JS `data-*` event delegation in `/static/app.js`, and template lint gates (`UI-3`, `SEC-5`). |
+| `14.d` | First-Run Setup, Login, TOTP & Session Security UI | Bootstrap `/setup` form with `setup-token`, `/login` with `__Host-llmroller_login_csrf`, TOTP QR/recovery enrollment, forced password change, and active web sessions table (`AUTH-1`..`AUTH-9`, `SEC-5`). |
+| `14.e` | Overview Analytics Dashboard & KPI Summary Cards | Centered `980px` analytics view, date-range selector (`Last 24h`, `Last 7 days`, `Last 30 days`, `All time`), `Connect CLI` button, 3-card KPI row (`Cost`, `Requests`, `Tokens`), and `A6` disk budget meter (`UI-1`, `UI-2`, `UI-6`). |
+| `14.f` | Time-Series Daily Cost & Token Histogram Charts (`uPlot`) | `Daily Cost` card with segmented `Cost` \| `Tokens` pill toggle, dynamic Y-axis gridlines (`$0`, midpoint, max `$N`), daily X-axis bars (`MM/DD`), and hover tooltips (`UI-6`). |
+| `14.g` | Usage by Model Breakdown Table & Provider Badges | Per-model table (`Model`, `Requests`, `Input`, `Cache Read`, `Cache Write`, `Output`, `Cost ↓`), `<N> models · <M> providers` badge, `[GO]`/`[CC]`/`[OD]`/`[OR]` icons, and `Free` tier pills (`UI-6`). |
+| `14.h` | Connection Setup Wizard, API Format Switcher & CLI Setup | 2-step `Connection setup` card (`1. Which API format does your tool use?` radio cards for `Chat Completions`, `Responses`, `Messages`; `2. Copy the API base URL for this format`) and `One-click agent setup` modal (`CLK-7`). |
+| `14.i` | Client API Keys Management & Inline Lifecycle Actions | `My API keys` table, search by name/prefix, `● Active` / `● Paused` badges, `Permissions` (`All`/`Restricted`), and inline `Rename`, `Pause key`, `Resume key`, `Rotate`, and `Revoke` buttons (`CLK-1`..`CLK-7`). |
+| `14.j` | Service Accounts Directory & Machine Principal IAM | `Settings > Service accounts` master table (`Name`, `Keys`, `Active keys`, `Created`, `IP restrictions`), search input, and `+ Add Service Account` modal (`CLK-6`). |
+| `14.k` | Service Account Detail View, 64-CIDR Editor & Child Keys | `Service Accounts > <name>` view, breadcrumbs, resizable `Allowed IP addresses` textarea (up to 64 IPv4/IPv6 CIDRs), 3-card KPIs (`Cost`, `Requests`, `Tokens`), and child `API Keys` table (`CLK-6`). |
+| `14.l` | Dual-Stream Logs Explorer (`Inference` vs `API` Logs) | `Logs` view (`1140px`) with segmented `Inference` (7-col) vs `API` (5-col) toggle, semantic status badges (`200`, `429 Rejected`, `403 Rejected`), `Filter` builder, refresh (`↻`), and export (`↓`) (`USG-9`, `AUD-2`). |
+| `14.m` | Request Detail Slide-Over Inspection Drawer | 460px right-docked drawer over dimmed backdrop, sticky `<` / `>` row navigation, and 7 sections (`Request`, `Model`, `Tokens`, `Identity`, `Client`, `Request headers`, `Metadata`) (`USG-9`, `SEC-6`). |
+| `14.n` | Granular Usage Ledger, 5-Token Strip & Pill Filters | `Usage` screen with `All initiators`, `All models`, and date-range pill dropdowns, 5-metric Token Summary Strip (`Total`, `Input`, `Output`, `Cache read`, `Cache write`), and usage table (`USG-10`). |
+| `14.o` | Credit & Cost Breakdown Popover & Plan Multipliers | `Credits used` cell with struck-through list price (`~$0.0024~ (i)`), emerald `Covered by <Plan> credits` subtitle, and dark floating `Credit usage breakdown` popover (`Plan contribution multiplier × 0.25`) (`USG-10`). |
+| `14.p` | Personal & Global Providers, Presets & Upstream Key Cards | Provider configuration (`opencode_go`, `command_code`, `open_design_amr`, `openrouter`, `custom`), `ProviderConfigJson` editor, live `RuntimeState` health badges, `Test`, and `Reset Health` (`PRV-1`..`PRV-8`, `UI-2`). |
+| `14.q` | Plan & Balance Dashboard, Budget Windows & `/usage` Gauges | Side-by-side local 360-bucket ring spend and `UpstreamObservation` gauges (`5h`, `7d`, `1mo`), reset countdowns, `Refresh /usage` button, decrypted raw `/usage` JSON modal, and calibration (`LIM-1`, `USG-4`..`USG-8`, `UI-2`). |
+| `14.r` | Consented Personal Sharing, Grants & Share Acceptance UI | Outgoing shares table (per-grantee spend, `allowed_models`, `max_monthly_micro_usd`, `share_overlap` guard) and `Shared With Me` destination disclosure & fingerprint acceptance (`SHR-1`..`SHR-6`). |
+| `14.s` | Routing Matrix, Pluggable Strategy Selector & Overrides | Model-by-key routing matrix, `"Global pool"` aggregated column via `project_key`, 6-strategy `RoutingStrategy` selector, inline `priority_override` inputs, and headroom scaling (`RTE-4`..`RTE-14`, `USR-4`). |
+| `14.t` | Active Sessions Pin Manager & Key Recent Sessions Drawer | 10s-polled `Active Sessions` table (`PinStore`), constant-session warning badge, `Unpin` / `Move Pin` controls, and per-client-key `Recently Active Sessions` drawer (`RTE-2`, `RTE-10`, `TRC-9`, `UI-4`). |
+| `14.u` | Read-Only Session Chat Preview & Turn Trace Inspector | Multi-turn conversation replay, live `current_pins` header badges, thread selector, system/tool accordions, `<pre>` reasoning/tool blocks, `pulldown-cmark` + `ammonia` Markdown, and raw JSON drawer (`TRC-5`, `TRC-6`, `SEC-19`). |
+| `14.v` | Canonical Model Catalog, Merge Review, Aliases & Prices | Model catalog table, `exposed` kill-switch, `pending_review` cross-vendor merge confirmation, `model_pk` merge/split modals, aliases, and tiered/scheduled price-book editor (`MDL-1`..`MDL-7`, `USG-3`). |
+| `14.w` | Settings Sub-Navigation Layout & Runtime Registry | Split-pane `Settings` layout with 180px left sidebar (`General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`), 14-key runtime settings form, and `traceability_config` controls (`TRC-1`, `TRC-7`, `UI-5`). |
+| `14.x` | Audit Log Explorer, Hash-Chain Verifier & Deleted Users | Tamper-evident `audit_log` explorer, `audit_anchor` integrity badge, event detail JSON drawer, and `deleted_users` historical attribution table (`AUD-1`, `AUTH-4`, `SEC-13`). |
+| `14.y` | Accessibility (WCAG 2.1 AA), Keyboard Nav, i18n & Responsive | Contrast verification across Dark/Light themes, keyboard shortcuts (`⌘K`, `<`/`>`, `Esc`), ARIA live regions, `[EN]` locale architecture, and desktop/tablet/mobile breakpoints (`UI-5`). |
+| `14.z` | Complete UI Component Inventory & Declarative `ui-spec` Map | Master traceability table from every screen/drawer/modal/popover to its Askama template, Rust handler, and complete `ui-spec` structural pseudocode (`UI-1`..`UI-6`). |
+
+## 14.a. Web UI Design System, Dual-Theme Tokens, and Typography
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-3`, `UI-5`, `SEC-5`  
+> **Visual Inspiration Sources:** OpenCode Console (`OpenCode/Image 1..10.png` — high-contrast carbon dark mode `#0d0d0d`) and OpenDesign AMR Console (`OpenDesign/Image 1..4.png` — crisp neutral light mode `#ffffff` with dark `#18181b` popovers).
+
+### 14.a.1 Design Philosophy and Dual-Theme Architecture
+
+LLMRoller's Web UI serves two complementary engineering workflows:
+1. **High-Density Telemetry, Log Inspection, and IAM Governance (OpenCode Dark Paradigm)**: Engineers inspecting thousands of inference requests, comparing 10+ models across multiple providers, or configuring 64-entry IPv4/IPv6 CIDR allow-lists on Service Accounts benefit from a low-glare, high-contrast carbon dark theme (`#0d0d0d` primary background, `#141414` elevated card/table surfaces, `#262626` 1px borders).
+2. **Approachable Self-Service Onboarding, Key Management, and Cost Attribution (OpenDesign Light Paradigm)**: Standard users generating personal API keys, selecting wire formats (`Chat Completions`, `Responses`, `Messages`), or reviewing monthly credit coverage in the Usage Ledger often prefer a high-legibility light theme (`#ffffff` primary canvas, `#f9fafb` secondary card surfaces, `#e5e7eb` subtle borders, paired with high-contrast dark `#18181b` floating breakdown popovers).
+
+LLMRoller unifies both visual paradigms inside `/static/app.css` using CSS custom properties scoped to `<html data-theme="dark">` (default) and `<html data-theme="light">`, with automatic `prefers-color-scheme` support when the user selects `system` (`users.ui_theme IN ('dark', 'light', 'system')`, `UI-5`).
+
+### 14.a.2 Normative Color Token Registry (`crates/admin/static/app.css`)
+
+Every surface, border, text hierarchy level, and semantic status badge in `crates/admin/templates/**/*.html` MUST reference the semantic CSS custom properties below rather than hardcoded hex literals.
+
+| CSS Custom Property | OpenCode Dark Theme (`data-theme="dark"`) | OpenDesign Light Theme (`data-theme="light"`) | Semantic Usage & Contrast Guarantee |
+| --- | --- | --- | --- |
+| `--bg-canvas` | `#0d0d0d` | `#ffffff` | Root viewport background (`<body>` and main scroll canvas). |
+| `--bg-topbar` | `#0d0d0d` | `#ffffff` | 48px Global Top Utility Header and 44px Horizontal Module Tab Bar. |
+| `--bg-sidebar` | `#0d0d0d` | `#f9fafb` | Collapsible Left Sidebar (`240px`) and Settings Sub-Navigation Sidebar (`180px`). |
+| `--bg-surface` | `#141414` | `#ffffff` | KPI summary cards, `Daily Cost` chart card, `Connection setup` card, and data tables. |
+| `--bg-surface-subtle` | `#1a1a1a` | `#f9fafb` | Table header rows (`<thead>`), code snippet wells (`Copy URL`), and inactive segmented controls. |
+| `--bg-surface-hover` | `#1f1f1f` | `#f3f4f6` | Interactive table row hover (`Logs`, `Service Accounts`, `My API keys`) and nav item hover. |
+| `--bg-pill-active` | `#262626` | `#eceef2` | Active left-sidebar navigation pill (`Service accounts`, `API Keys`, `Usage`) and active filter pills. |
+| `--bg-segmented-active` | `#2e2e2e` | `#ffffff` | Active thumb inside segmented controls (`Cost` \| `Tokens`, `Inference` \| `API`). |
+| `--bg-drawer` | `#121212` | `#ffffff` | 460px Right-Side Slide-Over Request Detail Inspection Drawer (`14.m`) and Sessions Drawer (`14.t`). |
+| `--bg-popover-dark` | `#18181b` | `#18181b` | Floating `Credit usage breakdown` popover card (`14.o`), kept dark in both themes for visual anchor contrast. |
+| `--bg-backdrop` | `rgba(0, 0, 0, 0.65)` | `rgba(17, 24, 39, 0.45)` | Dimmed modal and slide-over drawer overlay (`state: Dimmed-Backdrop`). |
+| `--border-subtle` | `#262626` | `#e5e7eb` | 1px solid card borders, table outer frames, drawer dividers, and horizontal section rules. |
+| `--border-row` | `#1f1f1f` | `#f3f4f6` | 1px horizontal dividers between `<tbody>` rows. |
+| `--border-focus` | `#ffffff` | `#111827` | Keyboard focus ring and active underline bar (`2px solid`) on horizontal module tabs. |
+| `--border-radio-active` | `#22c55e` | `#16a34a` | Active card border on the selected `Connection setup` API format card (`OpenDesign/Image 2`). |
+| `--text-primary` | `#ffffff` | `#111827` | Headings (`H1`–`H4`), KPI numbers (`$50.96`, `4.13B`), primary entity names, and active tab labels (`>= 15:1` contrast). |
+| `--text-secondary` | `#b3b3b3` | `#374151` | Table body cells, form labels, and navigation links (`>= 7.5:1` contrast). |
+| `--text-muted` | `#8c8c8c` | `#6b7280` | Subtitles, column headers, timestamps (`Oct 18, 02:45:57`), key prefixes (`llr_sk_bd82...`), and helper captions (`>= 4.6:1` contrast). |
+| `--text-strikethrough` | `#737373` | `#9ca3af` | Struck-through list-price cost (`~$0.0024~`) in the `Usage` ledger (`14.n`, `14.o`). |
+| `--status-success-fg` | `#22c55e` | `#15803d` | HTTP `● 200` log status, `● Active` key status pill text, and `Covered by <Plan> credits` subtitle. |
+| `--status-success-bg` | `rgba(34, 197, 94, 0.14)` | `#dcfce7` | Background pill for `● Active` key badge (`OpenDesign/Image 2`). |
+| `--status-warning-fg` | `#d99b26` | `#b45309` | HTTP `● 429 Rejected` and `● 403 Rejected` status indicators (`OpenCode/Image 5–7`) and `cooling_down` health. |
+| `--status-warning-bg` | `rgba(217, 155, 38, 0.14)` | `#fef3c7` | Background pill for warning badges and the global Content Traceability Mode banner (`UI-4`). |
+| `--status-danger-fg` | `#ef4444` | `#dc2626` | `Revoke` button text, `invalid` / `exhausted` key health badges, and destructive action confirmations. |
+| `--status-danger-bg` | `rgba(239, 68, 68, 0.14)` | `#fee2e2` | Hover/active fill for destructive `Revoke` and `Purge` buttons. |
+| `--status-paused-fg` | `#a3a3a3` | `#4b5563` | `● Paused` client key status pill text (`OpenDesign/Image 2`). |
+| `--status-paused-bg` | `#262626` | `#f3f4f6` | Background pill for `● Paused` client key badge and `Free` model tier badge (`OpenCode/Image 8`). |
+| `--chart-bar-fill` | `#a3a3a3` | `#374151` | Vertical histogram bars in the `Daily Cost` / `Tokens` `uPlot` chart (`OpenCode/Image 3–4`). |
+| `--chart-bar-hover` | `#ffffff` | `#111827` | Hovered histogram bar highlight in `uPlot`. |
+| `--chart-grid-dashed` | `#262626` | `#e5e7eb` | Dashed horizontal Y-axis reference lines (`$0`, midpoint, ceiling) in `uPlot`. |
+
+### 14.a.3 Typography Scale, Font Stacks, and Numeric Formatting Conventions
+
+To eliminate external font downloads (`PRIV-1`, `UI-3`) while maintaining crisp alignment across numeric tables, token counters, and key prefixes, `/static/app.css` defines two native font stacks and enforces `font-variant-numeric: tabular-nums` on all numeric cells:
+
+```css
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+```
+
+| Typographic Element | Font Family | Size (`rem` / `px`) | Weight | Line Height | Tracking & Numeric Rules |
+| --- | --- | --- | --- | --- | --- |
+| Page Title (`H1`: `Overview`, `Logs`, `Usage`, `Service Accounts`, `agents`) | `--font-sans` | `1.5rem` (`24px`) | `600` (SemiBold) | `1.3` (`32px`) | `letter-spacing: -0.02em`; `color: var(--text-primary)` |
+| KPI Hero Metric (`$50.96`, `25.519`, `9.431B`, `4.13B`) | `--font-sans` | `1.75rem` (`28px`) | `600` (SemiBold) | `1.2` (`34px`) | `font-variant-numeric: tabular-nums`; `letter-spacing: -0.025em` |
+| Section Heading (`H2` / `H3`: `Daily Cost`, `Usage by Model`, `API Keys`, `Connection setup`) | `--font-sans` | `1.0625rem` (`17px`) | `600` (SemiBold) | `1.4` (`24px`) | `letter-spacing: -0.01em`; `color: var(--text-primary)` |
+| Drawer Section Header (`Request`, `Model`, `Tokens`, `Identity`, `Client`, `Request headers`) | `--font-sans` | `0.875rem` (`14px`) | `600` (SemiBold) | `1.4` (`20px`) | `color: var(--text-primary)` |
+| Subtitle / Section Description (`Review your requests, token usage...`) | `--font-sans` | `0.8125rem` (`13px`) | `400` (Regular) | `1.5` (`20px`) | `color: var(--text-muted)` |
+| Table Column Header (`Time`, `Status`, `Model`, `User`, `Duration`, `Tokens`, `Cost ↓`) | `--font-sans` | `0.75rem` (`12px`) | `500` (Medium) | `1.33` (`16px`) | `color: var(--text-muted)`; right-aligned on numeric columns |
+| Table Body Cell (Primary: model slug, service account name, status `Active`) | `--font-sans` | `0.8125rem` (`13px`) | `500` (Medium) | `1.45` (`19px`) | `font-variant-numeric: tabular-nums`; `color: var(--text-primary)` |
+| Table Body Cell (Secondary: timestamps, `Restricted`, `No expiry`, `Never`) | `--font-sans` | `0.8125rem` (`13px`) | `400` (Regular) | `1.45` (`19px`) | `font-variant-numeric: tabular-nums`; `color: var(--text-muted)` |
+| Monospace Identifiers (`llr_sk_bd82...`, `/v1/chat/completions`, `request_id`, `session_hash`, `user-agent`) | `--font-mono` | `0.75rem` (`12px`) | `400` (Regular) | `1.4` (`17px`) | `font-variant-numeric: tabular-nums`; `word-break: break-all` inside drawers |
+
+#### 14.a.3.1 Deterministic Number, Token, and Currency Formatters (`crates/admin::format`)
+
+All Askama template filters in `crates/admin::format` apply consistent human-readable formatting across KPI cards, charts, tables, and popovers:
+1. **Currency (`format_usd(micro_usd: i64)`)**:
+   - In summary KPI cards (`Overview`, `Service Account Detail`) and `Usage by Model` table: `0` renders as `"$0.00"`; `1..=9_999` (`< 1 cent`) renders as `"<$0.01"`; `>= 10_000` renders with two decimal places (`"$1.82"`, `"$50.96"`).
+   - In per-request `Logs > Inference` and `Usage` ledger rows: `0` renders as `"$0.0000"`; `1..=99` (`< $0.0001`) renders as `"< $0.0001"`; `100..=9_999` renders with four to five significant decimal places (`"$0.00078"`, `"$0.0024"`).
+2. **Token Compact Notation (`format_tokens_compact(tokens: i64)`)**:
+   - `< 1,000`: exact integer (`"784"`, `"163"`).
+   - `1,000..=999,999`: one decimal place with `k` suffix (`"1.1k"`, `"486.5k"`).
+   - `1,000,000..=999,999,999`: one decimal place with `M` suffix (`"6.0M"`, `"416.3M"`).
+   - `>= 1,000,000,000`: two or three decimal places with `B` suffix (`"4.13B"`, `"9.431B"`).
+3. **Duration Formatting (`format_duration(ms: Option<i64>)`)**:
+   - `None`: `"—"`.
+   - `< 1,000 ms`: `"<N> ms"` (`"26 ms"`, `"71 ms"`, `"276 ms"`).
+   - `>= 1,000 ms`: `"<S.SS> s"` with trailing zero trimmed (`"1.82 s"`, `"4.5 s"`, `"6.96 s"`).
+
+### 14.a.4 Spacing Scale, Border Radii, and Elevation Primitives
+
+| Token | Value | Applied Components |
+| --- | --- | --- |
+| `--space-1` .. `--space-8` | `4px`, `8px`, `12px`, `16px`, `20px`, `24px`, `32px`, `48px` | Micro-gaps (`4px` label-to-subtext), button groups (`8px`), card grid gaps (`16px`), section vertical rhythm (`28px`–`32px`), settings split-pane gap (`48px`). |
+| `--radius-sm` | `6px` | Buttons, inputs, search boxes, segmented pill toggles, and provider badges (`[GO]`). |
+| `--radius-md` | `8px` | KPI cards, data tables, `uPlot` chart containers, and floating `Credit usage breakdown` popovers. |
+| `--radius-lg` | `12px` | `Connection setup` radio cards (`OpenDesign/Image 2`) and modal dialogs. |
+| `--radius-pill` | `9999px` | Filter dropdown pills (`All initiators v`, `All models v`, `Last 30 days v`), `● Active` / `● Paused` badges, and `One-click agent setup` CTA button. |
+
+### 14.a.5 Complete CSS Custom Property Implementation (`/static/app.css`)
+
+The stylesheet `/static/app.css` defines the complete dual-theme root variables and automatic system-preference media query as follows:
+
+```css
+/* Default Theme: OpenCode High-Contrast Carbon Dark (#0d0d0d) */
+:root,
+html[data-theme="dark"] {
+  --bg-canvas: #0d0d0d;
+  --bg-topbar: #0d0d0d;
+  --bg-sidebar: #0d0d0d;
+  --bg-surface: #141414;
+  --bg-surface-subtle: #1a1a1a;
+  --bg-surface-hover: #1f1f1f;
+  --bg-pill-active: #262626;
+  --bg-segmented-active: #2e2e2e;
+  --bg-drawer: #121212;
+  --bg-popover-dark: #18181b;
+  --bg-backdrop: rgba(0, 0, 0, 0.65);
+  --border-subtle: #262626;
+  --border-row: #1f1f1f;
+  --border-focus: #ffffff;
+  --border-radio-active: #22c55e;
+  --text-primary: #ffffff;
+  --text-secondary: #b3b3b3;
+  --text-muted: #8c8c8c;
+  --text-strikethrough: #737373;
+  --status-success-fg: #22c55e;
+  --status-success-bg: rgba(34, 197, 94, 0.14);
+  --status-warning-fg: #d99b26;
+  --status-warning-bg: rgba(217, 155, 38, 0.14);
+  --status-danger-fg: #ef4444;
+  --status-danger-bg: rgba(239, 68, 68, 0.14);
+  --status-paused-fg: #a3a3a3;
+  --status-paused-bg: #262626;
+  --chart-bar-fill: #a3a3a3;
+  --chart-bar-hover: #ffffff;
+  --chart-grid-dashed: #262626;
+}
+
+/* OpenDesign Clean Neutral Light Theme (#ffffff) */
+html[data-theme="light"] {
+  --bg-canvas: #ffffff;
+  --bg-topbar: #ffffff;
+  --bg-sidebar: #f9fafb;
+  --bg-surface: #ffffff;
+  --bg-surface-subtle: #f9fafb;
+  --bg-surface-hover: #f3f4f6;
+  --bg-pill-active: #eceef2;
+  --bg-segmented-active: #ffffff;
+  --bg-drawer: #ffffff;
+  --bg-popover-dark: #18181b;
+  --bg-backdrop: rgba(17, 24, 39, 0.45);
+  --border-subtle: #e5e7eb;
+  --border-row: #f3f4f6;
+  --border-focus: #111827;
+  --border-radio-active: #16a34a;
+  --text-primary: #111827;
+  --text-secondary: #374151;
+  --text-muted: #6b7280;
+  --text-strikethrough: #9ca3af;
+  --status-success-fg: #15803d;
+  --status-success-bg: #dcfce7;
+  --status-warning-fg: #b45309;
+  --status-warning-bg: #fef3c7;
+  --status-danger-fg: #dc2626;
+  --status-danger-bg: #fee2e2;
+  --status-paused-fg: #4b5563;
+  --status-paused-bg: #f3f4f6;
+  --chart-bar-fill: #374151;
+  --chart-bar-hover: #111827;
+  --chart-grid-dashed: #e5e7eb;
+}
+```
+
+## 14.b. Application Shell, Dual Navigation Modes, and Workspace Switcher
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-4`, `UI-5`, `USR-1`, `USR-4`  
+> **Visual Inspiration Sources:** OpenCode Dual-Bar Top Shell (`OpenCode/Image 1..10.png`) and OpenDesign Collapsible Left Sidebar Shell (`OpenDesign/Image 1..4.png`).
+
+### 14.b.1 Unified Application Shell Overview
+
+LLMRoller provides two user-selectable macro-navigation layouts (`users.ui_nav_layout IN ('top_tabs', 'sidebar')`, switchable at any time in `Settings > General` or the user profile menu) that render identical module routes (`/app/*` and `/admin/*`):
+1. **Mode A — Dual-Bar Top Navigation Shell (`top_tabs`, default, inspired by OpenCode Console)**:
+   - **Global Utility TopBar (`height: 48px`)**: Houses the LLMRoller monochrome brand mark on the far left, a vertical `16px` divider, the **Workspace Switcher Dropdown** (`[P] Personal` vs. `[D] Default (Global Admin)`), and on the right: the **Global Command / Search Trigger (`🔍` / `⌘K`)**, the **Theme Toggle (`☀/☾`)**, and the **User Profile Menu** (avatar badge + username/email).
+   - **Module Navigation Bar (`height: 44px`, `border-bottom: 1px solid var(--border-subtle)`)**: Horizontal underline-tab strip with `24px` item spacing (`Overview`, `Logs`, `Usage`, `Go / Quotas`, `Models`, `Providers`, `Controls / Matrix`, `Integrations / Sharing`, `Settings`, `Audit`). Active tab renders in bright `--text-primary` with a `2px` bottom underline bar.
+2. **Mode B — Collapsible Left Sidebar Shell (`sidebar`, inspired by OpenDesign AMR Console)**:
+   - **Left Vertical Sidebar (`width: 240px` expanded, `64px` collapsed via top-right `[|<]` icon button)**:
+     - Top header: Brand logo (`LLMRoller`) + collapse toggle button.
+     - Primary module group: `Overview`, `Plan & balance`, `API Keys`, `Usage`, `Logs`, `Providers`, `Sharing`, `Routing Matrix`, `Active Sessions`, `Workspace settings`.
+     - Bottom utility group: `Models & pricing`, `Help & docs`, `Theme & Layout`, `Language [EN]`, and the bottom-docked **`WORKSPACES` Switcher Card** (`[P] Personal workspace` / `[D] Default admin workspace` with dual chevron `⌄^`).
+
+### 14.b.2 Workspace Switcher & Multi-Role Context (`Personal` vs. `Default / Admin`)
+
+Every authenticated user (`Role::User` or `Role::Admin`) operates within an explicit workspace context reflected in the top-left Workspace Badge (`OpenCode/Image 1` `[P] Personal` vs. `OpenCode/Image 5` `[D] Default`) or bottom-left `WORKSPACES` card (`OpenDesign/Image 1`):
+
+| Workspace Context | Badge & Label | Accessible To | Data & Action Scope |
+| --- | --- | --- | --- |
+| **Personal Workspace** (`/app/*`, `/api/user/*`) | Square/rounded badge `P` + `Personal` (or `<username>'s workspace`) | Both `user` and `admin` roles | Scopes all KPI cards, `Daily Cost` charts, `Usage by Model`, `Logs`, `Usage` ledger, `Service Accounts`, `Client Keys`, `Personal Providers`, `Shares`, and `Active Sessions` strictly to `actor.user_id`. Global keys are projected via `project_key` as `"global pool"` (`USR-4`). |
+| **Default / Admin Console** (`/admin/*`, `/admin/api/*`) | Square/rounded badge `D` + `Default` (or `Admin Console`) | `admin` role only (`Role::User` receives HTTP 403 / redirect to `/app`) | Exposes instance-wide `Overview`, organization-wide `Logs` (`Inference` and `API` across all users and service accounts), global `Providers`, `Model Catalog` merge/split governance, `Users` management, `Traceability` controls, and hash-chained `Audit` logs. |
+
+### 14.b.3 Global Command Palette (`⌘K` / `/`) and Traceability Banner (`UI-4`)
+
+1. **Persistent Content Traceability Banner (`#traceability-banner`, `UI-4`)**:
+   - Whenever `settings.traceability_config.enabled == true` (and `auto_disable_at` has not elapsed), `BaseTemplate` renders a persistent top banner above the utility header:
+     `● Content Traceability Mode is active — prompts, reasoning, tool calls, and completions for matching traffic are encrypted and retained for <N> days.`
+2. **Global Command Palette (`#modal-command-palette`, triggered by clicking `🔍` or pressing `⌘K` / `Ctrl+K`)**:
+   - Allows instant keyboard navigation to any screen (`Go to Overview`, `Go to Logs`, `Go to Service Accounts`, `Go to API Keys`, `Go to Usage Ledger`, `Go to Routing Matrix`), quick actions (`+ Create API Key`, `+ Add Service Account`, `+ Add Provider`, `Toggle Dark/Light Theme`), or direct lookup of a `Request ID` (`01J9X...` -> opens Request Detail Drawer) or `Session Hash` (`9f8e...` -> opens Session Chat Preview).
+
+### 14.b.4 Declarative UI Structural Pseudocode (`BaseTemplate` Dual-Shell)
+
+```ui-spec
+AppShell [theme: Dynamic("dark" | "light"), layout-mode: Dynamic("top_tabs" | "sidebar")]
+├── ConditionalBanner [when: traceability_enabled == true, id: "traceability-banner", color: Amber]
+│   └── Text(text: "Content Traceability Mode is active. Turn content is being retained.")
+├── When [layout-mode == "top_tabs"]
+│   ├── TopBar [height: 48px, layout: Row, align: Space-Between, padding-x: 16px]
+│   │   ├── Row [gap: 12px, align: Center]
+│   │   │   ├── BrandLogo(icon: "llmroller-mark", color: Primary)
+│   │   │   ├── Divider(orientation: Vertical, height: 16px, color: Subtle)
+│   │   │   └── WorkspaceSwitcher(badge: "P" | "D", label: "Personal" | "Default", icon-right: "chevron-down")
+│   │   └── Row [gap: 16px, align: Center]
+│   │       ├── IconButton(icon: "search", shortcut: "⌘K", action: "open-command-palette")
+│   │       ├── IconButton(icon: "theme-toggle", action: "cycle-theme")
+│   │       └── UserProfileDropdown(avatar: user_initial, label: username, icon-right: "chevron-down")
+│   ├── ModuleNavBar [height: 44px, layout: Row, padding-x: 24px, border-bottom: Subtle]
+│   │   └── Tabs [variant: Underline, gap: 24px]
+│   │       ├── TabItem(label: "Overview", route: "/app/overview")
+│   │       ├── TabItem(label: "Logs", route: "/app/logs")
+│   │       ├── TabItem(label: "Usage", route: "/app/usage")
+│   │       ├── TabItem(label: "Audit", route: "/app/audit")
+│   │       ├── TabItem(label: "Go / Quotas", route: "/app/quotas")
+│   │       ├── TabItem(label: "Models", route: "/app/models")
+│   │       ├── TabItem(label: "Providers", route: "/app/providers")
+│   │       ├── TabItem(label: "Controls", route: "/app/routing")
+│   │       ├── TabItem(label: "Integrations", route: "/app/sharing")
+│   │       └── TabItem(label: "Settings", route: "/app/settings")
+│   └── MainScrollCanvas [flex: 1, id: "main-content"]
+└── When [layout-mode == "sidebar"]
+    └── Row [height: 100vh, width: 100vw]
+        ├── CollapsibleSidebar [width: 240px, collapsed-width: 64px, border-right: Subtle, layout: Column, justify: Space-Between]
+        │   ├── Column [gap: 4px, padding: 12px]
+        │   │   ├── Row [align: Space-Between, padding-bottom: 12px]
+        │   │   │   ├── BrandLogo(name: "LLMRoller")
+        │   │   │   └── IconButton(icon: "sidebar-collapse", action: "toggle-sidebar")
+        │   │   ├── SidebarNavItem(label: "Overview", icon: "chart-bar", route: "/app/overview")
+        │   │   ├── SidebarNavItem(label: "Plan & balance", icon: "gauge", route: "/app/quotas")
+        │   │   ├── SidebarNavItem(label: "API Keys", icon: "key", route: "/app/keys")
+        │   │   ├── SidebarNavItem(label: "Usage", icon: "line-chart", route: "/app/usage")
+        │   │   ├── SidebarNavItem(label: "Logs", icon: "list", route: "/app/logs")
+        │   │   ├── SidebarNavItem(label: "Providers", icon: "server", route: "/app/providers")
+        │   │   ├── SidebarNavItem(label: "Sharing", icon: "share-2", route: "/app/sharing")
+        │   │   ├── SidebarNavItem(label: "Routing Matrix", icon: "sliders", route: "/app/routing")
+        │   │   ├── SidebarNavItem(label: "Active Sessions", icon: "activity", route: "/app/sessions")
+        │   │   └── SidebarNavItem(label: "Workspace settings", icon: "settings", route: "/app/settings")
+        │   └── Column [gap: 4px, padding: 12px, border-top: Subtle]
+        │       ├── SidebarNavItem(label: "Models & pricing", icon: "cpu", route: "/app/models")
+        │       ├── SidebarNavItem(label: "Language", badge-right: "EN")
+        │       └── WorkspaceCard(badge: user_initial, title: "WORKSPACES", subtitle: workspace_label)
+        └── MainScrollCanvas [flex: 1, id: "main-content"]
+```
+
+### 14.b.5 Rust Askama `BaseTemplate` and Preference Persistence Contract
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiTheme {
+    Dark,
+    Light,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiNavLayout {
+    TopTabs,
+    Sidebar,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "base.html")]
+pub struct BaseTemplate {
+    pub title: String,
+    pub csrf_token: String,
+    pub traceability_enabled: bool,
+    pub is_admin: bool,
+    pub workspace_badge: &'static str, // "P" or "D"
+    pub workspace_label: String,       // "Personal" or "Default"
+    pub username: String,
+    pub user_initial: char,
+    pub ui_theme: UiTheme,
+    pub ui_nav_layout: UiNavLayout,
+    pub active_module: &'static str,   // "overview" | "logs" | "usage" | "audit" | "quotas" | "models" | "providers" | "routing" | "sharing" | "settings"
+    pub content: String,
+}
+```
+
+When a user switches themes or layout modes via `PATCH /api/user/preferences`, the handler updates `users.ui_theme` and `users.ui_nav_layout` in SQLite, triggers `Reloader`, and returns `HX-Refresh: true` (or swaps `<html data-theme="...">` directly via `/static/app.js`).
+
+## 14.c. HTMX Architecture, Event Delegation, and Strict CSP Runtime
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-3`, `UI-5`, `SEC-5`, `SEC-19`
+
+### 14.c.1 Zero-Eval HTMX & Content Security Policy Contract (`SEC-5`, `UI-3`)
+
+Every HTML response served by `crates/admin` carries the mandatory response headers:
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+```
+
+Because `script-src 'self'` and `style-src 'self'` forbid `unsafe-inline` and `unsafe-eval`, `/static/app.js` configures HTMX 2.x prior to DOM initialization:
+
+```javascript
+htmx.config.includeIndicatorStyles = false;
+htmx.config.allowEval = false;
+htmx.config.allowScriptTags = false;
+htmx.config.defaultSwapStyle = "innerHTML";
+```
+
+### 14.c.2 Progressive Enhancement & Partial Swap Routing (`HX-Request`)
+
+Every page handler in `crates/admin::ui` checks the inbound `HX-Request: true` header:
+- **Full-Page Navigation (`HX-Request` absent)**: Renders the target module template inside `BaseTemplate` (`crates/admin/templates/base.html`) with `<meta name="csrf-token" content="{{ csrf_token }}">` and `<body hx-headers='{"x-csrf-token": "{{ csrf_token }}"}'>`.
+- **Partial HTMX Swap (`HX-Request: true`)**: Renders only the inner partial template (`crates/admin/templates/partials/*.html`) and sets `HX-Push-Url` when navigating between top-level modules or sub-tabs (`Overview`, `Logs`, `Usage`, `Settings > Service accounts > <name>`).
+
+### 14.c.3 Declarative `data-*` Event Delegation Contract (`/static/app.js`)
+
+Since inline `onclick="..."` and `hx-on:*` attributes are prohibited by the CI template lint gate (`tests/security_csrf_and_headers.rs`), all client-side micro-interactions use a single document-level event listener in `/static/app.js` keyed by declarative `data-action` attributes:
+
+| `data-action` Attribute | Target Attributes | Client-Side Behavior in `/static/app.js` |
+| --- | --- | --- |
+| `data-action="switch-tab"` | `data-tab-target="<id>"` | Activates the selected tab button and reveals `#<id>` within the parent `.workspace-layout` or `.segmented-control`. |
+| `data-action="open-modal"` | `data-modal-id="<id>"` | Adds `.open` to `#<id>`, traps keyboard Tab focus inside `.modal-dialog`, and focuses the first input. |
+| `data-action="close-modal"` | `data-modal-id="<id>"` | Removes `.open` from `#<id>` and restores focus to the trigger button (also bound to `Escape`). |
+| `data-action="open-drawer"` | `data-drawer-url="<url>"` | Dim-backdrops `#main-content` (`state: Dimmed-Backdrop`), opens `#right-inspection-drawer`, and triggers HTMX `GET <url>` into `#drawer-body`. |
+| `data-action="close-drawer"` | None (or backdrop click / `Escape`) | Closes `#right-inspection-drawer` and removes the dimmed backdrop overlay. |
+| `data-action="step-drawer"` | `data-step-url="<prev_or_next_url>"` | Steps to the previous (`<`) or next (`>`) row in the `Logs` table (`14.m`) and updates the selected row highlight in the background table. |
+| `data-action="toggle-popover"` | `data-popover-id="<id>"` | Opens or positions the floating dark `Credit usage breakdown` popover card (`14.o`) anchored to the `(i)` button in the `Usage` table. |
+| `data-action="select-api-format"` | `data-format="chat\|responses\|messages"`, `data-base-url="<url>"`, `data-badge="<label>"` | Updates the active green radio card in `Connection setup` (`14.h`) and updates `#connection-base-url` and `#connection-format-badge` immediately. |
+| `data-action="copy-text"` | `data-copy-target="<id>"` or `data-copy-value="<str>"` | Copies the target string (e.g., `Request ID`, `Base URL`, newly created `llr_...` key, or CLI snippet) to `navigator.clipboard` and shows a `Copied` checkmark badge for `1,500 ms`. |
+| `data-action="chart-metric-toggle"` | `data-metric="cost\|tokens"` | Switches the `Overview` `Daily Cost` `uPlot` bar chart (`14.f`) between USD spend (`$`) and token volume without re-querying SQLite. |
+
+### 14.c.4 Askama Partial Swap & Error Toast Handling
+
+1. **Out-of-Band Toast Updates (`hx-swap-oob`)**:
+   - Every mutating HTMX response (`POST`, `PUT`, `PATCH`, `DELETE`) may include an out-of-band `<div id="aria-live-toast" hx-swap-oob="true" class="toast toast-success">...</div>` fragment so status confirmations (`"IP restrictions saved for agents"`, `"API key paused"`, `"Share accepted"`) appear without full page reloads.
+2. **Validation Error Rendering (`HTTP 422` / `HTTP 409`)**:
+   - In `/static/app.js`, an `htmx:beforeSwap` listener sets `event.detail.shouldSwap = true` on status `409` and `422` when `HX-Target-Error` is present, allowing modal forms to render inline field validation errors (e.g., `"Invalid CIDR at entry 3: 999.0.0.1/24"` or `"Overlapping provider-level share already exists for this grantee"`).
+3. **Automated CI Template Lint (`tests/security_csrf_and_headers.rs`)**:
+   - Parses every file in `crates/admin/templates/**/*.html` and fails the build if any line matches `(hx-on:|onclick=|onload=|onerror=|javascript:|https?://cdn\.|https?://fonts\.)`.
+
+## 14.d. First-Run Setup, Login, TOTP Enrollment, and Session Security UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `AUTH-1`..`AUTH-9`, `SEC-4`, `SEC-5`, `SEC-12`
+
+### 14.d.1 First-Admin Bootstrap Wizard (`GET /setup`, `POST /admin/api/setup`)
+
+When `SELECT COUNT(*) FROM users == 0` (`AUTH-1`), all unauthenticated browser requests redirect to `GET /setup`. Once at least one user row exists, `GET /setup` and `POST /admin/api/setup` return HTTP `404 Not Found` permanently (`AUTH-3`).
+- **Visual Layout**: Centered `420px` card on `--bg-canvas` (`#0d0d0d` dark default).
+- **Form Fields**:
+  1. `Setup Token` (`type="password"`, required unless `LLMROLLER_SETUP_TOKEN_REQUIRED=false`): Helper caption displays `"Read the one-time token from ${LLMROLLER_DATA_DIR}/setup-token on the host."`
+  2. `Admin Username` (`type="text"`, `^[a-zA-Z0-9_.-]{3,64}$`).
+  3. `Password` (`type="password"`, minimum 12 characters, hashed with Argon2id per `AUTH-6`).
+  4. `Confirm Password` (`type="password"`).
+  5. `Default UI Theme` (`Dark (OpenCode)` | `Light (OpenDesign)` | `System`).
+- **Submission**: `POST /admin/api/setup` runs inside a serialized writer `BEGIN IMMEDIATE` transaction, deletes `${LLMROLLER_DATA_DIR}/setup-token`, creates the admin user and initial `Personal` workspace, sets `__Host-llmroller_session`, and redirects to `/app/overview`.
+
+### 14.d.2 Login Screen & Two-Factor Challenge (`GET /login`, `POST /api/auth/login`)
+
+- **CSRF Protection (`SEC-5`)**: `GET /login` issues a 10-minute `__Host-llmroller_login_csrf` cookie (`HttpOnly`, `Secure`, `SameSite=Strict`) and embeds its matching token in `<meta name="csrf-token">`. `POST /api/auth/login` verifies both the `Origin` header and constant-time equality between the cookie and `x-csrf-token`.
+- **Two-Step TOTP Flow (`AUTH-9`)**:
+  - Step 1: User submits `username` and `password`.
+  - Step 2 (when `users.totp_enabled == 1` or when global username failure count `> 50/hr` per `AUTH-8`): Form transitions in-place to request a 6-digit RFC 6238 TOTP code or an 8-character single-use recovery code.
+- **Forced Password Change (`users.must_change_password == 1`, `AUTH-4`)**: After login with a temporary password (or after `llmroller reset-admin`), all control-plane routes redirect to `/app/security/change-password` until a new `>= 12`-character password is saved.
+
+### 14.d.3 TOTP Enrollment & Active Web Sessions Manager (`Settings > Security`)
+
+Inside `Settings > Security` (`14.w`), every user and admin can:
+1. **Enroll or Rotate TOTP (`POST /api/user/totp/enroll`, `POST /api/user/totp/verify`)**: Displays an inline SVG QR code (`img-src 'self' data:`), the base32 secret key in a monospace copy box, a 6-digit verification input, and upon confirmation, a one-time modal displaying 10 single-use recovery codes with a `Copy recovery codes` button.
+2. **Inspect & Revoke Active Web Sessions (`DELETE /api/user/web-sessions/{id_hash}`)**: Table listing all active rows in `web_sessions` for the user (`Device / User-Agent`, `IP Address`, `Created`, `Last active`, `Current session` badge, and `Revoke` button).
+
+### 14.d.4 Declarative UI Structural Pseudocode (`/login` & `/setup`)
+
+```ui-spec
+Screen [layout: CenterViewport, theme: Dark, viewport: Desktop]
+└── Card [width: 420px, padding: 32px, border: Subtle, radius: 12px, background: Surface]
+    ├── Column [gap: 24px]
+    │   ├── Column [gap: 6px, align: Center]
+    │   │   ├── Icon(name: "llmroller-logo", size: 32px, color: White)
+    │   │   ├── Heading(level: H1, text: "Sign in to LLMRoller")
+    │   │   └── Text(variant: Muted, text: "Enter your credentials to access your workspace.")
+    │   ├── Form [action: "POST /api/auth/login", hx-post: "/api/auth/login"]
+    │   │   ├── Input(label: "Username", name: "username", autocomplete: "username", required: True)
+    │   │   ├── Input(label: "Password", name: "password", type: Password, autocomplete: "current-password", required: True)
+    │   │   ├── ConditionalField [when: totp_required == true]
+    │   │   │   └── Input(label: "Two-Factor Code (TOTP or Recovery Code)", name: "totp_code", font: Monospace, placeholder: "123456")
+    │   │   └── Button(type: Submit, variant: Primary, width: Full, label: "Sign in")
+    │   └── Text(variant: Caption, color: Muted, align: Center, text: "Protected by Argon2id & session-bound CSRF tokens.")
+```
+
+### 14.d.5 Authentication & TOTP API Contracts and Rate-Limit Feedback
+
+| Endpoint | Request JSON / Form | Success Response | Error / Rate-Limit States |
+| --- | --- | --- | --- |
+| `POST /admin/api/setup` | `{"setup_token": "...", "username": "admin", "password": "..."}` | `201 Created` + `Set-Cookie: __Host-llmroller_session=...` | `403 invalid_setup_token`, `404 setup_already_completed` (`AUTH-3`), `429 rate_limit_exceeded` (`AUTH-8`) |
+| `POST /api/auth/login` | `{"username": "...", "password": "...", "totp_code": null}` | `200 OK` + session cookie, or `202 Accepted {"totp_required": true}` | `401 invalid_credentials`, `403 invalid_csrf_token`, `429 login_rate_limited` (`Retry-After` banner in UI), `503 login_busy` (`Argon2id` semaphore full) |
+| `POST /api/user/totp/enroll` | `{}` | `200 OK {"qr_svg_data_uri": "data:image/svg+xml;base64,...", "secret_base32": "..."}` | `409 totp_already_enabled` |
+| `POST /api/user/totp/verify` | `{"code": "123456"}` | `200 OK {"recovery_codes": ["ABCD-1234", ...]}` | `422 invalid_totp_code` |
+
+## 14.e. Overview Analytics Dashboard and KPI Summary Cards
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-2`, `UI-6`, `USG-1`..`USG-6`, `A6`  
+> **Visual Inspiration Sources:** OpenCode Overview Analytics Dashboard (`OpenCode/Image 3.png`, `Image 4.png`, `Image 8.png`, `Image 9.png`).
+
+### 14.e.1 Screen Archetype and Layout Geometry
+
+The **Overview Analytics Dashboard** (`/app/overview` for Personal Workspace; `/admin/overview` for Default/Global Admin Workspace) gives users an immediate executive and granular breakdown of their LLM inference spend, request volume, daily cost/token trends, per-model consumption, upstream key window health, and instance disk capacity.
+- **Container Geometry**: Centered single-column container (`width: 980px`, `max-width: 100%`, `padding-y: 36px`, `gap: 32px`) inside the main scroll area (`OpenCode/Image 3`).
+- **Page Header Row**:
+  - Left column (`gap: 4px`):
+    - Heading (`H1`): `Overview`
+    - Subtitle (`Muted`): `Review your requests, token usage, costs, and monthly budget.`
+  - Right action toolbar (`gap: 8px`):
+    - **`Connect CLI` Button** (`variant: Outlined`, `icon-left: "terminal"` `>_`, `data-action="open-modal"`, `data-modal-id="modal-connect-cli"`): Launches the interactive CLI & Agent Connection Setup modal (`Section 14.h`).
+    - **Date Range Selector Button** (`variant: Outlined`, `icon-left: "calendar"`, label: `Last 24 hours` | `Last 7 days` (default) | `Last 30 days` | `All time` | `Custom`): Triggers an HTMX partial refresh (`hx-get="/app/partials/overview?range=<selected>"`, `hx-target="#overview-body"`) that simultaneously updates the 3 KPI cards, the `Daily Cost` bar chart (`14.f`), and the `Usage by Model` table (`14.g`).
+
+### 14.e.2 Executive 3-Card KPI Summary Row (`OpenCode/Image 3, 4, 9`)
+
+Immediately below the page header sits a 3-column CSS Grid (`grid-template-columns: repeat(3, minmax(0, 1fr))`, `gap: 16px`). Each card uses `padding: 20px`, `background: var(--bg-surface)`, `border: 1px solid var(--border-subtle)`, and `border-radius: 8px`:
+
+| Card Position | Caption Label (`12px Muted`) | Primary Metric Value (`28px SemiBold Tabular`) | Data Source & Formatting Rule | Observed Reference States (`OpenCode/Image 3, 4, 9`) |
+| --- | --- | --- | --- | --- |
+| **Card 1 (Left)** | `Cost` | `$1.82` / `$52.12` / `$36.66` | `SUM(usage_rollups_hourly.cost_micro_usd)` for the selected workspace and time range, formatted via `format_usd`. When a monthly budget cap is configured (`users.global_budget_micro_usd_month`), a subtle secondary caption shows `of $<cap> monthly budget (<pct>%)`. | `$1.82` (`Personal`, `Last 7 days`), `$52.12` (`Personal`, `All time`), `$36.66` (`Default`, `Last 30 days`). |
+| **Card 2 (Center)** | `Requests` | `1,054` / `25,921` / `16,237` | `SUM(usage_rollups_hourly.requests)` for the selected range, formatted with thousands separator. | `1.054` / `25.921` / `16.237`. |
+| **Card 3 (Right)** | `Tokens` | `416.3M` / `9.465B` / `5.208B` | `SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens)` for the selected range, formatted in compact notation (`k`, `M`, `B`). | `416.3M` / `9.465B` / `5.208B`. |
+
+### 14.e.3 Upstream Key Quota Strip & `A6` Disk Projection Status Bar (`UI-2`)
+
+Below the `Usage by Model` table (or collapsible in the secondary status strip), the Overview dashboard renders:
+1. **Active Upstream Key Quota Cards (`UI-2`)**: Compact cards for each enabled upstream key in the workspace showing its live `RuntimeState` health badge (`healthy`, `cooling_down`, `exhausted`, `invalid`), local 360-bucket ring spend, and `UpstreamObservation` window bars (`5h`, `7d`, `1mo`) with reset countdowns and a one-click `↻ Refresh /usage` button (`Section 14.q`).
+2. **Instance Disk Capacity Meter (`A6`, Admin & Settings Overview)**: Displays current SQLite database + WAL byte size alongside the `A6` projected disk consumption formula (`daily_requests * retention_days * 750 B * 1.3`) and an `"Unpriced models: <N>"` warning badge if any active model relied on `unpriced_fallback_rates` during the selected period.
+
+### 14.e.4 Declarative UI Structural Pseudocode (`Overview` Screen)
+
+```ui-spec
+OverviewScreen [layout: Column, width: 980px, align: Center, padding-y: 36px, gap: 32px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Overview")
+│   │   └── Text(variant: Muted, text: "Review your requests, token usage, costs, and monthly budget.")
+│   └── Row [gap: 8px]
+│       ├── Button(variant: Outlined, icon-left: "terminal", label: "Connect CLI", data-action: "open-modal", data-modal-id: "modal-connect-cli")
+│       └── DateRangeSelect(variant: Outlined, icon-left: "calendar", active: "Last 7 days", options: ["Last 24 hours", "Last 7 days", "Last 30 days", "All time", "Custom"])
+├── Grid [cols: 3, gap: 16px, id: "overview-kpi-cards"]
+│   ├── Card [padding: 20px, border: Subtle]
+│   │   ├── Text(variant: Caption, color: Muted, text: "Cost")
+│   │   └── Heading(level: H2, text: "$1.82", font-numeric: Tabular)
+│   ├── Card [padding: 20px, border: Subtle]
+│   │   ├── Text(variant: Caption, color: Muted, text: "Requests")
+│   │   └── Heading(level: H2, text: "1,054", font-numeric: Tabular)
+│   └── Card [padding: 20px, border: Subtle]
+│       ├── Text(variant: Caption, color: Muted, text: "Tokens")
+│       └── Heading(level: H2, text: "416.3M", font-numeric: Tabular)
+├── DailyCostChartSection [ref: "14.f"]
+├── UsageByModelSection [ref: "14.g"]
+└── UpstreamKeyHealthAndDiskStrip [ref: "14.q"]
+```
+
+### 14.e.5 Rust Askama `OverviewPartialTemplate` and SQL Rollup Queries
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewKpiSummary {
+    pub cost_micro_usd: i64,
+    pub cost_formatted: String,       // "$1.82" or "$52.12"
+    pub requests: i64,
+    pub requests_formatted: String,   // "1,054" or "25,921"
+    pub tokens_total: i64,
+    pub tokens_formatted: String,     // "416.3M" or "9.465B"
+    pub monthly_budget_micro_usd: Option<i64>,
+    pub projected_disk_mb: f64,
+    pub unpriced_model_count: usize,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "partials/overview.html")]
+pub struct OverviewPartialTemplate {
+    pub range_key: String,            // "24h" | "7d" | "30d" | "all"
+    pub range_label: String,          // "Last 7 days" | "All time"
+    pub kpis: OverviewKpiSummary,
+    pub timeseries_json: String,      // Serialized DailyCostSeries for uPlot (14.f)
+    pub model_rows: Vec<ModelUsageRow>,
+    pub distinct_models_count: usize,
+    pub distinct_providers_count: usize,
+}
+```
+
+## 14.f. Time-Series Daily Cost and Token Histogram Charts (`uPlot`)
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-2`, `UI-3`, `UI-6`  
+> **Visual Inspiration Sources:** OpenCode `Daily Cost` Vertical Bar Histogram (`OpenCode/Image 3.png` — 7-day `$0`..`$1` scale; `Image 4.png` — 20-day `$0`..`$7` scale; `Image 8.png` & `Image 9.png` — 30-day `$0`..`$6` scale).
+
+### 14.f.1 Component Purpose and Visual Structure
+
+The **Daily Cost & Token Histogram Section** on the `Overview` dashboard visualizes daily expenditure (`$`) and daily token volume across the selected reporting range (`Last 7 days`, `Last 30 days`, `All time`, or `Custom`):
+- **Section Header Row (`align: Space-Between`, `vertical-align: Center`)**:
+  - Left column (`gap: 4px`):
+    - Heading (`H3`): `Daily Cost`
+    - Subtitle (`Muted`): `Cost and token usage for the selected range.`
+  - Right control: **Segmented Pill Toggle (`Cost` | `Tokens`)**:
+    - Outer container: `background: var(--bg-surface)`, `border: 1px solid var(--border-subtle)`, `border-radius: 6px`, `padding: 2px`.
+    - Active button (`Cost` by default): `background: var(--bg-segmented-active)` (`#2e2e2e` in Dark Mode), `color: var(--text-primary)`, `font-weight: 500`, `padding: 4px 12px`, `border-radius: 4px`.
+    - Inactive button (`Tokens`): `background: transparent`, `color: var(--text-muted)`.
+- **Chart Card Container**:
+  - Fixed height `240px`, `padding: 24px`, `background: var(--bg-surface)`, `border: 1px solid var(--border-subtle)`, `border-radius: 8px` (`CLS = 0`).
+
+### 14.f.2 Dynamic Axis Scaling, Gridlines, and Bar Geometry
+
+Rendered using the embedded `/static/uPlot.iife.min.js` `uPlot.paths.bars()` renderer configured in `/static/app.js`:
+1. **Y-Axis Scaling & Gridlines (`OpenCode/Image 3, 4, 9`)**:
+   - Computes `max_val` across all daily buckets in the active series (`cost_usd` or `total_tokens`).
+   - Rounds `y_ceiling` up to the nearest clean integer dollar ceiling (`$1`, `$2`, `$5`, `$6`, `$7`, `$10`, etc., or token ceiling `10M`, `100M`, `1B`).
+   - Renders **three horizontal reference lines**:
+     - Top dashed gridline (`stroke: var(--chart-grid-dashed)`, `lineDash: [4, 4]`) labeled with `y_ceiling` (`$1` in Image 3, `$7` in Image 4, `$6` in Image 9).
+     - Midpoint dashed gridline (`0.5 * y_ceiling`, unlabeled, `lineDash: [4, 4]`).
+     - Bottom solid baseline (`$0` / `0`, `stroke: var(--border-subtle)`).
+2. **X-Axis Bucket Formatting**:
+   - For `Last 7 days`: displays every daily label in `M/D` format (`10/16`, `10/17`, `10/18`, `10/19`, `10/20`, `10/21`, `10/22`) with wider vertical bars (`bar_width_ratio = 0.55`).
+   - For `Last 30 days` or `All time` (`20`–`31` bars): displays 6 evenly spaced `M/D` tick labels (`9/22`, `9/28`, `10/4`, `10/10`, `10/16`, `10/22` or `10/3`, `10/7`, `10/11`, `10/15`, `10/19`, `10/22`) while rendering one bar per calendar day (`gap: 4px`).
+   - Days with zero or near-zero spend (`<$0.01`) render a `1px`–`2px` baseline trace so active vs. idle days remain visually distinct.
+3. **Interactive Hover Tooltip**:
+   - Hovering any daily bar highlights the bar in `--chart-bar-hover` (`#ffffff` in Dark Mode) and displays a compact floating tooltip card showing:
+     - Date (`Oct 12, 2026`)
+     - Cost (`$6.98`)
+     - Requests (`3,412`)
+     - Tokens (`1.24B` — broken down into `Input`, `Cache Read`, `Output`)
+
+### 14.f.3 JSON Payload Contract (`GET /api/user/usage/timeseries` & `/admin/api/usage/timeseries`)
+
+Both `cost` and `tokens` series are returned in a single JSON payload embedded via `data-timeseries-json` on `#daily-cost-chart` so toggling between `Cost` and `Tokens` switches the chart in `< 1 ms` without an extra network round-trip:
+
+```json
+{
+  "range": "7d",
+  "bucket_unit": "day",
+  "labels": ["10/16", "10/17", "10/18", "10/19", "10/20", "10/21", "10/22"],
+  "timestamps_ms": [1792108800000, 1792195200000, 1792281600000, 1792368000000, 1792454400000, 1792540800000, 1792627200000],
+  "cost_micro_usd": [1002400, 101200, 91500, 134000, 31200, 161800, 1900],
+  "tokens_total": [228400000, 24100000, 21800000, 31500000, 7200000, 102900000, 400000],
+  "requests": [512, 118, 94, 142, 31, 151, 6],
+  "y_ceiling_usd": 1.0,
+  "y_ceiling_tokens": 250000000
+}
+```
+
+### 14.f.4 Client-Side `uPlot` Initialization & Theme Sync (`/static/app.js`)
+
+In `/static/app.js`, `renderDailyUsageChart(containerEl, activeMetric)` reads the pre-embedded `data-timeseries-json` attribute from `#daily-cost-chart` and instantiates a responsive `uPlot` canvas bar chart:
+
+```javascript
+function renderDailyUsageChart(containerEl, metric) {
+    const payload = JSON.parse(containerEl.getAttribute('data-timeseries-json') || '{}');
+    if (!payload.labels || typeof uPlot === 'undefined') return;
+    const style = getComputedStyle(document.documentElement);
+    const barFill = style.getPropertyValue('--chart-bar-fill').trim() || '#a3a3a3';
+    const gridColor = style.getPropertyValue('--chart-grid-dashed').trim() || '#262626';
+    const textMuted = style.getPropertyValue('--text-muted').trim() || '#8c8c8c';
+
+    const values = metric === 'tokens'
+        ? payload.tokens_total
+        : payload.cost_micro_usd.map(v => v / 1e6);
+    const yMax = metric === 'tokens' ? payload.y_ceiling_tokens : payload.y_ceiling_usd;
+
+    const opts = {
+        width: containerEl.clientWidth - 48,
+        height: 192,
+        legend: { show: false },
+        scales: { x: { time: false }, y: { range: [0, yMax] } },
+        axes: [
+            { stroke: textMuted, grid: { show: false }, values: (_, splits) => splits.map(i => payload.labels[i] || '') },
+            { stroke: textMuted, grid: { show: true, stroke: gridColor, dash: [4, 4] }, splits: () => [0, yMax / 2, yMax] }
+        ],
+        series: [
+            {},
+            { fill: barFill, stroke: barFill, paths: uPlot.paths.bars({ size: [0.55, 48] }) }
+        ]
+    };
+    containerEl.innerHTML = '';
+    new uPlot(opts, [payload.labels.map((_, i) => i), values], containerEl);
+}
+```
+
+## 14.g. Usage by Model Breakdown Table and Provider Badges
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-6`, `USG-1`..`USG-3`, `USR-4`  
+> **Visual Inspiration Sources:** OpenCode `Usage by Model` Table (`OpenCode/Image 3.png`, `Image 4.png`, `Image 8.png`, `Image 9.png`).
+
+### 14.g.1 Purpose and Visual Header Block
+
+The **Usage by Model** section on the `Overview` dashboard (`Section 14.e`) provides a sortable per-model breakdown of request volume, input/cache/output token consumption, and USD cost across all providers serving the workspace during the selected time window:
+- **Header Row (`gap: 8px`, `align: Center`)**:
+  - Heading (`H3`): `Usage by Model`
+  - **Summary Count Badge** (`variant: Subtle`, `background: var(--bg-pill-active)`, `border: 1px solid var(--border-subtle)`, `padding: 2px 8px`, `border-radius: 4px`, `font-size: 12px`): Displays `<N> models · <M> provider(s)` (for example, `3 models · 1 provider` in `OpenCode/Image 3`, `6 models · 1 provider` in `Image 4`, and `10 models · 2 providers` in `Image 8` & `Image 9`).
+- **Subtitle (`Muted`)**: `Per-model breakdown for the selected range.`
+
+### 14.g.2 Seven-Column Table Schema, Provider Icons, and `Free` Tier Badges
+
+The table (`border: 1px solid var(--border-subtle)`, `border-radius: 8px`, `background: var(--bg-surface)`) renders seven columns with interactive column-header sorting (`?sort=cost_desc` default, shown as `Cost ↓`):
+
+| Column Header | Alignment | Cell Formatting & Edge-Case Rules (`OpenCode/Image 3, 8, 9`) |
+| --- | --- | --- |
+| `Model` | Left | Horizontal flex cell (`gap: 8px`, `align: Center`):<br>1. **Monochrome Provider Badge (`18px × 18px`, `border-radius: 4px`)**: Renders `[GO]` for `opencode_go`, `[CC]` for `command_code`, `[OD]` for `open_design_amr`, `[OR]` for `openrouter`, or the rectangular `[LLR]` logo mark for custom/internal models.<br>2. **Model Canonical Slug (`weight: Medium`, `--text-primary`)**: e.g., `muse-spark-1.3-contributor`, `deepseek-v4.1-flash`, `mimo-v2.6-flash`, `mimo-v2.6-pro`, `glm-5.3`, `kimi-k3`, `deepseek-flash`, `Space Bunny`, `longcat-2.5-preview-free`, `space-bunny-free`.<br>3. **Optional `Free` Badge**: When `list_cost_micro_usd == 0` and the model is a zero-cost/free tier (`:free` or `$0/$0` price book), appends a muted pill badge `Free` (`background: var(--status-paused-bg)`, `color: var(--text-muted)`, `font-size: 11px`, as seen on `Space Bunny Free` in `OpenCode/Image 8`). |
+| `Requests` | Right | Total requests served for that model in the range, formatted with thousands separator (`8.392`, `4.365`, `994`, `4`). |
+| `Input` | Right | Compact token notation for `SUM(input_uncached_tokens)` (`33.2M`, `6.0M`, `16.0k`, `64`). |
+| `Cache Read` | Right | Compact token notation for `SUM(cache_read_tokens)` (`2.760B`, `404.6M`, `13.5k`, `608`, or `-` when `0`). |
+| `Cache Write` | Right | Compact token notation for `SUM(cache_write_tokens)` when `> 0`, or muted hyphen `-` when `0`. |
+| `Output` | Right | Compact token notation for `SUM(output_tokens)` (`5.5M`, `486.5k`, `1.4k`, `251`). |
+| `Cost ↓` | Right | Formatted USD (`$20.53`, `$8.34`, `$1.51`, `$0.08`), `<$0.01` when `1 <= cost_micro_usd < 10_000` (e.g., `deepseek-v4-flash`), or `$0.00` when `cost_micro_usd == 0` (e.g., `Space Bunny Free`, `longcat-2.5-preview-free`, `space-bunny-free`). |
+
+- **Table Footer (`padding: 12px 16px`, `border-top: 1px solid var(--border-row)`)**: Renders `1 - <K> results of <N>` (`1 - 10 results of 10` in `OpenCode/Image 8`).
+
+### 14.g.3 Declarative UI Structural Pseudocode (`Usage by Model` Section)
+
+```ui-spec
+Section [layout: Column, gap: 16px, id: "usage-by-model-section"]
+├── Column [gap: 4px]
+│   ├── Row [gap: 8px, align: Center]
+│   │   ├── Heading(level: H3, text: "Usage by Model")
+│   │   └── Badge(variant: Subtle, text: "10 models · 2 providers")
+│   └── Text(variant: Muted, text: "Per-model breakdown for the selected range.")
+└── Table [border: Subtle, rounded: True]
+    ├── TableHeader [columns: ["Model", "Requests", "Input", "Cache Read", "Cache Write", "Output", "Cost ↓"]]
+    ├── TableBody
+    │   ├── TableRow(icon: "provider-go", model: "deepseek-v4.1-flash", requests: "8,392", input: "33.2M", cache-read: "2.760B", cache-write: "-", output: "5.5M", cost: "$20.53")
+    │   ├── TableRow(icon: "provider-go", model: "mimo-v2.6-flash", requests: "4,365", input: "15.8M", cache-read: "1.770B", cache-write: "-", output: "4.1M", cost: "$8.34")
+    │   ├── TableRow(icon: "provider-go", model: "mimo-v2.6-pro", requests: "1,310", input: "8.2M", cache-read: "350.1M", cache-write: "-", output: "1.3M", cost: "$6.08")
+    │   ├── TableRow(icon: "provider-go", model: "deepseek-v4-flash", requests: "37", input: "17.6k", cache-read: "32.7k", cache-write: "-", output: "3.9k", cost: "<$0.01")
+    │   ├── TableRow(icon: "llmroller-logo", model: "Space Bunny", badge: "Free", requests: "4", input: "64", cache-read: "608", cache-write: "-", output: "251", cost: "$0.00")
+    │   └── TableRow(icon: "provider-go", model: "space-bunny-free", requests: "1,849", input: "5.7M", cache-read: "245.8M", cache-write: "-", output: "851.3k", cost: "$0.00")
+    └── TableFooter [padding: 12px]
+        └── Text(variant: Caption, color: Muted, text: "1 - 10 results of 10")
+```
+
+### 14.g.4 Rust `ModelUsageRow` Projection and Provider Badge Mapping
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelUsageRow {
+    pub canonical_id: String,
+    pub provider_badge_kind: &'static str, // "go" | "cc" | "od" | "or" | "llr"
+    pub is_free_tier: bool,                // Renders inline "Free" pill badge when true
+    pub requests: i64,
+    pub requests_formatted: String,
+    pub input_uncached_formatted: String,
+    pub cache_read_formatted: String,      // "-" when 0
+    pub cache_write_formatted: String,     // "-" when 0
+    pub output_formatted: String,
+    pub cost_micro_usd: i64,
+    pub cost_formatted: String,            // "$20.53", "<$0.01", or "$0.00"
+}
+```
+
+## 14.h. Connection Setup Wizard, API Format Switcher, and One-Click Agent Setup
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `CLK-1`, `CLK-7`, `API-1`, `COM-1`, `UI-1`  
+> **Visual Inspiration Sources:** OpenDesign `API keys > Connection setup` & `One-click agent setup` (`OpenDesign/Image 2.png`, `Image 3.png`) and OpenCode `Overview > Connect CLI` (`OpenCode/Image 3.png`).
+
+### 14.h.1 Screen & Component Purpose
+
+Coding agents require different base URLs depending on whether they speak OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), or Anthropic Messages (`/v1/messages`, where tools such as Claude Code append `/v1/messages` automatically to `ANTHROPIC_BASE_URL` and therefore expect a root base URL without `/v1`).
+
+To eliminate base-URL misconfiguration, LLMRoller embeds the **Connection Setup Wizard** directly at the top of the `API Keys` screen (`Section 14.i`, matching `OpenDesign/Image 2` & `Image 3`) and exposes a **`One-click agent setup` / `Connect CLI`** modal accessible from both `API Keys` and `Overview`.
+
+### 14.h.2 Two-Step `Connection setup` Card Specification (`OpenDesign/Image 2 & 3`)
+
+- **Page Header (above card on `API Keys` screen)**:
+  - Left: Heading (`H1`) `API keys`; Subtitle `Manage API keys for your account. Keys are personal, not shared with workspace members.`
+  - Right CTA: Pill button **`One-click agent setup`** (`background: var(--text-primary)`, `color: var(--bg-canvas)`, `border-radius: 9999px`, `padding: 8px 16px`, `font-weight: 600`).
+- **Outer Card Container**:
+  - `padding: 24px`, `border: 1px solid var(--border-subtle)`, `border-radius: 12px`, `background: var(--bg-surface)`.
+  - Card Heading (`H3`): `Connection setup`
+  - Card Subtitle (`Muted`): `Choose an API format, then copy its base URL into your tool.`
+
+#### Step `1` — `Which API format does your tool use?`
+A 3-column horizontal grid (`grid-template-columns: repeat(3, minmax(0, 1fr))`, `gap: 12px`) of interactive radio selection cards (`data-action="select-api-format"`). Each card has a top-right circular radio indicator (`16px × 16px`):
+
+| Card Index | Vendor Suptitle (`12px Muted`) | Format Title (`15px SemiBold`) | Recommendation Caption (`12px Muted`) | Target Base URL (`#connection-base-url`) | Format Pill Badge (`#connection-format-badge`) |
+| --- | --- | --- | --- | --- | --- |
+| **Card 1 (Default Active)** | `OpenAI` | `Chat Completions` | `Recommended for DeepSeek Harness, OpenCode, and Hermes Agent.` | `https://<public_host>/v1` | `OpenAI · Chat Completions` |
+| **Card 2** | `OpenAI` | `Responses` | `Recommended for Codex.` | `https://<public_host>/v1` | `OpenAI · Responses` |
+| **Card 3** | `Anthropic` | `Messages` | `Recommended for Claude Code.` | `https://<public_host>` (plus `/v1/messages` endpoint note) | `Anthropic · Messages` |
+
+- **Active Card Visual State**: `border: 1.5px solid var(--border-radio-active)` (`#16a34a` / `#22c55e`) and filled green inner dot in the top-right radio circle.
+
+#### Step `2` — `Copy the API base URL for this format`
+- **Sub-container (`background: var(--bg-surface-subtle)`, `border-radius: 8px`, `padding: 16px`, `gap: 10px`)**:
+  - Numbered badge `2` + label `Copy the API base URL for this format`.
+  - Active format pill badge (`OpenAI · Chat Completions`, `OpenAI · Responses`, or `Anthropic · Messages`).
+  - **Base URL Copy Box**: Full-width input-like container (`background: var(--bg-surface)`, `border: 1px solid var(--border-subtle)`, `border-radius: 6px`, `padding: 10px 14px`, `display: flex`, `justify-content: space-between`, `align-items: center`) displaying the monospace URL (`https://llmroller.internal.example.com/v1`) on the left and a **`Copy URL`** button (`data-action="copy-text"`, `data-copy-target="connection-base-url"`) on the right.
+  - Helper caption: `Switch formats above to update the corresponding base URL.`
+
+### 14.h.3 `One-click agent setup` / `Connect CLI` Modal (`#modal-connect-cli`)
+
+Clicking `One-click agent setup` (`API Keys` top-right) or `Connect CLI` (`Overview` top-right) opens `#modal-connect-cli` (`width: 620px`) containing copyable shell configuration tabs for:
+1. **Claude Code (`~/.claude/settings.json` / shell env)**: `export ANTHROPIC_BASE_URL="https://<host>"` + `export ANTHROPIC_AUTH_TOKEN="llr_..."`.
+2. **Codex CLI (`~/.codex/config.toml`)**: `base_url = "https://<host>/v1"` + `export OPENAI_API_KEY="llr_..."`.
+3. **OpenCode (`opencode.json`)**: `@ai-sdk/openai-compatible` provider stanza with `baseURL: "https://<host>/v1"`.
+4. **Hermes Agent & Generic OpenAI / Anthropic SDKs**: Python & TypeScript initialization snippets.
+
+### 14.h.4 Declarative UI Structural Pseudocode (`Connection setup` Card)
+
+```ui-spec
+Card [padding: 24px, border: Subtle, radius: 12px, id: "connection-setup-card"]
+├── Column [gap: 20px]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H3, text: "Connection setup")
+│   │   └── Text(variant: Muted, text: "Choose an API format, then copy its base URL into your tool.")
+│   ├── Column [gap: 10px]
+│   │   ├── Row [gap: 8px, align: Center]
+│   │   │   ├── StepBadge(number: "1", color: Green)
+│   │   │   └── Text(weight: Medium, text: "Which API format does your tool use?")
+│   │   └── Grid [cols: 3, gap: 12px]
+│   │       ├── RadioCard(vendor: "OpenAI", title: "Chat Completions", desc: "Recommended for DeepSeek Harness, OpenCode, and Hermes Agent.", state: Selected, data-format: "chat")
+│   │       ├── RadioCard(vendor: "OpenAI", title: "Responses", desc: "Recommended for Codex.", state: Default, data-format: "responses")
+│   │       └── RadioCard(vendor: "Anthropic", title: "Messages", desc: "Recommended for Claude Code.", state: Default, data-format: "messages")
+│   └── Box [background: SurfaceSubtle, padding: 16px, radius: 8px, layout: Column, gap: 10px]
+│       ├── Row [gap: 8px, align: Center]
+│       │   ├── StepBadge(number: "2", color: Green)
+│       │   └── Text(weight: Medium, text: "Copy the API base URL for this format")
+│       ├── Badge(id: "connection-format-badge", variant: Subtle, text: "OpenAI · Chat Completions")
+│       ├── Row [background: Surface, border: Subtle, radius: 6px, padding: 10px, align: Space-Between]
+│       │   ├── Text(id: "connection-base-url", font: Monospace, text: "https://llmroller.internal.example.com/v1")
+│       │   └── Button(variant: Ghost, size: Small, label: "Copy URL", data-action: "copy-text", data-copy-target: "connection-base-url")
+│       └── Text(variant: Caption, color: Muted, text: "Switch formats above to update the corresponding base URL.")
+```
+
+### 14.h.5 Protocol-to-Base-URL Resolution Logic (`GET /api/user/connection-setup`)
+
+When rendering the `Connection setup` card or switching between the three protocol radio cards (`OpenAI · Chat Completions`, `OpenAI · Responses`, `Anthropic · Messages`), `crates/admin` derives the public origin `origin = format!("{scheme}://{host}")` from `Host` and `X-Forwarded-Proto` (when peer matches `LLMROLLER_TRUSTED_PROXIES`):
+
+| Selected Format | `data-format` | Displayed Badge | Displayed Base URL (`#connection-base-url`) | Environment Variable Snippet (`#modal-connect-cli`) |
+| --- | --- | --- | --- | --- |
+| `OpenAI Chat Completions` | `"chat"` | `OpenAI · Chat Completions` | `{origin}/v1` | `export OPENAI_BASE_URL="{origin}/v1"`<br>`export OPENAI_API_KEY="llr_..."` |
+| `OpenAI Responses` | `"responses"` | `OpenAI · Responses` | `{origin}/v1` | `base_url = "{origin}/v1"` (`~/.codex/config.toml`)<br>`export OPENAI_API_KEY="llr_..."` |
+| `Anthropic Messages` | `"messages"` | `Anthropic · Messages` | `{origin}` | `export ANTHROPIC_BASE_URL="{origin}"`<br>`export ANTHROPIC_AUTH_TOKEN="llr_..."` |
+
+## 14.i. Client API Keys Management, Inline Lifecycle Actions, and Rotation UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `CLK-1`..`CLK-7`, `TRC-9`, `SEC-3`, `UI-1`, `UI-4`  
+> **Visual Inspiration Sources:** OpenDesign `My API keys` Table (`OpenDesign/Image 2.png`, `Image 3.png`) and OpenCode `API Keys` Table (`OpenCode/Image 1.png`).
+
+### 14.i.1 Purpose and Dual-Table Capabilities
+
+The **Client API Keys Management (`My API keys`)** component sits immediately below the `Connection setup` card on `/app/keys` (and is reused inside the Service Account Detail View in `Section 14.k`). It synthesizes the best affordances of both reference consoles:
+1. From **OpenDesign (`Image 2` & `Image 3`)**: Live client/HTMX search input (`Search keys by name or prefix`), refresh button (`↻`), `+ Create API key` button, masked prefix display (`llr_o9Bl7••••••••`), semantic status pills (`● Active` vs. `● Paused`), full `Expires at`, `Last used`, and `Created at` timestamps, and direct **inline pill buttons** (`Rename`, `Pause key` / `Resume key`, `Revoke`).
+2. From **OpenCode (`Image 1`)**: Derived **`Permissions`** indicator (`All` vs. `Restricted`), `routing_scope` badge (`personal_first`, `blended`, `own_only`, etc.), and an overflow/drawer trigger to open the **Recently Active Sessions** drawer (`TRC-9`, `Section 14.t`) or rotate the key with a configurable grace period (`CLK-2`).
+
+### 14.i.2 `My API keys` Table Schema and Row States
+
+| Column Header | Content & Formatting | Interactive / State Behavior |
+| --- | --- | --- |
+| `Key` | Two-line stack:<br>• Line 1 (`weight: Medium`, `--text-primary`): Key `label` (`opendesign_go_key_for_testing`, `lxcagents`, `testkey`, `agent-sandbox`).<br>• Line 2 (`font: Monospace`, `--text-muted`): Prefix + mask (`llr_o9Bl7••••••••` or `llr_sk_bd822c5274e5...`) plus optional `grace active` badge if `now_ms < prev_key_expires_at`. | Clicking the key name or `Sessions` badge opens the **Recently Active Sessions** slide-over drawer (`GET /api/user/client-keys/{id}/sessions`, `TRC-9`, `Section 14.t`). |
+| `Permissions` / `Scope` | Displays `All` (muted) when `allowed_models IS NULL AND rate_limit_rpm IS NULL AND budget_micro_usd_month IS NULL AND allowed_cidrs IS NULL`, or `Restricted` (with tooltip listing active model/RPM/budget/CIDR caps) alongside the `routing_scope` chip (`inherit`, `personal_first`, `own_only`, etc.). | Clicking `Restricted` opens the key configuration modal (`PATCH /api/user/client-keys/{id}`). |
+| `Status` | Semantic pill badge:<br>• **`● Active`**: Green dot + `--status-success-fg` on `--status-success-bg` when `disabled == 0 AND paused_at IS NULL AND revoked_at IS NULL`.<br>• **`● Paused`**: Grey dot + `--status-paused-fg` on `--status-paused-bg` when `paused_at IS NOT NULL`.<br>• **`● Expired`**: Amber badge when `expires_at <= now_ms`. | Updated immediately via HTMX row swap when `Pause key` or `Resume key` is clicked. |
+| `Expires at` | `No expiration` (`No expiry`) when `expires_at IS NULL`, else formatted UTC/local date (`Oct 31, 2026`). | Muted text (`--text-muted`). |
+| `Last used` | `Never` when `last_used_at IS NULL`, relative time (`16h ago`) or full timestamp (`Oct 22, 2026, 2:25 PM`). | Updated from `client_keys.last_used_at`. |
+| `Created at` | Formatted creation timestamp (`Oct 16, 2026, 3:35 PM`). | Immutable (`client_keys.created_at`). |
+| `Actions` | Horizontal button group (`gap: 6px`):<br>• `Rename` (`variant: OutlinedPill`)<br>• `Pause key` (when `Active`) or `Resume key` (when `Paused`, `variant: OutlinedPill`)<br>• `Revoke` (`variant: OutlinedDangerPill`, red text `#dc2626` / `#ef4444`)<br>• `...` overflow (`Rotate key`, `Edit limits & CIDRs`, `Recent sessions`) | • `Pause key` calls `POST /api/user/client-keys/{id}/pause` (`CLK-7`).<br>• `Resume key` calls `POST /api/user/client-keys/{id}/resume` (`CLK-7`).<br>• `Revoke` prompts confirmation and calls `DELETE /api/user/client-keys/{id}` (`CLK-4`). |
+
+- **Table Footer & Security Caption**:
+  - Inside table footer: `Keys shown: <N>` (or `1 - <N> results of <N>`).
+  - Below table card: `Keep your keys private. Full keys are only shown once, when created.`
+
+### 14.i.3 One-Time Key Creation & Grace-Period Rotation Modals (`CLK-1`, `CLK-2`)
+
+1. **Create API Key Modal (`#modal-create-client-key`)**:
+   - Inputs: `Key name` (`label`), optional `Service account` selector (`None (Personal)` or any user service account), `Routing scope` (`inherit`, `personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), optional `Expiration date`, optional `Allowed models` multi-select, optional `RPM limit`, optional `Monthly budget (USD)`, and optional `Allowed CIDRs`.
+   - On `POST /api/user/client-keys` HTTP `201`: Transitions modal to the **One-Time Secret Reveal State** displaying the raw `llr_...` token in a monospace box with a `Copy Key` button and warning `"Save this key now. LLMRoller stores only its SHA-256 digest and cannot show it again."`
+2. **Rotate Key Modal (`POST /api/user/client-keys/{id}/rotate`)**:
+   - Allows selecting `grace_period_secs` (`0 s (immediate)`, `300 s (5 minutes, default)`, `3600 s (1 hour)`, `86400 s (24 hours)`). Generates a new `llr_...` secret while keeping `prev_key_hash` valid until `now_ms + grace_period_secs * 1000` (`G1`) and preserving all active `PinStore` entries (`CLK-2`).
+
+### 14.i.4 Declarative UI Structural Pseudocode (`My API keys` Card)
+
+```ui-spec
+Card [padding: 24px, border: Subtle, radius: 12px, id: "my-api-keys-card"]
+├── Column [gap: 16px]
+│   ├── Row [align: Space-Between, vertical-align: Center]
+│   │   ├── Heading(level: H3, text: "My API keys")
+│   │   └── Row [gap: 8px]
+│   │       ├── IconButton(icon: "refresh-cw", variant: Ghost, hx-get: "/app/partials/client-keys")
+│   │       └── Button(variant: OutlinedPill, icon-left: "plus", label: "Create API key", data-action: "open-modal", data-modal-id: "modal-create-client-key")
+│   ├── Input(type: Search, icon-left: "search", placeholder: "Search keys by name or prefix", width: 280px, hx-get: "/app/partials/client-keys", hx-trigger: "keyup changed delay:200ms")
+│   ├── Table [border: Subtle, rounded: True]
+│   │   ├── TableHeader [columns: ["Key", "Permissions", "Status", "Expires at", "Last used", "Created at", "Actions"]]
+│   │   ├── TableBody
+│   │   │   ├── TableRow
+│   │   │   │   ├── Cell [title: "opendesign_go_key_for_testing", subtitle-mono: "llr_o9Bl7••••••••"]
+│   │   │   │   ├── Cell(text: "All", color: Muted)
+│   │   │   │   ├── Cell [badge: Pill(dot: Green, text: "Active")]
+│   │   │   │   ├── Cell(text: "No expiration", color: Muted)
+│   │   │   │   ├── Cell(text: "Oct 17, 2026, 1:07 AM", color: Muted)
+│   │   │   │   ├── Cell(text: "Oct 16, 2026, 3:35 PM", color: Muted)
+│   │   │   │   └── Cell [actions: [Button("Rename"), Button("Pause key", hx-post: "/api/user/client-keys/01J.../pause"), Button("Revoke", variant: Danger)]]
+│   │   │   └── TableRow
+│   │   │       ├── Cell [title: "testkey", subtitle-mono: "llr_Diu-c••••••••"]
+│   │   │       ├── Cell(text: "Restricted", color: Muted)
+│   │   │       ├── Cell [badge: Pill(dot: Grey, text: "Paused")]
+│   │   │       ├── Cell(text: "No expiration", color: Muted)
+│   │   │       ├── Cell(text: "Oct 16, 2026, 3:22 PM", color: Muted)
+│   │   │       ├── Cell(text: "Oct 16, 2026, 2:42 PM", color: Muted)
+│   │   │       └── Cell [actions: [Button("Rename"), Button("Resume key", hx-post: "/api/user/client-keys/01J.../resume"), Button("Revoke", variant: Danger)]]
+│   │   └── TableFooter [text: "Keys shown: 2"]
+└── Text(variant: Caption, color: Muted, text: "Keep your keys private. Full keys are only shown once, when created.")
+```
+
+### 14.i.5 Client Key Lifecycle State Machine (`Active`, `Paused`, `Rotated`, `Revoked`)
+
+| Current State | User / Admin UI Action | Endpoint Called | Database & `ConfigSnapshot` Mutation | PinStore Effect | Next State |
+| --- | --- | --- | --- | --- | --- |
+| `Absent` | Click `+ Create API key` | `POST /api/user/client-keys` | Inserts `client_keys` row with `SHA-256` `key_hash`; returns raw `llr_...` once | None | `● Active` |
+| `● Active` | Click `Pause key` | `POST /api/user/client-keys/{id}/pause` | Sets `paused_at = now_ms, disabled = 1`; increments `config_version`; reloads within `1 s` | Pins **preserved** in `PinStore` until natural TTL | `● Paused` |
+| `● Paused` | Click `Resume key` | `POST /api/user/client-keys/{id}/resume` | Sets `paused_at = NULL, disabled = 0`; increments `config_version`; reloads within `1 s` | Existing non-expired pins immediately reusable | `● Active` |
+| `● Active` | Click `Rename` | `PATCH /api/user/client-keys/{id}` | Updates `label` in place | Pins preserved | `● Active` |
+| `● Active` | Click `Rotate` (`grace_period_secs`) | `POST /api/user/client-keys/{id}/rotate` | Moves `key_hash -> prev_key_hash`, sets `prev_key_expires_at = now + grace`, generates new `key_hash` | Pins & `response_links` preserved on same `client_key.id` | `● Active (Grace)` |
+| `● Active` or `● Paused` | Click `Revoke` | `DELETE /api/user/client-keys/{id}` | Sets `revoked_at = now_ms, disabled = 1, prev_key_hash = NULL`; reloads within `1 s` | Immediately purges all pins for `client_key_id` | `Revoked` (removed from active list) |
+
+## 14.j. Service Accounts Directory and Machine Principal Management
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `CLK-6`, `USR-2`, `USR-3`, `SEC-17`, `UI-1`, `UI-5`  
+> **Visual Inspiration Sources:** OpenCode `Settings > Service Accounts` Directory View (`OpenCode/Image 2.png`).
+
+### 14.j.1 Screen Archetype and Layout Context
+
+The **Service Accounts Directory View** (`/app/settings/service-accounts` and `/admin/settings/service-accounts`) is rendered inside the right-hand detail canvas (`max-width: 740px`, `gap: 20px`) of the `Settings` split-pane layout (`Section 14.w`, `OpenCode/Image 2`). It provides a centralized directory of all machine principals (`service_accounts`) in the active workspace (`Personal` or `Default / Global`), enabling users and admins to search accounts, inspect total vs. active key counts, verify IP restriction statuses at a glance, or provision new service accounts.
+
+### 14.j.2 Header, Toolbar, and 5-Column Directory Table (`OpenCode/Image 2`)
+
+- **Main Content Header (`gap: 4px`)**:
+  - Heading (`H1`): `Service Accounts`
+  - Subtitle (`Muted` with inline link): `Machine principals for CI and automations · ` + **`Learn more`** (styled in bright `--text-primary` white/dark-ink, opening a documentation modal explaining Service Account CIDR inheritance and child key management).
+- **Toolbar Controls (`Row`, `gap: 10px`, `align: Center`)**:
+  - **Search Input**: `width: 190px`, `icon-left: "search"`, `placeholder: "Search"`, `hx-get="/app/partials/service-accounts"`, `hx-trigger="keyup changed delay:200ms"`, `hx-target="#service-accounts-table-body"`.
+  - **Primary CTA Button**: `+ Add Service Account` (`variant: Outlined`, `icon-left: "plus"`, `data-action="open-modal"`, `data-modal-id="modal-add-service-account"`).
+- **5-Column Interactive Directory Table**:
+  - Every `TableRow` is interactive (`cursor: pointer`, `hx-get="/app/settings/service-accounts/{id}"`, `hx-push-url="true"`), navigating directly to the Service Account Detail View (`Section 14.k`, `OpenCode/Image 1`).
+
+| Column Header | Text Weight & Color | Data Source & Formatting Rule (`OpenCode/Image 2`) |
+| --- | --- | --- |
+| `Name` | `weight: Medium`, `--text-primary` | `service_accounts.name` (e.g., `agents`, `testing`, `bots`, `ci`). |
+| `Keys` | `weight: Regular`, `--text-primary` | Total non-revoked child `client_keys` attached to `service_account_id` (e.g., `4`, `1`, `1`, `1`). |
+| `Active keys` | `weight: Regular`, `--text-primary` | Count of child `client_keys` with `disabled == 0 AND paused_at IS NULL AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now_ms)` (e.g., `4`, `1`, `1`, `1`). |
+| `Created` | `weight: Regular`, `--text-muted` | Short creation date (`Oct 3`, `Oct 4`, or `Oct 3, 2026`). |
+| `IP restrictions` | `weight: Medium`, `--text-primary` | Displays `Unrestricted` when `allowed_cidrs IS NULL` or `[]`, or `<N> CIDR(s)` (e.g., `2 CIDRs`) when active IP restrictions are configured. |
+
+- **Table Footer (`padding: 12px 16px`)**: Displays `1 - <K> results of <N>` (`1 - 4 results of 4`).
+
+### 14.j.3 Declarative UI Structural Pseudocode (`Service Accounts` Directory View)
+
+```ui-spec
+SplitPane [layout: Row, gap: 48px, align: Top, padding-y: 32px, padding-x: 64px]
+├── SettingsSidebar [width: 180px, active: "Service accounts", ref: "14.w"]
+└── Column [flex: 1, max-width: 740px, gap: 20px, id: "service-accounts-directory"]
+    ├── Column [gap: 4px]
+    │   ├── Heading(level: H1, text: "Service Accounts")
+    │   └── Row [gap: 4px, align: Center]
+    │       ├── Text(variant: Muted, text: "Machine principals for CI and automations ·")
+    │       └── Button(variant: Link, label: "Learn more", color: Primary, data-action: "open-modal", data-modal-id: "modal-sa-docs")
+    ├── Row [gap: 10px, align: Center]
+    │   ├── Input(type: Search, icon-left: "search", placeholder: "Search", width: 190px)
+    │   └── Button(variant: Outlined, icon-left: "plus", label: "Add Service Account", data-action: "open-modal", data-modal-id: "modal-add-service-account")
+    └── Table [border: Subtle, rounded: True, interactive-rows: True]
+        ├── TableHeader [columns: ["Name", "Keys", "Active keys", "Created", "IP restrictions"]]
+        ├── TableBody [id: "service-accounts-table-body"]
+        │   ├── TableRow(name: "agents", keys: "4", active-keys: "4", created: "Oct 3", ip-restrictions: "Unrestricted", href: "/app/settings/service-accounts/01J...agents")
+        │   ├── TableRow(name: "testing", keys: "1", active-keys: "1", created: "Oct 3", ip-restrictions: "Unrestricted", href: "/app/settings/service-accounts/01J...testing")
+        │   ├── TableRow(name: "bots", keys: "1", active-keys: "1", created: "Oct 3", ip-restrictions: "Unrestricted", href: "/app/settings/service-accounts/01J...bots")
+        │   └── TableRow(name: "ci", keys: "1", active-keys: "1", created: "Oct 4", ip-restrictions: "Unrestricted", href: "/app/settings/service-accounts/01J...ci")
+        └── TableFooter [padding: 12px]
+            └── Text(variant: Caption, color: Muted, text: "1 - 4 results of 4")
+```
+
+### 14.j.4 Service Account Creation & Validation Contract (`POST /api/user/service-accounts`)
+
+```json
+// Request: POST /api/user/service-accounts
+{
+  "name": "agents",
+  "description": "Autonomous coding agents and CI runners",
+  "allowed_cidrs": ["203.0.113.10/32", "2001:db8::/48"]
+}
+
+// Response: 201 Created
+{
+  "id": "01M3487QVWYJMMKC1PP07MKHTD",
+  "display_subtext": "svcacct_01M3487QVWYJMMKC1PP07MKHTD",
+  "owner_user_id": "01J9X0USER...",
+  "workspace_scope": "personal",
+  "name": "agents",
+  "description": "Autonomous coding agents and CI runners",
+  "allowed_cidrs": ["203.0.113.10/32", "2001:db8::/48"],
+  "ip_restrictions_label": "Restricted (2 CIDRs)",
+  "keys_count": 0,
+  "active_keys_count": 0,
+  "created_at": 1791000000000
+}
+```
+- Duplicate `name` within the same `(owner_user_id, workspace_scope)` returns HTTP `409 Conflict` (`service_account_name_taken`, enforced by `uq_service_accounts_owner_name`).
+
+## 14.k. Service Account Detail View, CIDR IP Restrictions, and Child Keys
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `CLK-1`..`CLK-7`, `G4`, `SEC-12`, `UI-1`, `UI-5`  
+> **Visual Inspiration Sources:** OpenCode `Settings > Service Accounts > agents` Detail View (`OpenCode/Image 1.png`).
+
+### 14.k.1 Screen Purpose and Navigation Hierarchy
+
+Clicking any row in the Service Accounts Directory (`Section 14.j`) navigates to the **Service Account Detail View** (`/app/settings/service-accounts/{id}` or `/admin/settings/service-accounts/{id}`, `OpenCode/Image 1`). It allows administrators and developers to:
+1. Configure and persist network-level IPv4/IPv6 allow-lists (`allowed_cidrs`, up to 64 addresses or CIDRs) that apply to every child API key belonging to that service account at Gate `G4`.
+2. Monitor aggregated `Cost`, `Requests`, and `Tokens` KPI cards across all child keys of the service account over a selectable time window (`All time`, `Last 30 days`, `Last 7 days`, `Last 24 hours`).
+3. Provision, inspect, pause/resume, rotate, or revoke individual child API keys under the service account.
+
+### 14.k.2 Exhaustive Component Breakdown (`OpenCode/Image 1`)
+
+#### 1. Breadcrumbs & Entity Header
+- **Breadcrumbs (`Row`, `gap: 8px`, `font-size: 13px`)**:
+  - Link `Service Accounts` (`href="/app/settings/service-accounts"`, `--text-muted`) `>` Current entity `agents` (`--text-muted`).
+- **Entity Title & Toolbar Row (`align: Space-Between`, `vertical-align: Center`)**:
+  - Left column (`gap: 4px`):
+    - Heading (`H1`): `agents`
+    - Subtitle (`Muted`): `Service account · 4 keys · Created 03 Oct 2026`
+  - Right controls (`gap: 8px`):
+    - **Time Range Filter Button**: `variant: Outlined`, `icon-left: "calendar"`, label `All time` (dropdown options: `Last 24 hours`, `Last 7 days`, `Last 30 days`, `All time`). Updating this filter refreshes the 3 KPI summary cards (`Cost`, `Requests`, `Tokens`) via HTMX.
+    - **Overflow Action Menu (`...` IconButton)**: `variant: Outlined`, `icon: "more-horizontal"`. Opens dropdown with `Rename service account`, `Disable all keys`, and `Delete service account`.
+
+#### 2. IP Restrictions Form (`PUT /api/user/service-accounts/{id}/ip-restrictions`)
+- **Status Heading (`H4`, `14px SemiBold`)**:
+  - Renders `IP restrictions: Unrestricted` when `allowed_cidrs` is empty, or `IP restrictions: Restricted (<N> CIDRs)` when active.
+- **Field Label (`13px Medium`)**: `Allowed IP addresses`
+- **Resizable Textarea (`name="allowed_cidrs_text"`, `rows="3"`, `width: 320px`, `resize: both`)**:
+  - Placeholder copy: `203.0.113.10, 2001:db8::/48`
+  - Pre-filled with comma-and-newline separated CIDRs when configured.
+- **Helper & Lockout Warning Caption (`12px Muted`, `max-width: 680px`)**:
+  - Verbatim copy: `Optional. Up to 64 IPv4/IPv6 addresses or CIDRs, separated by commas or new lines. Blank allows any IP. Applies to every key for this service account. IP changes can lock clients out.`
+- **Action Button**: `Save IP restrictions` (`variant: Secondary` / `#1f1f1f` with `#262626` border). Submitting validates every entry with `ipnet::IpNet` (converting bare IPv4 addresses to `/32` and bare IPv6 addresses to `/128`), updates `service_accounts.allowed_cidrs`, bumps `instance_meta.config_version`, and hot-reloads `ConfigSnapshot` within 1 s (`REL-4`).
+
+#### 3. Aggregated Service Account KPI Summary Cards (3-Card Grid)
+- 3-column CSS Grid (`cols: 3`, `gap: 16px`), identical in styling to the `Overview` KPI row (`Section 14.e`):
+  - **Card 1 (`Cost`)**: e.g., `$50.96`
+  - **Card 2 (`Requests`)**: e.g., `25.519` (`25,519`)
+  - **Card 3 (`Tokens`)**: e.g., `9.431B`
+
+#### 4. Child `API Keys` Section & Table
+- **Section Header Row (`align: Space-Between`, `vertical-align: Center`)**:
+  - Left: Heading (`H3`) `API Keys`; Subtitle (`Muted`) `Manage keys used to access the API.`
+  - Right: Button `+ Add API Key` (`variant: Outlined`, `icon-left: "plus"`, opens `#modal-create-client-key` pre-bound to `service_account_id`).
+- **Child API Keys Table (`6 columns: Key, Permissions, Status, Last used, Expires, [Actions]`)**:
+  - **Row 1**: `agent-sandbox` / `llr_sk_bd822c5274e5...` | `Restricted` | `Active` | `Oct 14` | `No expiry` | `...`
+  - **Row 2**: `bot` / `llr_sk_4556cec66b0b...` | `All` | `Active` | `Never` | `No expiry` | `...`
+  - **Row 3**: `opencode_go_key_for_testing` / `llr_sk_f26a0104d7a2...` | `All` | `Active` | `Never` | `No expiry` | `...`
+  - **Row 4**: `misapw laptop pi` / `llr_sk_9d53912998e5...` | `All` | `Active` | `16h ago` | `No expiry` | `...`
+  - **Footer**: `1 - 4 results of 4`.
+  - Clicking `...` on any row exposes `Rename`, `Edit permissions & model limits`, `Pause key` / `Resume key`, `Rotate key`, `View recent sessions`, and `Revoke key`.
+
+### 14.k.3 Declarative UI Structural Pseudocode (`Service Accounts > agents`)
+
+```ui-spec
+SplitPane [layout: Row, gap: 48px, align: Top, padding-y: 32px, padding-x: 64px]
+├── SettingsSidebar [width: 180px, active: "Service accounts", ref: "14.w"]
+└── Column [flex: 1, max-width: 740px, gap: 28px, id: "service-account-detail"]
+    ├── Breadcrumbs(items: ["Service Accounts", "agents"], separator: ">")
+    ├── Row [align: Space-Between, vertical-align: Center]
+    │   ├── Column [gap: 4px]
+    │   │   ├── Heading(level: H1, text: "agents")
+    │   │   └── Text(variant: Muted, text: "Service account · 4 keys · Created 03 Oct 2026")
+    │   └── Row [gap: 8px]
+    │       ├── Button(variant: Outlined, icon-left: "calendar", label: "All time")
+    │       └── IconButton(variant: Outlined, icon: "more-horizontal")
+    ├── Form [hx-put: "/api/user/service-accounts/01J...agents/ip-restrictions", layout: Column, gap: 10px]
+    │   ├── Heading(level: H4, text: "IP restrictions: Unrestricted")
+    │   ├── Text(variant: Label, text: "Allowed IP addresses")
+    │   ├── Input(type: Textarea, name: "allowed_cidrs", rows: 3, resizable: True, width: 320px, value: "", placeholder: "203.0.113.10, 2001:db8::/48")
+    │   ├── Text(variant: Caption, color: Muted, text: "Optional. Up to 64 IPv4/IPv6 addresses or CIDRs, separated by commas or new lines. Blank allows any IP. Applies to every key for this service account. IP changes can lock clients out.")
+    │   └── Row [padding-top: 4px]
+    │       └── Button(type: Submit, variant: Secondary, label: "Save IP restrictions")
+    ├── Grid [cols: 3, gap: 16px]
+    │   ├── Card [padding: 20px, border: Subtle, caption: "Cost", value: "$50.96"]
+    │   ├── Card [padding: 20px, border: Subtle, caption: "Requests", value: "25,519"]
+    │   └── Card [padding: 20px, border: Subtle, caption: "Tokens", value: "9.431B"]
+    └── Section [layout: Column, gap: 16px]
+        ├── Row [align: Space-Between, vertical-align: Center]
+        │   ├── Column [gap: 4px]
+        │   │   ├── Heading(level: H3, text: "API Keys")
+        │   │   └── Text(variant: Muted, text: "Manage keys used to access the API.")
+        │   └── Button(variant: Outlined, icon-left: "plus", label: "Add API Key", data-action: "open-modal", data-modal-id: "modal-create-client-key")
+        └── Table [border: Subtle, rounded: True]
+            ├── TableHeader [columns: ["Key", "Permissions", "Status", "Last used", "Expires", ""]]
+            ├── TableBody
+            │   ├── TableRow(name: "agent-sandbox", prefix: "llr_sk_bd822c5274e5...", permissions: "Restricted", status: "Active", last-used: "Oct 14", expires: "No expiry")
+            │   ├── TableRow(name: "bot", prefix: "llr_sk_4556cec66b0b...", permissions: "All", status: "Active", last-used: "Never", expires: "No expiry")
+            │   ├── TableRow(name: "opencode_go_key_for_testing", prefix: "llr_sk_f26a0104d7a2...", permissions: "All", status: "Active", last-used: "Never", expires: "No expiry")
+            │   └── TableRow(name: "misapw laptop pi", prefix: "llr_sk_9d53912998e5...", permissions: "All", status: "Active", last-used: "16h ago", expires: "No expiry")
+            └── TableFooter [padding: 12px, text: "1 - 4 results of 4"]
+```
+
+### 14.k.4 CIDR Parser & Lockout Prevention Validation (`PUT .../ip-restrictions`)
+
+When the user submits the `Allowed IP addresses` textarea on `Service Accounts > <name>` (`OpenCode/Image 1`):
+1. The server splits the input string on commas (`,`) and newlines (`\r`, `\n`), trims whitespace, and discards empty tokens.
+2. If the resulting list is empty, `service_accounts.allowed_cidrs` is set to `NULL` and the status heading updates to `IP restrictions: Unrestricted`.
+3. If the list contains more than `64` entries, the handler returns HTTP `422 Unprocessable Entity` (`"Maximum of 64 IPv4/IPv6 addresses or CIDRs allowed"`).
+4. Each token is parsed via `ipnet::IpNet::from_str` (or `std::net::IpAddr::from_str`, which normalizes a single host IP like `203.0.113.10` to `203.0.113.10/32` and `2001:db8::1` to `2001:db8::1/128`). Any unparseable token returns HTTP `422` naming the exact offending token.
+
+## 14.l. Dual-Stream Logs Explorer (`Inference` vs. Control-Plane `API` Logs)
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `USG-1`, `USG-9`, `AUD-2`, `USR-4`, `SEC-6`, `UI-1`  
+> **Visual Inspiration Sources:** OpenCode `Logs > Inference` Master Data Table (`OpenCode/Image 7.png`) and `Logs > API` Console API Request Log Table (`OpenCode/Image 10.png`).
+
+### 14.l.1 Screen Archetype and Dual-Stream Architecture
+
+The **Logs Explorer** (`/app/logs` for Personal Workspace; `/admin/logs` for Default / Global Admin Workspace) provides a high-density, chronological audit trail of both data-plane LLM inference requests (`Inference` sub-tab, backed by `usage_events`) and control-plane dashboard/API requests (`API` sub-tab, backed by `control_plane_logs`), newest first, kept for 30 days (`usage_events_retention_days = 30`).
+
+- **Container Geometry**: Centered column (`width: 1140px`, `max-width: 100%`, `padding-y: 36px`, `gap: 20px`).
+- **Page Header & Right Utility Toolbar (`align: Space-Between`, `vertical-align: Center`)**:
+  - Left column (`gap: 4px`):
+    - Heading (`H1`): `Logs`
+    - Dynamic Subtitle (`Muted`):
+      - When `Inference` sub-tab is active (`OpenCode/Image 7`): `Every inference request in this organization, newest first. Kept for 30 days.`
+      - When `API` sub-tab is active (`OpenCode/Image 10`): `Every console API request in this organization, newest first. Kept for 30 days.`
+  - Right utility controls (`Row`, `gap: 8px`):
+    - **Date Range Picker Button**: `variant: Outlined`, `icon-left: "calendar"`, label `Last 7 days` (`Last 24 hours`, `Last 7 days`, `Last 30 days`, `Custom`).
+    - **Refresh IconButton (`↻`)**: `variant: Outlined`, `icon: "refresh-cw"`, triggers an immediate HTMX reload of the active log table (`hx-get="/app/partials/logs?stream=<active>"`).
+    - **Export / Download IconButton (`↓`)**: `variant: Outlined`, `icon: "download"`, downloads formula-sanitized CSV or JSON (`GET /api/user/request-logs/export.csv?stream=<active>&range=<range>`, `SEC-6`).
+- **Sub-Navigation & Filter Row (`Row`, `gap: 8px`, `align: Center`)**:
+  - **Segmented Stream Toggle (`Inference` | `API`)**:
+    - Clicking `Inference` or `API` switches the table schema, subtitle, and query target (`hx-get="/app/partials/logs?stream=inference"` vs. `stream=api`).
+  - **Filter Popover Trigger (`Filter` button with funnel icon `▽`)**:
+    - Opens a multi-facet filter popover allowing filtering by:
+      - `Status`: `2xx Success`, `429 Rate Limited / Quota`, `403 Rejected`, `4xx Client Error`, `5xx Upstream Error`.
+      - `Model` (`Inference` mode): Dropdown of canonical models (`deepseek-v4.1-flash`, `deepseek-flash`, etc.).
+      - `Endpoint / Method` (`API` mode): `GET`, `POST`, `PATCH`, `PUT`, `DELETE` and path prefix (`/api/user/*`, `/admin/api/*`).
+      - `User / Service Account`: Filter by initiating user or service account.
+
+### 14.l.2 Mode 1: `Inference` Request Logs Table (7 Columns — `OpenCode/Image 7`)
+
+When the `Inference` segmented pill is active, the table renders 7 columns. Every row is interactive (`cursor: pointer`, `data-action="open-drawer"`, `data-drawer-url="/app/partials/request-logs/{id}"`), sliding in the 460px Request Detail Inspection Drawer (`Section 14.m`, `OpenCode/Image 5` & `Image 6`):
+
+| Column Header | Alignment | Visual Formatting & Semantic States (`OpenCode/Image 7`) |
+| --- | --- | --- |
+| `Time` | Left | Formatted timestamp `MMM DD, HH:MM:SS` (`Oct 20, 14:05:56`, `Oct 18, 02:45:57`) in `--text-muted` (`tabular-nums`). |
+| `Status` | Left | Semantic dot + status code + optional sub-reason stack:<br>• **Success (`200`)**: Green dot `● 200` in emerald `--status-success-fg` (`#22c55e`).<br>• **Rejected / Failed (`429`, `403`, `4xx`, `5xx`)**: Two-line cell with amber/orange dot `● 429 Rejected` or `● 403 Rejected` (`#d99b26`) on line 1 and monospace muted `error_code` (`inference_failed`, `ip_restricted`, `client_key_budget_exhausted`) on line 2. |
+| `Model` | Left | Horizontal flex with provider icon (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`) + two-line stack:<br>• Line 1 (`--text-primary`, `weight: Medium`): Model name (`DeepSeek V4.1 Flash`, `deepseek-flash`).<br>• Line 2 (`--text-muted`, `12px`): Provider name (`OpenCode Go`, or `"global pool"` via `project_key`). |
+| `User` | Left | Principal badge + label:<br>• When called by a personal user key: Circular avatar badge (`M` / `I`) + username (`misaalanshori@gmail.com`).<br>• When called by a Service Account key: Key icon (`🔑`) + `ServiceAccountName: <label>` (`agents: agent-sandbox` or `Legacy: misaalanshori@gmail....`). |
+| `Duration` | Right | Total request latency (`latency_ms`) formatted as `276 ms`, `26 ms`, `6.96 s`, `4.5 s` (`--text-primary`, `tabular-nums`). |
+| `Tokens` | Right | Compact total tokens (`1.1k`, `1.6k`, `784`, `4.6k`) on HTTP 200 rows; muted em-dash `—` on rejected (`429`/`403`) rows. |
+| `Cost` | Right | Formatted USD (`$0.00078`, `$0.00056`, `$0.0011`) on HTTP 200 rows; muted em-dash `—` on uncharged rejected (`429`/`403`) rows. |
+
+### 14.l.3 Mode 2: Console `API` Logs Table (5 Columns — `OpenCode/Image 10`)
+
+When the `API` segmented pill is active, the table queries `control_plane_logs` (`AUD-2`) and dynamically switches to a 5-column schema:
+
+| Column Header | Alignment | Visual Formatting (`OpenCode/Image 10`) |
+| --- | --- | --- |
+| `Time` | Left | Timestamp `MMM DD, HH:MM:SS` (`Oct 22, 14:34:21`, `Oct 22, 14:34:08`, `Oct 22, 14:34:03`). |
+| `Status` | Left | Status dot + HTTP status code (`● 200` in emerald green; `● 403` / `● 422` in amber). |
+| `Endpoint` | Left | Monospace HTTP verb (`GET`, `POST`, `PATCH`, `DELETE`) in `--text-muted` followed by a space and the monospace request path (`/api/user/request-logs`, `/api/user/service-accounts`, `/api/user/providers`) in bright `--text-primary`. |
+| `User` | Left | Circular avatar badge (`I`) + authenticated username (`isabungsu@gmail.com`). |
+| `Duration` | Right | Control-plane handler latency in milliseconds (`71 ms`, `67 ms`, `34 ms`, `32 ms`, `30 ms`, `22 ms`). |
+
+### 14.l.4 Declarative UI Structural Pseudocode (`Logs` Master Screen)
+
+```ui-spec
+LogsScreen [layout: Column, width: 1140px, align: Center, padding-y: 36px, gap: 20px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Logs")
+│   │   └── Text(id: "logs-subtitle", variant: Muted, text: "Every inference request in this organization, newest first. Kept for 30 days.")
+│   └── Row [gap: 8px]
+│       ├── Button(variant: Outlined, icon-left: "calendar", label: "Last 7 days")
+│       ├── IconButton(variant: Outlined, icon: "refresh-cw", hx-get: "/app/partials/logs")
+│       └── IconButton(variant: Outlined, icon: "download", href: "/api/user/request-logs/export.csv")
+├── Row [gap: 8px, align: Center]
+│   ├── Tabs [variant: SegmentedPill, active: Dynamic("Inference" | "API")]
+│   │   ├── TabItem(label: "Inference", hx-get: "/app/partials/logs?stream=inference")
+│   │   └── TabItem(label: "API", hx-get: "/app/partials/logs?stream=api")
+│   └── Button(variant: Outlined, icon-left: "filter", label: "Filter", data-action: "toggle-popover", data-popover-id: "logs-filter-popover")
+└── DynamicTableContainer [id: "logs-table-container"]
+    ├── When [stream == "inference"]
+    │   └── Table [columns: ["Time", "Status", "Model", "User", "Duration", "Tokens", "Cost"], interactive-rows: True]
+    └── When [stream == "api"]
+        └── Table [columns: ["Time", "Status", "Endpoint", "User", "Duration"], interactive-rows: True]
+```
+
+### 14.l.5 JSON Response Schema (`GET /api/user/request-logs`)
+
+```json
+{
+  "stream": "inference",
+  "retention_days": 30,
+  "pagination": {
+    "after": null,
+    "limit": 50,
+    "next_after": "1792291513000:01J9X5REQ13"
+  },
+  "rows": [
+    {
+      "id": "01J9X5REQ1",
+      "request_id": "99730363-1a89-447f-8298-90603ac35afc",
+      "ts": 1792428356000,
+      "time_formatted": "Oct 20, 14:05:56",
+      "status": 429,
+      "status_badge": "429 Rejected",
+      "status_color": "amber",
+      "error_code": "inference_failed",
+      "model_display": "DeepSeek V4.1 Flash",
+      "provider_display": "OpenCode",
+      "provider_badge": "go",
+      "initiator_kind": "user",
+      "initiator_display": "misaalanshori@gmail.com",
+      "duration_formatted": "276 ms",
+      "tokens_formatted": "—",
+      "cost_formatted": "—"
+    },
+    {
+      "id": "01J9X5REQ3",
+      "request_id": "99730363-1a89-447f-8298-90603ac35afc",
+      "ts": 1792291557000,
+      "time_formatted": "Oct 18, 02:45:57",
+      "status": 200,
+      "status_badge": "200",
+      "status_color": "green",
+      "error_code": null,
+      "model_display": "deepseek-flash",
+      "provider_display": "OpenCode",
+      "provider_badge": "go",
+      "initiator_kind": "service_account_key",
+      "initiator_display": "Legacy: misaalanshori@gmail....",
+      "duration_formatted": "6.96 s",
+      "tokens_formatted": "1.1k",
+      "cost_formatted": "$0.00078"
+    }
+  ]
+}
+```
+
+## 14.m. Request Detail Slide-Over Inspection Drawer
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `USG-1`..`USG-3`, `USG-9`, `TRC-6`, `USR-4`, `SEC-6`, `UI-1`, `UI-4`  
+> **Visual Inspiration Sources:** OpenCode Inference Log Request Detail Drawer — Top Scroll State (`OpenCode/Image 6.png`) and Bottom Scroll State (`OpenCode/Image 5.png`).
+
+### 14.m.1 Archetype, Docking Geometry, and Backdrop Overlay
+
+Clicking any row in the `Logs` table (`Section 14.l`) opens the **Request Detail Slide-Over Inspection Drawer** (`#right-inspection-drawer`):
+- **Backdrop Overlay (`state: Dimmed-Backdrop`)**: The main `Logs` table canvas remains visible on the left (exposing the `Time`, `Status`, `Model`, and `User` columns) beneath a translucent dark backdrop (`--bg-backdrop`), with the inspected row highlighted (`state: Selected`). Clicking the backdrop or pressing `Escape` dismisses the drawer and returns to the full 7-column table (`OpenCode/Image 7`).
+- **Drawer Container Geometry**: Fixed right-docked panel (`position: fixed`, `top: 0`, `right: 0`, `width: 460px`, `height: 100vh`, `background: var(--bg-drawer)`, `border-left: 1px solid var(--border-subtle)`, `z-index: 900`, `display: flex`, `flex-direction: column`).
+
+### 14.m.2 Sticky Header Bar & Sequential Row Navigation (`<` / `>`)
+
+At the top of the drawer sits a sticky header bar (`height: 48px`, `padding: 0 20px`, `border-bottom: 1px solid var(--border-subtle)`, `align: Space-Between`):
+- **Left Status Indicator**: Semantic status dot + HTTP status code (`● 200` in emerald green `#22c55e`, or `● 429 Rejected` / `● 403 Rejected` in amber `#d99b26`).
+- **Right Control Cluster (`Row`, `gap: 8px`)**:
+  1. **Previous Log Button (`<` chevron-left)**: Steps immediately to the newer adjacent log row (`hx-get="/app/partials/request-logs/{prev_id}"`, `hx-target="#drawer-content"`, also bound to `ArrowUp` / `k`). Disabled when inspecting the first row.
+  2. **Next Log Button (`>` chevron-right)**: Steps immediately to the older adjacent log row (`hx-get="/app/partials/request-logs/{next_id}"`, `hx-target="#drawer-content"`, also bound to `ArrowDown` / `j`).
+  3. **Overflow Actions Menu (`...` more-horizontal)**: Dropdown with:
+     - `Copy raw log JSON`
+     - `Preview Session Chat` (enabled when `has_traces == true` for `session_hash`, navigating to `/app/sessions/{session_hash}/chat`, `UI-4`)
+     - `Filter logs by this Session` (`?session_hash=<hash>`)
+     - `Filter logs by this Key` (`?client_key_id=<id>`)
+  4. **Close Button (`×` close)**: Closes the drawer (`data-action="close-drawer"`).
+
+### 14.m.3 Complete 7-Section Telemetry Stack (`OpenCode/Image 5 & Image 6`)
+
+The scrollable body (`ScrollArea`, `padding: 20px`, `gap: 24px`) renders a summary title block followed by seven structured sections separated by `1px solid var(--border-subtle)` horizontal dividers:
+
+| Order | Section Title | Key-Value Fields & Formatting Rules | Example Values (`OpenCode/Image 5 & 6`) |
+| --- | --- | --- | --- |
+| **0** | **Summary Header Block** | • Heading (`H2`, `18px SemiBold`): Model slug (`canonical_id`)<br>• Subtitle (`13px Muted`): Full timestamp + middot + total duration (`latency_ms`) | `deepseek-flash`<br>`Oct 18, 2026, 02:45:57 · 6.96 s` |
+| **1** | **`Request`** | 9-row key-value list (`label` in `13px --text-muted` on left, `value` in `13px --text-primary` on right):<br>• `Request ID`: Monospace `request_id` + inline copy icon button (`📋`)<br>• `HTTP status`: Status integer (`200`, `429`, `403`)<br>• `Stop reason`: Normalized stop reason (`stop`, `length`, `tool_calls`, `end_turn`, or `—`)<br>• `Endpoint`: Monospace inbound path (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`)<br>• `Method`: `POST`<br>• `Streaming`: `Yes` (`stream == 1`) or `No` (`stream == 0`)<br>• `Protocol`: `openai-chat`, `openai-responses`, or `anthropic-messages`<br>• `Product`: Pool tier / provider preset slug (`go`, `own`, `shared`, `global`)<br>• `Time to first token`: Formatted `ttfb_ms` (`1.82 s`, `410 ms`, or `—`) | `Request ID`: `99730363-1a89-447f-8298-90603ac35afc` `[📋]`<br>`HTTP status`: `200`<br>`Stop reason`: `stop`<br>`Endpoint`: `/v1/chat/completions`<br>`Method`: `POST`<br>`Streaming`: `Yes`<br>`Protocol`: `openai-chat`<br>`Product`: `go`<br>`Time to first token`: `1.82 s` |
+| **2** | **`Model`** | 2-row key-value list:<br>• `Model`: `canonical_id` (with `upstream_model_id` tooltip)<br>• `Provider`: Provider display name (passed through `project_key(viewer, key)` so standard users see `"Global pool"` on global routes) | `Model`: `deepseek-flash`<br>`Provider`: `OpenCode` |
+| **3** | **`Tokens`** | 5-to-6 row key-value list (`tabular-nums`):<br>• `Input`: `input_uncached_tokens`<br>• `Output`: `output_tokens`<br>• `Reasoning`: `reasoning_tokens`<br>• `Cache read`: `cache_read_tokens` (with thousands separator)<br>• `Cache write`: `cache_write_tokens` (shown when `> 0`)<br>• `Cost`: Formatted `cost_micro_usd` (with `cost_source` badge and `Usage_attempts` count if `failovers > 0`) | `Input`: `163`<br>`Output`: `955`<br>`Reasoning`: `146`<br>`Cache read`: `62.464`<br>`Cost`: `$0.00078` |
+| **4** | **`Identity`** | 2-row key-value list with monospace ID subtext:<br>• `Service account`: Service account name (`agents` or `Legacy: <owner>`) on line 1; muted monospace `svcacct_<id>` on line 2.<br>• `Key`: Client key `label` (`lca-testing-key`) on line 1; muted monospace `llr_<prefix>_<id>` on line 2. | `Service account`: `Legacy: misaalanshori@gmail.com` / `svcacct_01M3487Q...`<br>`Key`: `lca-testing-key` / `sk_01M35WDTE8PG21YS6GYJ5BX32N` |
+| **5** | **`Client`** | 3-row key-value list:<br>• `Session`: Monospace session affinity token or `session_hash`<br>• `User agent`: Monospace `client_user_agent`<br>• `Location`: `client_location` or client IP prefix | `Session`: `1792266230924-65bbf89a`<br>`User agent`: `lca/0.6.0 (linux; x86_64; abi-0.6)`<br>`Location`: `Singapore, SG` |
+| **6** | **`Request headers`** | Bordered 2-column table (`border: 1px solid var(--border-subtle)`, `border-radius: 6px`) rendering each key-value pair from `usage_events.request_headers_json` (`SEC-6` allow-listed diagnostic headers only, never credentials). | `content-length`: `242031`<br>`content-type`: `application/json`<br>`user-agent`: `lca/0.6.0 (linux; x86_64; abi-0.6)`<br>`x-opencode-session`: `1792266230924-65bbf89a` |
+| **7** | **`Metadata` & Footer** | • `Metadata` section: Renders key-value pairs from `metadata_json`, or muted text `None recorded.` when null/empty.<br>• Drawer Footer: Monospace caption `Log <request_id>`. | `None recorded.`<br>`Log 99730363-1a89-447f-8298-90603ac35afc` |
+
+### 14.m.4 Declarative UI Structural Pseudocode (`Request Detail Drawer`)
+
+```ui-spec
+Drawer [dock: Right, width: 460px, height: Full, border-left: Subtle, id: "right-inspection-drawer"]
+├── TopBar [height: 48px, align: Space-Between, padding-x: 20px, border-bottom: Subtle]
+│   ├── Badge(variant: Dot, color: Green, text: "200")
+│   └── Row [gap: 8px]
+│       ├── IconButton(icon: "chevron-left", variant: Ghost, data-action: "step-drawer", data-step-url: prev_url)
+│       ├── IconButton(icon: "chevron-right", variant: Ghost, data-action: "step-drawer", data-step-url: next_url)
+│       ├── IconButton(icon: "more-horizontal", variant: Ghost)
+│       └── IconButton(icon: "close", variant: Ghost, data-action: "close-drawer")
+└── ScrollArea [flex: 1, padding: 20px, id: "drawer-content"]
+    └── Column [gap: 24px]
+        ├── Column [gap: 4px]
+        │   ├── Heading(level: H2, text: "deepseek-flash")
+        │   └── Text(variant: Muted, text: "Oct 18, 2026, 02:45:57 · 6.96 s")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Request", layout: KeyValueList]
+        │   ├── KeyValue(label: "Request ID", value: "99730363-1a89-447f-8298-90603ac35afc", font: Monospace, action-icon: "copy")
+        │   ├── KeyValue(label: "HTTP status", value: "200")
+        │   ├── KeyValue(label: "Stop reason", value: "stop")
+        │   ├── KeyValue(label: "Endpoint", value: "/v1/chat/completions", font: Monospace)
+        │   ├── KeyValue(label: "Method", value: "POST")
+        │   ├── KeyValue(label: "Streaming", value: "Yes")
+        │   ├── KeyValue(label: "Protocol", value: "openai-chat")
+        │   ├── KeyValue(label: "Product", value: "go")
+        │   └── KeyValue(label: "Time to first token", value: "1.82 s")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Model", layout: KeyValueList]
+        │   ├── KeyValue(label: "Model", value: "deepseek-flash")
+        │   └── KeyValue(label: "Provider", value: "OpenCode")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Tokens", layout: KeyValueList]
+        │   ├── KeyValue(label: "Input", value: "163")
+        │   ├── KeyValue(label: "Output", value: "955")
+        │   ├── KeyValue(label: "Reasoning", value: "146")
+        │   ├── KeyValue(label: "Cache read", value: "62.464")
+        │   └── KeyValue(label: "Cost", value: "$0.00078")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Identity", layout: KeyValueList]
+        │   ├── KeyValue(label: "Service account", value: "agents", subtext: "svcacct_01M3487QVWYJMMKC1PP07MKHTD")
+        │   └── KeyValue(label: "Key", value: "lca-testing-key", subtext: "llr_sk_01M35WDTE8PG21YS6GYJ5BX32N")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Client", layout: KeyValueList]
+        │   ├── KeyValue(label: "Session", value: "1792266230924-65bbf89a", font: Monospace)
+        │   ├── KeyValue(label: "User agent", value: "lca/0.6.0 (linux; x86_64; abi-0.6)", font: Monospace)
+        │   └── KeyValue(label: "Location", value: "Singapore, SG")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Request headers"]
+        │   └── Table [border: Subtle, cols: 2]
+        │       ├── TableRow(key: "content-length", value: "242031")
+        │       ├── TableRow(key: "content-type", value: "application/json")
+        │       ├── TableRow(key: "user-agent", value: "lca/0.6.0 (linux; x86_64; abi-0.6)")
+        │       └── TableRow(key: "x-opencode-session", value: "1792266230924-65bbf89a")
+        ├── Divider(color: Subtle)
+        ├── Section [title: "Metadata"]
+        │   └── Text(variant: Muted, text: "None recorded.")
+        └── Text(variant: Caption, font: Monospace, color: Muted, text: "Log 99730363-1a89-447f-8298-90603ac35afc")
+```
+
+### 14.m.5 JSON Response Schema (`GET /api/user/request-logs/{id}`)
+
+```json
+{
+  "id": "01J9X5REQ3",
+  "request_id": "99730363-1a89-447f-8298-90603ac35afc",
+  "prev_id": "01J9X5REQ2",
+  "next_id": "01J9X5REQ4",
+  "status": 200,
+  "status_color": "green",
+  "model_heading": "deepseek-flash",
+  "timestamp_and_duration": "Oct 18, 2026, 02:45:57 · 6.96 s",
+  "request": {
+    "request_id": "99730363-1a89-447f-8298-90603ac35afc",
+    "http_status": 200,
+    "stop_reason": "stop",
+    "endpoint": "/v1/chat/completions",
+    "method": "POST",
+    "streaming": "Yes",
+    "protocol": "openai-chat",
+    "product": "go",
+    "ttft_formatted": "1.82 s"
+  },
+  "model": {
+    "model": "deepseek-flash",
+    "provider": "OpenCode"
+  },
+  "tokens": {
+    "input": "163",
+    "output": "955",
+    "reasoning": "146",
+    "cache_read": "62.464",
+    "cache_write": "0",
+    "cost": "$0.00078"
+  },
+  "identity": {
+    "service_account_name": "Legacy: misaalanshori@gmail.com",
+    "service_account_subtext": "svcacct_01M3487QVWYJMMKC1PP07MKHTD",
+    "key_name": "lca-testing-key",
+    "key_subtext": "llr_sk_01M35WDTE8PG21YS6GYJ5BX32N"
+  },
+  "client": {
+    "session": "1792266230924-65bbf89a",
+    "user_agent": "lca/0.6.0 (linux; x86_64; abi-0.6)",
+    "location": "Singapore, SG"
+  },
+  "request_headers": [
+    {"name": "content-length", "value": "242031"},
+    {"name": "content-type", "value": "application/json"},
+    {"name": "user-agent", "value": "lca/0.6.0 (linux; x86_64; abi-0.6)"},
+    {"name": "x-opencode-session", "value": "1792266230924-65bbf89a"}
+  ],
+  "metadata": null,
+  "has_traces": true,
+  "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c"
+}
+```
+
+## 14.n. Usage Ledger, 5-Token Summary Strip, and Initiator-Model-Date Pill Filters
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `USG-1`..`USG-3`, `USG-10`, `USR-4`, `SEC-6`, `UI-1`  
+> **Visual Inspiration Sources:** OpenDesign `Usage` Ledger View (`OpenDesign/Image 1.png` — `All initiators`, `All models`, `Last 30 days`; `OpenDesign/Image 4.png` — filtered to `deepseek-v4.1-flash`, `Last 7 days`).
+
+### 14.n.1 Screen Purpose and Layout Hierarchy
+
+The **Usage Ledger** (`/app/usage` and `/admin/usage`) provides a comprehensive token-and-credit accounting view for every inference request in the workspace. Unlike the operational `Logs` screen (`Section 14.l`), which focuses on HTTP status codes, latencies, and request headers, the `Usage` screen focuses on **token composition (`Total`, `Input`, `Output`, `Cache read`, `Cache write`)** and **financial / subscription plan credit attribution (`Credits used`, list-price strikethrough, and `Covered by <Plan> credits`)**.
+
+- **Page Header**:
+  - Heading (`H1`): `Usage`
+  - Subtitle (`Muted`): `Review every usage record and credit charge in this workspace.`
+
+### 14.n.2 Three-Pill Filter Bar (`All initiators`, `All models`, `Date range`)
+
+Directly below the subtitle sits a horizontal filter row (`Row`, `gap: 8px`, `align: Center`) containing three rounded pill dropdown selectors (`border-radius: 9999px`, `padding: 6px 14px`, `border: 1px solid var(--border-subtle)`, `background: var(--bg-surface)`):
+1. **Initiator Filter Pill (`?initiator=`)**: Defaults to `All initiators ⌄`. Dropdown lists all users, service accounts (`agents`, `ci`, `bots`), and individual client keys (`llr_...`) in the workspace.
+2. **Model Filter Pill (`?model=`)**: Defaults to `All models ⌄` (`OpenDesign/Image 1`) or displays the active canonical model slug (`deepseek-v4.1-flash ⌄` in `OpenDesign/Image 4`).
+3. **Date Window Pill (`?range=`)**: Defaults to `Last 30 days ⌄` (`OpenDesign/Image 1`) or `Last 7 days ⌄` (`OpenDesign/Image 4`), with options `Last 24 hours`, `Last 7 days`, `Last 30 days`, `Current UTC month`, and `All time`.
+
+Changing any of the three pill dropdowns triggers an HTMX partial refresh (`hx-get="/app/partials/usage-ledger"`, `hx-include="closest .filter-pill-bar"`, `hx-target="#usage-ledger-content"`) that updates both the 5-Metric Token Summary Strip and the Usage Ledger Table.
+
+### 14.n.3 5-Metric Token Summary Strip Card (`OpenDesign/Image 1 & 4`)
+
+Above the usage table sits a single full-width card (`padding: 24px`, `border: 1px solid var(--border-subtle)`, `border-radius: 10px`, `background: var(--bg-surface)`) divided into a 5-column horizontal grid (`grid-template-columns: repeat(5, minmax(0, 1fr))`, `gap: 24px`):
+
+| Column Position | Caption Label (`12px Muted`) | Hero Metric (`28px SemiBold Tabular`) | SQL Aggregation Formula (`usage_rollups_hourly`) | Observed Reference Values (`OpenDesign/Image 1` vs `Image 4`) |
+| --- | --- | --- | --- | --- |
+| **1** | `Total tokens` | `4.13B` / `3.89B` | `SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens)` | `4.13B` (`All models, 30d`) / `3.89B` (`deepseek-v4.1-flash, 7d`) |
+| **2** | `Input tokens` | `4.12B` / `3.89B` | `SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens)` (total prompt input tokens) | `4.12B` / `3.89B` |
+| **3** | `Output tokens` | `6.43M` / `5.99M` | `SUM(output_tokens)` | `6.43M` / `5.99M` |
+| **4** | `Cache read tokens` | `4.1B` / `3.87B` | `SUM(cache_read_tokens)` | `4.1B` / `3.87B` |
+| **5** | `Cache write tokens` | `0` | `SUM(cache_write_tokens)` | `0` / `0` |
+
+### 14.n.4 8-Column Granular Usage Records Table (`OpenDesign/Image 1 & 4`)
+
+Below the 5-metric summary strip sits the chronological Usage Records Table (`border: 1px solid var(--border-subtle)`, `border-radius: 10px`, `background: var(--bg-surface)`):
+
+| Column Header | Alignment | Visual Formatting & Data Rules (`OpenDesign/Image 1 & 4`) |
+| --- | --- | --- |
+| `Time` | Left | Two-line timestamp cell:<br>• Line 1 (`13px --text-primary`): ISO date `YYYY-MM-DD` (`2026-10-22`).<br>• Line 2 (`12px --text-muted`): 24-hour time `HH:MM` (`14:24`, `14:23`, `14:22`, `14:21`). |
+| `Initiator` | Left | Display name of the initiating user, service account, or client key (`M Isa`, `agents / bot`). |
+| `Model` | Left | Canonical model slug (`deepseek-v4.1-flash`). |
+| `Input tokens` | Left / Tabular | Total input tokens for the turn (`input_uncached_tokens + cache_read_tokens + cache_write_tokens`) formatted with thousands separator (`352.235`, `351.868`, `348.410`, `403.559`). |
+| `Output tokens` | Left / Tabular | `output_tokens` (`216`, `201`, `95`, `115`, `69`, `744`). |
+| `Cache read` | Left / Tabular | `cache_read_tokens` (`351.744`, `350.592`, `347.648`, `403.328`), or `—` when `0`. |
+| `Cache write` | Left / Tabular | `cache_write_tokens` when `> 0`, or muted em-dash `—` when `0`. |
+| `Credits used` | Right / Left-aligned stack | Two-line financial attribution stack (`Section 14.o`):<br>• **When covered by a subscription coding plan (`billing_coverage_mode == 'subscription_plan'`)**: Line 1 renders struck-through list price `~$0.0024~` (`--text-strikethrough`) + info icon button `(i)` (`data-action="toggle-popover"`, `data-popover-id="cost-popover-{id}"`); Line 2 renders emerald green text (`--status-success-fg`) `Covered by <Provider Plan> credits` (e.g., `Covered by Design Plan credits`, `Covered by OpenCode Go credits`, `Covered by Command Code GOAT credits`).<br>• **When billed pay-as-you-go (`billing_coverage_mode == 'pay_as_you_go'`)**: Line 1 renders bold `$0.0024` + `(i)`; Line 2 renders muted `Pay-as-you-go balance`. |
+
+### 14.n.5 Declarative UI Structural Pseudocode (`Usage` Ledger View)
+
+```ui-spec
+UsageLedgerScreen [layout: Column, padding: 32px, gap: 24px, id: "usage-ledger-screen"]
+├── Column [gap: 4px]
+│   ├── Heading(level: H1, text: "Usage")
+│   └── Text(variant: Muted, text: "Review every usage record and credit charge in this workspace.")
+├── Row [gap: 8px, align: Center, class: "filter-pill-bar"]
+│   ├── SelectPill(name: "initiator", label: "All initiators", icon-right: "chevron-down")
+│   ├── SelectPill(name: "model", label: "deepseek-v4.1-flash", icon-right: "chevron-down")
+│   └── SelectPill(name: "range", label: "Last 7 days", icon-right: "chevron-down")
+├── Card [padding: 24px, border: Subtle, radius: 10px]
+│   └── Grid [cols: 5, gap: 24px]
+│       ├── MetricCol(label: "Total tokens", value: "3.89B")
+│       ├── MetricCol(label: "Input tokens", value: "3.89B")
+│       ├── MetricCol(label: "Output tokens", value: "5.99M")
+│       ├── MetricCol(label: "Cache read tokens", value: "3.87B")
+│       └── MetricCol(label: "Cache write tokens", value: "0")
+└── Table [border: Subtle, radius: 10px]
+    ├── TableHeader [columns: ["Time", "Initiator", "Model", "Input tokens", "Output tokens", "Cache read", "Cache write", "Credits used"]]
+    └── TableBody
+        ├── TableRow(date: "2026-10-22", time: "14:24", initiator: "M Isa", model: "deepseek-v4.1-flash", input: "352,235", output: "216", cache-read: "351,744", cache-write: "—", list-cost-strike: "$0.0026", coverage: "Covered by Design Plan credits")
+        └── TableRow(date: "2026-10-22", time: "14:23", initiator: "M Isa", model: "deepseek-v4.1-flash", input: "348,410", output: "69", cache-read: "347,648", cache-write: "—", list-cost-strike: "$0.0024", coverage: "Covered by Design Plan credits", popover-open: True)
+```
+
+### 14.n.6 Rust `UsageLedgerPartialTemplate` and JSON Contract
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenSummaryStrip {
+    pub total_tokens_formatted: String,       // "4.13B" / "3.89B"
+    pub input_tokens_formatted: String,       // "4.12B" / "3.89B"
+    pub output_tokens_formatted: String,      // "6.43M" / "5.99M"
+    pub cache_read_tokens_formatted: String,  // "4.1B"  / "3.87B"
+    pub cache_write_tokens_formatted: String, // "0"
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageLedgerRow {
+    pub id: String,
+    pub date_line: String,                    // "2026-10-22"
+    pub time_line: String,                    // "14:24"
+    pub initiator_display: String,            // "M Isa" or "agents / bot"
+    pub canonical_model: String,              // "deepseek-v4.1-flash"
+    pub input_tokens_formatted: String,       // "348,410"
+    pub output_tokens_formatted: String,      // "69"
+    pub cache_read_formatted: String,         // "347,648"
+    pub cache_write_formatted: String,        // "—"
+    pub list_cost_formatted: String,          // "$0.0024"
+    pub actual_cost_formatted: String,        // "$0.0006"
+    pub is_plan_covered: bool,
+    pub coverage_subtitle: String,            // "Covered by Design Plan credits"
+}
+```
+
+## 14.o. Credit and Cost Breakdown Popover and Plan Coverage Multipliers
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `USG-3`, `USG-10`, `LIM-1`, `UI-1`  
+> **Visual Inspiration Sources:** OpenDesign `Credit usage breakdown` Floating Dark Popover (`OpenDesign/Image 4.png`).
+
+### 14.o.1 Component Purpose and Visual Contrast Design
+
+When a user hovers or clicks the `(i)` icon next to a request's cost in the `Credits used` column of the `Usage` ledger (`Section 14.n`, `OpenDesign/Image 4`), LLMRoller displays a floating **`Credit usage breakdown`** popover card:
+- **High-Contrast Dark Popover Surface (`--bg-popover-dark: #18181b`)**: Even when the workspace is in Light Mode (`#ffffff`), the popover uses a deep carbon surface (`#18181b`), `#27272a` 1px borders, `#ffffff` primary text, and `#a1a1aa` muted captions (`width: 380px`, `padding: 18px`, `border-radius: 10px`, `box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.45)`, `z-index: 950`).
+
+### 14.o.2 Exhaustive Content & Line-Item Math Inventory (`OpenDesign/Image 4`)
+
+1. **Popover Header**:
+   - Title (`14px SemiBold`, `#ffffff`): `Credit usage breakdown`
+   - Subtitle (`12px Regular`, `#a1a1aa`): `Prices per million tokens. Amounts in USD.`
+2. **4-Column Token Line-Item Table (`Type`, `Tokens`, `Price`, `Credits used`)**:
+   - Column alignments: `Type` (left), `Tokens` (right, `tabular-nums`), `Price` (right, 4 decimal places `$0.3000`), `Credits used` (right, 4 decimal places `$0.0002` or `< $0.0001`).
+
+| Row Label (`Type`) | `Tokens` Source (`usage_events`) | `Price` Source (`prices` per 1M tokens) | `Credits used` Line-Item Formula | Example Row (`OpenDesign/Image 4`) |
+| --- | --- | --- | --- | --- |
+| `Input (excluding cache)` | `input_uncached_tokens` (`762`) | `input_per_mtok_micro_usd` (`$0.3000`) | `div_ceil(input_uncached * rate_in, 1_000_000)` | `762` \| `$0.3000` \| `$0.0002` |
+| `Output` | `output_tokens` (`69`) | `output_per_mtok_micro_usd` (`$1.2000`) | `div_ceil(output * rate_out, 1_000_000)` | `69` \| `$1.2000` \| `< $0.0001` |
+| `Cache read` | `cache_read_tokens` (`347.648`) | `cache_read_per_mtok_micro_usd` (`$0.0060`) | `div_ceil(cache_read * rate_cache_read, 1_000_000)` | `347.648` \| `$0.0060` \| `$0.0021` |
+| `Cache write` | `cache_write_tokens` (`0`) | `cache_write_per_mtok_micro_usd` (`$0.3000`) | `div_ceil(cache_write * rate_cache_write, 1_000_000)` | `0` \| `$0.3000` \| `$0.0000` |
+
+3. **Subtotal, Multiplier, and Actual Plan Credits Summary Rows**:
+   - **`Model list-price subtotal`**: Right-aligned sum of the four line items (`list_cost_micro_usd`, e.g., `$0.0024`).
+   - **`Plan contribution multiplier (i)`** (with dashed underline and tooltip explaining the provider's plan or time-of-day schedule multiplier): Right-aligned multiplier formatted from `plan_multiplier_bps` (e.g., `× 0.25` when `plan_multiplier_bps == 2500`, `× 2.00` during DeepSeek weekday peak hours, or `× 1.00` standard).
+   - Horizontal divider (`1px solid #27272a`).
+   - **`Actual Plan credits used` (`weight: SemiBold`, `#ffffff`)**: Right-aligned effective charge (`cost_micro_usd = div_ceil(list_cost_micro_usd * plan_multiplier_bps, 10_000)`, e.g., `$0.0006`).
+   - Horizontal divider (`1px solid #27272a`).
+4. **Popover Footer Caption (`11.5px`, `#a1a1aa`)**:
+   - When `billing_coverage_mode == 'subscription_plan'`: `This call uses <Plan Name> credits and does not deduct from your pay-as-you-go balance.`
+   - When `billing_coverage_mode == 'shared_grant'`: `This call is covered by shared grant allowance (<owner>/<key_label>).`
+   - When `billing_coverage_mode == 'pay_as_you_go'`: `This call deducts from the upstream key's pay-as-you-go balance.`
+
+### 14.o.3 Declarative UI Structural Pseudocode (`Credit usage breakdown` Popover)
+
+```ui-spec
+Popover [theme: DarkFixed("#18181b"), width: 380px, padding: 18px, radius: 10px, border: SubtleDark, id: "credit-usage-breakdown-popover"]
+└── Column [gap: 12px]
+    ├── Column [gap: 2px]
+    │   ├── Heading(level: H4, text: "Credit usage breakdown", color: White)
+    │   └── Text(variant: Caption, color: Muted, text: "Prices per million tokens. Amounts in USD.")
+    ├── Table [border: None, compact: True, columns: ["Type", "Tokens", "Price", "Credits used"]]
+    │   ├── TableRow(type: "Input (excluding cache)", tokens: "762", price: "$0.3000", credits: "$0.0002")
+    │   ├── TableRow(type: "Output", tokens: "69", price: "$1.2000", credits: "< $0.0001")
+    │   ├── TableRow(type: "Cache read", tokens: "347,648", price: "$0.0060", credits: "$0.0021")
+    │   └── TableRow(type: "Cache write", tokens: "0", price: "$0.3000", credits: "$0.0000")
+    ├── Row [align: Space-Between]
+    │   ├── Text(text: "Model list-price subtotal", color: LightGrey)
+    │   └── Text(text: "$0.0024", color: White, font-numeric: Tabular)
+    ├── Row [align: Space-Between]
+    │   ├── Text(text: "Plan contribution multiplier", style: DottedUnderline, icon-right: "info", color: LightGrey)
+    │   └── Text(text: "× 0.25", color: White, font-numeric: Tabular)
+    ├── Divider(color: SubtleDark)
+    ├── Row [align: Space-Between]
+    │   ├── Text(text: "Actual Plan credits used", weight: SemiBold, color: White)
+    │   └── Text(text: "$0.0006", weight: SemiBold, color: White, font-numeric: Tabular)
+    ├── Divider(color: SubtleDark)
+    └── Text(variant: Caption, color: Muted, text: "This call uses Design Plan credits and does not deduct from your pay-as-you-go balance.")
+```
+
+### 14.o.4 Client-Side Popover Positioning & Dismissal (`/static/app.js`)
+
+1. **Viewport-Aware Anchoring**: Clicking `[data-action="toggle-popover"]` positions `#credit-usage-breakdown-popover` directly below-left of the clicked `(i)` icon, flipping above the row if `rect.bottom + 320 > window.innerHeight` (as seen in `OpenDesign/Image 4`).
+2. **Single Active Popover Invariant**: Opening a breakdown popover for Row `i` automatically closes any previously open popover. Clicking outside the popover or pressing `Escape` dismisses it immediately.
+
+## 14.p. Personal and Global Providers, Presets, and Upstream Key Cards
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `PRV-1`..`PRV-8`, `SEC-1`, `SEC-7`, `UI-1`, `UI-2`
+
+### 14.p.1 Screen Purpose and Scope Separation (`Personal` vs. `Global`)
+
+The **Providers & Upstream Keys** screen (`/app/providers` for user-owned `personal` providers; `/admin/providers` for admin-managed `global` providers) lets users and admins onboard subscription coding plans (`opencode_go`, `command_code`, `open_design_amr`), pay-as-you-go aggregators (`openrouter`), and `custom` OpenAI/Anthropic-compatible endpoints.
+
+### 14.p.2 Provider Preset Selector & `ProviderConfigJson` Editor Modal
+
+Clicking `+ Add Provider` opens `#modal-new-provider`:
+1. **Preset Selection (`kind`)**: Selecting `OpenCode Go`, `Command Code`, `Open Design AMR`, or `OpenRouter` auto-populates `base_url` (`https://opencode.ai/zen/go/v1`, `https://api.commandcode.ai/provider/v1`, `https://amr-link.open-design.ai/v1`, `https://openrouter.ai/api/v1`), protocol paths, session affinity profile, `/usage` polling profile, and error classifiers from `/etc/llmroller/presets/<kind>.toml`.
+2. **Custom Provider & SSRF Controls (`PRV-7`, `SEC-7`)**:
+   - Enforces `https://` URLs and blocks private/loopback IP ranges via `GuardedConnector` unless an admin explicitly checks `Allow private network (RFC 1918 / loopback)` (`allow_private_network = 1`).
+   - On personal providers with a cross-origin `usage_url`, requires checking `Acknowledge cross-origin /usage URL (disables sharing this provider)` (`usage_url_cross_origin_ack = 1`).
+3. **Advanced `ProviderConfigJson` Accordion**: Exposes editable fields for `paths` (`chat`, `responses`, `messages`, `models`), `auth` schemes, `usage_reporting.chat_stream` (`inject`, `native`, `none`), `strip_headers`, `add_headers`, `ua_policy` (`pass`, `label`, `reject`), `session_profile`, and `timeouts`. Saving recomputes `providers.share_config_fingerprint` in the same transaction (`SHR-3`).
+
+### 14.p.3 Upstream Key Card Anatomy & Live `RuntimeState` Health Actions (`PRV-4`, `PRV-6`, `UI-2`)
+
+Each provider card expands to display its attached upstream keys (`upstream_keys`):
+- **Header Row**: Key `label` (`my-opencode-go-1`), masked secret suffix (`••••9a4f` — visible only to the key owner or admin per `USR-4`), `Priority` badge (`100`, range `1..=1000`), `Strict Tier` badge (`Tier 1`, range `1..=10`), and **Live Health Badge** read from `RuntimeState`:
+  - `● Healthy` (`--status-success-fg`)
+  - `● Cooling down (resets in 42s)` (`--status-warning-fg`)
+  - `● Quota exhausted (resets at 18:00 UTC)` (`--status-danger-fg`)
+  - `● Invalid credential` (`--status-danger-fg`)
+- **Action Buttons per Key**:
+  1. **`Test Key` (`POST /api/user/upstream-keys/{id}/test`)**: Calls upstream `GET /models` and `/usage`, rendering an inline toast/banner with HTTP status, discovered model count, and live quota percentage (`PRV-6`).
+  2. **`Reset Health` (`POST /api/user/upstream-keys/{id}/reset-health`)**: Increments `health_version` in `RuntimeState` first, sets `health = 'healthy'`, and enqueues a guarded `WHERE health_version < ?` SQLite update (`Section 21.5`).
+  3. **`Configure Windows & Calibrate`**: Opens the budget window and manual calibration drawer (`Section 14.q`).
+  4. **`Disable` / `Delete`**: Immediately purges active pins on that key via `CacheInvalidationEvent` (`PRV-8`).
+
+### 14.p.4 Declarative UI Structural Pseudocode (`Providers & Keys` Screen)
+
+```ui-spec
+ProvidersScreen [layout: Column, width: 980px, align: Center, padding-y: 36px, gap: 24px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Providers")
+│   │   └── Text(variant: Muted, text: "Configure upstream inference endpoints, presets, and encrypted API keys.")
+│   └── Button(variant: Outlined, icon-left: "plus", label: "Add Provider", data-action: "open-modal", data-modal-id: "modal-new-provider")
+└── Column [gap: 16px, id: "providers-stack"]
+    └── ProviderCard [border: Subtle, radius: 10px, padding: 20px]
+        ├── Row [align: Space-Between]
+        │   ├── Row [gap: 10px, align: Center]
+        │   │   ├── Badge(icon: "provider-go", text: "opencode_go")
+        │   │   ├── Heading(level: H3, text: "my-opencode-go")
+        │   │   └── Text(font: Monospace, color: Muted, text: "https://opencode.ai/zen/go/v1")
+        │   └── Row [gap: 8px]
+        │       ├── Button(variant: Outlined, size: Small, label: "Add Key")
+        │       └── Button(variant: Ghost, size: Small, label: "Configure")
+        └── KeyCardsList [padding-top: 16px, gap: 12px]
+            └── UpstreamKeyCard [label: "my-opencode-go-1", last4: "••••9a4f", priority: 100, strict-tier: 1, health: "healthy", actions: ["Test", "Refresh /usage", "Raw /usage JSON", "Calibrate", "Reset Health"]]
+```
+
+### 14.p.5 Provider & Key Test Probe JSON Contract (`POST .../test`)
+
+```json
+{
+  "upstream_key_id": "01J9X1B...",
+  "models_probe": {
+    "http_status": 200,
+    "latency_ms": 184,
+    "discovered_models_count": 14,
+    "sample_models": ["deepseek-v4.1-flash", "mimo-v2.6-pro", "claude-sonnet-4.6"]
+  },
+  "usage_probe": {
+    "supported": true,
+    "http_status": 200,
+    "plan_name": "OpenCode Go",
+    "windows": [
+      {"kind": "5h", "status": "ok", "used_pct": 12.5, "resets_at": 1792400000000},
+      {"kind": "7d", "status": "ok", "used_pct": 34.0, "resets_at": 1792800000000},
+      {"kind": "1mo", "status": "ok", "used_pct": 48.0, "resets_at": 1794000000000}
+    ]
+  }
+}
+```
+
+## 14.q. Plan and Balance Dashboard, Budget Windows, and Source Usage Gauges
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `USG-4`..`USG-8`, `LIM-1`, `SEC-18`, `UI-2`  
+> **Visual Inspiration Sources:** OpenCode `Go` Tab (`OpenCode/Image 1..10.png`) and OpenDesign `Plan & balance` Sidebar Module (`OpenDesign/Image 1..4.png`).
+
+### 14.q.1 Screen Purpose
+
+Accessible via the `Go` tab in Top-Tab mode or `Plan & balance` in Sidebar mode (`/app/quotas` and `/admin/quotas`), this screen provides real-time visibility into rolling and anchored subscription quota windows (`5h`, `7d`, `1mo`), prepaid wallet balances, in-flight reservations (`reserved_in_flight`), and source provider `/usage` observations (`UpstreamObservation`).
+
+### 14.q.2 Dual Local Ring vs. Reconciled `UpstreamObservation` Gauges (`UI-2`, `USG-6`)
+
+For every upstream key and configured `budget_windows` row (`rolling`, `anchored_fixed`, `anchored_calendar_month`, `anchored_provider`), the card renders a dual progress bar and telemetry row:
+1. **Local Ring + Manual Offset Spend**: `w.ring.sum_at(now_ms) + w.manual_offset.value_at(now_ms)` in USD (`$4.20 / $12.00 (35.0%)`).
+2. **Source Provider `/usage` Observation (`UpstreamObservation`)**:
+   - Displays the latest observed upstream quota percentage (`used_pct`), projected effective spend `effective_used(w, now_ms) = max(local, o.used_micro_usd + max(0, local - o.local_at_observation))`, observation age (` polled 2m ago`, decaying after `30m`), and exact reset countdown (`Resets in 3h 14m · 18:00 UTC`).
+3. **In-Flight Reservation Indicator (`try_reserve`)**: Shows currently reserved in-flight spend (`+$0.14 reserved across 3 active streams`) and configured admission reserve (`reserve_pct = 2%`).
+
+### 14.q.3 `Refresh /usage`, Raw `/usage` JSON Inspector Modal, and Manual Calibration (`LIM-1`, `SEC-18`)
+
+- **`↻ Refresh /usage` Button (`POST /api/user/upstream-keys/{id}/usage/refresh`)**: Triggers a single-flight live `/usage` poll (enforcing the 10 s minimum manual interval and 8-permit global concurrency cap, `USG-4`).
+- **`Inspect Raw /usage JSON` Modal (`GET /api/user/upstream-keys/{id}/usage`)**:
+  - For personal key owners (`Own` tier) and admins: Unseals `upstream_usage_snapshots.raw_json_enc` (`XChaCha20-Poly1305` domain `usage_raw`) and renders the formatted JSON inside an auto-escaped `<pre>` block.
+  - For grantees on `Shared` keys: Displays only the allow-listed `sanitized_json` window percentages and reset timestamps, stripping all account emails, org IDs, and wallet payment metadata (`SEC-18`).
+- **Window-Instance-Bound Manual Calibration Modal (`POST /api/user/upstream-keys/{id}/calibrate`)**: Lets the key owner or admin enter a positive or negative dollar offset (`delta_micro_usd`) and `note`, recording a `budget_adjustments` row bound to the current `window_instance_start` (`LIM-1`).
+
+### 14.q.4 Declarative UI Structural Pseudocode (`Plan & balance` / `Go` Quotas View)
+
+```ui-spec
+PlanAndBalanceScreen [layout: Column, width: 980px, align: Center, padding-y: 36px, gap: 28px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Plan & balance")
+│   │   └── Text(variant: Muted, text: "Monitor rolling 5h, 7d, and monthly quota windows alongside source provider /usage observations.")
+│   └── Button(variant: Outlined, icon-left: "refresh-cw", label: "Refresh All /usage")
+└── Grid [cols: 2, gap: 16px]
+    └── KeyQuotaCard [border: Subtle, radius: 10px, padding: 20px]
+        ├── Row [align: Space-Between]
+        │   ├── Heading(level: H3, text: "my-opencode-go-1 (OpenCode Go)")
+        │   └── Badge(variant: Dot, color: Green, text: "Healthy")
+        ├── WindowGaugeRow(window: "5h Rolling", local-spend: "$4.20", observed-pct: "35.0%", limit: "$12.00", resets-in: "3h 14m")
+        ├── WindowGaugeRow(window: "7d Weekly", local-spend: "$14.80", observed-pct: "49.3%", limit: "$30.00", resets-in: "4d 11h")
+        ├── WindowGaugeRow(window: "1mo Monthly", local-spend: "$28.50", observed-pct: "47.5%", limit: "$60.00", resets-in: "19d 04h")
+        └── Row [gap: 8px, padding-top: 12px]
+            ├── Button(variant: Outlined, size: Small, label: "Refresh /usage")
+            ├── Button(variant: Outlined, size: Small, label: "Inspect Raw JSON")
+            └── Button(variant: Ghost, size: Small, label: "Calibrate Offset")
+```
+
+### 14.q.5 Window Gauge Color Thresholds & Calibration Contract
+
+| Effective Window Usage % (`effective_used / limit`) | Progress Bar Fill Token | Status Label |
+| --- | --- | --- |
+| `0.0%` .. `< 75.0%` | `--status-success-fg` (`#22c55e` / `#15803d`) | `OK` |
+| `75.0%` .. `< (100 - reserve_pct)%` | `--status-warning-fg` (`#d99b26` / `#b45309`) | `Approaching cap` |
+| `>= (100 - reserve_pct)%` | `--status-danger-fg` (`#ef4444` / `#dc2626`) | `Exhausted (Reserve held)` |
+
+## 14.r. Consented Personal Sharing, Outgoing Grants, and Incoming Share Acceptance UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `SHR-1`..`SHR-6`, `SEC-16`, `SEC-18`, `TRC-8`, `UI-1`
+
+### 14.r.1 Two-Tab Sharing Workspace (`Outgoing Shares` vs. `Shared With Me`)
+
+Accessible via `Integrations / Sharing` (`/app/sharing`), the sharing screen splits into two tabs:
+1. **Tab 1 — `Outgoing Shares (Granted by Me)` (`GET /api/user/shares/outgoing`)**:
+   - `+ Grant Share` button opening `#modal-new-share`:
+     - Select target scope: Entire personal provider (`upstream_key_id IS NULL`) or one specific personal upstream key (`upstream_key_id IS NOT NULL`). The form prevents creating overlapping provider-level and key-level shares for the same grantee (`409 share_overlap`, `SHR-1`) and disables sharing on providers with `usage_url_cross_origin_ack == 1`.
+     - Select `Grantee username`, optional `Allowed models` subset, and optional `Monthly spend cap ($ USD)` (`max_monthly_micro_usd`, `SHR-2`).
+   - **Outgoing Shares Table**: Lists each grant with `Grantee`, `Target Provider / Key`, `Consent Status` (`● Accepted`, `● Pending Grantee Acceptance`, `● Suspended (Config Changed — Re-acceptance Required)`, or `● Pending Admin Approval` for `custom` providers), `Monthly Spend / Cap` (`$1.45 / $5.00`), **Per-Grantee Requests, Tokens & Charged Attempts Breakdown (`SHR-6`)**, and `Revoke` button (`DELETE /api/user/shares/{id}`). Note that Grantor A never sees Grantee B's client key labels, session hashes, or chat transcripts (`TRC-8`).
+2. **Tab 2 — `Shared With Me (Incoming Grants)` (`GET /api/user/shares/incoming`)**:
+   - Displays all shares granted to the current user.
+   - **Mandatory Destination Disclosure & Consent Modal (`SHR-3`, `SEC-16`)**:
+     - Before a pending or config-updated share becomes eligible in Tier `Shared (1)`, the grantee must click **`Review & Accept Share`**, which displays:
+       - `Owner`: `<owner_username>`
+       - `Provider Kind & Base URL Host`: e.g., `opencode_go · https://opencode.ai/zen/go/v1`
+       - `Config Fingerprint`: Monospace `share_config_fingerprint` (`SHA-256` prefix)
+       - **Explicit Disclosure Box**: `"Requests you send through this share travel to the endpoint above and are visible to its operator. LLMRoller strips your raw session headers and replaces them with a tenant-salted affinity token."`
+     - Clicking **`Accept Share`** submits `POST /api/user/shares/{id}/accept` echoing `{"config_fingerprint": "<hex>"}`, setting `accepted_at = now_ms` and `accepted_config_fingerprint` and hot-reloading `ConfigSnapshot` within 1 s.
+
+### 14.r.2 Declarative UI Structural Pseudocode (`Sharing & Consent` View)
+
+```ui-spec
+SharingScreen [layout: Column, width: 980px, align: Center, padding-y: 36px, gap: 24px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Integrations & Sharing")
+│   │   └── Text(variant: Muted, text: "Share personal providers or keys with teammates using explicit destination consent and monthly caps.")
+│   └── Button(variant: Outlined, icon-left: "plus", label: "Grant Share", data-action: "open-modal", data-modal-id: "modal-new-share")
+├── Tabs [variant: SegmentedPill, active: "Outgoing Shares"]
+│   ├── TabItem(label: "Outgoing Shares")
+│   └── TabItem(label: "Shared With Me")
+└── Table [columns: ["Grantee", "Target Provider / Key", "Allowed Models", "Consent Status", "Monthly Spend / Cap", "Actions"]]
+```
+
+### 14.r.3 Share Consent & Overlap Validation Contract (`POST /api/user/shares`)
+
+| Scenario | HTTP Status & Error Code | UI Feedback in Share Modal |
+| --- | --- | --- |
+| Grantee already has an active provider-level share and grantor submits a key-level share (or vice versa) | `409 Conflict` (`share_overlap`) | Inline error banner: `"An active share already covers this provider/key for <grantee>. Edit or revoke the existing share instead."` |
+| Provider has `usage_url_cross_origin_ack == 1` | `409 Conflict` (`cross_origin_usage_unshareable`) | Share button disabled with tooltip explaining `PRV-7` security boundary. |
+| Grantee submits `POST /api/user/shares/{id}/accept` with stale `config_fingerprint` | `409 Conflict` (`fingerprint_mismatch`) | Refreshes modal with the updated `base_url` and `share_config_fingerprint` and asks grantee to review and confirm again. |
+
+## 14.s. Routing Matrix, Pluggable Strategy Selector, and Per-Model Weight Overrides
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `RTE-4`..`RTE-6`, `RTE-13`, `RTE-14`, `USR-4`, `UI-1`
+
+### 14.s.1 Screen Purpose and `project_key` Column Aggregation
+
+Accessible via `Controls / Routing Matrix` (`/app/routing` and `/admin/routing`), the Routing Matrix visualizes and edits how new conversation sessions are distributed across eligible upstream routes for each canonical model:
+- **Rows**: Accessible canonical models (`deepseek-v4.1-flash`, `claude-sonnet-4.6`, `mimo-v2.6-pro`, etc.).
+- **Columns**:
+  - **For Standard Users (`/app/routing`, `USR-4`)**: One column for each of the user's `Own` personal keys, one column for each accepted `Shared` key (`shared: <owner>/<label>`), and **one single aggregated `"Global pool"` column** representing all global upstream keys combined (`project_key` never exposes individual global key IDs, labels, or priorities to standard users).
+  - **For Admins (`/admin/routing`)**: Individual columns for every global upstream key plus personal key inspection filters.
+
+### 14.s.2 Pluggable `RoutingStrategy` Badges, Distribution Mode, and Inline Weight Overrides (`RTE-14`)
+
+Each model row displays:
+1. **Model & Protocol Chips**: Canonical slug + supported wire protocol badges (`chat`, `responses`, `messages`).
+2. **Distribution Mode Badge (`RTE-6`)**: `weighted` or `strict` (with `strict_tier` `1..10` indicator).
+3. **Active `RoutingStrategy` Selector / Badge (`RTE-14`)**:
+   - Displays the model's effective routing strategy (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`, plus `headroom` scaling indicator when `headroom_scaling_enabled == true`).
+   - Admins can change `models.routing_strategy` inline via `PATCH /admin/api/models/{canonical_id}` (or change the instance default via `PATCH /admin/api/settings`), hot-reloading within 1 s via `Reloader`.
+4. **Route Cell Controls (`PUT /api/user/routes/{upstream_key_id}/{canonical_id}`)**:
+   - Displays route health dot (`healthy`, `cooling_down`, `exhausted`, `unavailable`), effective weight `W_eff` (`1..=1000`), and **projected new-session percentage share** (`52.6%`, `31.6%`, `15.8%`; or `100% / N` equal share badge when an unweighted strategy `naive_rr` or `uniform_random` is active, while keeping stored weights intact).
+   - For `Own` and `Shared` columns (and `Global` columns in `/admin/routing`), provides an inline numeric input (`1..=1000`) to set or clear `priority_override` and an enable/disable route toggle.
+
+### 14.s.3 Declarative UI Structural Pseudocode (`Controls / Routing Matrix` View)
+
+```ui-spec
+RoutingMatrixScreen [layout: Column, width: 1140px, align: Center, padding-y: 36px, gap: 24px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Controls & Routing Matrix")
+│   │   └── Text(variant: Muted, text: "Configure pluggable routing strategies, headroom scaling, and per-model route weight overrides.")
+│   └── Row [gap: 12px]
+│       ├── Select(label: "Default Strategy", value: "smooth_weighted_rr", options: ["smooth_weighted_rr", "naive_rr", "weighted_rr", "uniform_random", "weighted_random", "power_of_two_choices"])
+│       └── Toggle(label: "Headroom Scaling", checked: False)
+└── MatrixTable [rows: CanonicalModels, cols: ["Model & Strategy", "Own Keys...", "Shared Keys...", "Global pool (project_key)"]]
+```
+
+### 14.s.4 Projected Share Calculation in the Matrix UI
+
+For each row (model `M`) and active tier group `C`, the Routing Matrix computes each candidate route's displayed share percentage:
+- When `effective_strategy(M)` is `naive_rr` or `uniform_random`: every healthy eligible route in `C` displays `100.0% / |C|` alongside an `(Unweighted strategy — stored weight W=<W> preserved)` tooltip (`RTE-14`).
+- When `effective_strategy(M)` is `smooth_weighted_rr`, `weighted_rr`, `weighted_random`, or `power_of_two_choices`: each route displays `100.0 * W_eff(U, r) / sum_{k in C} W_eff(U, k)`. For standard users viewing the aggregated `"Global pool"` column (`USR-4`), only the combined `"Global pool"` availability badge is shown without disclosing individual global key weights.
+
+## 14.t. Active Sessions Pin Manager and Client-Key Recently Active Sessions Drawer
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `RTE-2`, `RTE-7`, `RTE-10`..`RTE-12`, `TRC-9`, `USR-4`, `UI-1`, `UI-4`
+
+### 14.t.1 Active Sessions Pin Manager (`/app/sessions` and `/admin/sessions`)
+
+The **Active Sessions** screen renders a live table (auto-refreshed every `10 s` via HTMX `hx-trigger="every 10s"`) of confirmed session pins in `PinStore` (with a toggle `"Include expired sessions active in last 24h"` that merges historical sessions from `usage_events`):
+- **Filter Toolbar**: Filter by `Client Key`, `Service Account`, `Model`, `Pool Tier` (`Own`, `Shared`, `Global`, `Blended`), or `Constant-Session Warning`.
+- **Table Columns**:
+  1. `Session Hash`: 12-char monospace prefix of `session_hash` + copy button + optional amber **`⚠ Constant Session Suspected`** badge when flagged by the 21-slot `ConstantSessionDetector` (`Section 11.1.1`).
+  2. `Client Key / Service Account`: Key label (`llr_7f9a · laptop-claude-code` or `agents / bot`).
+  3. `Model & Protocol`: Canonical model slug (`claude-sonnet-4.6`) + protocol chip.
+  4. `Live Pinned Route`: Provider name/kind badge (`[GO] my-opencode-go`) + `project_key`-redacted upstream key label (`my-opencode-go-1` or `"global pool"`) + `PoolTier` badge (`Own`, `Shared`, `Global`).
+  5. `Activity & TTL`: `Pinned 14m ago · Last turn 12s ago · Expires in 23h 59m` + `Repins: <repin_count>`.
+  6. `Telemetry`: Logged `Requests`, `Tokens`, `Cache Hit %`, and `Cost`.
+  7. `Actions`:
+     - **`Preview Chat`** button (shown when `has_traces == true` or traceability is active, opening `/app/sessions/{session_hash}/chat`, `UI-4`).
+     - **`View Requests`** link (navigates to `Logs > Inference` pre-filtered to `?session_hash=<hash>`, `UI-4`).
+     - **`Move Pin`** modal trigger (`POST /api/user/pins/move` — selects a new eligible upstream key passing `C1`..`C8` and bumps `PinEntry.generation`).
+     - **`Unpin`** button (`DELETE /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}`).
+
+### 14.t.2 Per-Client-Key `Recently Active Sessions` Slide-Over Drawer (`TRC-9`)
+
+From the `My API keys` table (`Section 14.i`) or `Service Account Detail` key table (`Section 14.k`), clicking `Recent sessions` on any client key opens the 520px right-docked **Recently Active Sessions Drawer** (`GET /api/user/client-keys/{id}/sessions?since_ms=...`, `Section 12.6.2`):
+- Lists up to 50 sessions per cursor page ordered by `last_active_at DESC`.
+- For each session, displays:
+  - `session_hash` prefix, `first_active_at` .. `last_active_at`, `request_count`, `error_count`, `traced_turn_count`, total tokens, and `cost_micro_usd`.
+  - **Live `current_pins` badges** from `PinStore` showing which provider and `project_key`-redacted upstream key each model in that session is pinned to right now (or `"Unpinned / Expired"` with `last_served_route` metadata).
+  - Direct action buttons: **`Preview Chat`** (`TRC-6`) and **`View Requests in Logs`** (`USG-9`).
+
+### 14.t.3 Declarative UI Structural Pseudocode (`Active Sessions` & `Client Key Sessions Drawer`)
+
+```ui-spec
+ActiveSessionsScreen [layout: Column, width: 1140px, align: Center, padding-y: 36px, gap: 20px, hx-get: "/app/partials/sessions", hx-trigger: "every 10s"]
+├── Row [align: Space-Between]
+│   ├── Heading(level: H1, text: "Active Sessions")
+│   └── Toggle(label: "Include expired sessions (24h)", checked: True)
+└── Table [columns: ["Session Hash", "Client Key", "Model", "Live Pinned Provider & Key", "Tier", "TTL & Repins", "Requests & Cost", "Actions"]]
+```
+
+### 14.t.4 Pin Move & Unpin API Contracts (`POST /api/user/pins/move`)
+
+```json
+// Request: POST /api/user/pins/move
+{
+  "client_key_id": "01J9X0CLK...",
+  "session_hash": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+  "canonical_id": "claude-sonnet-4.6",
+  "target_upstream_key_id": "01J9X1B_NEW..."
+}
+```
+The handler verifies that `target_upstream_key_id` passes candidate checks `C1` through `C8` for `(caller, canonical_id)` (returning HTTP `422 target_route_ineligible` otherwise), calls `PinStore::admin_move` to increment `PinEntry.generation`, and enqueues a durable `pins` upsert (`RTE-7`, `Section 10.4`).
+
+## 14.u. Read-Only Session Chat Preview and Turn Trace Inspector UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `TRC-1`..`TRC-9`, `USR-4`, `SEC-19`, `UI-4`
+
+### 14.u.1 Screen Purpose and Security Boundaries (`SEC-19`, `TRC-8`)
+
+When Content Traceability Mode is enabled (`TRC-1`) or historical `trace_records` exist for a session, clicking **`Preview Chat`** from `Active Sessions` (`14.t`), `My API keys > Recently Active Sessions` (`14.i`), or the `Logs` Request Detail Drawer (`14.m`) opens the **Read-Only Session Chat Preview** (`/app/sessions/{session_hash}/chat` for the session owner; `/admin/sessions/{session_hash}/chat` for admins, logging a deduplicated `trace.viewed` row in `audit_log` once per 30 minutes per `(admin, session_hash)`).
+- **Strict Tenant Isolation (`TRC-8`)**: A share grantor (`Grantor A`) can never access `Session Chat Preview` for a grantee's (`Grantee B`) session even when routed through `A`'s personal upstream key; all `trace_blocks` and `trace_records` are keyed and filtered by `owner_user_id` of the `client_key`.
+- **Zero-XSS Rendering Contract (`SEC-19`)**:
+  - Assistant Markdown text (`response.assistant_text`) is parsed on the server with `pulldown-cmark` (raw HTML tags disabled) and sanitized through `ammonia` (allowing only safe formatting tags and `https://` / `http://` links with `rel="noopener noreferrer nofollow"`).
+  - User prompts, system instructions, tool schemas, tool call JSON arguments, tool result outputs, assistant reasoning/thinking blocks, and raw turn JSON are rendered strictly as Askama auto-escaped plain text inside `<pre><code>` blocks.
+
+### 14.u.2 Header Bar, Live `current_pins` Badges, and Thread Selector
+
+1. **Sticky Session Header**:
+   - Displays `session_hash` (`9f8e7d6c...`), originating `client_key_prefix` and `client_key_label` (`llr_7f9a · laptop-claude-code`), and `total_turns`.
+   - **Live `current_pins` Badges (`TRC-6`)**: Renders one pill badge per active model pin in `PinStore` showing `[Provider Icon] <provider_name> / <project_key(upstream_key)> (<pool_tier>, expires in <TTL>)`.
+2. **Thread Selector (`threads` map)**:
+   - Switches between `main` and any subagent threads (`x-claude-code-agent-id` / `thread_id`), displaying the collapsible `System Instructions` and `Tools Schema (<N> tools)` accordions for that thread.
+
+### 14.u.3 Chronological Turn Timeline & LCP Deduplication Indicators (`TRC-5`, `TRC-6`)
+
+Turns are paginated by `(ts ASC, request_id ASC)` (`?after=<ts>:<request_id>&limit=50`, `8 MiB` decrypted cap per page):
+- Each turn card displays:
+  - **Turn Header Bar**: Turn ordinal (`#1`, `#2`), timestamp, `request_id` (clicking opens the Raw Turn JSON Drawer `GET /api/user/traces/{request_id}`), `canonical_model` badge, `protocol` chip (`messages`, `chat`, `responses`), `pin_outcome` badge (`new_pin`, `followed`, `repin`), and `project_key`-redacted upstream key label.
+  - **Context Change Dividers**: Renders a horizontal badge divider whenever `system_changed == true` or `context_compacted_or_branched == true` (when block-hash Longest Common Prefix `LCP` is shorter than the previous turn's block count).
+  - **New Input Messages**: Only the newly appended delta messages `turn_k.message_block_refs[LCP..]` for that turn (user prompts and tool results). Binary/base64 assets (`> 1 KiB`) render as `[Binary omitted · SHA-256: <hex> · <N> bytes]`.
+  - **Collapsible Assistant Reasoning Block (`<details class="reasoning-block">`)**: Auto-escaped `<pre>` reasoning trace with token count badge (`146 reasoning tokens`).
+  - **Assistant Tool Calls**: Formatted cards showing `tool_name`, `tool_call_id`, and auto-escaped `<pre>` `arguments_json`.
+  - **Sanitized Assistant Markdown Response**: Rendered via `pulldown-cmark` + `ammonia`.
+  - **Per-Turn Telemetry Footer**: `Status: 200`, `TTFT: 410 ms`, `Latency: 1.25 s`, `Input: 1,850`, `Cache Read: 62,464`, `Cache Write: 1,500`, `Output: 95`, `Cost: $0.00782`.
+
+### 14.u.4 Declarative UI Structural Pseudocode (`Session Chat Preview`)
+
+```ui-spec
+SessionChatPreviewScreen [layout: Column, width: 980px, align: Center, padding-y: 32px, gap: 24px]
+├── SessionHeaderCard [border: Subtle, radius: 10px, padding: 20px]
+│   ├── Row [align: Space-Between]
+│   │   ├── Column [gap: 4px]
+│   │   │   ├── Heading(level: H2, text: "Session 9f8e7d6c5b4a...")
+│   │   │   └── Text(variant: Muted, text: "Client Key: llr_7f9a (laptop-claude-code) · 14 traced turns")
+│   │   └── LiveCurrentPinsRow [badges: ["claude-sonnet-4.6 → my-opencode-go / my-opencode-go-1 (Own)"]]
+│   └── AccordionGroup [items: ["System Instructions", "Declared Tools (12)"]]
+└── TimelineStack [gap: 20px, id: "chat-timeline"]
+    └── TurnCard [ordinal: 1, request-id: "01J9X5REQ1", model: "claude-sonnet-4.6", protocol: "messages", pin-outcome: "new_pin"]
+        ├── UserMessageBubble [role: "user", content-escaped: "Check why cargo test fails in crates/core."]
+        ├── CollapsibleReasoning [tokens: 42, content-escaped: "Let us run cargo test -p llmroller-core first."]
+        ├── ToolCallBlock [id: "toolu_01A", name: "bash", args-escaped: "{"cmd":"cargo test -p llmroller-core"}"]
+        ├── AssistantMarkdownBubble [sanitized-html: "<p>Running the core test suite now.</p>"]
+        └── TurnMetricsFooter [status: 200, ttfb: "410 ms", latency: "1.25 s", input: 1850, cache-read: 0, cache-write: 1500, output: 95, cost: "$0.00782"]
+```
+
+### 14.u.5 Turn Trace Raw JSON Drawer & Purge Controls (`TRC-7`)
+
+1. **Single-Turn Raw JSON Inspector (`GET /api/user/traces/{request_id}`)**:
+   - Clicking `Inspect Turn JSON` on any turn card opens a right-side drawer displaying the reconstructed `request_skeleton` (with `$blk` references resolved from `trace_blocks`), `response`, and `truncation` metadata inside an auto-escaped `<pre>` block (`SEC-19`).
+2. **Per-Session & Global Trace Purge (`DELETE /admin/api/sessions/{session_hash}/trace`, `DELETE /admin/api/traces`)**:
+   - Admins can purge all recorded traces for a single `session_hash` directly from the Session Chat Preview header or purge all traces instance-wide from `Settings > Privacy`, deleting unreferenced `trace_blocks` while preserving `usage_events` and rollups (`TRC-7`).
+
+## 14.v. Canonical Model Catalog, Cross-Vendor Merge Review, Aliases, and Price Book UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `MDL-1`..`MDL-7`, `USG-3`, `PRIV-1`, `UI-1`  
+> **Visual Inspiration Sources:** OpenCode `Models` Tab (`OpenCode/Image 1..10.png`) and OpenDesign `Models & pricing` Sidebar Module (`OpenDesign/Image 1..4.png`).
+
+### 14.v.1 Dual-Role `Models & Pricing` Workspace (`/app/models` and `/admin/models`)
+
+1. **For Standard Users (`/app/models`)**:
+   - Read-only searchable directory of all accessible canonical models (`C1`..`C5`), showing each model's `canonical_id`, `display_name`, supported protocols (`chat`, `responses`, `messages`), active `routing_strategy`, confirmed aliases (`alias_of`), and active per-MTok price rates (`Input`, `Output`, `Cache Read`, `Cache Write`, plus any context tiers `> 200k` or weekday peak schedules such as `deepseek_weekday_peak × 2.0`), along with a personal enable/disable toggle on the user's `Own` and `Shared` routes.
+2. **For Administrators (`/admin/models`)**:
+   - Full catalog governance over `models` (`model_pk`), `model_redirects`, `model_aliases`, and `prices`:
+     - **`Refresh All /models` Button (`POST /admin/api/models/refresh`)**: Triggers immediate discovery across all enabled upstream keys (`MDL-1`).
+     - **Exposure Kill-Switch (`exposed`)**: 3-state segmented control per model: `Auto (Union/Intersection)` (`NULL`), `Force On` (`1`), or `Force Off (Instance Kill-Switch)` (`0`, blocking all tiers `Own`, `Shared`, `Global`, `MDL-4`).
+     - **Cross-Vendor `pending_review` Merge Banner & Confirmation (`POST /admin/api/models/{canonical_id}/confirm-merge`)**: Highlights models where routes with differing `vendor_prefix` values normalized to the same slug (`MDL-2`), allowing the admin to confirm the merge or split them into separate `model_pk` rows (`POST /admin/api/models/split`).
+     - **Transactional Merge Modal (`POST /admin/api/models/merge`)**: Merges model `A` into model `B` over `model_pk` and creates a permanent `model_redirects` entry without dropping pins or budget windows (`MDL-4`).
+     - **Confirmed Aliases Manager (`PUT /admin/api/model-aliases`, `DELETE /admin/api/model-aliases?alias=...`)**: Maps aliases (including strings containing `/`) to target `canonical_id` models (`MDL-6`).
+     - **Price Book & Schedule Editor (`PUT /admin/api/prices`, `POST /admin/api/prices/sync`)**: Edits micro-USD rates per MTok, non-overlapping context-length `tiers_json`, and half-open `[start, end)` UTC `schedule_json` peak multipliers (`Section 9.3.2`).
+
+### 14.v.2 Declarative UI Structural Pseudocode (`Models & Pricing`)
+
+```ui-spec
+ModelsAndPricingScreen [layout: Column, width: 1140px, align: Center, padding-y: 36px, gap: 24px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Models & Pricing")
+│   │   └── Text(variant: Muted, text: "Canonical model registry, protocol support, confirmed aliases, and token price book.")
+│   └── Row [gap: 8px]
+│       ├── Button(variant: Outlined, icon-left: "refresh-cw", label: "Refresh Discovery")
+│       ├── Button(variant: Outlined, icon-left: "git-merge", label: "Merge / Split Models")
+│       └── Button(variant: Outlined, icon-left: "dollar-sign", label: "Sync models.dev Prices")
+├── Tabs [variant: SegmentedPill, active: "Catalog"]
+│   ├── TabItem(label: "Catalog")
+│   ├── TabItem(label: "Aliases")
+│   └── TabItem(label: "Price Book & Schedules")
+└── Table [columns: ["Canonical Model", "Protocols", "Origin & Merge State", "Exposure", "Strategy", "Price (In / Out / Cache R/W)", "Actions"]]
+```
+
+### 14.v.3 Transactional Model Merge & Split API Payloads (`MDL-4`)
+
+```json
+// POST /admin/api/models/merge
+{
+  "source_canonical_id": "deepseek-v4-1-flash",
+  "target_canonical_id": "deepseek-v4.1-flash"
+}
+
+// POST /admin/api/models/split
+{
+  "source_canonical_id": "deepseek-v4.1-flash",
+  "new_canonical_id": "deepseek-v4.1-flash-custom",
+  "routes": [
+    {"upstream_key_id": "01J9X1B...", "upstream_model_id": "custom/deepseek-v4.1-flash"}
+  ]
+}
+```
+
+## 14.w. Settings Sub-Navigation Layout (`General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`)
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-4`, `UI-5`, `AUTH-4`..`AUTH-9`, `USR-5`, `CLK-6`, `TRC-1`, `TRC-7`  
+> **Visual Inspiration Sources:** OpenCode `Settings` Split-Pane Layout (`OpenCode/Image 1.png` & `Image 2.png`) and OpenDesign `Workspace settings` / `Billing` / `Members` (`OpenDesign/Image 1..4.png`).
+
+### 14.w.1 Split-Pane `Settings` Architecture (`OpenCode/Image 1 & 2`)
+
+Whenever the user selects `Settings` in the top navigation bar (or `Workspace settings` in Sidebar mode), LLMRoller renders the **Settings Split-Pane Layout** (`ScrollArea`, `padding-y: 32px`, `padding-x: 64px`, `SplitPane` row with `gap: 48px`):
+- **Left Settings Sub-Navigation Sidebar (`width: 180px`, `layout: Column`, `gap: 16px`)**:
+  - Heading (`H3`, `16px SemiBold`, `--text-primary`): `Settings`
+  - Vertical navigation list (`gap: 4px`), where the active item is enclosed in a rounded highlight pill (`background: var(--bg-pill-active)`, `#262626` in Dark Mode, `#eceef2` in Light Mode) with bright primary icon and text:
+
+| Sidebar Item | Icon | Route (`/app/settings/*` & `/admin/settings/*`) | Primary Settings & Controls on Right Canvas (`max-width: 740px`) |
+| --- | --- | --- | --- |
+| **`General`** | `sliders` | `/app/settings/general` | Workspace display name, **UI Theme Selector** (`OpenCode Dark #0d0d0d`, `OpenDesign Light #ffffff`, `System`), **Navigation Shell Mode** (`Top Module Tabs` vs. `Collapsible Left Sidebar`), `Language [EN]`, user `default_routing_scope` (`personal_first`, `blended`, `personal_only`, `own_only`, `global_only`), and (for admins) the 14-key runtime `settings` registry (`pin_ttl_secs`, `max_active_pins`, `usage_poll_interval_secs`, `default_routing_strategy`, `headroom_scaling_enabled`, `repin_on_personal_recovery`, `recovery_repin_min_idle_secs`, `global_exposure_mode`, `drain_timeout_secs`). |
+| **`Members`** | `users` | `/app/settings/members` | **Admin Console**: Create, disable, enable, or delete user accounts (`DELETE /admin/api/users/{id}?confirm=<username>`, enforcing the in-transaction `last_admin` guard `AUTH-5`), set per-user `can_use_global_providers` and `global_budget_micro_usd_month` (`USR-5`), reset user passwords/TOTP, and inspect `deleted_users`. **Personal Workspace**: View workspace profile and role permissions. |
+| **`Service accounts`** | `key` | `/app/settings/service-accounts` | Machine principal **Service Accounts Directory** (`Section 14.j`, `OpenCode/Image 2`) and **Service Account Detail View** (`Section 14.k`, `OpenCode/Image 1`) with 64-entry IPv4/IPv6 CIDR restrictions, 3 KPI cards (`Cost`, `Requests`, `Tokens`), and child API keys (`CLK-6`). |
+| **`Billing`** | `receipt` | `/app/settings/billing` | Monthly budget caps (`global_budget_micro_usd_month`), `unpriced_fallback_rates` configuration (`$3/$15/$0.30/$3.75` per MTok), external `price_sync_catalog_url` toggle, and `A6` SQLite storage & retention settings (`usage_events_retention_days`, `usage_events_max_rows`). |
+| **`Security`** | `shield` | `/app/settings/security` | Password change form (`Argon2id`, `>= 12` chars), TOTP two-factor authentication enrollment/verification and recovery codes (`AUTH-9`), active `web_sessions` revocation table (`Section 14.d`), and `auth_failure_counters` rate-limit summary. |
+| **`Privacy`** | `lock` | `/app/settings/privacy` | **Content Traceability Mode (`traceability_config`, `TRC-1`, `TRC-7`)**: Admin opt-in toggle, target match filters (`user_ids`, `client_key_ids`, `models`), `auto_disable_at` timer, `retention_days` (`1..=90`, requiring `"confirm_purge": true` when lowered), global/per-session trace purge buttons (`DELETE /admin/api/traces`), and zero-telemetry verification summary (`PRIV-1`). Standard users see a read-only status card indicating whether traceability is active on their traffic. |
+
+### 14.w.2 Declarative UI Structural Pseudocode (`Settings` Split-Pane Shell)
+
+```ui-spec
+SettingsSplitPane [layout: Row, gap: 48px, align: Top, padding-y: 32px, padding-x: 64px]
+├── Sidebar [width: 180px, layout: Column, gap: 16px]
+│   ├── Heading(level: H3, text: "Settings", color: Primary)
+│   └── List [layout: Column, gap: 4px]
+│       ├── NavItem(icon: "sliders", label: "General", route: "/app/settings/general")
+│       ├── NavItem(icon: "users", label: "Members", route: "/app/settings/members")
+│       ├── NavItem(icon: "key", label: "Service accounts", route: "/app/settings/service-accounts", state: Active, style: Pill)
+│       ├── NavItem(icon: "receipt", label: "Billing", route: "/app/settings/billing")
+│       ├── NavItem(icon: "shield", label: "Security", route: "/app/settings/security")
+│       └── NavItem(icon: "lock", label: "Privacy", route: "/app/settings/privacy")
+└── Column [flex: 1, max-width: 740px, gap: 28px, id: "settings-detail-canvas"]
+```
+
+### 14.w.3 Runtime Settings Validation Table (`PATCH /admin/api/settings`)
+
+Every field in the `Settings > General`, `Settings > Billing`, and `Settings > Privacy` forms maps directly to the closed 14-key `settings` registry (`Section 9.3.3`). Submitting an out-of-range value returns HTTP `422` with a field-specific validation message, whereas valid updates increment `instance_meta.config_version` and take effect in `ArcSwap<ConfigSnapshot>` within `1 s` (`REL-4`).
+
+## 14.x. Audit Log Explorer, Hash-Chain Verification Status, and Deleted Users UI
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `AUD-1`, `SEC-13`, `AUTH-4`, `UI-1`  
+> **Visual Inspiration Sources:** OpenCode `Audit` Module Tab (`OpenCode/Image 1..10.png`).
+
+### 14.x.1 Screen Purpose and Tamper-Evident Chain Banner (`SEC-13`, `AUD-1`)
+
+Accessible via the `Audit` top navigation tab (`/app/audit` for user-scoped events; `/admin/audit` for all instance events), the **Audit Log Explorer** displays every state-changing action recorded in `audit_log` (plus deduplicated `trace.viewed` events and `ActorScope::System` maintenance tasks):
+- **HMAC-SHA256 Chain Integrity Banner**:
+  - Displays the latest `seq` number, its 64-character hex `hash`, the timestamp of the most recent emitted `audit_anchor`, and a **`Verify Hash Chain`** button that runs an online read-pool check verifying that every row from `seq = 1` (`prev_hash = 64 zeros`) links unbroken to `max(seq)`.
+- **Filter Bar**: Filter by `Actor` (`user`, `admin`, or `SystemTask`), `Action` (`user.created`, `service_account.ip_restrictions_updated`, `client_key.paused`, `share.accepted`, `trace.viewed`, `master_key.rotated`), `Target Type`, and date range.
+- **Audit Table Columns**: `Seq (#)`, `Time`, `Actor` (or `System: <task>`), `Action`, `Target`, `IP Address`, `HMAC Hash Prefix`, and `Inspect JSON` (opens a right-hand detail drawer displaying formatted `detail_json`, `prev_hash`, and `hash`).
+- **Deleted Users Attribution Tab (`deleted_users`, `AUTH-4`)**: In `/admin/audit`, a secondary tab lists historical `deleted_users(user_id, username, deleted_at)` rows so historical `usage_events` and `audit_log` rows remain attributable after account deletion.
+
+### 14.x.2 Declarative UI Structural Pseudocode (`Audit` Screen)
+
+```ui-spec
+AuditLogScreen [layout: Column, width: 1140px, align: Center, padding-y: 36px, gap: 20px]
+├── Row [align: Space-Between, vertical-align: Center]
+│   ├── Column [gap: 4px]
+│   │   ├── Heading(level: H1, text: "Audit")
+│   │   └── Text(variant: Muted, text: "Tamper-evident HMAC-SHA256 hash-chained log of every configuration, key, share, and security change.")
+│   └── Badge(variant: Dot, color: Green, text: "Chain Verified · Anchor #1,400")
+└── Table [columns: ["Seq", "Time", "Actor", "Action", "Target", "IP Address", "Hash Prefix"]]
+```
+
+### 14.x.3 Online Chain Verification Endpoint (`GET /admin/api/audit/verify`)
+
+Clicking **`Verify Hash Chain`** in the `Audit` header invokes `GET /admin/api/audit/verify`, which streams `audit_log` rows in batches on a read-only connection, recomputes `HMAC_SHA256(audit_hmac_key, canonical_frame)` from `seq = 1`, and returns:
+
+```json
+{
+  "verified": true,
+  "rows_checked": 1428,
+  "first_seq": 1,
+  "last_seq": 1428,
+  "last_hash": "8f3c2a...",
+  "latest_anchor_seq": 1400
+}
+```
+
+## 14.y. Accessibility (WCAG 2.1 AA), Keyboard Navigation, Internationalization, and Responsive Breakpoints
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`, `UI-3`, `UI-5`  
+> **Visual Inspiration Sources:** OpenDesign `Language [EN]` Selector (`OpenDesign/Image 1..4.png`) and OpenCode Keyboard-Driven Drawer Navigation (`OpenCode/Image 5..6.png`).
+
+### 14.y.1 WCAG 2.1 Level AA Contrast and Semantic ARIA Landmarks
+
+1. **Color Contrast Compliance**:
+   - Every text token in Section `14.a.2` meets or exceeds WCAG 2.1 AA (`>= 4.5:1` for normal text, `>= 3.0:1` for UI borders/icons, and `>= 7.0:1` AAA for primary data values) across both `data-theme="dark"` (`#0d0d0d`) and `data-theme="light"` (`#ffffff`).
+   - Status indicators never rely on color alone: HTTP statuses pair color dots with explicit text (`● 200`, `● 429 Rejected`, `● 403 Rejected`), and client key statuses pair dots with text labels (`● Active`, `● Paused`).
+2. **ARIA Roles & HTMX Live Regions**:
+   - Modals use `role="dialog" aria-modal="true" aria-labelledby="..."`.
+   - Slide-over drawers (`Request Detail Drawer` `14.m` and `Recently Active Sessions Drawer` `14.t`) use `role="complementary"` / `role="dialog"` with `aria-label="Request telemetry details"`.
+   - Toast notifications and copy confirmations (`Copied to clipboard`) announce via `<div id="aria-live-toast" aria-live="polite" aria-atomic="true">`.
+
+### 14.y.2 Global Keyboard Shortcut Map (`/static/app.js`)
+
+| Shortcut | Scope | Action |
+| --- | --- | --- |
+| `⌘K` / `Ctrl+K` or `/` | Global (when not focused inside an `<input>` or `<textarea>`) | Opens the Global Command Palette (`Section 14.b.3`). |
+| `Escape` | Global | Closes any open popover (`Credit usage breakdown`), slide-over drawer (`Request Detail Drawer`), or modal dialog, restoring focus to the invoking trigger. |
+| `ArrowUp` / `k` and `ArrowDown` / `j` | When `Request Detail Drawer` (`14.m`) is open | Steps to the previous (`<`) or next (`>`) request log row in `Logs` (`OpenCode/Image 5` & `Image 6`). |
+| `Tab` / `Shift+Tab` | Open Modal or Drawer | Cycles focus within the active modal/drawer focus trap with a visible `2px solid var(--border-focus)` outline. |
+
+### 14.y.3 Internationalization (`Language [EN]`) and Responsive Viewport Breakpoints
+
+- **Locale Architecture (`users.ui_locale`, default `"en"`)**: As shown in the bottom-left utility menu of `OpenDesign/Image 1..4` (`Language [EN]`), UI copy keys are centralized in `crates/admin::i18n` with English (`en`) shipped by default and clean catalog hooks for additional locales.
+- **Responsive Viewport Breakpoints**:
+  - **Desktop Wide (`>= 1280px`)**: Full `1140px` (`Logs`, `Routing Matrix`) and `980px` (`Overview`, `Usage`) centered containers; `240px` expanded left sidebar in `sidebar` mode.
+  - **Desktop / Laptop (`1024px`–`1279px`)**: Fluid `100%` container width with `24px` horizontal padding; `460px` slide-over drawer overlays right edge.
+  - **Tablet & Narrow Window (`< 1024px`)**: KPI grids wrap from 3/5 columns to 2 columns (`grid-template-columns: repeat(auto-fit, minmax(220px, 1fr))`); `Settings` split-pane stacks its sub-navigation horizontally above the form canvas; tables enable horizontal scroll with sticky first column (`Key` / `Time` / `Model`); slide-over drawer expands to `min(460px, 100vw)`.
+
+### 14.y.4 Focus Management & Screen Reader Announcements
+
+1. **Drawer & Modal Focus Restoration**: `/static/app.js` stores `lastFocusedElement = document.activeElement` before opening any modal or slide-over drawer, moves focus to the drawer/modal heading (`tabindex="-1"`), and restores focus to `lastFocusedElement` on close.
+2. **Table Sorting & Filter Announcements**: Sortable column headers (`Cost ↓`, `Requests`, `Input`, `Output`) set `aria-sort="descending"` or `"ascending"` and announce filter/sort updates via `#aria-live-toast`.
+
+## 14.z. Complete Web UI Component Inventory, Askama Template Map, and Declarative UI Specifications
+
+> **Parent Specification:** [14. SRDD - API and Web UI Specification.md](./14.%20SRDD%20-%20API%20and%20Web%20UI%20Specification.md)  
+> **Linked Requirements:** `UI-1`..`UI-6`, `CLK-6`, `CLK-7`, `USG-9`, `USG-10`, `AUD-2`, `TRC-6`, `TRC-9`, `SEC-5`, `SEC-19`
+
+### 14.z.1 Master Web UI Screen-to-Template-to-API Traceability Matrix
+
+The table below maps every screen, slide-over drawer, popover, and modal across `Section 14.a` through `14.y` to its Askama template path in `crates/admin/templates/`, its Rust handler module in `crates/admin/src/`, its backing JSON/HTML endpoints, and its verification test target.
+
+| Sub-Spec | UI Screen / Component | Askama Template (`crates/admin/templates/`) | Rust Handler Module (`crates/admin/src/`) | Primary Backing Route(s) | Requirement IDs |
+| --- | --- | --- | --- | --- | --- |
+| `14.a`, `14.b`, `14.c` | Root Dual-Theme & Dual-Shell Layout (`top_tabs` & `sidebar`) | `base.html`, `app.html`, `admin.html` | `ui.rs`, `assets.rs` | `GET /app`, `GET /admin`, `PATCH /api/user/preferences` | `UI-1`, `UI-3`, `UI-4`, `UI-5`, `SEC-5` |
+| `14.d` | First-Run Setup, Login, TOTP & Web Sessions | `setup.html`, `login.html`, `partials/security.html` | `setup.rs`, `auth.rs` | `GET /setup`, `POST /admin/api/setup`, `GET /login`, `POST /api/auth/login`, `POST /api/user/totp/*` | `AUTH-1`..`AUTH-9`, `SEC-4`, `SEC-5` |
+| `14.e` | Overview Analytics Dashboard & 3-Card KPI Row | `partials/overview.html` | `ui.rs` | `GET /app/partials/overview`, `GET /api/user/usage/summary` | `UI-1`, `UI-2`, `UI-6` |
+| `14.f` | Daily Cost & Tokens Segmented `uPlot` Bar Chart | `partials/overview.html` (`#daily-cost-chart`) | `ui.rs` | `GET /api/user/usage/timeseries?range=&metric=cost\|tokens` | `UI-2`, `UI-3`, `UI-6` |
+| `14.g` | Usage by Model Breakdown Table & Provider Badges | `partials/overview.html` (`#usage-by-model`) | `ui.rs` | `GET /api/user/usage/breakdown?range=&sort=cost_desc` | `UI-6`, `USG-1`..`USG-3` |
+| `14.h` | Connection Setup Format Switcher & One-Click CLI Modal | `partials/connection_setup.html`, `modals/connect_cli.html` | `ui.rs`, `api.rs` | `GET /api/user/connection-setup?format=chat\|responses\|messages` | `CLK-7`, `COM-1` |
+| `14.i` | Client API Keys Table (`Active`/`Paused`, `Rename`, `Pause`/`Resume`, `Rotate`, `Revoke`) | `partials/client_keys.html` | `api.rs`, `ui.rs` | `GET /api/user/client-keys`, `POST /api/user/client-keys/{id}/pause`, `/resume`, `/rotate`, `DELETE` | `CLK-1`..`CLK-7`, `SEC-3` |
+| `14.j` | Service Accounts Directory View (`Settings > Service accounts`) | `partials/service_accounts.html` | `service_accounts.rs` | `GET /api/user/service-accounts?q=`, `POST /api/user/service-accounts` | `CLK-6`, `USR-2`, `SEC-17` |
+| `14.k` | Service Account Detail View (`Allowed IP addresses` 64-CIDR form, 3 KPIs, child keys) | `partials/service_account_detail.html` | `service_accounts.rs` | `GET /api/user/service-accounts/{id}`, `PUT /api/user/service-accounts/{id}/ip-restrictions` | `CLK-6`, `G4`, `SEC-12` |
+| `14.l` | Dual-Stream Logs Explorer (`Inference` 7-col vs `API` 5-col) | `partials/logs_table.html` | `logs_explorer.rs` | `GET /api/user/request-logs?stream=inference\|api`, `GET /admin/api/request-logs` | `USG-9`, `AUD-2`, `SEC-6` |
+| `14.m` | 460px Right-Side Slide-Over Request Detail Inspection Drawer | `partials/log_drawer.html` | `logs_explorer.rs` | `GET /api/user/request-logs/{id}`, `GET /admin/api/request-logs/{id}` | `USG-9`, `USR-4`, `SEC-6` |
+| `14.n` | Granular Usage Ledger, Pill Filters & 5-Token Summary Strip | `partials/usage_ledger.html` | `usage_ledger.rs` | `GET /api/user/usage/events?initiator=&model=&range=` | `USG-10`, `UI-1` |
+| `14.o` | Floating Dark `Credit usage breakdown` Popover (`Plan contribution multiplier`) | `partials/cost_popover.html` | `usage_ledger.rs` | `GET /api/user/usage/events/{id}/breakdown` | `USG-3`, `USG-10` |
+| `14.p` | Personal & Global Providers, Presets & Upstream Key Cards | `partials/providers_keys.html` | `api.rs`, `ui.rs` | `GET /api/user/providers`, `POST /api/user/upstream-keys/{id}/test`, `/reset-health` | `PRV-1`..`PRV-8`, `UI-2` |
+| `14.q` | Plan & Balance Quotas, 360-Bucket Rings & `/usage` Gauges | `partials/quotas.html` | `api.rs`, `ui.rs` | `GET /api/user/upstream-keys/{id}/usage`, `POST .../usage/refresh`, `POST .../calibrate` | `USG-4`..`USG-8`, `LIM-1`, `SEC-18` |
+| `14.r` | Outgoing Shares & `Shared With Me` Consent Acceptance UI | `partials/shares.html` | `api.rs`, `ui.rs` | `GET /api/user/shares/outgoing`, `GET /api/user/shares/incoming`, `POST .../accept` | `SHR-1`..`SHR-6`, `SEC-16` |
+| `14.s` | Routing Matrix, `Global pool` Column & 6-Strategy Selector | `partials/routing_matrix.html` | `api.rs`, `ui.rs` | `GET /api/user/routes`, `PUT /api/user/routes/{key}/{model}`, `PATCH /admin/api/models/{id}` | `RTE-4`..`RTE-6`, `RTE-13`, `RTE-14`, `USR-4` |
+| `14.t` | Active Sessions Table & Per-Key `Recently Active Sessions` Drawer | `partials/active_sessions.html`, `partials/key_sessions_drawer.html` | `api.rs`, `ui.rs` | `GET /api/user/pins`, `POST /api/user/pins/move`, `GET /api/user/client-keys/{id}/sessions` | `RTE-2`, `RTE-10`, `TRC-9`, `UI-4` |
+| `14.u` | Read-Only Session Chat Preview & Turn Trace Inspector | `partials/chat_preview.html` | `ui.rs` | `GET /api/user/sessions/{session_hash}/chat`, `GET /api/user/traces/{request_id}` | `TRC-5`, `TRC-6`, `TRC-8`, `SEC-19` |
+| `14.v` | Model Catalog, Merge/Split Modals, Aliases & Price Book | `partials/models_catalog.html` | `api.rs`, `ui.rs` | `GET /admin/api/models`, `POST .../merge`, `POST .../split`, `PUT /admin/api/prices` | `MDL-1`..`MDL-7`, `USG-3` |
+| `14.w` | Split-Pane `Settings` Sidebar & 14-Key Runtime Registry | `partials/settings_split.html` | `api.rs`, `ui.rs` | `GET /admin/api/settings`, `PATCH /admin/api/settings`, `PUT /admin/api/settings/traceability` | `TRC-1`, `TRC-7`, `UI-5` |
+| `14.x` | Audit Log Explorer, Hash-Chain Verifier & `deleted_users` | `partials/audit_log.html` | `api.rs`, `ui.rs` | `GET /api/user/audit`, `GET /admin/api/audit` | `AUD-1`, `AUTH-4`, `SEC-13` |
+
+### 14.z.2 Consolidated Reference `ui-spec` Component Hierarchy
+
+All fourteen UI reference captures from `UIReferences.zip` (`OpenCode/Image 1..10.png` and `OpenDesign/Image 1..4.png`) map 1-to-1 into the normative component hierarchy below:
+- **`OpenCode/Image 1.png`** -> `Section 14.k` (`Settings > Service Accounts > agents` Detail View, IP Restrictions Textarea, 3 KPI Cards, Child API Keys Table).
+- **`OpenCode/Image 2.png`** -> `Section 14.j` (`Settings > Service Accounts` Master Directory Table).
+- **`OpenCode/Image 3.png`** -> `Section 14.e`, `14.f`, `14.g` (`Overview` Analytics Dashboard — `Personal` Workspace, `Last 7 days`, `Daily Cost` `$0`..`$1` Bar Chart, `3 models · 1 provider` Table).
+- **`OpenCode/Image 4.png`** -> `Section 14.e`, `14.f`, `14.g` (`Overview` Analytics Dashboard — `Personal` Workspace, `All time`, `Daily Cost` `$0`..`$7` 20-Bar Chart, `6 models · 1 provider` Table).
+- **`OpenCode/Image 5.png`** -> `Section 14.m` (`Logs > Inference` with 460px Right-Side Request Detail Drawer scrolled to bottom: `Tokens`, `Identity`, `Client`, `Request headers`, `Metadata`).
+- **`OpenCode/Image 6.png`** -> `Section 14.m` (`Logs > Inference` with 460px Right-Side Request Detail Drawer scrolled to top: `deepseek-flash`, `Request`, `Model`, `Tokens`, `Identity`).
+- **`OpenCode/Image 7.png`** -> `Section 14.l` (`Logs > Inference` Full-Width 7-Column Master Data Table with `200`, `429 Rejected`, and `403 Rejected` rows).
+- **`OpenCode/Image 8.png`** -> `Section 14.g` (`Overview > Usage by Model` 10-Row Breakdown Table with `[GO]` badges and `Space Bunny Free` badge).
+- **`OpenCode/Image 9.png`** -> `Section 14.e`, `14.f`, `14.g` (`Overview` — `Default` Workspace, `$36.66` / `16.237` / `5.208B` KPIs, `$0`..`$6` `Daily Cost` Histogram).
+- **`OpenCode/Image 10.png`** -> `Section 14.l` (`Logs > API` 5-Column Control-Plane Request Log Table).
+- **`OpenDesign/Image 1.png`** -> `Section 14.b`, `14.n` (Collapsible Left-Sidebar Light Shell + `Usage` Ledger with `All initiators`, `All models`, `Last 30 days` pills, 5-Metric Token Summary Strip, and `Covered by Design Plan credits` rows).
+- **`OpenDesign/Image 2.png`** -> `Section 14.h`, `14.i` (`Connection setup` Step 1 & Step 2 + `My API keys` Table with `● Active` / `● Paused` pills and inline `Rename`, `Pause key`, `Resume key`, `Revoke` buttons).
+- **`OpenDesign/Image 3.png`** -> `Section 14.h`, `14.i` (`API keys` Top Header with `One-click agent setup` CTA button + `Connection setup` + `My API keys`).
+- **`OpenDesign/Image 4.png`** -> `Section 14.n`, `14.o` (`Usage` Ledger filtered to `deepseek-v4.1-flash`, `Last 7 days` with open dark `Credit usage breakdown` Popover showing `Plan contribution multiplier × 0.25` and `Actual Plan credits used $0.0006`).
 
 ## 15. Technology choices and workspace layout
 
@@ -2625,7 +5090,7 @@ Every dependency is chosen for predictable speed, memory safety, zero external r
 | Database | SQLite in WAL mode via `sqlx 0.9` (`connect_options(role)`) | Zero-configuration single-file persistence with per-role pragma enforcement and migration-tested SQL queries. | PostgreSQL (needs an external database server for single-node installs). |
 | Cryptography | `chacha20poly1305`, `hkdf`, `sha2`, `hmac`, `argon2`, `totp-rs`, `subtle`, `secrecy`, `zeroize` | Pure-Rust audited RustCrypto implementations for XChaCha20-Poly1305 AEAD with canonical length-prefixed AAD, Argon2id, HMAC-SHA256, and memory zeroization. | OpenSSL (`openssl-sys` C bindings complicate static musl builds). |
 | In-memory state & caches | `arc-swap` (`ConfigSnapshot`), `dashmap` + `parking_lot` + `smallvec` (`PinStore`, `WrrState`, `OriginBreaker`, window rings, UTC month accumulators), `moka` (`response_links` cache), `indexmap` (`durable_state` queue) | Lock-free atomic snapshot reads on the hot path, `Clock`-driven deterministic pin expiry in `PinStore` (`max_active_pins = 250,000`), and `moka` read-through caching for `response_links`. | `moka` for session pins (whose internal `quanta` timer cannot be driven by `FakeClock` and whose TinyLFU eviction would silently drop confirmed pins). |
-| Web UI & safe chat rendering | `askama`, `rust-embed`, `pulldown-cmark`, `ammonia`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates and strict HTML/Markdown sanitization (`ammonia` with raw HTML disabled in `pulldown-cmark`) for the read-only Session Chat Preview with zero CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
+| Web UI, dual-theme shell & safe chat rendering | `askama`, `rust-embed`, `pulldown-cmark`, `ammonia`, vendored `htmx 2.x` and `uPlot` | Type-checked server templates supporting both OpenCode Dark (`#0d0d0d`) and OpenDesign Light (`#ffffff`) CSS token themes, adaptive top-tab and collapsible left-sidebar shells, slide-over Request Detail Inspection Drawers, interactive `Credit usage breakdown` popovers, and strict HTML/Markdown sanitization (`ammonia` with raw HTML disabled in `pulldown-cmark`) with zero CDN requests. | React or Next.js SPA (adds a large `node_modules` supply chain). |
 | Compression & sealer pool | `zstd` (`zstd::bulk::Compressor` on 2 OS threads via `crossbeam-channel`) + `async-compression` | Reusable bulk zstd contexts on a fixed 2-thread sealer pool (`~7 MiB` total RAM) for `trace_blocks` and `trace_records`, plus fallback `async-compression` decoders (`gzip`, `deflate`, `br`, `zstd`) only for upstreams that ignore `accept-encoding: identity`. | Per-stream `zstd::stream::Encoder` (which allocates `~3.5 MiB` per stream = `~7 GB` at 2,000 streams). |
 | Observability | `tracing`, `tracing-subscriber` (JSON formatter), `metrics`, `metrics-exporter-prometheus` | Structured JSON request logs with `request_id` correlation, `audit_anchor` emission, and bounded-cardinality Prometheus metrics. | Heavy OpenTelemetry gRPC exporters in v1.0 core. |
 | Workspace automation & testing | `xtask` (Rust workspace binary), `cargo-nextest`, `proptest`, `wiremock`, `insta`, `cargo-llvm-cov`, `cargo-mutants`, `cargo-fuzz`, `cargo-deny`, `cargo-audit`, `cargo-vet` | Pure-Rust `cargo xtask` commands (`traceability`, `doc-consistency`, `docs-bundle`) with zero Python supply-chain dependencies, plus property testing and automated mutation testing ([cargo-mutants](https://mutants.rs/)). | External Python or Node CI scripts. |
@@ -2650,6 +5115,7 @@ llmroller/
   docs/
     srdd/
       0. SRDD - Introduction.md .. 22. SRDD - Deployment and Containers.md
+      14.a. SRDD .. 14.z. SRDD    # 26-part exhaustive Web UI & API sub-specifications
       requirements.toml       # Authoritative requirement -> milestone & sub-phase registry
     bigbang/
       big-bang-phases-0.md .. big-bang-phases-7.md (including big-bang-phases-4b.md)
@@ -2691,8 +5157,11 @@ llmroller/
                               #   64 KiB pre-first-frame hold buffer, RequestLifecycle RAII drop guard,
                               #   pre-first-byte failover loop, AsyncClock, /v1/usage pass-through
     admin/                    # Control plane HTTP service (127.0.0.1:8081):
-                              #   /api/user/* and /admin/api/* handlers, project_key redaction,
-                              #   CSRF & session middleware, Askama templates, embedded static assets
+                              #   /api/user/* and /admin/api/* handlers, service_accounts & control_plane_logs,
+                              #   project_key redaction, CSRF & session middleware, dual-theme Askama templates
+                              #   (Overview, Dual-Stream Logs + Request Drawer, Usage Ledger + Cost Popover,
+                              #   Service Accounts, Connection Setup, Client Keys, Providers, Shares, Matrix,
+                              #   Active Sessions, Session Chat Preview, Settings, Audit), embedded static assets
     server/                   # Binary entrypoint and background supervisor:
                               #   CLI subcommands (exit codes 0..14), ordered startup & 8-step SIGTERM drain,
                               #   Reloader task, supervised discovery, single-flight /usage poller,
@@ -2700,6 +5169,49 @@ llmroller/
 ```
 
 `crates/core` depends only on pure-Rust in-memory crates (`serde`, `serde_json`, `time`, `ulid`, `sha2`, `hmac`, `subtle`, `secrecy`, `zeroize`, `ipnet`, `arc-swap`, `dashmap`, `parking_lot`, `smallvec`, `rand`, `rand_chacha`). Its `Clock` seam (`fn now_ms(&self) -> i64`, `fn monotonic_ms(&self) -> i64`) is strictly synchronous; `crates/proxy::AsyncClock: Clock` extends it with `async fn sleep(&self, d: Duration)` outside `crates/core`. It cannot import `tokio`, `reqwest`, `hyper`, `axum`, or `sqlx`. This boundary guarantees that every routing, sharing, eligibility, pinning, breaker, and budget rule can be unit-tested and mutation-tested in milliseconds without sockets or disk files.
+
+### 15.3 Control-plane Askama template and static asset layout (`crates/admin`)
+
+To support the expanded Web UI specified across `Section 14.a` through `14.z` while maintaining zero external JavaScript build steps (`UI-3`, `UI-5`), `crates/admin` organizes its compiled-in templates and static assets as follows:
+
+```
+crates/admin/
+  src/
+    lib.rs                    # Router assembly & control_plane_logs middleware (AUD-2)
+    api.rs                    # /api/user/* and /admin/api/* JSON CRUD handlers
+    auth.rs                   # Argon2id login, TOTP, __Host-llmroller_session, CSRF
+    projection.rs             # Universal project_key(viewer, key) tenant redaction (USR-4)
+    service_accounts.rs       # Service Account CRUD, 64-CIDR parser, KPI rollups (CLK-6)
+    logs_explorer.rs          # Dual-Stream Logs (Inference & API) + 460px Request Drawer (USG-9)
+    usage_ledger.rs           # 5-Token Strip, Initiator/Model/Date filters, Breakdown Popover (USG-10)
+    ui.rs                     # Askama page & HTMX partial handlers (/app/*, /admin/*)
+  templates/
+    base.html                 # Dual-theme (dark/light) & dual-shell (top_tabs/sidebar) root layout
+    app.html                  # Personal Workspace shell and module containers
+    admin.html                # Admin Console shell and governance containers
+    partials/
+      overview.html           # 3 KPI cards, Daily Cost/Tokens uPlot bar chart, Usage by Model table
+      connection_setup.html   # 2-step API format switcher + Base URL copy + One-click CLI modal
+      client_keys.html        # My API keys table with Active/Paused badges & inline actions
+      service_accounts.html   # Service Accounts directory & detail view with CIDR textarea
+      logs_table.html         # Segmented Inference (7-col) & API (5-col) log tables
+      log_drawer.html         # 460px right-docked Request Detail Inspection Drawer (7 sections)
+      usage_ledger.html       # Pill filters, 5-token summary strip, and usage rows
+      cost_popover.html       # Floating dark Credit usage breakdown popover card
+      providers_keys.html     # Provider cards, dual local/upstream gauges, raw /usage modal
+      shares.html             # Outgoing shares & Shared With Me consent disclosure
+      routing_matrix.html     # Model x Key matrix with Global pool column & strategy selector
+      active_sessions.html    # Live PinStore table & per-key Recently Active Sessions drawer
+      chat_preview.html       # Read-only Session Chat Preview timeline & turn trace drawer
+      settings_split.html     # Split-pane Settings sidebar (General, Members, Service accounts, etc.)
+      audit_log.html          # Tamper-evident hash-chained audit table & anchor verifier
+  static/
+    app.css                   # Dual-theme (--bg, --surface, --border) CSS variables & layout rules
+    app.js                    # CSP-safe event delegation (tabs, modals, drawers, popovers, uPlot)
+    htmx.min.js               # Vendored HTMX 2.x runtime
+    uPlot.iife.min.js         # Vendored uPlot canvas charting library
+    uPlot.min.css             # Vendored uPlot styles
+```
 
 ## 16. Testing plan and TDD governance
 
@@ -2711,7 +5223,7 @@ A disciplined test suite tests the logic that the engineering team controls and 
 
 | Inside our testing boundary (MUST test thoroughly) | Outside our testing boundary (DO NOT over-test) |
 | --- | --- |
-| Request gates (`G1`..`G7`), candidate checks (`C1`..`C8`), `effective_share` precedence, and three-tier pool resolution (`Own`, `Shared`, `Global`, `Blended`) (`RTE-3`, `SHR-3`, `USR-3`) | Whether `tokio::spawn` schedules tasks onto OS threads or whether `dashmap` implements concurrent hash shards internally |
+| Request gates (`G1`..`G7`, including `paused_at` pause state in `G2` and `service_accounts.allowed_cidrs` 64-CIDR inheritance in `G4`), candidate checks (`C1`..`C8`), `effective_share` precedence, and three-tier pool resolution (`Own`, `Shared`, `Global`, `Blended`) (`RTE-3`, `SHR-3`, `USR-3`, `CLK-6`, `CLK-7`) | Whether `tokio::spawn` schedules tasks onto OS threads or whether `dashmap` implements concurrent hash shards internally |
 | Pluggable `RouteSelector` strategies (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`), zero-sum SWRR weight invariant across subset churn, `u64::MAX` wrap-around in `naive_rr`, seeded PRNG determinism and chi-squared distribution bounds, `p2c` load scoring, per-model priority overrides, strict tier fallback, and headroom `bps` scaling (`RTE-4`, `RTE-5`, `RTE-6`, `RTE-13`, `RTE-14`) | Whether `reqwest` or `rustls` implements the TLS 1.3 handshake state machine according to RFC 8446 |
 | Eight-step inbound session precedence, `response_links` session inheritance (`Section 11.1.2`), canonical byte-sliced Step 8 fingerprinting, 21-slot `ConstantSessionDetector`, and `Shared`/`Global` carrier stripping (`RTE-1`, `RTE-12`, `SEC-16`) | Whether `sha2`, `chacha20poly1305`, or `argon2` implements its underlying mathematical primitives correctly |
 | Duplicate-key rejection and surgical top-level JSON span editing (`model`, `prompt_cache_key`, `stream_options.include_usage`) without altering message byte order (`TRN-1`, `TRN-2`, `API-4`, `API-5`) | Whether `serde_json` parses valid RFC 8259 JSON strings in general |
@@ -2781,7 +5293,7 @@ Unit and property tests verify pure domain and protocol rules in milliseconds wi
 | Table-driven unit tests | Eight-step session resolution plus `response_links` inheritance, canonical byte-sliced Step 8 fingerprinting (including multi-byte UTF-8 characters straddling offset 4096 and moving `cache_control` markers), 21-slot `ConstantSessionDetector` (skipping Steps 1..3 and `x-claude-code-agent-id`), digit-preserving model normalization and within-key `--` collision resolution, `ActorScope` RBAC checks, `G1`..`G7` and `C1`..`C8` across all five `routing_scope` modes, and five-class error classification. |
 | Pluggable routing strategy `proptest` and statistical suite (`RTE-4`, `RTE-14`) | (1) `smooth_weighted_rr` & `weighted_rr`: for 1 to 50 routes with weights in `1..=1000`, over 100,000 picks, each route's share stays within `0.5%` of `W_eff_i / sum(W_eff)`, SWRR consecutive runs never exceed `ceil(max(W) / min(W))`, and `sum(current) == 0` holds across subset churn (`1.0%` subset-relative bound). (2) `naive_rr`: exact cyclic sequence `0, 1, ..., N-1` over `K * N` picks regardless of configured route weights, plus `AtomicU64` wrap-around from `u64::MAX - 5` across 8 concurrent threads. (3) `uniform_random` & `weighted_random`: seeded determinism with `DeterministicRng(42)` produces identical pick sequences across runs, `weighted_random` binary search (`partition_point`) matches exact cumulative intervals, and over 100,000 picks empirical frequencies stay within `1.0%` of target probabilities and pass a Pearson chi-squared goodness-of-fit test (`p > 0.001`). (4) `power_of_two_choices`: routes with higher `in_flight` or `ewma_ttfb_ms` receive proportionally fewer selections than idle low-latency routes of equal weight. (5) Two-user isolation: user B's `priority_override = 1000` on a shared key never alters user C's selection shares. |
 | Surgical JSON span `proptest` suite | For any generated JSON payload, duplicate top-level keys always return 400; random `upstream_model_id` strings containing quotes and backslashes produce valid JSON whose parsed `model` equals the input; when `Own` tier and no edit applies, output `Bytes` pointer is identical to input (`TRN-1`); when edited, untouched spans keep exact byte equality (`TRN-2`). |
-| Micro-USD cost, estimator, and window `proptest` suite | Integer micro-USD cost math never overflows up to `10^9` tokens; `estimate_input_tokens` counts a 4 MB base64 image as `1,600` tokens plus text; generalized 360-bucket rolling rings, day-clamped calendar months (31 Jan -> 28/29 Feb -> 31 Mar), and 30-minute decaying `UpstreamObservation` projections match exact reference sums. |
+| Micro-USD cost, list-price vs. plan multiplier, estimator, and window `proptest` suite | Integer micro-USD cost math never overflows up to `10^9` tokens; `list_cost_micro_usd` and `plan_multiplier_bps` (`× 0.25` contribution multiplier, `× 2.0` weekday peak schedule) match exact line-item subtotals (`USG-10`); `estimate_input_tokens` counts a 4 MB base64 image as `1,600` tokens plus text; generalized 360-bucket rolling rings, day-clamped calendar months (31 Jan -> 28/29 Feb -> 31 Mar), and 30-minute decaying `UpstreamObservation` projections match exact reference sums. |
 
 #### 16.5.2 Level 2: Golden fixture and wire-contract tests (`fixtures/`)
 
@@ -2844,15 +5356,23 @@ Every requirement ID in this SRDD is registered in `docs/srdd/requirements.toml`
 | `USR-1`..`USR-5` | `M0` (`1.2`), `M1` (`2.0`), `M2` (`3.0c`), `M5` (`6.2`, `6.3`) | `crates/core::rbac`, `crates/admin::projection`, `crates/store::*` | `core::rbac::tests::actor_scope_matrix` | `tests/integration_rbac_isolation.rs` (`ActorScope::System` boundary, 404 IDOR checks, `project_key` global label redaction) + `cargo-mutants` |
 | `PRV-1`..`PRV-8` | `M1` (`2.0`, `2.1`, `2.6`), `M2` (`3.6b`), `M4` (`4b.2`) | `crates/core::provider`, `crates/proto::adapters`, `crates/proxy::ssrf`, `crates/store::providers` | `core::provider::tests::*`, `proto::adapters::tests::*`, `proxy::ssrf::tests::ip_ranges` | `tests/integration_providers_and_keys.rs` (`GuardedConnector` IP-literal / 6to4 / DNS-rebinding SSRF tests, key disable invalidation) |
 | `SHR-1`..`SHR-6` | `M2` (`3.2`), `M3` (`4.3`) | `crates/core::shares`, `crates/store::shares`, `crates/admin::shares` | `core::shares::tests::eligibility_and_caps` | `tests/integration_personal_sharing.rs` (409 `share_overlap`, `share_config_fingerprint` acceptance & suspension, `custom` admin approval, monthly cap reservation) |
-| `CLK-1`..`CLK-5` | `M1` (`2.2`), `M2` (`3.0c`, `3.4`, `3.6b`) | `crates/core::client_key`, `crates/proxy::auth` | `core::client_key::tests::*` | `tests/integration_client_keys.rs` (`prev_key_hash` rotation grace, 5 `routing_scope` modes, <1 s revocation, G1..G7 gates) |
+| `CLK-1`..`CLK-7` | `M1` (`2.2`), `M2` (`3.0c`, `3.4`, `3.6b`), `M5` (`6.2`) | `crates/core::client_key`, `crates/proxy::auth`, `crates/admin::api` | `core::client_key::tests::*` | `tests/integration_client_keys.rs`, `tests/e2e_dashboard_htmx.rs` (`prev_key_hash` rotation grace, 5 `routing_scope` modes, <1 s revocation, Service Account 64-CIDR inheritance, inline Pause/Resume key, Connection Setup URL switcher) |
 | `MDL-1`..`MDL-7` | `M2` (`3.1`) | `crates/core::catalog`, `crates/proto::discovery`, `crates/store::models` | `core::catalog::tests::normalization_and_exposure` | `tests/integration_model_catalog.rs` (digit-dot preservation, `--` collision, `merge_state`, surrogate `model_pk` merge/split, `union`/`intersection`, 2,000 personal cap) |
 | `RTE-1`..`RTE-14` | `M2` (`3.3`, `3.4`, `3.5`, `3.6a`, `3.6b`, `3.7`) | `crates/core::router`, `crates/core::strategy`, `crates/core::wrr`, `crates/core::pins`, `crates/core::session` | `core::strategy::proptests::*`, `core::wrr::proptests::*`, `core::session::tests::*`, `core::pins::tests::*` | `tests/integration_routing_and_failover.rs` (all 6 `RoutingStrategy` variants, hot-reload strategy switching, `PinStore` 10-way 429 loser adoption, durable `response_links` session inheritance, `HardKey` no-failover, `OriginBreaker`) + `cargo-mutants` |
 | `API-1`..`API-8`, `TRN-1`..`TRN-3` | `M1` (`2.3`..`2.7`), `M2` (`3.6a`, `3.6b`), `M3` (`4.1`), `M4` (`4b.2`) | `crates/proto::body_edit`, `crates/proto::headers`, `crates/proxy::forward` | `proto::body_edit::proptests::*`, `proto::headers::tests::*` | `tests/integration_wire_transparency.rs` (duplicate-key 400, response header `R1`..`R5`, 64 KiB frame filter, `RequestLifecycle` disconnect guard, 5-class error classifier) |
-| `USG-1`..`USG-8`, `LIM-1` | `M2` (`3.0a`, `3.0b`), `M3` (`4.1`, `4.2`, `4.3`, `4.6`), `M4` (`4b.1`, `4b.2`) | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs` (`usage_attempts`, `usage_rollups_5min` `< 2 s` rebuild, 30-min `UpstreamObservation` decay, single-flight polling, `raw_json_enc`) |
+| `USG-1`..`USG-10`, `LIM-1` | `M2` (`3.0a`, `3.0b`), `M3` (`4.1`, `4.2`, `4.3`, `4.6`), `M4` (`4b.1`, `4b.2`), `M5` (`6.4`) | `crates/proto::sse_tap`, `crates/core::pricing`, `crates/core::windows`, `crates/proto::usage_poller`, `crates/admin::ui` | `proto::sse_tap::golden_tests::*`, `core::pricing::proptests::*`, `core::windows::tests::*` | `tests/integration_usage_and_passthrough.rs`, `tests/e2e_dashboard_htmx.rs` (`usage_attempts`, `usage_rollups_5min` `< 2 s` rebuild, 30-min `UpstreamObservation` decay, Dual-Stream Logs & 460px Request Detail Drawer, 5-token Usage Ledger & `Credit usage breakdown` popover) |
 | `TRC-1`..`TRC-9`, `PERF-5`, `SEC-19` | `M3b` (`5.1`..`5.4`), `M5` (`6.2`, `6.4`, `6.5`) | `crates/proto::trace_tap`, `crates/core::chat_preview`, `crates/store::traces`, `crates/admin::traces` | `proto::trace_tap::tests::*`, `core::chat_preview::tests::dedup_and_branching` | `tests/integration_content_traceability.rs` (`trace_blocks` dedup, 2-thread `zstd::bulk::Compressor` pool, block-hash LCP, `(ts, request_id)` cursor pagination, per-client-key recently active sessions with live `PinStore` provider/key projection, `ammonia` + `<pre>` XSS tests) |
-| `UI-1`..`UI-4`, `AUD-1` | `M0` (`1.5`), `M5` (`6.1`..`6.5`) | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs` (`audit_anchor` truncation detection, HTMX CSP lint, share acceptance UI, `"Global pool"` matrix column, preview drawer) |
+| `UI-1`..`UI-6`, `AUD-1`..`AUD-2` | `M0` (`1.5`), `M5` (`6.1`..`6.5`) | `crates/admin::ui`, `crates/store::audit` | `store::audit::tests::hash_chain_verification` | `tests/e2e_dashboard_htmx.rs`, `tests/security_csrf_and_headers.rs` (`audit_anchor` truncation detection, `control_plane_logs` API log stream, Dual-Theme Dark/Light CSS tokens, Overview `Cost`/`Tokens` bar chart & `Usage by Model` table, HTMX CSP lint, share acceptance UI, `"Global pool"` matrix column, preview drawer) |
 | `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `COM-1`, `POR-1`, `MNT-1`..`MNT-2`, `OBS-1`, `PRIV-1` | `M0` (`1.1`, `1.6`), `M1` (`2.2`, `2.5`, `2.7`), `M3` (`4.3`, `4.7`), `M4` (`4b.1`), `M6` (`7.1`..`7.5`) | `crates/server`, workspace-wide | `tests/workspace_boundaries.rs`, metric label allow-list test | `benches/proxy_latency.rs` (log-normal TTFF stub), `tests/e2e_sigterm_drain.rs`, `tests/e2e_kill9_recovery.rs`, `tests/e2e_cli_harnesses.rs` |
 | `SEC-1`..`SEC-19` | `M0` (`1.1`..`1.5`), `M1` (`2.1`..`2.4`), `M2` (`3.2`, `3.3`), `M3b` (`5.3`, `5.4`), `M4` (`4b.2`), `M5` (`6.1`), `M6` (`7.1`, `7.5`) | `crates/store::crypto`, `crates/proxy::ssrf`, `crates/admin::csrf`, `crates/admin::traces` | `store::crypto::tests::aead_aad_and_rotation`, `proxy::ssrf::tests::ip_ranges` | `tests/security_canary_and_ssrf.rs`, `tests/security_csrf_and_headers.rs` + `cargo-mutants` on all security modules |
+
+### 16.7 Web UI and HTMX partial verification matrix (`14.a`–`14.z`)
+
+Every Web UI screen and interactive component defined in `Section 14.a` through `14.z` is verified in `crates/server/tests/e2e_dashboard_htmx.rs` and `crates/server/tests/security_csrf_and_headers.rs` against four automated assertions:
+1. **Strict CSP & Zero Inline Handlers (`UI-3`, `SEC-5`)**: Scans all rendered HTML responses and template files to assert zero `onclick=`, `hx-on:*`, `javascript:`, or external `https://` script/style/font URLs.
+2. **Universal `project_key` Redaction (`USR-4`)**: Verifies that standard user responses across `Overview` (`Usage by Model`), `Logs` (`Inference` table and Request Detail Drawer), `Usage` (`Credit usage breakdown` popover), `Routing Matrix`, `Active Sessions`, and `Session Chat Preview` never contain global `upstream_key_id` ULIDs, administrative key labels, priorities, or `secret_last4` suffixes.
+3. **Interactive State Transitions (`CLK-6`, `CLK-7`, `USG-9`, `USG-10`, `UI-5`, `UI-6`, `AUD-2`)**: Verifies Service Account creation and 64-CIDR enforcement, inline Client Key `Pause key` -> `401 client_key_paused` -> `Resume key` -> `200 OK`, Connection Setup format switching (`Chat Completions` -> `/v1`, `Responses` -> `/v1`, `Messages` -> root URL), `Logs` `Inference` vs. `API` stream toggling and Request Detail Drawer rendering, and `Usage` ledger `Credit usage breakdown` math (`list_cost_micro_usd * plan_multiplier_bps / 10_000 == cost_micro_usd`).
+4. **Cross-Tenant IDOR 404 Isolation (`USR-3`, `SEC-17`)**: Verifies that User A requesting User B's Service Account ID, Client Key ID, Inference Log ID, or Cost Breakdown ID receives HTTP `404 not_found`.
 
 ## 17. Roadmap and milestones
 
@@ -2870,7 +5390,7 @@ The table below defines the scope, deliverables, and exit criteria for each mile
 | `M3`: Usage Pipeline, 5-Min & Hourly Rollups, Orchestrator v3, and Retention (`Epic 4`: `4.1`..`4.3`, `4.6`, `4.7`) | Inline `SseUsageTap` and `JsonUsageExtractor` with unified `cache_read` and `cache_write` subtraction (`4.1`), `models.dev` price sync and body-based price APIs (`4.2`), three-queue writer (`durable_state`, `rollups`, `raw_events` `VecDeque` dropping oldest) + `usage_events` + `usage_attempts` + `usage_rollups_5min` + `usage_rollups_hourly` + `SIGKILL` recovery (`4.3`), orchestrator v3 wiring live usage and reservations (`4.6`), and general retention sweeper + 30 s/256 MiB WAL checkpointer + `SQLITE_FULL` handling (`4.7`). | `SHR-6`, `API-5`, `USG-1`..`USG-3`, `REL-2`, `REL-3`, `PRIV-1` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
 | `M4`: Window Persistence, `< 2 s` Startup Reconstruction, and Source Provider `/usage` Engine (`Epic 4b`: `4b.1`, `4b.2`) | Startup reconstruction (`< 2 s`) of all window rings and UTC monthly accumulators from `usage_rollups_5min`, window-instance-bound `budget_adjustments`, and `upstream_usage_snapshots` (`4b.1`), plus single-flight `/usage` poller (8-permit concurrency semaphore, `local_at_observation` at `t0`, `raw_json_enc` sealing, allow-list `sanitized_json`, decaying `UpstreamObservation` sync, and header-scoped `/v1/usage`, `/v1/key`, and stored `/v1/usage/raw`) (`4b.2`). | `PRV-6`, `API-1`, `USG-4`..`USG-8`, `PERF-4`, `SEC-18` tests and all `/usage` fixtures in `fixtures/usage/` pass. |
 | `M3b`: Opt-In Content Traceability and Session Chat Preview API (`Epic 5`: `5.1`..`5.4`) | Request-start `traceability_config` matcher + `"confirm_purge": true` guard (`5.1`), bounded `TraceTap` (`mpsc(256)` + `64 MiB` in-flight + `1 MiB` per-stream output cap + 2,000-stream memory soak) (`5.2`), content-addressed `trace_blocks` + 2-thread OS sealer pool (`crossbeam::bounded(64)` + `zstd::bulk::Compressor`) (`5.3`), and block-hash LCP reconstructor + `(ts, request_id)` cursor pagination + per-client-key recently active sessions with live `PinStore` provider/key lookup + 30-min deduplicated `trace.viewed` audit logging (`5.4`). | `TRC-1`..`TRC-5`, `TRC-7`..`TRC-9`, `PERF-5`, `SEC-19` tests pass. |
-| `M5`: Dual-Workspace HTMX Web UI and Session Chat Preview UI (`Epic 6`: `6.1`..`6.5`) | Embedded Askama + HTMX shell (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`) + CSRF middleware (`6.1`), Personal Workspace `/app/*` and `/api/user/*` with share-acceptance modal and `project_key` verification (`6.2`), Admin Console `/admin/*` and `/admin/api/*` with user-resource override routes and `model_pk` merge/split (`6.3`), Overview dashboard (`uPlot`, dual gauges, disk budget `A6`) + Active Sessions + paged Usage Explorer (`6.4`), and read-only Session Chat Preview UI (`6.5`). | `UI-1`..`UI-4`, `TRC-6`, `SEC-5` E2E browser and HTMX tests pass. |
+| `M5`: Dual-Theme HTMX Web UI, Service Accounts, Dual-Stream Logs Drawer, Usage Breakdown Popover, and Session Chat Preview UI (`Epic 6`: `6.1`..`6.5`) | Dual-Theme (OpenCode Dark `#0d0d0d` + OpenDesign Light `#ffffff`) Askama + HTMX shell (`includeIndicatorStyles = false`, `allowEval = false`, `allowScriptTags = false`), adaptive Top-Tab and Collapsible Sidebar navigation, and CSRF middleware (`6.1`); Personal Workspace `/app/*` and `/api/user/*` with Service Accounts (`service_accounts` + 64-CIDR allow-lists), Connection Setup format switcher (`Chat Completions`, `Responses`, `Messages`), inline Client Key Pause/Resume/Rename, share-acceptance modal, and `project_key` verification (`6.2`); Admin Console `/admin/*` and `/admin/api/*` with `control_plane_logs` recording, user-resource override routes, and `model_pk` merge/split (`6.3`); Overview dashboard (`Cost`/`Tokens` segmented `uPlot` bar chart, `Usage by Model` table, dual gauges, disk budget `A6`), Dual-Stream Logs (`Inference` vs `API`) + 460px Request Detail Drawer, Usage Ledger + 5-Token Strip + `Credit usage breakdown` popover, and Active Sessions (`6.4`); and read-only Session Chat Preview UI (`6.5`). | `UI-1`..`UI-6`, `CLK-6`, `CLK-7`, `USG-9`, `USG-10`, `AUD-2`, `TRC-6`, `SEC-5` E2E browser and HTMX tests pass. |
 | `M6`: Extended Fuzzing, Full Soak Verification, Live Harnesses, Container Smoke Gate, and v1.0.0 Release (`Epic 7`: `7.1`..`7.5`) | Extended 24-hour fuzzing across all 6 fuzz targets + full-stack canary redaction test (`7.1`), full-workspace `cargo mutants --workspace` + `cargo xtask traceability --milestone M6` + `cargo xtask doc-consistency` (`7.2`), 500 req/s and 2,000-stream soak benchmark against 50M-row DB + `llmroller backup` `fsync` + exit codes `0..14` (`7.3`), headless CLI harness compatibility (`COM-1`) (`7.4`), and multi-arch static release + `< 50 MB` distroless container + `docker compose` smoke & routing-strategy integration gate + SBOM + `cosign` + `llmroller --version` (`7.5`). | All `PERF-1`..`PERF-5`, `REL-1`..`REL-6`, `POR-1`, `COM-1`, `SEC-11` checks pass; `cargo xtask traceability --milestone M6` reports 100% coverage. |
 
 ### 17.2 Post-1.0 roadmap (`P2` items)
@@ -2881,9 +5401,21 @@ Capabilities scheduled after version 1.0 ship behind clean extension traits with
 3. Scoped automation API tokens for `/admin/api/*` and `/api/user/*` CI/CD provisioning.
 4. Optional PostgreSQL storage backend implementing the `StorageRepository` traits for multi-node active-active deployments.
 
+### 17.3 Milestone `M5` (`Epic 6`) Web UI sub-phase mapping to `14.a`–`14.z`
+
+The table below maps each sub-phase of Epic 6 (`Milestone M5`) to its authoritative specifications in `Section 14.a` through `14.z`.
+
+| Sub-phase | Delivered UI & API capabilities | Authoritative SRDD Sub-Specifications |
+| --- | --- | --- |
+| `6.1` | Dual-theme Design System (`#0d0d0d` Dark / `#ffffff` Light), Top-Tab & Collapsible Left-Sidebar shells, HTMX CSP runtime, Setup, Login, TOTP, and Session Security UI | `14.a`, `14.b`, `14.c`, `14.d`, `14.y`, `14.z` (`UI-1`, `UI-3`, `UI-4`, `UI-5`, `SEC-5`) |
+| `6.2` | Connection Setup Format Switcher & One-Click CLI Wizard, Client Keys with inline Pause/Resume/Rename, Service Accounts Directory & Detail View with 64-CIDR allow-lists, Personal Providers, Shares & Consent UI, and Routing Matrix | `14.h`, `14.i`, `14.j`, `14.k`, `14.p`, `14.q`, `14.r`, `14.s` (`USR-2`..`USR-4`, `CLK-6`, `CLK-7`, `UI-1`, `UI-2`) |
+| `6.3` | Admin Console, Global Providers, Canonical Model Catalog & Cross-Vendor Merge UI, Tiered/Scheduled Price Book Editor, Split-Pane Settings (`General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`), Control-Plane API Logger (`control_plane_logs`), and Audit Log Explorer | `14.v`, `14.w`, `14.x` (`AUTH-4`, `USR-5`, `MDL-3`, `MDL-4`, `AUD-1`, `AUD-2`) |
+| `6.4` | Overview Analytics Dashboard (`Cost`/`Tokens` segmented `uPlot` bar chart & `Usage by Model` table), Dual-Stream Logs Explorer (`Inference` vs `API`) + 460px Request Detail Drawer, Usage Ledger + 5-Token Strip + `Credit usage breakdown` Popover, and Active Sessions Pin Manager | `14.e`, `14.f`, `14.g`, `14.l`, `14.m`, `14.n`, `14.o`, `14.t` (`UI-1`, `UI-2`, `UI-6`, `USG-9`, `USG-10`, `SEC-6`) |
+| `6.5` | Read-Only Session Chat Preview UI and Turn Trace Inspector Drawer | `14.u` (`TRC-5`, `TRC-6`, `TRC-8`, `TRC-9`, `UI-4`, `SEC-19`) |
+
 ## 18. Risks and mitigations
 
-Fifteen technical, vendor, security, and operational risks are tracked below alongside their concrete architectural mitigations.
+Eighteen technical, vendor, security, and operational risks are tracked below alongside their concrete architectural mitigations.
 
 ### 18.1 Risk register
 
@@ -2906,6 +5438,9 @@ Each risk lists its likelihood, impact, and the specific design mechanisms and r
 | R13 | Tests become brittle or allow subtle logic regressions in routing, budget math, or RBAC checks to slip into production. | Medium | High | Enforce strict TDD contract testing, boundary discipline, the Expected vs. Unexpected failure protocol (`Section 16.2`), `cargo xtask traceability`, and automated mutation testing with `cargo-mutants` (`Section 16.5.6`). |
 | R14 | A single-node SQLite instance experiences disk growth, WAL starvation, or hardware failure. | Medium | Medium | Cap raw `usage_events` at 30 days and 50,000,000 rows (`A6`), rebuild startup state from narrow `usage_rollups_5min` rows in `< 2 s` (`PERF-4`), page all read queries so readers never pin the WAL, run 30 s `PASSIVE` and 256 MiB `RESTART` WAL checkpoints, handle `SQLITE_FULL` gracefully, and provide `fsync`-verified `llmroller backup` (`REL-6`). |
 | R15 | Enabling content traceability mode exhausts RAM with per-stream compressors or exposes sensitive prompts across shared personal keys. | Medium | High | Keep traceability off by default (`TRC-1`), accumulate turn outputs in memory (`1 MiB` per stream, `256 MiB` global) and compress at turn end on a fixed 2-thread `zstd::bulk::Compressor` pool (`~7 MiB` total RAM, `PERF-5`), deduplicate request blocks per user in `trace_blocks` (`TRC-4`), and isolate traces strictly by `owner_user_id` (`TRC-8`, `SEC-19`). |
+| R16 | An administrator or user enters an overly restrictive or malformed IPv4/IPv6 CIDR list in a Service Account's `Allowed IP addresses` form, locking out CI runners or agents using child API keys. | Medium | Medium | Validate all CIDR entries (up to 64 IPv4/IPv6 addresses or prefixes) via `ipnet` before saving (`422 invalid_cidr`), display a prominent warning in the Service Account UI (`"Applies to every key for this service account. IP changes can lock clients out."`), surface `● 403 Rejected / inference_failed` rows immediately in `Logs > Inference`, and allow instant clearing (`Blank allows any IP`) (`CLK-6`, `Section 14.k`). |
+| R17 | Storing inbound request headers for the `Logs` Request Detail Drawer accidentally captures `Authorization`, `x-api-key`, `Cookie`, or custom secret headers in SQLite. | Low | High | Enforce a strict lowercase header allow-list in `crates/proto::headers::extract_safe_diagnostic_headers` (`content-length`, `content-type`, `user-agent`, `accept`, `anthropic-version`, `anthropic-beta`, `openai-beta`, and tenant-salted session headers) and run automated canary tests asserting zero secret substrings in `usage_events.request_headers_json` and `control_plane_logs` (`SEC-6`, `USG-9`). |
+| R18 | Users confuse unadjusted model list prices with actual subscription plan credit deductions when a provider applies a contribution multiplier (e.g., `× 0.25`) or peak-hour schedule (`× 2.0`). | Medium | Low | Compute and persist both `list_cost_micro_usd` and `cost_micro_usd` with `plan_multiplier_bps` and `billing_coverage_mode`, render struck-through list prices (`~$0.0024~`) alongside `Covered by <Plan> credits` badges in the `Usage` table, and expose the line-item `Credit usage breakdown` popover on every usage row (`USG-10`, `Section 14.o`). |
 
 ## 19. Architectural decisions and open questions
 
@@ -2913,7 +5448,7 @@ This section records the architectural decisions resolved during specification r
 
 ### 19.1 Resolved architectural decisions (ADRs)
 
-Twelve core design decisions govern version 1.0 of LLMRoller.
+Sixteen core design decisions govern version 1.0 of LLMRoller.
 
 | ADR ID | Topic | Decision for version 1.0 | Rationale |
 | --- | --- | --- | --- |
@@ -2929,7 +5464,10 @@ Twelve core design decisions govern version 1.0 of LLMRoller.
 | `ADR-10` | Pre-flight body budgeting and opt-in wait-timeout failover | Buffer request bodies once in shared `Bytes` under `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` (`819 MiB` on a 2 GB host, `2,000 ms` queue wait), and fail over automatically on connection/write errors and explicit HTTP rejections while keeping wait-timeout failover opt-in (`timeout_failover = false`). | Sustains high concurrency for realistic megabyte-scale coding prompts and prevents duplicate billing on slow prefills or non-streaming calls. |
 | `ADR-11` | Separation of instance secrets from the rotatable master key | Store `session_hmac_secret` and `audit_hmac_key` as random 256-bit secrets sealed in `instance_secrets`, and run `llmroller rotate-master-key` as an offline resumable 500-row state machine tracked in `instance_meta`. | Guarantees that rotating `LLMROLLER_MASTER_KEY` never invalidates the `audit_log` HMAC chain or existing `session_hash` pins and recovers cleanly from mid-rotation crashes. |
 | `ADR-12` | Distroless production container with built-in `healthcheck` subcommand and split Compose networks | Ship a multi-stage `Dockerfile` targeting `gcr.io/distroless/static-debian12:nonroot` (UID `65532`, read-only rootfs, `< 50 MB`) with a native `llmroller healthcheck` subcommand and segmented `edge_net` / `internal_obs_net` networks in `docker-compose.yml` (`Section 22`). | Eliminates shell and package-manager attack surfaces in production containers while supporting native Docker healthchecks, `llmroller-init` volume ownership setup, and a `runtime-dev` profile for CI integration testing (`POR-1`, `SEC-11`). |
-| `ADR-12` | Distroless production container with built-in `healthcheck` subcommand and split Compose networks | Ship a multi-stage `Dockerfile` targeting `gcr.io/distroless/static-debian12:nonroot` (UID `65532`, read-only rootfs, `< 50 MB`) with a native `llmroller healthcheck` subcommand and segmented `edge_net` / `internal_obs_net` networks in `docker-compose.yml` (`Section 22`). | Eliminates shell and package-manager attack surfaces in production containers while supporting native Docker healthchecks, `llmroller-init` volume ownership setup, and a `runtime-dev` profile for CI integration testing (`POR-1`, `SEC-11`). |
+| `ADR-13` | Machine principal Service Accounts (`service_accounts`) and reversible Client Key Pause (`paused_at`) | Model machine principals as first-class `service_accounts` rows that group child `client_keys`, enforce up to 64 inherited IPv4/IPv6 CIDR rules at Gate `G4`, and roll up `Cost`, `Requests`, and `Tokens` KPIs; support reversible `Pause key` / `Resume key` (`paused_at`) alongside permanent `Revoke`. | Enables clean IAM separation for CI, bots, and multi-agent clusters without duplicating CIDR rules across keys, and lets developers temporarily pause a key during troubleshooting without losing warm session pins (`CLK-6`, `CLK-7`). |
+| `ADR-14` | Dual-stream `Logs` explorer (`Inference` vs `API`) and 460px slide-over Request Detail Drawer | Store sanitized request headers (`request_headers_json`), `stop_reason`, and `client_user_agent` on `usage_events`, log `/api/user/*` and `/admin/api/*` calls in `control_plane_logs`, and inspect requests via a 460px right-docked slide-over drawer with `<` / `>` row navigation. | Gives engineers complete wire-level observability (TTFT, stop reason, tokens, identity, client session/user-agent, and safe request headers) even when full prompt traceability (`TRC-1`) is disabled (`USG-9`, `AUD-2`). |
+| `ADR-15` | Dual-cost accounting (`list_cost_micro_usd` + `plan_multiplier_bps`) and interactive `Credit usage breakdown` popover | Persist both base price-book list cost and effective plan-multiplied cost on every `usage_events` row, and render an interactive `Credit usage breakdown` popover in the `Usage` ledger. | Reconciles model list prices with subscription plan credit multipliers (`× 0.25` contribution multiplier, `× 2.0` peak schedule) so users see exact per-token-type math and plan coverage (`USG-10`). |
+| `ADR-16` | Dual-theme Design System (OpenCode Dark `#0d0d0d` + OpenDesign Light `#ffffff`) and adaptive shell | Implement CSS custom-property token themes (`dark`, `light`, `system`) and two selectable navigation layouts (`top_tabs` with split-pane `Settings` sub-nav vs. collapsible `sidebar`) in server-rendered Askama + HTMX. | Combines the high-density dark telemetry ergonomics of OpenCode Console with the approachable light onboarding and usage ledger clarity of OpenDesign Console while keeping zero external JS build dependencies (`UI-5`, `UI-6`). |
 
 ### 19.2 Operational verification items for Milestone 1 (`M1`)
 
@@ -3016,6 +5554,19 @@ The links below cover Rust mutation testing, supply-chain security advisories, c
 | IANA IPv6 Special-Purpose Address Registry (`SEC-7` SSRF filter ranges) | https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml |
 | Facebook `zstd` C manual (`ZSTD_estimateCStreamSize` memory sizing) | https://facebook.github.io/zstd/zstd_manual.html |
 
+### 20.4 Web UI reference architectures, design systems, and accessibility standards
+
+The links below ground the Web UI design system, HTMX strict-CSP architecture, time-series visualization, and WCAG 2.1 AA accessibility specifications in Section 14 (`14.a` through `14.z`).
+
+| Source topic | Verified URL |
+| --- | --- |
+| OpenCode Console UI & IAM architecture (`Service accounts`, `Overview`, `Logs`, Request Detail Drawer) | https://opencode.ai/docs/go |
+| OpenDesign AMR Console UI (`Connection setup`, `API keys` Pause/Resume, `Usage` Ledger & Credit Breakdown Popover) | https://open-design.ai/pricing/ |
+| HTMX 2.x Content Security Policy (`includeIndicatorStyles`, `allowEval`, `allowScriptTags`) documentation | https://htmx.org/docs/#config |
+| `uPlot` fast HTML5 Canvas time-series bar and line chart library | https://github.com/leeoniya/uPlot |
+| W3C Web Content Accessibility Guidelines (WCAG) 2.1 Level AA contrast and keyboard navigation | https://www.w3.org/TR/WCAG21/ |
+| WAI-ARIA Authoring Practices 1.2 (Modal Dialogs, Slide-Over Drawers, Tabs, Popovers, and Live Regions) | https://www.w3.org/WAI/ARIA/apg/ |
+
 ## 21. Concurrency, Lifecycle, and Failure-Recovery Model
 
 LLMRoller coordinates high-concurrency streaming inference (`2,000` open SSE streams and `500 req/s`) and lock-free configuration reads. It also coordinates in-memory state machines and asynchronous SQLite WAL persistence in one process. This section specifies the cross-cutting concurrency invariants, lock hierarchies, RAII lifecycle guards, state-machine synchronization rules, and failure-recovery protocols that govern every crate in the workspace.
@@ -3060,7 +5611,7 @@ pub enum Termination {
 
 The `finalize()` method (invoked either explicitly or from `Drop::drop` when `!self.finalized`) runs with zero blocking I/O:
 1. Sets `self.finalized = true`.
-2. Computes request cost from `self.usage` using observed token counts if a usage frame arrived. Otherwise, it estimates input via `estimate_input_tokens(body)` and output via `ceil(decoded_text_bytes / 4)` (`cost_source = 'estimated_incomplete'`).
+2. Computes both unadjusted `list_cost_micro_usd` and effective `cost_micro_usd` (applying `plan_multiplier_bps` and setting `billing_coverage_mode`, `USG-10`) from `self.usage` using observed token counts if a usage frame arrived. Otherwise, it estimates input via `estimate_input_tokens(body)` and output via `ceil(decoded_text_bytes / 4)` (`cost_source = 'estimated_incomplete'`). It also extracts the normalized `stop_reason` and sanitized `request_headers_json` (`USG-9`, `SEC-6`).
 3. Posts the actual or estimated cost into the window rings and monthly accumulators **before** subtracting the estimate from `reserved_in_flight`. Thus `effective_used + reserved_in_flight` never dips below truth.
 4. Enqueues the `UsageEvent` (with `termination` and `incomplete = (termination != Completed) as i32`) and any `usage_attempts` rows to the batching writer's non-blocking queues.
 5. Marks any active `TraceCollectorHandle` as finished (setting `truncated_content = 1` if `termination != Completed`) and releases any remaining `preflight_permit` or `probe_slot`.
@@ -3120,7 +5671,7 @@ The writer polls two command channels and three data-plane queues:
 1. `control_rx` (`WriterCommand::Control { tx, reply }`): high-priority channel for control-plane transactions. The writer drains **all** pending `control_rx` commands before every data-plane batch so user/admin actions (`CLK-4`, `SHR-5`) never block behind data-plane load. Control handlers await `reply` with a `2,000 ms` timeout (`503 writer_busy`).
 2. `durable_state` (`Mutex<IndexMap<DurableKey, DurableOp>>`, max `500,000` keys): non-dropping coalescing queue for confirmed pins, `response_links`, and `HealthWrite` items. If `len() >= 500,000`, new pin confirmations remain in memory only (`llmroller_durable_queue_full_total`) and `/readyz` returns HTTP `503`.
 3. `rollups` (`Mutex<HashMap<RollupKey, RollupDelta>>`): non-dropping additive coalescing map for `usage_rollups_5min` and `usage_rollups_hourly`.
-4. `raw_events` (`Mutex<VecDeque<RawItem>>`, max `10,000` items and `64 MiB`): bounded ring for `usage_events`, `usage_attempts`, `trace_blocks`, and `trace_records`. When full, the oldest item is popped and dropped (its token/cost totals are already folded into `rollups`) and `llmroller_usage_dropped_total{kind}` increments.
+4. `raw_events` (`Mutex<VecDeque<RawItem>>`, max `10,000` items and `64 MiB`): bounded ring for `usage_events`, `usage_attempts`, `control_plane_logs`, `trace_blocks`, and `trace_records`. When full, the oldest item is popped and dropped (its token/cost totals are already folded into `rollups`) and `llmroller_usage_dropped_total{kind}` increments.
 5. Each data-plane batch flushes at `200` items, `4 MiB` of serialized row bytes (`writer_batch_max_bytes`), or `250 ms` (`writer_batch_max_age_ms`). Any `trace_records` item `> 1 MiB` commits in its own dedicated transaction.
 
 #### 21.6.2 Versioned `ConfigSnapshot` publication (`Reloader`)
@@ -3216,7 +5767,7 @@ The table below defines the four stages in the `Dockerfile` and the security con
 | --- | --- | --- |
 | `planner` | `rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` | Installs `cargo-chef` (`0.1.78`) and computes `recipe.json` from `Cargo.toml` and `Cargo.lock` so source edits in `crates/*` never invalidate cached third-party crate compilations. |
 | `builder` | `rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` | Compiles cached dependencies via `cargo chef cook --release --locked --target <musl_target>`, verifies `cargo xtask doc-consistency`, compiles the static `llmroller` binary (`--locked`, stripped of debug symbols), and prepares empty `/var/lib/llmroller` and `/etc/llmroller/presets` directories owned by `65532:65532`. |
-| `runtime-distroless` (default production target) | `gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab` | Copies only `/usr/local/bin/llmroller` and `/etc/llmroller/presets/*.toml`. Runs as non-root `65532:65532` (`nonroot`), contains zero shell (`/bin/sh` absent) and zero package manager, keeps total uncompressed image size `< 50 MB` (`POR-1`), and uses `llmroller healthcheck` for native container probes. |
+| `runtime-distroless` (default production target) | `gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab` | Copies only `/usr/local/bin/llmroller` (which embeds all Askama HTML templates, dual-theme Dark/Light CSS stylesheets, provider SVG icons, vendored `htmx.min.js`, `uPlot.iife.min.js`, and `/static/app.js` via `rust-embed`) and `/etc/llmroller/presets/*.toml`. Runs as non-root `65532:65532` (`nonroot`), contains zero shell (`/bin/sh` absent) and zero package manager, keeps total uncompressed image size `< 50 MB` (`POR-1`), and uses `llmroller healthcheck` for native container probes. |
 | `runtime-dev` (development & CI target) | `debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587` | Installs `tini`, `ca-certificates`, `curl`, and `sqlite3`, creates non-root user `llmroller` (`65532:65532`), and runs under `/usr/bin/tini -- /usr/local/bin/llmroller` for interactive debugging and Compose smoke testing. |
 
 #### 22.1.2 Complete `.dockerignore` reference manifest

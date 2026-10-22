@@ -219,6 +219,18 @@ delivering_subphase = "3.0c"
 partial_subphases = ["2.2"]
 tests = ["crates/core/src/accumulators/tests.rs", "crates/server/tests/integration_client_keys.rs"]
 
+[requirements.CLK-6]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.2"
+tests = ["crates/server/tests/integration_client_keys.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+
+[requirements.CLK-7]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.2"
+tests = ["crates/server/tests/integration_client_keys.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+
 # --- 6.6 Model catalog and discovery (MDL) ---
 [requirements.MDL-1]
 priority = "P0"
@@ -461,6 +473,20 @@ delivering_subphase = "3.0b"
 partial_subphases = ["4.6", "4b.1"]
 tests = ["crates/core/src/windows/tests.rs"]
 
+[requirements.USG-9]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.4"
+partial_subphases = ["4.3"]
+tests = ["crates/server/tests/integration_usage_writer.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+
+[requirements.USG-10]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.4"
+partial_subphases = ["3.0a", "4.3"]
+tests = ["crates/core/src/pricing/proptests.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+
 # --- 6.10 Content traceability mode and session chat preview (TRC) ---
 [requirements.TRC-1]
 priority = "P0"
@@ -553,6 +579,26 @@ milestone = "M0"
 delivering_subphase = "1.5"
 partial_subphases = ["5.1", "6.3"]
 tests = ["crates/store/src/audit/tests.rs"]
+
+[requirements.UI-5]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.1"
+partial_subphases = ["6.2", "6.3"]
+tests = ["crates/server/tests/security_csrf_and_headers.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+
+[requirements.UI-6]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.4"
+tests = ["crates/server/tests/e2e_dashboard_htmx.rs"]
+
+[requirements.AUD-2]
+priority = "P0"
+milestone = "M5"
+delivering_subphase = "6.3"
+partial_subphases = ["6.4"]
+tests = ["crates/store/src/audit/tests.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
 
 # --- 7. Non-functional requirements (PERF, REL, TRN, COM, POR, MNT, OBS, PRIV) ---
 [requirements.PERF-1]
