@@ -39,7 +39,7 @@ use llmroller_core::pricing::{
     CostSource, PriceEntry, Rates, compute_request_cost, estimate_input_tokens,
 };
 use llmroller_core::provider::{ProviderAuthScheme, ProviderEndpoint, ProviderKind};
-use llmroller_core::rbac::{PoolTier, RoutingScope};
+use llmroller_core::rbac::{PoolTier, Role, RoutingScope};
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::seams::{Clock as _, ExposeSecret as _, OsEntropy, SystemClock};
 use llmroller_core::snapshot::{
@@ -1916,11 +1916,12 @@ fn upstream_error_response(
     body: Bytes,
     candidate: &RouteCandidate,
     request_id: &str,
+    is_admin: bool,
 ) -> Response {
     let headers_out = llmroller_proto::headers::apply_response_header_pipeline(
         upstream_headers,
         candidate.pool_tier(),
-        false,
+        is_admin,
         request_id,
         &candidate.config.response_header_allow,
     );
@@ -2603,6 +2604,11 @@ pub async fn handle_inference_request(
     let Some(caller) = client_key.clone() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    // Response header policy R4 depends on the caller role, not the request path (SEC-16).
+    let is_admin = snapshot
+        .users
+        .get(&caller.owner_user_id)
+        .is_some_and(|user| user.role == Role::Admin);
 
     // 4. Gate G6: client key model allow-list.
     if let Some(ref allowed) = caller.allowed_models
@@ -3265,6 +3271,7 @@ pub async fn handle_inference_request(
                         error_body,
                         &candidate,
                         &request_id.to_string(),
+                        is_admin,
                     );
                 }
                 ErrorClass::PlanRestricted => {
@@ -3400,6 +3407,7 @@ pub async fn handle_inference_request(
                         error_body,
                         &candidate,
                         &request_id.to_string(),
+                        is_admin,
                     );
                 }
             }
@@ -3670,7 +3678,7 @@ pub async fn handle_inference_request(
                 let mut response_headers = llmroller_proto::headers::apply_response_header_pipeline(
                     &upstream_headers,
                     candidate.pool_tier(),
-                    true,
+                    is_admin,
                     &request_id.to_string(),
                     &candidate.config.response_header_allow,
                 );
@@ -3691,7 +3699,7 @@ pub async fn handle_inference_request(
             let headers_out = llmroller_proto::headers::apply_response_header_pipeline(
                 response.headers(),
                 candidate.pool_tier(),
-                false,
+                is_admin,
                 &request_id.to_string(),
                 &candidate.config.response_header_allow,
             );
@@ -3716,7 +3724,7 @@ pub async fn handle_inference_request(
         let response_headers = llmroller_proto::headers::apply_response_header_pipeline(
             response.headers(),
             candidate.pool_tier(),
-            false,
+            is_admin,
             &request_id.to_string(),
             &candidate.config.response_header_allow,
         );

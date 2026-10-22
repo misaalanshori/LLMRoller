@@ -161,7 +161,11 @@ async fn mock_chat_handler(
         let stream_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"mock upstream!\"}}]}\n\ndata: [DONE]\n\n";
         (
             StatusCode::OK,
-            [("content-type", "text/event-stream")],
+            [
+                ("content-type", "text/event-stream"),
+                ("openai-organization", "org-secret-admin-id"),
+                ("x-ratelimit-remaining-requests", "999"),
+            ],
             stream_body,
         )
             .into_response()
@@ -171,6 +175,8 @@ async fn mock_chat_handler(
             [
                 ("content-type", "application/json"),
                 ("x-upstream-custom", "yes"),
+                ("openai-organization", "org-secret-admin-id"),
+                ("x-ratelimit-remaining-requests", "999"),
             ],
             Json(serde_json::json!({
                 "id": "chatcmpl-mock-upstream-123",
@@ -324,6 +330,36 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
 
     let client_token = client_key.raw_token.expose_secret().to_string();
 
+    // An admin caller on the same Global key must still receive diagnostic headers.
+    let admin_user_id = UserId::generate();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, 'wire_admin', 'h', 'admin', 1000)",
+    )
+    .bind(admin_user_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert admin user");
+    let admin_client_key = create_client_key_tx(
+        &mut tx,
+        &system_actor,
+        admin_user_id,
+        NewClientKey {
+            label: "wire_admin_key".to_string(),
+            allowed_models: Some(vec!["gpt-4o".to_string()]),
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &entropy,
+        1000,
+    )
+    .await
+    .expect("create admin client key");
+    let admin_token = admin_client_key.raw_token.expose_secret().to_string();
+
     let provider = create_provider_tx(
         &mut tx,
         &system_actor,
@@ -449,6 +485,16 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .expect("req");
     let res_chat = app.clone().oneshot(req_chat).await.expect("res");
     assert_eq!(res_chat.status(), StatusCode::OK);
+    assert!(
+        !res_chat.headers().contains_key("openai-organization"),
+        "non-admin non-streaming responses must not leak org identity"
+    );
+    assert!(
+        !res_chat
+            .headers()
+            .contains_key("x-ratelimit-remaining-requests"),
+        "non-admin non-streaming responses must not leak pooled rate limits"
+    );
     let chat_body = res_chat
         .into_body()
         .collect()
@@ -472,6 +518,16 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         .expect("req");
     let res_stream = app.clone().oneshot(req_stream).await.expect("res");
     assert_eq!(res_stream.status(), StatusCode::OK);
+    assert!(
+        !res_stream.headers().contains_key("openai-organization"),
+        "non-admin streaming responses must not leak org identity"
+    );
+    assert!(
+        !res_stream
+            .headers()
+            .contains_key("x-ratelimit-remaining-requests"),
+        "non-admin streaming responses must not leak pooled rate limits"
+    );
     let stream_body = res_stream
         .into_body()
         .collect()
@@ -482,6 +538,50 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
     assert!(stream_text.contains("Hello from "));
     assert!(stream_text.contains("mock upstream!"));
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
+
+    // Admin callers keep diagnostic rate-limit headers on both paths.
+    let req_admin_stream = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"admin stream"}],"stream":true}"#,
+        ))
+        .expect("req");
+    let res_admin_stream = app.clone().oneshot(req_admin_stream).await.expect("res");
+    assert_eq!(res_admin_stream.status(), StatusCode::OK);
+    assert_eq!(
+        res_admin_stream
+            .headers()
+            .get("x-ratelimit-remaining-requests")
+            .and_then(|value| value.to_str().ok()),
+        Some("999")
+    );
+    let _ = res_admin_stream
+        .into_body()
+        .collect()
+        .await
+        .expect("admin stream body");
+
+    let req_admin_plain = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"admin plain"}]}"#,
+        ))
+        .expect("req");
+    let res_admin_plain = app.clone().oneshot(req_admin_plain).await.expect("res");
+    assert_eq!(res_admin_plain.status(), StatusCode::OK);
+    assert_eq!(
+        res_admin_plain
+            .headers()
+            .get("x-ratelimit-remaining-requests")
+            .and_then(|value| value.to_str().ok()),
+        Some("999")
+    );
 }
 
 /// Inserts a user plus an allowed-models client key and returns the raw token.
