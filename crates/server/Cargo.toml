@@ -52,6 +52,7 @@ brotli.workspace = true
 bytes.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
+sysinfo.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 llmroller-admin = { path = "../admin" }

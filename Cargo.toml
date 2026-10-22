@@ -101,6 +101,7 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 proptest = "1.10.0"
 tempfile = "3.25.0"
 tokio-test = "0.4.5"
+sysinfo = "0.39.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
