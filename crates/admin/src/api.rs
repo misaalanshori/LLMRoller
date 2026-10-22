@@ -33,7 +33,7 @@ use llmroller_store::settings::{
     RuntimeSettings, SettingsError, load_settings, update_setting, validate_setting,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::auth::{AuthAppState, AuthError, authenticate_session};
 
@@ -1283,8 +1283,23 @@ async fn get_session_preview_internal(
         prev_block_refs = turn_trace.block_refs.clone();
         prev_thread_id = thread_id.clone();
 
+        // Tool schemas participate in trace deduplication but are not chat
+        // messages; expose them through the per-thread tools view instead of
+        // rendering them as input turns (TRC-4, TRC-6).
+        let tool_refs: HashSet<String> = turn_trace
+            .request_skeleton
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("$blk")?.as_str().map(str::to_string))
+            .collect();
+
         let mut new_input_messages = Vec::new();
         for hash in &turn_trace.block_refs[lcp..] {
+            if tool_refs.contains(hash) {
+                continue;
+            }
             let block_row = sqlx::query(
                 "SELECT payload_enc, master_key_id FROM trace_blocks WHERE owner_user_id = ? AND block_hash = ?",
             )

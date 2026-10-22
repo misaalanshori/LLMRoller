@@ -12,12 +12,15 @@ use tokio::sync::mpsc;
 
 use crate::sse_frame::find_frame_delimiter;
 
-pub const MAX_REQUEST_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+pub const MAX_REQUEST_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB per block
+pub const MAX_TURN_NEW_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB per turn, newest kept
 pub const MAX_RESPONSE_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const HALF_RESPONSE_OUTPUT_BYTES: usize = 512 * 1024; // 512 KiB
 pub const GLOBAL_TRACE_BUDGET_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 pub const MAX_INFLIGHT_TRACE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB per turn
-pub const MAX_REQUEST_TRACE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB of request blocks per turn
+/// Retained for callers that used the old per-turn name; the authoritative
+/// per-turn cap is [`MAX_TURN_NEW_BLOCKS_BYTES`] (TRC-2, Section 12.6).
+pub const MAX_REQUEST_TRACE_BYTES: usize = MAX_TURN_NEW_BLOCKS_BYTES;
 pub const MAX_SSE_PENDING_BYTES: usize = 2 * 1024 * 1024; // incomplete frame guard
 
 /// Global accumulator tracking trace memory usage across all active streams (PERF-5).
@@ -106,95 +109,212 @@ pub fn replace_binary_blocks(value: &mut serde_json::Value) {
 /// Request body split into an audit skeleton plus ordered content-addressed blocks.
 #[derive(Debug, Clone)]
 pub struct PreparedRequestBlocks {
-    /// Request metadata with prompt-bearing fields removed (`model`, `stream`, ...).
+    /// Request metadata with prompt-bearing fields replaced in place by
+    /// `{"$blk": "<hash>"}` references (or `{"$dropped": true, ...}` markers).
     pub skeleton: serde_json::Value,
     /// Deduplicated `(sha256_hex, canonical_block_bytes)` pairs.
     pub blocks: Vec<(String, Vec<u8>)>,
-    /// Ordered block hashes corresponding to the conversation history.
+    /// Ordered block hashes corresponding to every prompt position. Repeated
+    /// blocks appear once per position so LCP reconstruction stays aligned.
     pub block_refs: Vec<String>,
-    /// Number of oversized or budget-exceeding blocks replaced with markers.
+    /// Number of oversized or budget-exceeding block positions replaced with markers.
     pub dropped_blocks: u32,
+}
+
+#[derive(Debug)]
+struct BlockCandidate {
+    hash: String,
+    bytes: Vec<u8>,
+    drop_reason: Option<&'static str>,
+}
+
+/// Recursively removes per-turn annotations that must not affect block hashes.
+fn strip_volatile_trace_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            map.remove("citations");
+            for child in map.values_mut() {
+                strip_volatile_trace_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_volatile_trace_fields(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalizes a prompt-bearing field value into the block shape used by the
+/// preview API without changing the wire meaning of the stored content.
+fn normalize_trace_field_value(field: &str, value: serde_json::Value) -> serde_json::Value {
+    match field {
+        "system" | "instructions" => serde_json::json!({
+            "role": "system",
+            "content": value,
+        }),
+        "messages" | "input" => match value {
+            serde_json::Value::String(text) => serde_json::json!({
+                "role": "user",
+                "content": text,
+            }),
+            other => other,
+        },
+        _ => value,
+    }
 }
 
 /// Split a request into a metadata skeleton and content-addressed message blocks.
 ///
-/// The preview API replays `block_refs` in order, so system content is emitted
-/// before `messages`/`input`. Duplicate blocks (for example a repeated system
-/// prompt or a retried user turn) are stored once. Blocks above the 4 MiB
-/// per-block cap or the 16 MiB per-turn budget are replaced by an omission
-/// marker so tracing can never retain unbounded prompt bytes (TRC-2, TRC-4).
+/// The preview API reconstructs messages by replaying `block_refs` in order.
+/// Prompt-bearing fields (`system`, `instructions`, `tools`, `messages`, and
+/// `input`) are replaced in place by `{"$blk": "<hash>"}` references while all
+/// other top-level request keys (`model`, `temperature`, `max_tokens`, ...) stay
+/// intact (TRC-2, TRC-4, Section 12.6).
+///
+/// `cache_control` and `citations` are stripped recursively before hashing so a
+/// moving cache marker cannot defeat deduplication. Binary/base64 assets above
+/// 1 KiB are replaced with SHA-256 placeholders. Duplicate blocks are stored once
+/// per turn but retain one reference per prompt position. When the turn's unique
+/// blocks exceed 4 MiB, selection runs from the newest block backwards so the
+/// newest prompt is retained and the oldest prefix is dropped.
 #[must_use]
 pub fn prepare_request_blocks(request: &serde_json::Value) -> PreparedRequestBlocks {
     let mut skeleton = request.clone();
-    let mut candidates: Vec<serde_json::Value> = Vec::new();
+    let mut field_candidates: Vec<(&'static str, Vec<usize>)> = Vec::new();
+    let mut candidates: Vec<BlockCandidate> = Vec::new();
 
     if let Some(object) = skeleton.as_object_mut() {
-        for key in ["system", "messages", "input"] {
-            let Some(value) = object.remove(key) else {
+        for (field, single) in [
+            ("system", true),
+            ("instructions", true),
+            ("tools", false),
+            ("messages", false),
+            ("input", false),
+        ] {
+            let Some(value) = object.remove(field) else {
                 continue;
             };
-            match value {
-                serde_json::Value::Array(items) => candidates.extend(items),
-                serde_json::Value::String(text) => {
-                    candidates.push(serde_json::json!({
-                        "role": if key == "system" { "system" } else { "user" },
-                        "content": text,
-                    }));
-                }
-                serde_json::Value::Null => {}
-                other => candidates.push(other),
-            }
-        }
-    }
-
-    let mut blocks: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut total_bytes = 0_usize;
-    let mut dropped_blocks = 0_u32;
-
-    for message in candidates {
-        let bytes = match serde_json::to_vec(&message) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                dropped_blocks = dropped_blocks.saturating_add(1);
+            if value.is_null() {
+                object.insert(field.to_string(), serde_json::Value::Null);
                 continue;
             }
-        };
 
-        let bytes = if bytes.len() > MAX_REQUEST_BLOCKS_BYTES {
-            dropped_blocks = dropped_blocks.saturating_add(1);
-            serde_json::to_vec(&serde_json::json!({
-                "llmroller_omitted": "oversized_block",
-                "bytes": bytes.len(),
-            }))
-            .unwrap_or_else(|_| b"{}".to_vec())
-        } else if total_bytes.saturating_add(bytes.len()) > MAX_REQUEST_TRACE_BYTES {
-            dropped_blocks = dropped_blocks.saturating_add(1);
-            serde_json::to_vec(&serde_json::json!({
-                "llmroller_omitted": "trace_budget_exceeded",
-                "bytes": bytes.len(),
-            }))
-            .unwrap_or_else(|_| b"{}".to_vec())
-        } else {
-            bytes
-        };
+            let values = if single {
+                vec![normalize_trace_field_value(field, value)]
+            } else {
+                match value {
+                    serde_json::Value::Array(items) => items
+                        .into_iter()
+                        .map(|item| normalize_trace_field_value(field, item))
+                        .collect(),
+                    other => vec![normalize_trace_field_value(field, other)],
+                }
+            };
 
-        total_bytes = total_bytes.saturating_add(bytes.len());
-        let hash = hex_sha256(&bytes);
-        if seen.insert(hash.clone()) {
-            blocks.push((hash, bytes));
+            let mut indices = Vec::with_capacity(values.len());
+            for mut value in values {
+                strip_volatile_trace_fields(&mut value);
+                replace_binary_blocks(&mut value);
+                let Ok(bytes) = serde_json::to_vec(&value) else {
+                    let index = candidates.len();
+                    candidates.push(BlockCandidate {
+                        hash: String::new(),
+                        bytes: Vec::new(),
+                        drop_reason: Some("serialization_failed"),
+                    });
+                    indices.push(index);
+                    continue;
+                };
+                let hash = hex_sha256(&bytes);
+                let index = candidates.len();
+                candidates.push(BlockCandidate {
+                    hash,
+                    bytes,
+                    drop_reason: None,
+                });
+                indices.push(index);
+            }
+            field_candidates.push((field, indices));
         }
     }
 
-    let block_refs: Vec<String> = blocks.iter().map(|(hash, _)| hash.clone()).collect();
+    // Tail-preserving budget selection: walk newest to oldest so the latest turn
+    // survives. Duplicate hashes encountered from the tail are already stored and
+    // therefore consume no additional budget.
+    let mut kept_hashes: HashSet<String> = HashSet::new();
+    let mut kept = vec![false; candidates.len()];
+    let mut total_bytes = 0_usize;
+    for index in (0..candidates.len()).rev() {
+        let candidate = &mut candidates[index];
+        if candidate.drop_reason.is_some() {
+            continue;
+        }
+        if kept_hashes.contains(&candidate.hash) {
+            kept[index] = true;
+            continue;
+        }
+        if candidate.bytes.len() > MAX_REQUEST_BLOCKS_BYTES {
+            candidate.drop_reason = Some("oversized_block");
+            continue;
+        }
+        if total_bytes.saturating_add(candidate.bytes.len()) > MAX_TURN_NEW_BLOCKS_BYTES {
+            candidate.drop_reason = Some("turn_budget_exceeded");
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(candidate.bytes.len());
+        kept_hashes.insert(candidate.hash.clone());
+        kept[index] = true;
+    }
+
+    let dropped_blocks = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| !kept[*index] && candidate.drop_reason.is_some())
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+
+    let block_refs: Vec<String> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| kept[*index])
+        .map(|(_, candidate)| candidate.hash.clone())
+        .collect();
+
     if let Some(object) = skeleton.as_object_mut() {
+        for (field, indices) in &field_candidates {
+            let references = indices
+                .iter()
+                .map(|&index| {
+                    let candidate = &candidates[index];
+                    if kept[index] {
+                        serde_json::json!({ "$blk": candidate.hash })
+                    } else {
+                        serde_json::json!({
+                            "$dropped": true,
+                            "reason": candidate.drop_reason.unwrap_or("serialization_failed"),
+                            "bytes": candidate.bytes.len(),
+                        })
+                    }
+                })
+                .collect();
+            object.insert(field.to_string(), serde_json::Value::Array(references));
+        }
         object.insert(
-            "_llmroller_trace".to_string(),
-            serde_json::json!({
-                "block_refs": block_refs,
-                "dropped_blocks": dropped_blocks,
-            }),
+            "dropped_block_count".to_string(),
+            serde_json::json!(dropped_blocks),
         );
+    }
+
+    let mut blocks = Vec::new();
+    let mut emitted: HashSet<String> = HashSet::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if kept[index] && emitted.insert(candidate.hash.clone()) {
+            blocks.push((candidate.hash, candidate.bytes));
+        }
     }
 
     PreparedRequestBlocks {

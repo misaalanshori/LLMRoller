@@ -333,7 +333,11 @@ async fn test_trace_pipeline_persists_streaming_and_non_streaming_turns() {
     assert_eq!(turn.response["assistant_text"], "trace pipeline answer");
     assert_eq!(turn.response["response_id"], "chatcmpl-trace-1");
     assert_eq!(turn.block_refs.len(), 1, "one user message block");
-    assert!(turn.request_skeleton.get("messages").is_none());
+    assert_eq!(turn.request_skeleton["model"], "gpt-4o");
+    assert_eq!(
+        turn.request_skeleton["messages"][0]["$blk"],
+        turn.block_refs[0]
+    );
     let block_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks")
         .fetch_one(&pool)
         .await

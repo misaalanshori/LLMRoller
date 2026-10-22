@@ -1976,6 +1976,32 @@ impl TraceCapture {
     }
 }
 
+/// Extract the sub-agent thread identifier for trace records (TRC-4).
+///
+/// Claude Code subagents share the parent session/pin but add their agent id;
+/// other compatible clients use `x-subagent-id`. Header values are trimmed and
+/// capped at 256 UTF-8 bytes before persisting.
+fn extract_trace_thread_id(headers: &HeaderMap) -> String {
+    const MAX_THREAD_ID_BYTES: usize = 256;
+
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let Some(raw) = value("x-claude-code-agent-id").or_else(|| value("x-subagent-id")) else {
+        return "main".to_string();
+    };
+
+    let mut end = raw.len().min(MAX_THREAD_ID_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_string()
+}
+
 /// Build the request skeleton and content-addressed blocks for one turn (TRC-2, TRC-4).
 fn prepare_trace_request(
     body: &[u8],
@@ -2003,6 +2029,7 @@ struct TraceJobMeta<'a> {
     owner_user_id: UserId,
     client_key_id: ClientKeyId,
     session_hash: &'a str,
+    thread_id: &'a str,
     canonical_id: &'a str,
     protocol: &'a str,
     response_raw: Option<serde_json::Value>,
@@ -2040,7 +2067,7 @@ fn submit_trace_job(
         owner_user_id: meta.owner_user_id,
         client_key_id: meta.client_key_id,
         session_hash: meta.session_hash.to_string(),
-        thread_id: "main".to_string(),
+        thread_id: meta.thread_id.to_string(),
         canonical_id: meta.canonical_id.to_string(),
         protocol: meta.protocol.to_string(),
         truncated_content,
@@ -2165,6 +2192,7 @@ struct StreamFinalizer {
     attempt_key_id: UpstreamKeyId,
     http_status: u16,
     tap: SseUsageTap,
+    thread_id: String,
     reservation: Option<Reservation>,
     client_guard: Option<MonthReservationGuard>,
     cap_guards: CandidateCapGuards,
@@ -2240,6 +2268,7 @@ impl StreamFinalizer {
                         owner_user_id: self.usage.owner_user_id,
                         client_key_id: self.usage.client_key_id,
                         session_hash: self.usage.session_hash.as_deref().unwrap_or_default(),
+                        thread_id: &self.thread_id,
                         canonical_id: &self.usage.canonical_model,
                         protocol: &self.usage.endpoint_str,
                         response_raw: None,
@@ -2492,6 +2521,7 @@ pub async fn handle_inference_request(
     } else {
         None
     };
+    let trace_thread_id = extract_trace_thread_id(&headers);
     // 5. Response-link session inheritance and HardKey affinity (RTE-12, Section 11.1.2).
     let hard_link: Option<ResponseLinkRow> = if matches!(endpoint, EndpointKind::Responses) {
         match scan.previous_response_id.as_ref() {
@@ -3386,6 +3416,7 @@ pub async fn handle_inference_request(
                     attempt_key_id: candidate.upstream_key_id,
                     http_status: status.as_u16(),
                     tap,
+                    thread_id: trace_thread_id.clone(),
                     reservation,
                     client_guard: client_guard.take(),
                     cap_guards,
@@ -3679,6 +3710,7 @@ pub async fn handle_inference_request(
                         owner_user_id: caller.owner_user_id,
                         client_key_id: caller.id,
                         session_hash: pin_key.as_ref().map_or("", |key| key.session_hash.as_str()),
+                        thread_id: &trace_thread_id,
                         canonical_id: &model.canonical_id,
                         protocol: endpoint_str,
                         response_raw,
@@ -3810,6 +3842,25 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         drop(first);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[doc = "Spec: TRC-4 — F09 tags subagent traces with their thread id"]
+    fn subagent_thread_id_prefers_claude_agent_header() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_trace_thread_id(&headers), "main");
+
+        headers.insert("x-subagent-id", HeaderValue::from_static("subagent-7"));
+        assert_eq!(extract_trace_thread_id(&headers), "subagent-7");
+
+        headers.insert(
+            "x-claude-code-agent-id",
+            HeaderValue::from_static("claude-agent-2"),
+        );
+        assert_eq!(extract_trace_thread_id(&headers), "claude-agent-2");
+
+        headers.insert("x-claude-code-agent-id", HeaderValue::from_static("  "));
+        assert_eq!(extract_trace_thread_id(&headers), "subagent-7");
     }
 
     fn tier_candidate(tier: CandidatePoolTier, share_id: Option<ShareId>) -> RouteCandidate {

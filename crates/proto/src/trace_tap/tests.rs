@@ -206,20 +206,143 @@ fn test_split_request_blocks_extracts_messages_and_deduplicates() {
         ]
     });
     let prepared = prepare_request_blocks(&request);
-    assert!(prepared.skeleton.get("messages").is_none());
-    assert!(prepared.skeleton.get("system").is_none());
     assert_eq!(
         prepared.blocks.len(),
         2,
         "system + one deduplicated user block"
     );
     assert_eq!(
-        prepared.block_refs,
-        prepared
-            .blocks
-            .iter()
-            .map(|(hash, _)| hash.clone())
-            .collect::<Vec<_>>()
+        prepared.block_refs.len(),
+        4,
+        "every message position keeps its reference, including repeats"
     );
+    assert_eq!(prepared.block_refs[0], prepared.block_refs[1]);
+    assert_eq!(prepared.block_refs[2], prepared.block_refs[3]);
+    assert_ne!(prepared.block_refs[1], prepared.block_refs[2]);
     assert_eq!(prepared.dropped_blocks, 0);
+}
+
+#[doc = "Spec: TRC-2, TRC-4 — F09 strips volatile fields before canonical hashing"]
+#[test]
+fn test_prepare_request_blocks_strips_cache_control_and_citations_before_hashing() {
+    let baseline = serde_json::json!({
+        "model": "claude-sonnet-4",
+        "tools": [{"name": "bash", "description": "run a command"}],
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "be brief"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        ]
+    });
+    let mut volatile = baseline.clone();
+    volatile["tools"][0]["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    volatile["messages"][0]["content"][0]["cache_control"] =
+        serde_json::json!({"type": "ephemeral"});
+    volatile["messages"][1]["content"][0]["citations"] =
+        serde_json::json!([{"type": "char_location", "cited_text": "hi"}]);
+
+    let baseline_prepared = prepare_request_blocks(&baseline);
+    let volatile_prepared = prepare_request_blocks(&volatile);
+
+    assert_eq!(
+        baseline_prepared.block_refs, volatile_prepared.block_refs,
+        "moving cache_control or citations must not change block hashes"
+    );
+    assert_eq!(baseline_prepared.blocks, volatile_prepared.blocks);
+    for (_, bytes) in &volatile_prepared.blocks {
+        let encoded = String::from_utf8_lossy(bytes);
+        assert!(!encoded.contains("cache_control"));
+        assert!(!encoded.contains("citations"));
+    }
+}
+
+#[doc = "Spec: TRC-2, TRC-4 — F09 preserves the request skeleton with in-place block refs"]
+#[test]
+fn test_prepare_request_blocks_preserves_request_skeleton_and_replaces_messages_with_blk_refs() {
+    let request = serde_json::json!({
+        "model": "claude-sonnet-4.6",
+        "system": "You are a helpful assistant.",
+        "tools": [
+            {"name": "bash", "description": "Run a shell command"},
+            {"name": "read", "description": "Read a file"}
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "max_tokens": 512,
+        "stream": true
+    });
+    let prepared = prepare_request_blocks(&request);
+
+    assert_eq!(prepared.skeleton["model"], "claude-sonnet-4.6");
+    assert_eq!(prepared.skeleton["temperature"], 0.2);
+    assert_eq!(prepared.skeleton["max_tokens"], 512);
+    assert_eq!(prepared.skeleton["stream"], true);
+    assert!(
+        prepared.skeleton.get("_llmroller_trace").is_none(),
+        "the skeleton must not be replaced by a stub marker"
+    );
+
+    let system_refs = prepared.skeleton["system"].as_array().expect("system refs");
+    let tool_refs = prepared.skeleton["tools"].as_array().expect("tool refs");
+    let message_refs = prepared.skeleton["messages"]
+        .as_array()
+        .expect("message refs");
+    assert_eq!(system_refs.len(), 1);
+    assert_eq!(tool_refs.len(), 2);
+    assert_eq!(message_refs.len(), 1);
+
+    let system_hash = system_refs[0]["$blk"].as_str().expect("system $blk");
+    let tool_hashes: Vec<&str> = tool_refs
+        .iter()
+        .map(|reference| reference["$blk"].as_str().expect("tool $blk"))
+        .collect();
+    let message_hash = message_refs[0]["$blk"].as_str().expect("message $blk");
+    let expected_refs = vec![
+        system_hash.to_string(),
+        tool_hashes[0].to_string(),
+        tool_hashes[1].to_string(),
+        message_hash.to_string(),
+    ];
+    assert_eq!(prepared.block_refs, expected_refs);
+    assert_eq!(prepared.blocks.len(), 4);
+    assert_eq!(prepared.dropped_blocks, 0);
+    assert_eq!(prepared.skeleton["dropped_block_count"], 0);
+    assert!(
+        message_refs[0].get("role").is_none(),
+        "raw message content belongs in the block, not the skeleton"
+    );
+}
+
+#[doc = "Spec: TRC-2, TRC-4 — F09 keeps newest blocks and drops the oldest prefix"]
+#[test]
+fn test_prepare_request_blocks_drops_oldest_blocks_first_when_exceeding_4mib() {
+    let block_size = MAX_TURN_NEW_BLOCKS_BYTES / 4 + 4096;
+    let pad = "x".repeat(block_size);
+    let request = serde_json::json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": format!("0-{pad}")},
+            {"role": "assistant", "content": format!("1-{pad}")},
+            {"role": "user", "content": format!("2-{pad}")},
+            {"role": "assistant", "content": format!("3-{pad}")}
+        ]
+    });
+    let prepared = prepare_request_blocks(&request);
+
+    assert_eq!(prepared.dropped_blocks, 1);
+    assert_eq!(prepared.block_refs.len(), 3);
+    assert_eq!(prepared.blocks.len(), 3);
+    let message_refs = prepared.skeleton["messages"]
+        .as_array()
+        .expect("message refs");
+    assert_eq!(message_refs.len(), 4);
+    assert_eq!(message_refs[0]["$dropped"], true);
+    assert_eq!(message_refs[0]["reason"], "turn_budget_exceeded");
+    assert!(message_refs[1]["$blk"].is_string());
+    assert!(message_refs[2]["$blk"].is_string());
+    assert!(message_refs[3]["$blk"].is_string());
+    assert_eq!(
+        message_refs[3]["$blk"].as_str(),
+        prepared.block_refs.last().map(String::as_str),
+        "the newest prompt must be retained"
+    );
 }
