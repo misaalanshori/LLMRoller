@@ -428,6 +428,20 @@ pub async fn create_user(
     entropy: &dyn EntropySource,
     now_ms: i64,
 ) -> Result<User, UserError> {
+    let mut tx = pool.begin().await?;
+    let user = create_user_tx(&mut tx, actor, new_user, entropy, now_ms).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Create a standard user or administrator inside an active transaction.
+pub async fn create_user_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    new_user: NewUser<'_>,
+    entropy: &dyn EntropySource,
+    now_ms: i64,
+) -> Result<User, UserError> {
     ensure_admin(actor)?;
     let username = validate_username(new_user.username)?;
     let password_hash = hash_password(new_user.password, entropy)?;
@@ -439,15 +453,15 @@ pub async fn create_user(
          ) VALUES (?, ?, ?, ?, ?, 0, 1, 0, ?)",
     )
     .bind(id.to_string())
-    .bind(username)
+    .bind(&username)
     .bind(password_hash)
     .bind(new_user.role.as_str())
     .bind(i64::from(new_user.must_change_password))
     .bind(now_ms)
-    .execute(pool)
+    .execute(&mut **tx)
     .await;
     result.map_err(map_insert_error)?;
-    get_user_by_id(pool, id).await
+    get_user_by_id_tx(tx, id).await
 }
 
 /// List all accounts in creation order.
@@ -544,6 +558,24 @@ pub async fn get_user_by_id(pool: &SqlitePool, user_id: UserId) -> Result<User, 
     user_from_row(&row)
 }
 
+/// Load one account by ULID inside an active transaction.
+pub async fn get_user_by_id_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    user_id: UserId,
+) -> Result<User, UserError> {
+    let row = sqlx::query(
+        "SELECT id, username, role, must_change_password, totp_enabled,
+                can_use_global_providers, global_budget_micro_usd_month, disabled,
+                created_at, last_login_at
+         FROM users WHERE id = ?",
+    )
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(UserError::NotFound)?;
+    user_from_row(&row)
+}
+
 /// Load one account with self-or-admin authorization.
 ///
 /// # Errors
@@ -614,6 +646,25 @@ pub async fn find_login_record_by_id(
     login_record_from_row(&row)
 }
 
+/// Load login verifier material by account ID inside an active transaction.
+pub async fn find_login_record_by_id_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    user_id: UserId,
+) -> Result<UserLoginRecord, UserError> {
+    let row = sqlx::query(
+        "SELECT id, username, role, must_change_password, totp_enabled,
+                can_use_global_providers, global_budget_micro_usd_month, disabled,
+                created_at, last_login_at, password_hash, totp_secret_enc,
+                totp_master_key_id, totp_last_step, totp_recovery_hashes_json
+         FROM users WHERE id = ?",
+    )
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(UserError::NotFound)?;
+    login_record_from_row(&row)
+}
+
 fn login_record_from_row(row: &SqliteRow) -> Result<UserLoginRecord, UserError> {
     let recovery_json: Option<String> = row.try_get("totp_recovery_hashes_json")?;
     let recovery_hashes = recovery_json
@@ -644,14 +695,26 @@ pub async fn patch_user(
     actor: &ActorScope,
     user_id: UserId,
     patch: UserPatch,
+    now_ms: i64,
+) -> Result<User, UserError> {
+    let mut tx = pool.begin().await?;
+    let user = patch_user_tx(&mut tx, actor, user_id, patch, now_ms).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Apply administrator-controlled account changes inside an active transaction.
+pub async fn patch_user_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    user_id: UserId,
+    patch: UserPatch,
     _now_ms: i64,
 ) -> Result<User, UserError> {
     ensure_admin(actor)?;
-    let mut connection = pool.acquire().await?;
-    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
     let target = sqlx::query("SELECT role, disabled FROM users WHERE id = ?")
         .bind(user_id.to_string())
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(UserError::NotFound)?;
     let current_role: String = target.try_get("role")?;
@@ -662,7 +725,7 @@ pub async fn patch_user(
         && !current_disabled
         && (new_role != Role::Admin || new_disabled)
     {
-        ensure_another_enabled_admin(&mut transaction, user_id).await?;
+        ensure_another_enabled_admin(tx, user_id).await?;
     }
 
     let role_changed = patch.role.is_some();
@@ -687,18 +750,16 @@ pub async fn patch_user(
     .bind(i64::from(budget_changed))
     .bind(budget)
     .bind(user_id.to_string())
-    .execute(&mut *transaction)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);
     }
-    transaction.commit().await?;
-    drop(connection);
-    get_user_by_id(pool, user_id).await
+    get_user_by_id_tx(tx, user_id).await
 }
 
 async fn ensure_another_enabled_admin(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     excluded: UserId,
 ) -> Result<(), UserError> {
     let count: i64 = sqlx::query_scalar(
@@ -706,7 +767,7 @@ async fn ensure_another_enabled_admin(
          WHERE role = 'admin' AND disabled = 0 AND id != ?",
     )
     .bind(excluded.to_string())
-    .fetch_one(&mut **transaction)
+    .fetch_one(&mut **tx)
     .await?;
     if count == 0 {
         Err(UserError::LastAdmin)
@@ -780,12 +841,24 @@ pub async fn delete_user(
     confirmation: &str,
     now_ms: i64,
 ) -> Result<(), UserError> {
+    let mut tx = pool.begin().await?;
+    delete_user_tx(&mut tx, actor, user_id, confirmation, now_ms).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Delete an account inside an active transaction.
+pub async fn delete_user_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    user_id: UserId,
+    confirmation: &str,
+    now_ms: i64,
+) -> Result<(), UserError> {
     ensure_admin(actor)?;
-    let mut connection = pool.acquire().await?;
-    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
     let target = sqlx::query("SELECT username, role, disabled FROM users WHERE id = ?")
         .bind(user_id.to_string())
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(UserError::NotFound)?;
     let username: String = target.try_get("username")?;
@@ -795,7 +868,7 @@ pub async fn delete_user(
         return Err(UserError::ConfirmationMismatch);
     }
     if role == Role::Admin.as_str() && !disabled {
-        ensure_another_enabled_admin(&mut transaction, user_id).await?;
+        ensure_another_enabled_admin(tx, user_id).await?;
     }
 
     sqlx::query(
@@ -805,7 +878,7 @@ pub async fn delete_user(
     .bind(now_ms)
     .bind(user_id.to_string())
     .bind(user_id.to_string())
-    .execute(&mut *transaction)
+    .execute(&mut **tx)
     .await?;
     for statement in [
         "DELETE FROM pins WHERE client_key_id IN
@@ -821,16 +894,15 @@ pub async fn delete_user(
     ] {
         sqlx::query(statement)
             .bind(user_id.to_string())
-            .execute(&mut *transaction)
+            .execute(&mut **tx)
             .await?;
     }
     sqlx::query("INSERT INTO deleted_users (user_id, username, deleted_at) VALUES (?, ?, ?)")
         .bind(user_id.to_string())
         .bind(&username)
         .bind(now_ms)
-        .execute(&mut *transaction)
+        .execute(&mut **tx)
         .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -848,16 +920,39 @@ pub async fn set_password(
     entropy: &dyn EntropySource,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
+    let mut tx = pool.begin().await?;
+    let user = set_password_tx(
+        &mut tx,
+        actor,
+        user_id,
+        new_password,
+        must_change_password,
+        entropy,
+        keep_session,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Set a password directly and revoke sessions inside an active transaction.
+pub async fn set_password_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    user_id: UserId,
+    new_password: &str,
+    must_change_password: bool,
+    entropy: &dyn EntropySource,
+    keep_session: Option<&str>,
+) -> Result<User, UserError> {
     ensure_self_or_admin(actor, user_id)?;
     let password_hash = hash_password(new_password, entropy)?;
-    let mut connection = pool.acquire().await?;
-    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
     let result =
         sqlx::query("UPDATE users SET password_hash = ?, must_change_password = ? WHERE id = ?")
             .bind(password_hash)
             .bind(i64::from(must_change_password))
             .bind(user_id.to_string())
-            .execute(&mut *transaction)
+            .execute(&mut **tx)
             .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);
@@ -866,17 +961,15 @@ pub async fn set_password(
         sqlx::query("DELETE FROM web_sessions WHERE user_id = ? AND id_hash != ?")
             .bind(user_id.to_string())
             .bind(keep)
-            .execute(&mut *transaction)
+            .execute(&mut **tx)
             .await?;
     } else {
         sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
             .bind(user_id.to_string())
-            .execute(&mut *transaction)
+            .execute(&mut **tx)
             .await?;
     }
-    transaction.commit().await?;
-    drop(connection);
-    get_user_by_id(pool, user_id).await
+    get_user_by_id_tx(tx, user_id).await
 }
 
 /// Change one's own password after verifying the current password.
@@ -893,13 +986,36 @@ pub async fn change_password(
     entropy: &dyn EntropySource,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
+    let mut tx = pool.begin().await?;
+    let user = change_password_tx(
+        &mut tx,
+        actor,
+        current_password,
+        new_password,
+        entropy,
+        keep_session,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Change one's own password inside an active transaction.
+pub async fn change_password_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    current_password: &str,
+    new_password: &str,
+    entropy: &dyn EntropySource,
+    keep_session: Option<&str>,
+) -> Result<User, UserError> {
     let user_id = actor_user(actor)?;
-    let record = find_login_record_by_id(pool, user_id).await?;
+    let record = find_login_record_by_id_tx(tx, user_id).await?;
     if !verify_password(current_password, &record.password_hash) {
         return Err(UserError::InvalidCredentials);
     }
-    set_password(
-        pool,
+    set_password_tx(
+        tx,
         actor,
         user_id,
         new_password,
@@ -1084,11 +1200,30 @@ pub async fn delete_owned_web_session(
     actor: &ActorScope,
     id_hash: &str,
 ) -> Result<(), UserError> {
-    let session = load_web_session(pool, id_hash)
+    let mut tx = pool.begin().await?;
+    delete_owned_web_session_tx(&mut tx, actor, id_hash).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Delete one owned session inside an active transaction.
+pub async fn delete_owned_web_session_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    id_hash: &str,
+) -> Result<(), UserError> {
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM web_sessions WHERE id_hash = ?")
+        .bind(id_hash)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(UserError::NotFound)?;
-    ensure_self_or_admin(actor, session.session.user_id)?;
-    delete_web_session(pool, id_hash).await
+    let user_id = UserId::from_str(&user_id).map_err(|_| UserError::Corrupt)?;
+    ensure_self_or_admin(actor, user_id)?;
+    sqlx::query("DELETE FROM web_sessions WHERE id_hash = ?")
+        .bind(id_hash)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn build_totp(secret: &[u8]) -> Result<Totp, UserError> {
@@ -1127,8 +1262,22 @@ pub async fn enroll_totp(
     key_id: &str,
     entropy: &dyn EntropySource,
 ) -> Result<TotpEnrollment, UserError> {
+    let mut tx = pool.begin().await?;
+    let enrollment = enroll_totp_tx(&mut tx, actor, sealer, key_id, entropy).await?;
+    tx.commit().await?;
+    Ok(enrollment)
+}
+
+/// Enroll a TOTP secret inside an active transaction.
+pub async fn enroll_totp_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    sealer: &XChaCha20Poly1305Sealer,
+    key_id: &str,
+    entropy: &dyn EntropySource,
+) -> Result<TotpEnrollment, UserError> {
     let user_id = actor_user(actor)?;
-    let record = find_login_record_by_id(pool, user_id).await?;
+    let record = find_login_record_by_id_tx(tx, user_id).await?;
     if record.user.totp_enabled {
         return Err(UserError::TotpAlreadyEnabled);
     }
@@ -1169,7 +1318,7 @@ pub async fn enroll_totp(
     .bind(key_id)
     .bind(hashes_json)
     .bind(user_id.to_string())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);
@@ -1202,8 +1351,23 @@ pub async fn confirm_totp(
     key_id: &str,
     now_ms: i64,
 ) -> Result<(), UserError> {
+    let mut tx = pool.begin().await?;
+    confirm_totp_tx(&mut tx, actor, code, sealer, key_id, now_ms).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Confirm TOTP enrollment inside an active transaction.
+pub async fn confirm_totp_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    code: &str,
+    sealer: &XChaCha20Poly1305Sealer,
+    key_id: &str,
+    now_ms: i64,
+) -> Result<(), UserError> {
     let user_id = actor_user(actor)?;
-    let record = find_login_record_by_id(pool, user_id).await?;
+    let record = find_login_record_by_id_tx(tx, user_id).await?;
     if record.user.totp_enabled {
         return Err(UserError::TotpAlreadyEnabled);
     }
@@ -1234,7 +1398,7 @@ pub async fn confirm_totp(
     .bind(step_i64)
     .bind(user_id.to_string())
     .bind(step_i64)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::TotpReplay);
@@ -1335,6 +1499,18 @@ pub async fn clear_totp(
     actor: &ActorScope,
     user_id: UserId,
 ) -> Result<(), UserError> {
+    let mut tx = pool.begin().await?;
+    clear_totp_tx(&mut tx, actor, user_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Clear TOTP material inside an active transaction.
+pub async fn clear_totp_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    user_id: UserId,
+) -> Result<(), UserError> {
     ensure_self_or_admin(actor, user_id)?;
     let result = sqlx::query(
         "UPDATE users SET totp_secret_enc = NULL, totp_master_key_id = NULL,
@@ -1342,7 +1518,7 @@ pub async fn clear_totp(
          WHERE id = ?",
     )
     .bind(user_id.to_string())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);

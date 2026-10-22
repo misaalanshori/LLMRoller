@@ -13,7 +13,10 @@ use llmroller_core::seams::{Clock as _, ExposeSecret as _, OsEntropy, SystemCloc
 use llmroller_core::snapshot::{ConfigSnapshot, SnapshotBudgetWindow, UpstreamKeyRecord};
 use llmroller_proto::usage_poller::{SanitizedUsageSnapshot, parse_raw_usage_to_sanitized};
 use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
-use llmroller_store::usage_snapshots::{NewUsageSnapshot, insert_usage_snapshot_tx};
+use llmroller_store::usage_snapshots::{
+    NewUsageSnapshot, insert_usage_snapshot_tx, seal_usage_snapshot,
+};
+use llmroller_store::writer::{DurableKey, DurableOp};
 use serde::Deserialize;
 use sqlx::Row as _;
 use std::collections::HashMap;
@@ -464,31 +467,36 @@ async fn fresh_poll_usage(
     let windows_json = serde_json::to_string(&parsed.windows)
         .map_err(|error| format!("cannot serialize usage windows: {error}"))?;
 
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|error| format!("cannot begin usage snapshot transaction: {error}"))?;
-    insert_usage_snapshot_tx(
-        &mut tx,
-        &sealer,
-        NewUsageSnapshot {
-            key_id: &key.id,
-            now_ms,
-            http_status,
-            plan_name: parsed.plan_name.as_deref(),
-            windows_json: &windows_json,
-            balance_micro_usd: parsed.balance_micro_usd,
-            master_key_id: &key.master_key_id,
-            sanitized_json: &sanitized_json,
-            raw_json_bytes: &raw_bytes,
-        },
-    )
-    .await
-    .map_err(|error| format!("cannot store usage snapshot: {error}"))?;
-    tx.commit()
-        .await
-        .map_err(|error| format!("cannot commit usage snapshot: {error}"))?;
+    let new_snapshot = NewUsageSnapshot {
+        key_id: &key.id,
+        now_ms,
+        http_status,
+        plan_name: parsed.plan_name.as_deref(),
+        windows_json: &windows_json,
+        balance_micro_usd: parsed.balance_micro_usd,
+        master_key_id: &key.master_key_id,
+        sanitized_json: &sanitized_json,
+        raw_json_bytes: &raw_bytes,
+    };
+    if let Some(writer) = &state.writer {
+        let sealed = seal_usage_snapshot(&sealer, &new_snapshot);
+        writer.queues.durable_state.lock().insert(
+            DurableKey::UsageSnapshot(sealed.id.clone()),
+            DurableOp::UsageSnapshotInsert(sealed),
+        );
+    } else {
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("cannot begin usage snapshot transaction: {error}"))?;
+        insert_usage_snapshot_tx(&mut tx, &sealer, new_snapshot)
+            .await
+            .map_err(|error| format!("cannot store usage snapshot: {error}"))?;
+        tx.commit()
+            .await
+            .map_err(|error| format!("cannot commit usage snapshot: {error}"))?;
+    }
 
     let observations: Vec<llmroller_core::runtime_state::UpstreamWindowObservation> = parsed
         .windows

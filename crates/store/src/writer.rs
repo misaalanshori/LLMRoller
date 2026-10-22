@@ -18,6 +18,8 @@ use sqlx::{Connection as _, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::traces::SealedTurnResult;
+use crate::usage_snapshots::SealedUsageSnapshot;
 use crate::usage_writer::ThreeQueueUsageWriter;
 
 /// Maximum number of raw items retained in the bounded queue before evicting oldest per `REL-3`.
@@ -87,6 +89,7 @@ pub enum DurableKey {
     RouteHealth(String, String),
     RouteProtocolBlock(String, String, String),
     RouteProtocolClear(String),
+    UsageSnapshot(String),
 }
 
 /// Durable operation executed in SQLite with per-item SAVEPOINT.
@@ -104,6 +107,14 @@ pub enum DurableOp {
         repin_count: i64,
     },
     ResponseLinkUpsert(crate::pins::ResponseLinkRow),
+    ResponseLinkDelete {
+        response_id: String,
+    },
+    ResponseLinkMarkIncomplete {
+        response_id: String,
+        updated_at: i64,
+    },
+    UsageSnapshotInsert(SealedUsageSnapshot),
     HealthVersionUpdate {
         upstream_key_id: String,
         health: String,
@@ -139,6 +150,9 @@ pub struct DataQueues {
     pub rollups: Mutex<HashMap<String, i64>>,
     pub raw_events: Mutex<VecDeque<String>>,
     pub raw_bytes: Mutex<usize>,
+    /// Sealed traces waiting for the writer to persist them after their
+    /// referenced `usage_events` row in the same batch (F09).
+    pub sealed_traces: Mutex<VecDeque<SealedTurnResult>>,
 }
 
 impl Default for DataQueues {
@@ -149,6 +163,7 @@ impl Default for DataQueues {
             rollups: Mutex::new(HashMap::new()),
             raw_events: Mutex::new(VecDeque::new()),
             raw_bytes: Mutex::new(0),
+            sealed_traces: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -174,6 +189,17 @@ impl DataQueues {
         }
         *bytes += item_len;
         raw.push_back(item);
+    }
+
+    /// Enqueue a sealed trace produced by the sealer pool. The writer persists
+    /// it after `usage_events` in the same transaction so the foreign key is
+    /// always satisfied (F09).
+    pub fn push_sealed_trace(&self, trace: SealedTurnResult) {
+        let mut traces = self.sealed_traces.lock();
+        while traces.len() >= RAW_EVENTS_MAX_ITEMS {
+            traces.pop_front();
+        }
+        traces.push_back(trace);
     }
 }
 
@@ -298,20 +324,30 @@ async fn execute_single_control_task(
     op.call(&mut transaction).await?;
 
     // Bump instance_meta.config_version in the exact same transaction per SRDD Section 5.4 / 21.6.2
+    let new_version = bump_config_version_tx(&mut transaction).await?;
+
+    transaction.commit().await?;
+    Ok(new_version)
+}
+
+/// Increment `instance_meta.config_version` inside an existing write transaction.
+///
+/// Control-plane mutations use this together with their entity write and
+/// `audit_log` append so all three become visible atomically (AUD-1, F09).
+pub async fn bump_config_version_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<i64, sqlx::Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
 
-    let new_version: i64 = sqlx::query_scalar(
+    sqlx::query_scalar(
         "UPDATE instance_meta SET config_version = config_version + 1, updated_at = ?
          RETURNING config_version",
     )
     .bind(now)
-    .fetch_one(&mut *transaction)
-    .await?;
-
-    transaction.commit().await?;
-    Ok(new_version)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
@@ -320,8 +356,9 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         || !queues.usage_writer.rollups_hourly.lock().is_empty()
         || !queues.usage_writer.raw_events.lock().is_empty();
     let has_raw = !queues.raw_events.lock().is_empty();
+    let has_traces = !queues.sealed_traces.lock().is_empty();
 
-    if !has_durable && !has_usage && !has_raw {
+    if !has_durable && !has_usage && !has_raw && !has_traces {
         return;
     }
 
@@ -383,6 +420,29 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .map(|_| ()),
             DurableOp::ResponseLinkUpsert(link) => {
                 crate::pins::insert_response_link_tx(&mut transaction, &link).await
+            }
+            DurableOp::ResponseLinkDelete { response_id } => {
+                sqlx::query("DELETE FROM response_links WHERE response_id = ?")
+                    .bind(response_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map(|_| ())
+            }
+            DurableOp::ResponseLinkMarkIncomplete {
+                response_id,
+                updated_at,
+            } => sqlx::query(
+                "UPDATE response_links SET status = 'incomplete', updated_at = ? WHERE response_id = ?",
+            )
+            .bind(updated_at)
+            .bind(response_id)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
+            DurableOp::UsageSnapshotInsert(snapshot) => {
+                crate::usage_snapshots::insert_sealed_usage_snapshot_tx(&mut transaction, &snapshot)
+                    .await
+                    .map(|_| ())
             }
             DurableOp::HealthVersionUpdate {
                 upstream_key_id,
@@ -471,6 +531,46 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
 
     // 2. Flush usage rollups, usage_events, and usage_attempts
     let _ = queues.usage_writer.flush_to_db(&mut transaction).await;
+
+    // 2b. Persist sealed traces immediately after their `usage_events` rows so
+    // the foreign key is satisfied without a retry loop (F09). A trace whose
+    // event was dropped by the bounded queue is discarded in its own savepoint.
+    let trace_items: Vec<SealedTurnResult> = {
+        let mut lock = queues.sealed_traces.lock();
+        std::mem::take(&mut *lock).into_iter().collect()
+    };
+    for (idx, trace) in trace_items.into_iter().enumerate() {
+        let sp_name = format!("trace_{idx}");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+            .execute(&mut *transaction)
+            .await;
+        let master_key_id = trace.master_key_id.clone();
+        let result = crate::traces::insert_sealed_trace_tx(
+            &mut transaction,
+            &trace,
+            &master_key_id,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                    .execute(&mut *transaction)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    usage_event_id = %trace.usage_event_id,
+                    %error,
+                    "dropping trace whose usage event is unavailable"
+                );
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ROLLBACK TO SAVEPOINT {sp_name}"
+                )))
+                .execute(&mut *transaction)
+                .await;
+            }
+        }
+    }
 
     // 3. Drain raw_events items up to batch limits
     {

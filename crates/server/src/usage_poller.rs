@@ -15,16 +15,16 @@ use llmroller_core::seams::{Clock as _, ExposeSecret as _};
 use llmroller_core::snapshot::{ConfigSnapshot, UpstreamKeyRecord};
 use llmroller_proto::usage_poller::{KeyPollerState, UsagePoller, parse_raw_usage_to_sanitized};
 use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sealer};
-use llmroller_store::usage_snapshots::{NewUsageSnapshot, insert_usage_snapshot_tx};
-use sqlx::SqlitePool;
+use llmroller_store::usage_snapshots::{NewUsageSnapshot, seal_usage_snapshot};
+use llmroller_store::writer::{DurableKey, DurableOp, WriterHandle};
 
 const TICK: Duration = Duration::from_secs(15);
 
 /// Startup dependencies for the usage poller supervisor.
 pub struct UsagePollerDeps {
-    pub pool: SqlitePool,
     pub snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     pub runtime_state: Arc<RuntimeState>,
+    pub writer: WriterHandle,
     pub master_key: MasterKey,
     pub master_key_id: String,
     pub instance_id: [u8; 16],
@@ -34,7 +34,6 @@ impl std::fmt::Debug for UsagePollerDeps {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("UsagePollerDeps")
-            .field("pool", &self.pool)
             .field("snapshot", &self.snapshot)
             .field("runtime_state", &self.runtime_state)
             .field("master_key", &"<redacted>")
@@ -78,7 +77,7 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                     .get(&key.id)
                     .cloned()
                     .unwrap_or_default();
-                let pool = deps.pool.clone();
+                let writer = deps.writer.clone();
                 let runtime_state = deps.runtime_state.clone();
                 let sealer = XChaCha20Poly1305Sealer::new(
                     deps.master_key.clone(),
@@ -90,7 +89,7 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = poll_key(
-                        &pool,
+                        &writer,
                         &runtime_state,
                         &sealer,
                         &master_key_id,
@@ -126,7 +125,7 @@ fn usage_endpoint(config_json: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn poll_key(
-    pool: &SqlitePool,
+    writer: &WriterHandle,
     runtime_state: &RuntimeState,
     sealer: &XChaCha20Poly1305Sealer,
     master_key_id: &str,
@@ -184,11 +183,9 @@ async fn poll_key(
     let sanitized_json = serde_json::to_string(&parsed).map_err(|error| error.to_string())?;
     let windows_json = serde_json::to_string(&parsed.windows).map_err(|error| error.to_string())?;
 
-    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-    insert_usage_snapshot_tx(
-        &mut tx,
+    let sealed = seal_usage_snapshot(
         sealer,
-        NewUsageSnapshot {
+        &NewUsageSnapshot {
             key_id: &key.id,
             now_ms,
             http_status,
@@ -199,10 +196,11 @@ async fn poll_key(
             sanitized_json: &sanitized_json,
             raw_json_bytes: &raw_bytes,
         },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    tx.commit().await.map_err(|error| error.to_string())?;
+    );
+    writer.queues.durable_state.lock().insert(
+        DurableKey::UsageSnapshot(sealed.id.clone()),
+        DurableOp::UsageSnapshotInsert(sealed),
+    );
 
     let observations: Vec<llmroller_core::runtime_state::UpstreamWindowObservation> = parsed
         .windows

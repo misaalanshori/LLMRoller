@@ -810,7 +810,14 @@ async fn forward_state_bound_response_op(
 
     if status.is_success() {
         if method == Method::DELETE && subpath.is_empty() {
-            if sqlx::query("DELETE FROM response_links WHERE response_id = ?")
+            if let Some(writer) = &state.writer {
+                writer.queues.durable_state.lock().insert(
+                    DurableKey::ResponseLink(response_id.to_string()),
+                    DurableOp::ResponseLinkDelete {
+                        response_id: response_id.to_string(),
+                    },
+                );
+            } else if sqlx::query("DELETE FROM response_links WHERE response_id = ?")
                 .bind(response_id)
                 .execute(&state.pool)
                 .await
@@ -818,14 +825,25 @@ async fn forward_state_bound_response_op(
             {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-        } else if subpath == "/cancel"
-            && sqlx::query("UPDATE response_links SET status = 'incomplete' WHERE response_id = ?")
-                .bind(response_id)
-                .execute(&state.pool)
-                .await
-                .is_err()
-        {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        } else if subpath == "/cancel" {
+            if let Some(writer) = &state.writer {
+                writer.queues.durable_state.lock().insert(
+                    DurableKey::ResponseLink(response_id.to_string()),
+                    DurableOp::ResponseLinkMarkIncomplete {
+                        response_id: response_id.to_string(),
+                        updated_at: now_ms(),
+                    },
+                );
+            } else if sqlx::query(
+                "UPDATE response_links SET status = 'incomplete' WHERE response_id = ?",
+            )
+            .bind(response_id)
+            .execute(&state.pool)
+            .await
+            .is_err()
+            {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
     }
 

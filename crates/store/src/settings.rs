@@ -337,6 +337,19 @@ pub async fn update_setting(
     value_json: &str,
     now_ms: i64,
 ) -> Result<String, SettingsError> {
+    let mut tx = pool.begin().await?;
+    let validated = update_setting_tx(&mut tx, key, value_json, now_ms).await?;
+    tx.commit().await?;
+    Ok(validated)
+}
+
+/// Update a single setting inside an active transaction.
+pub async fn update_setting_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &str,
+    value_json: &str,
+    now_ms: i64,
+) -> Result<String, SettingsError> {
     let validated = validate_setting(key, value_json)?;
     sqlx::query(
         "INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)
@@ -345,7 +358,7 @@ pub async fn update_setting(
     .bind(key)
     .bind(&validated)
     .bind(now_ms)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(validated)
 }

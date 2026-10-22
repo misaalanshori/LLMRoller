@@ -499,53 +499,24 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             },
         );
     api_state.discovery_tx = Some(discovery_tx);
-    let trace_pool = pool.clone();
-    let trace_master_key_id = master_key_id.clone();
-    let runtime_handle = tokio::runtime::Handle::current();
+    // Sealing happens on the dedicated OS pool. This bridge only moves the
+    // sealed payload into the single writer's queue; it never opens SQLite
+    // (F09, PERF-1).
+    let trace_writer = writer_handle.clone();
     std::thread::Builder::new()
-        .name("llmroller-trace-writer".to_string())
+        .name("llmroller-trace-enqueue".to_string())
         .spawn(move || {
             while let Ok(sealed) = sealed_trace_rx.recv() {
-                let pool = trace_pool.clone();
-                let key_id = trace_master_key_id.clone();
-                runtime_handle.block_on(async move {
-                    // The usage writer may not have committed the referenced event yet; retry
-                    // the FK-bound insert briefly instead of dropping the trace permanently.
-                    for attempt in 0..100_u32 {
-                        let result = async {
-                            let mut tx = pool.begin().await?;
-                            llmroller_store::traces::insert_sealed_trace_tx(
-                                &mut tx, &sealed, &key_id,
-                            )
-                            .await?;
-                            tx.commit().await
-                        }
-                        .await;
-                        match result {
-                            Ok(()) => return,
-                            Err(error) if attempt < 99 => {
-                                let _ = error;
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    usage_event_id = %sealed.usage_event_id,
-                                    "trace persist failed after retries: {error}"
-                                );
-                                return;
-                            }
-                        }
-                    }
-                });
+                trace_writer.queues.push_sealed_trace(sealed);
             }
         })
-        .expect("spawn trace writer thread");
+        .expect("spawn trace enqueue thread");
 
     let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller(
         llmroller_server::usage_poller::UsagePollerDeps {
-            pool: pool.clone(),
             snapshot: shared_snapshot.clone(),
             runtime_state: runtime_state.clone(),
+            writer: writer_handle.clone(),
             master_key: master_key.clone(),
             master_key_id: master_key_id.clone(),
             instance_id: instance_state.instance_id,

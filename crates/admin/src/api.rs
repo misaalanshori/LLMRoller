@@ -35,8 +35,219 @@ use llmroller_store::settings::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex};
+use sqlx::{Connection as _, Sqlite, Transaction};
 
 use crate::auth::{AuthAppState, AuthError, authenticate_session};
+
+type MutationResponseError = (StatusCode, Json<serde_json::Value>);
+type MutationFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, MutationResponseError>> + Send + 'a>>;
+
+tokio::task_local! {
+    /// Audit metadata for the mutation currently executing inside the control
+    /// plane. Set by `control_mutation_barrier` before dispatch (F09).
+    static CURRENT_MUTATION_AUDIT: Option<MutationAuditContext>;
+}
+
+#[derive(Debug, Clone)]
+struct MutationAuditContext {
+    ts: i64,
+    actor_user_id: Option<String>,
+    ip_addr: Option<String>,
+    action: String,
+    target_type: String,
+    target_id: Option<String>,
+    detail_json: String,
+}
+
+/// Run one control-plane mutation, its `audit_log` row, and the
+/// `config_version` bump in a single `BEGIN IMMEDIATE` transaction on the
+/// writer actor (F09, AUD-1, REL-4).
+///
+/// Entity SQL is deliberately supplied as a transaction closure so network
+/// operations and validation can stay outside the write lock.
+async fn execute_atomic_mutation<T, F>(
+    state: &ApiAppState,
+    domains: Vec<ConfigDomain>,
+    run: F,
+) -> Result<T, MutationResponseError>
+where
+    T: Send + 'static,
+    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, T>
+        + Send
+        + 'static,
+{
+    use llmroller_core::seams::ExposeSecret as _;
+
+    let audit = CURRENT_MUTATION_AUDIT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let fallback = llmroller_store::crypto::sha256_hex(state.master_key.as_bytes());
+    let audit_key: Vec<u8> = state
+        .audit_hmac_key
+        .as_ref()
+        .map_or_else(|| fallback.into_bytes(), |secret| secret.expose_secret().to_vec());
+    let slot = Arc::new(StdMutex::new(
+        None::<Result<T, MutationResponseError>>,
+    ));
+    let slot_for_op = slot.clone();
+
+    let op = move |tx: &mut Transaction<'_, Sqlite>| -> MutationFuture<'_, ()> {
+        Box::pin(async move {
+            match run(tx).await {
+                Ok(value) => {
+                    if let Some(audit) = audit {
+                        scan_mutation_audit(tx, &audit_key, &audit)
+                            .await
+                            .map_err(|_| writer_busy_error())?;
+                    }
+                    *slot_for_op.lock().expect("mutation result lock") = Some(Ok(value));
+                    Ok(())
+                }
+                Err(error) => {
+                    *slot_for_op.lock().expect("mutation result lock") = Some(Err(error));
+                    Err(llmroller_store::writer::WriterError::Execution(
+                        "control mutation aborted".to_string(),
+                    ))
+                }
+            }
+        })
+    };
+
+    if let Some(writer) = &state.writer {
+        let result = writer
+            .execute_control(
+                domains,
+                Vec::new(),
+                AdminControlOp { run: Some(op) },
+            )
+            .await;
+        if let Ok(version) = result {
+            await_published_version(state, version).await;
+        } else {
+            tracing::error!("control-plane mutation failed: {result:?}");
+        }
+    } else {
+        let mut connection = state
+            .auth
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| writer_busy_error())?;
+        let mut tx = connection
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| writer_busy_error())?;
+        op(&mut tx).await.map_err(|_| writer_busy_error())?;
+        llmroller_store::writer::bump_config_version_tx(&mut tx)
+            .await
+            .map_err(|_| writer_busy_error())?;
+        tx.commit().await.map_err(|_| writer_busy_error())?;
+    }
+
+    let result = slot
+        .lock()
+        .expect("mutation result lock")
+        .take()
+        .ok_or_else(writer_busy_error)?;
+    result
+}
+
+/// Record a control-plane action that has no entity SQL of its own (for
+/// example a discovery refresh request) while still auditing it atomically.
+async fn record_control_mutation(
+    state: &ApiAppState,
+    domains: Vec<ConfigDomain>,
+) -> Result<(), MutationResponseError> {
+    execute_atomic_mutation(state, domains, |_tx| Box::pin(async { Ok(()) })).await
+}
+
+fn writer_busy_error() -> MutationResponseError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "code": "writer_busy",
+                "message": "the configuration writer did not commit the mutation"
+            }
+        })),
+    )
+}
+
+struct AdminControlOp<F> {
+    run: Option<F>,
+}
+
+impl<F> llmroller_store::writer::ControlOp for AdminControlOp<F>
+where
+    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, ()>
+        + Send
+        + 'static,
+{
+    fn call<'a>(
+        self: Box<Self>,
+        tx: &'a mut Transaction<'_, Sqlite>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<(), llmroller_store::writer::WriterError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let run = self.run.expect("control mutation executed twice");
+            run(tx).await
+        })
+    }
+}
+
+async fn scan_mutation_audit(tx: &mut Transaction<'_, Sqlite>, key: &[u8], audit: &MutationAuditContext) -> Result<(), sqlx::Error> {
+    let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+    llmroller_store::audit::append(
+        tx,
+        key,
+        llmroller_store::audit::AuditEntry {
+            id: &audit_id,
+            ts: audit.ts,
+            actor_user_id: audit.actor_user_id.as_deref(),
+            ip_addr: audit.ip_addr.as_deref(),
+            action: &audit.action,
+            target_type: &audit.target_type,
+            target_id: audit.target_id.as_deref(),
+            detail_json: Some(&audit.detail_json),
+        },
+    )
+    .await
+    .map_err(|_| sqlx::Error::Protocol("audit append failed".to_string()))
+}
+
+async fn await_published_version(state: &ApiAppState, version: i64) {
+    let Some(rx) = &state.published_version else {
+        return;
+    };
+    let mut rx = rx.clone();
+    if *rx.borrow_and_update() >= version {
+        return;
+    }
+    let wait = async {
+        while rx.changed().await.is_ok() {
+            if *rx.borrow_and_update() >= version {
+                return;
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_millis(2_000), wait)
+        .await
+        .is_err()
+    {
+        tracing::warn!("reloader did not publish version {version} within 2s");
+    }
+}
 
 /// Shared state for the control-plane JSON API.
 #[derive(Clone, Debug)]
@@ -101,57 +312,6 @@ impl ApiAppState {
         }
     }
 
-    /// Commit barrier: bump `config_version` through the writer and await publication.
-    async fn publish_control_change(&self, domains: Vec<ConfigDomain>) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
-        let result = writer
-            .execute_control(domains, Vec::new(), NoopControlOp)
-            .await;
-        let Ok(version) = result else {
-            tracing::error!("control-plane version bump failed: {result:?}");
-            return;
-        };
-        let Some(rx) = &self.published_version else {
-            return;
-        };
-        let mut rx = rx.clone();
-        if *rx.borrow_and_update() >= version {
-            return;
-        }
-        let wait = async {
-            while rx.changed().await.is_ok() {
-                if *rx.borrow_and_update() >= version {
-                    return;
-                }
-            }
-        };
-        if tokio::time::timeout(std::time::Duration::from_millis(2_000), wait)
-            .await
-            .is_err()
-        {
-            tracing::warn!("reloader did not publish version {version} within 2s");
-        }
-    }
-}
-
-/// A no-op writer job used solely to serialize a config-version bump.
-struct NoopControlOp;
-
-impl llmroller_store::writer::ControlOp for NoopControlOp {
-    fn call<'a>(
-        self: Box<Self>,
-        _tx: &'a mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), llmroller_store::writer::WriterError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(()) })
-    }
 }
 
 fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
