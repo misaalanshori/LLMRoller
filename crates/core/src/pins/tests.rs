@@ -412,3 +412,90 @@ fn test_repin_on_personal_recovery_timing() {
     assert_eq!(t_301.outcome, PinOutcome::RepinRecovery);
     assert_eq!(t_301.upstream_key_id, k_recovered_own);
 }
+
+#[doc = "Spec: SECTION-10.4, SEC-17 — F11 manual pin deletion evicts only the addressed pin"]
+#[test]
+fn test_remove_exact_pin_keeps_other_sessions() {
+    let store = PinStore::new(10_000);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let client_key_id = ClientKeyId::generate();
+    let upstream_key_id = UpstreamKeyId::generate();
+
+    let target = PinKey {
+        client_key_id,
+        canonical_id: "model-a".to_string(),
+        session_hash: "session-a".to_string(),
+    };
+    let sibling = PinKey {
+        client_key_id,
+        canonical_id: "model-b".to_string(),
+        session_hash: "session-a".to_string(),
+    };
+    for key in [&target, &sibling] {
+        store
+            .acquire(
+                key,
+                &clock,
+                86_400_000,
+                false,
+                300,
+                RoutingScope::PersonalFirst,
+                Some(CandidatePoolTier::Own),
+                |_| true,
+                |_| Some((upstream_key_id, CandidatePoolTier::Own)),
+            )
+            .expect("ticket");
+    }
+
+    assert!(store.remove(&target));
+    assert_eq!(store.len(), 1);
+    assert!(
+        !store.remove(&target),
+        "deleting an absent pin is idempotent"
+    );
+    assert!(store.entries.contains_key(&sibling));
+}
+
+#[doc = "Spec: SECTION-10.4, SEC-17 — F11 admin session deletion evicts every pin for the hash"]
+#[test]
+fn test_remove_by_session_hash_keeps_other_sessions() {
+    let store = PinStore::new(10_000);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let upstream_key_id = UpstreamKeyId::generate();
+
+    let target_a = PinKey {
+        client_key_id: ClientKeyId::generate(),
+        canonical_id: "model-a".to_string(),
+        session_hash: "session-target".to_string(),
+    };
+    let target_b = PinKey {
+        client_key_id: ClientKeyId::generate(),
+        canonical_id: "model-b".to_string(),
+        session_hash: "session-target".to_string(),
+    };
+    let other = PinKey {
+        client_key_id: ClientKeyId::generate(),
+        canonical_id: "model-a".to_string(),
+        session_hash: "session-other".to_string(),
+    };
+    for key in [&target_a, &target_b, &other] {
+        store
+            .acquire(
+                key,
+                &clock,
+                86_400_000,
+                false,
+                300,
+                RoutingScope::PersonalFirst,
+                Some(CandidatePoolTier::Own),
+                |_| true,
+                |_| Some((upstream_key_id, CandidatePoolTier::Own)),
+            )
+            .expect("ticket");
+    }
+
+    assert_eq!(store.remove_by_session_hash("session-target"), 2);
+    assert_eq!(store.len(), 1);
+    assert!(store.entries.contains_key(&other));
+    assert_eq!(store.remove_by_session_hash("session-target"), 0);
+}

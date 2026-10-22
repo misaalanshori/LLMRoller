@@ -94,6 +94,21 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     assert!(admin_html.contains("Admin Console"));
     assert!(admin_html.contains("Projected Disk Usage"));
     assert!(admin_html.contains("uplot-container"));
+    assert!(admin_html.contains("id=\"uplot-summary\""));
+    assert!(admin_html.contains("id=\"adm-settings-grid\""));
+    assert!(admin_html.contains("id=\"adm-aliases-body\""));
+
+    // 2b. UI-1, UI-2: Admin tabs are populated from the control-plane APIs and uPlot is initialized.
+    let app_js = include_str!("../../../crates/admin/static/app.js");
+    assert!(app_js.contains("loadAdminSettings"));
+    assert!(app_js.contains("loadAdminAliases"));
+    assert!(app_js.contains("loadUsageChart"));
+    assert!(app_js.contains("/admin/api/settings"));
+    assert!(app_js.contains("/admin/api/models"));
+    assert!(app_js.contains("/admin/api/usage/summary"));
+    assert!(app_js.contains("adm-settings-grid"));
+    assert!(app_js.contains("adm-aliases-body"));
+    assert!(app_js.contains("new uPlot("));
 
     // 3. UI-4: Global traceability status banner
     let base_html = include_str!("../../../crates/admin/templates/base.html");
@@ -698,7 +713,9 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     let pins_html = std::str::from_utf8(&pins_body).expect("utf8");
     assert!(pins_html.contains("dave-active-"));
     assert!(pins_html.contains("data-action=\"preview-chat\""));
-    assert!(pins_html.contains("hx-delete=\"/admin/api/sessions/dave-active-hash/pin\""));
+    assert!(pins_html.contains(&format!(
+        "hx-delete=\"/api/user/pins/{clk_id}/dave-active-hash/claude-sonnet-4.6\""
+    )));
 
     // 2. GET /app/partials/client-keys: returns rendered HTML rows with HTMX Revoke action
     let clk_req = Request::builder()
@@ -715,10 +732,12 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     assert!(clk_html.contains("Dave Laptop"));
     assert!(clk_html.contains(&format!("hx-delete=\"/api/user/client-keys/{clk_id}\"")));
 
-    // 3. HTMX Unpin action: DELETE /admin/api/sessions/dave-active-hash/pin with hx-request returns 200 OK
+    // 3. HTMX Unpin action: owner-scoped DELETE /api/user/pins/... with hx-request returns 200 OK
     let unpin_req = Request::builder()
         .method("DELETE")
-        .uri("/admin/api/sessions/dave-active-hash/pin")
+        .uri(format!(
+            "/api/user/pins/{clk_id}/dave-active-hash/claude-sonnet-4.6"
+        ))
         .header(header::COOKIE, &dave_cookie)
         .header("x-csrf-token", &csrf_token)
         .header("hx-request", "true")

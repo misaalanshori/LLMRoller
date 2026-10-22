@@ -7,7 +7,7 @@
 //! Spec: ./docs/srdd/9. SRDD - Data Model.md#933-closed-runtime-settings-registry
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#20-sub-phase-20-minimal-control-plane-json-crud-for-providers-keys-client-keys-and-settings
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, Response};
@@ -53,6 +53,9 @@ pub struct ApiAppState {
     /// Background `/models` discovery worker trigger (MDL-1).
     pub discovery_tx:
         Option<tokio::sync::mpsc::UnboundedSender<llmroller_proto::discovery::DiscoveryTarget>>,
+    /// Live data-plane session pins, shared with `ProxyAuthState` so control-plane
+    /// unpin actions take effect before the next proxied request (SEC-17).
+    pub pin_store: Option<std::sync::Arc<llmroller_core::pins::PinStore>>,
 }
 
 impl ApiAppState {
@@ -67,7 +70,14 @@ impl ApiAppState {
             published_version: None,
             audit_hmac_key: None,
             discovery_tx: None,
+            pin_store: None,
         }
+    }
+
+    /// Share the data-plane `PinStore` with the control plane so unpin actions
+    /// evict live entries immediately (SEC-17).
+    pub fn attach_pin_store(&mut self, pin_store: std::sync::Arc<llmroller_core::pins::PinStore>) {
+        self.pin_store = Some(pin_store);
     }
 
     /// Attach the Reloader notification channel and version watch.
@@ -166,29 +176,198 @@ fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
     }
 }
 
+struct MutationAudit {
+    action: String,
+    target_type: &'static str,
+    target_id: Option<String>,
+}
+
+fn mutation_resource(segment: &str) -> Option<&'static str> {
+    match segment {
+        "providers" => Some("provider"),
+        "upstream-keys" | "keys" => Some("upstream_key"),
+        "client-keys" => Some("client_key"),
+        "users" => Some("user"),
+        "models" => Some("model"),
+        "model-aliases" | "aliases" => Some("model_alias"),
+        "settings" => Some("setting"),
+        "shares" => Some("share"),
+        "pins" => Some("pin"),
+        "sessions" => Some("session"),
+        "routes" => Some("route"),
+        "prices" => Some("price"),
+        "traces" => Some("trace"),
+        "web-sessions" => Some("web_session"),
+        "password" => Some("password"),
+        "totp" => Some("totp"),
+        "usage" => Some("usage"),
+        "audit-log" => Some("audit"),
+        _ => None,
+    }
+}
+
+fn method_verb(method: &Method) -> &'static str {
+    match *method {
+        Method::POST => "created",
+        Method::PUT => "replaced",
+        Method::PATCH => "updated",
+        Method::DELETE => "deleted",
+        _ => "mutated",
+    }
+}
+
+fn mutation_target_id(segments: &[&str], resource_index: usize, resource: &str) -> Option<String> {
+    let candidate = *segments.get(resource_index + 1)?;
+    if matches!(
+        candidate,
+        "keys"
+            | "aliases"
+            | "pin"
+            | "trace"
+            | "rotate"
+            | "accept"
+            | "approve"
+            | "test"
+            | "refresh"
+            | "sync"
+            | "move"
+            | "confirm-merge"
+            | "traceability"
+            | "enroll"
+            | "verify"
+            | "disable"
+            | "reset"
+            | "reset-password"
+            | "summary"
+            | "events"
+            | "timeseries"
+            | "breakdown"
+            | "export.csv"
+    ) {
+        return None;
+    }
+    if resource == "pin" {
+        // /api/user/pins/{client_key_id}/{session_hash}/{canonical_id}
+        return segments
+            .get(resource_index + 2)
+            .map(|session_hash| (*session_hash).to_string());
+    }
+    Some(candidate.to_string())
+}
+
+fn classify_mutation(method: &Method, path: &str) -> MutationAudit {
+    let scope = if path.starts_with("/admin/") {
+        "admin"
+    } else if path.starts_with("/api/user/") {
+        "user"
+    } else {
+        "control"
+    };
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some(resource_index) = segments
+        .iter()
+        .position(|segment| mutation_resource(segment).is_some())
+    else {
+        return MutationAudit {
+            action: format!("{scope}.control.{}", method_verb(method)),
+            target_type: "http_path",
+            target_id: Some(path.to_string()),
+        };
+    };
+
+    let resource_segment = segments[resource_index];
+    let resource = mutation_resource(resource_segment).unwrap_or("resource");
+    let last = segments.last().copied().unwrap_or(resource_segment);
+    let (target_type, verb) = match (last, method.as_str()) {
+        ("keys", "POST") => ("upstream_key", "created"),
+        ("aliases", "POST") => ("model_alias", "created"),
+        ("pin", "DELETE") => ("session_pin", "deleted"),
+        ("trace", "DELETE") => ("trace", "deleted"),
+        ("rotate", "POST") => ("client_key", "rotated"),
+        ("accept", "POST") => ("share", "accepted"),
+        ("approve", "POST") => ("share", "approved"),
+        ("test", "POST") => ("upstream_key", "tested"),
+        ("refresh", "POST") => ("model", "refreshed"),
+        ("sync", "POST") => ("price", "synced"),
+        ("move", "POST") => ("pin", "moved"),
+        ("confirm-merge", "POST") => ("model", "merged"),
+        ("traceability", "PUT") => ("traceability", "updated"),
+        ("enroll", "POST") => ("totp", "enrolled"),
+        ("verify", "POST") => ("totp", "verified"),
+        ("disable", "POST") => ("totp", "disabled"),
+        ("reset-password", "POST") => ("user", "password_reset"),
+        ("reset", "POST") => ("user", "totp_reset"),
+        ("password", "POST") => ("password", "changed"),
+        _ => (resource, method_verb(method)),
+    };
+    let target_id = mutation_target_id(&segments, resource_index, resource);
+    MutationAudit {
+        action: format!("{scope}.{target_type}.{verb}"),
+        target_type,
+        target_id,
+    }
+}
+
 /// Publish a config version after every successful control-plane mutation so that
 /// revocations and edits are visible to the next request (`REL-4`).
+///
+/// `AUD-1`: the successful mutation is recorded with the authenticated actor,
+/// client IP, semantic action, target, and request detail. Actor resolution
+/// happens before dispatch so self-invalidating mutations (password changes)
+/// still retain their actor.
 async fn control_mutation_barrier(
     State(state): State<ApiAppState>,
     request: Request,
     next: Next,
 ) -> Response {
+    let method = request.method().clone();
     let is_mutation = matches!(
-        *request.method(),
+        method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
     let path = request.uri().path().to_string();
     let domains = domains_for_path(&path);
+    let headers = request.headers().clone();
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    let actor_user_id = if is_mutation {
+        authenticate_actor(&state, &headers, false)
+            .await
+            .ok()
+            .and_then(|actor| actor.user_id().map(|id| id.to_string()))
+    } else {
+        None
+    };
+    let ip_addr = peer_addr.map(|peer| {
+        crate::auth::extract_client_ip(peer, &headers, &state.auth.config.trusted_proxies)
+            .to_string()
+    });
+
     let response = next.run(request).await;
     if is_mutation && response.status().is_success() {
         state.publish_control_change(domains).await;
+        let audit = classify_mutation(&method, &path);
+        let detail = serde_json::json!({
+            "method": method.as_str(),
+            "path": path,
+        })
+        .to_string();
         let _ = append_audit_entry_helper(
             &state,
             chrono_like_now_ms(),
-            None,
-            "control.mutation",
-            "http_path",
-            Some(&path),
+            AuditEnvelope {
+                actor_user_id: actor_user_id.as_deref(),
+                ip_addr: ip_addr.as_deref(),
+                action: &audit.action,
+                target_type: audit.target_type,
+                target_id: audit.target_id.as_deref(),
+                detail_json: &detail,
+            },
         )
         .await;
     }
@@ -1155,10 +1334,14 @@ async fn get_admin_session_preview_handler(
         let _ = append_audit_entry_helper(
             &state,
             now_ms,
-            admin_id.as_deref(),
-            "trace.viewed",
-            "session",
-            Some(&session_hash),
+            AuditEnvelope {
+                actor_user_id: admin_id.as_deref(),
+                ip_addr: None,
+                action: "trace.viewed",
+                target_type: "session",
+                target_id: Some(&session_hash),
+                detail_json: "{}",
+            },
         )
         .await;
     }
@@ -1563,13 +1746,19 @@ async fn delete_admin_traces_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+struct AuditEnvelope<'a> {
+    actor_user_id: Option<&'a str>,
+    ip_addr: Option<&'a str>,
+    action: &'a str,
+    target_type: &'a str,
+    target_id: Option<&'a str>,
+    detail_json: &'a str,
+}
+
 async fn append_audit_entry_helper(
     state: &ApiAppState,
     now_ms: i64,
-    actor_user_id: Option<&str>,
-    action: &str,
-    target_type: &str,
-    target_id: Option<&str>,
+    envelope: AuditEnvelope<'_>,
 ) -> Result<(), sqlx::Error> {
     use llmroller_core::seams::ExposeSecret as _;
 
@@ -1589,12 +1778,12 @@ async fn append_audit_entry_helper(
         llmroller_store::audit::AuditEntry {
             id: &audit_id,
             ts: now_ms,
-            actor_user_id,
-            ip_addr: None,
-            action,
-            target_type,
-            target_id,
-            detail_json: Some("{}"),
+            actor_user_id: envelope.actor_user_id,
+            ip_addr: envelope.ip_addr,
+            action: envelope.action,
+            target_type: envelope.target_type,
+            target_id: envelope.target_id,
+            detail_json: Some(envelope.detail_json),
         },
     )
     .await
@@ -2308,21 +2497,87 @@ async fn get_active_pins_handler(
     Ok(Json(list))
 }
 
+fn pin_delete_status(headers: &HeaderMap) -> StatusCode {
+    if headers.contains_key("hx-request") {
+        StatusCode::OK
+    } else {
+        StatusCode::NO_CONTENT
+    }
+}
+
+/// Admin-wide unpin: every tenant's pin for the session hash is removed.
+///
+/// `SEC-17`: only administrators may delete pins they do not own.
 async fn delete_pin_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let _actor = authenticate_actor(&state, &headers, true).await?;
-    let _ = sqlx::query("DELETE FROM pins WHERE session_hash = ?")
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    sqlx::query("DELETE FROM pins WHERE session_hash = ?")
         .bind(&hash)
         .execute(&state.auth.pool)
-        .await;
-    if headers.contains_key("hx-request") {
-        Ok(StatusCode::OK)
-    } else {
-        Ok(StatusCode::NO_CONTENT)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(store) = &state.pin_store {
+        store.remove_by_session_hash(&hash);
     }
+    Ok(pin_delete_status(&headers))
+}
+
+/// Owner-scoped unpin for the session detail UI.
+///
+/// `SEC-17` / `USR-3`: the SQL predicate derives ownership from the client key
+/// join, and a cross-tenant attempt is an indistinguishable no-op. Only the
+/// exact live pin is evicted from the shared `PinStore`.
+async fn delete_user_pin_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path((client_key_id, session_hash, canonical_id)): Path<(ClientKeyId, String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let owner_user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Forbidden))?
+        .to_string();
+
+    // `USR-3`: a foreign client key is indistinguishable from a missing one.
+    let owns_client_key: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM client_keys WHERE id = ? AND owner_user_id = ?")
+            .bind(client_key_id.to_string())
+            .bind(&owner_user_id)
+            .fetch_optional(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if owns_client_key.is_none() {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "not_found"));
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM pins
+         WHERE client_key_id = ?
+           AND session_hash = ?
+           AND model_pk = (SELECT model_pk FROM models WHERE canonical_id = ?)
+           AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
+    )
+    .bind(client_key_id.to_string())
+    .bind(&session_hash)
+    .bind(&canonical_id)
+    .bind(owner_user_id)
+    .execute(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if result.rows_affected() > 0
+        && let Some(store) = &state.pin_store
+    {
+        store.remove(&llmroller_core::pins::PinKey {
+            client_key_id,
+            canonical_id,
+            session_hash,
+        });
+    }
+    Ok(pin_delete_status(&headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -3190,6 +3445,17 @@ async fn get_partial_pins_handler(
             "{}s ago",
             (state.auth.clock.now_ms() - last_used).max(0) / 1000
         );
+        let unpin_button = if is_admin {
+            format!(
+                "<button class=\"btn btn-xs btn-danger\" hx-delete=\"/admin/api/sessions/{hash}/pin\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Unpin</button>"
+            )
+        } else if model == "unresolved" {
+            String::new()
+        } else {
+            format!(
+                "<button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/pins/{clk}/{hash}/{model}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Unpin</button>"
+            )
+        };
 
         html.push_str(&format!(
             "<tr>\
@@ -3201,7 +3467,7 @@ async fn get_partial_pins_handler(
                 <td>{time_str}</td>\
                 <td>\
                     <button class=\"btn btn-xs btn-primary\" data-action=\"preview-chat\" data-session-hash=\"{hash}\">Preview Chat</button>\
-                    <button class=\"btn btn-xs btn-danger\" hx-delete=\"/admin/api/sessions/{hash}/pin\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Unpin</button>\
+                    {unpin_button}\
                 </td>\
             </tr>"
         ));
@@ -4015,6 +4281,10 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route("/api/user/shares/{id}", delete(delete_user_share_handler))
         .route("/api/user/pins", get(get_active_pins_handler))
+        .route(
+            "/api/user/pins/{client_key_id}/{session_hash}/{canonical_id}",
+            delete(delete_user_pin_handler),
+        )
         .route(
             "/api/user/client-keys/{id}/sessions",
             get(get_user_client_key_sessions_handler),

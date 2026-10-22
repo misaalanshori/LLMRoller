@@ -38,6 +38,11 @@ function copySnippet(id) {
     alert('Copied to clipboard!');
 }
 
+function escapeHtml(value) {
+    const replacements = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(value ?? '').replace(/[&<>"']/g, ch => replacements[ch]);
+}
+
 function onProviderKindChange(kind, selectId) {
     const isGlobal = selectId === 'gp-kind';
     const urlInput = document.getElementById(isGlobal ? 'gp-url' : 'prov-url');
@@ -128,6 +133,14 @@ document.addEventListener('click', function(e) {
     if (saveSettingBtn) {
         const key = saveSettingBtn.getAttribute('data-key');
         saveSetting(key);
+        return;
+    }
+
+    // 10. Delete Model Alias
+    const deleteAliasBtn = e.target.closest('[data-action="delete-alias"]');
+    if (deleteAliasBtn) {
+        const alias = deleteAliasBtn.getAttribute('data-alias');
+        deleteAlias(alias);
         return;
     }
 });
@@ -350,8 +363,64 @@ async function handleAddAlias(e) {
 
         const mBody = document.getElementById('adm-models-body');
         if (mBody) htmx.trigger(mBody, 'load');
+        await loadAdminAliases();
     } catch (err) {
         alert('Failed to add alias: ' + err);
+    }
+}
+
+async function deleteAlias(alias) {
+    if (!alias || !confirm(`Delete alias "${alias}"? Clients using it will no longer resolve to its target.`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/admin/api/model-aliases?alias=${encodeURIComponent(alias)}`, {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            throw new Error(body.error?.message || `HTTP ${res.status}`);
+        }
+        await loadAdminAliases();
+        const mBody = document.getElementById('adm-models-body');
+        if (mBody) htmx.trigger(mBody, 'load');
+    } catch (err) {
+        alert('Failed to delete alias: ' + err);
+    }
+}
+
+async function loadAdminAliases() {
+    const tbody = document.getElementById('adm-aliases-body');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/admin/api/models');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const modelNames = new Map((data.models || []).map(m => [m.model_pk, m.canonical_id]));
+        const aliases = data.aliases || [];
+
+        const targetSelect = document.getElementById('alias-target-select');
+        if (targetSelect) {
+            targetSelect.innerHTML = (data.models || []).map(m =>
+                `<option value="${escapeHtml(m.model_pk)}">${escapeHtml(m.canonical_id)}</option>`
+            ).join('');
+        }
+
+        if (aliases.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No confirmed aliases yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = aliases.map(alias => {
+            const target = modelNames.get(alias.model_pk) || alias.model_pk;
+            return `<tr>
+                <td><code>${escapeHtml(alias.alias)}</code></td>
+                <td><code>${escapeHtml(target)}</code></td>
+                <td><button class="btn btn-xs btn-danger" data-action="delete-alias" data-alias="${escapeHtml(alias.alias)}">Delete</button></td>
+            </tr>`;
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load aliases: ${escapeHtml(err)}</td></tr>`;
     }
 }
 
@@ -397,24 +466,154 @@ async function toggleModelExposed(modelPk, exposed) {
     }
 }
 
+async function loadAdminSettings() {
+    const grid = document.getElementById('adm-settings-grid');
+    if (!grid) return;
+    try {
+        const res = await fetch('/admin/api/settings');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const settings = await res.json();
+        const keys = Object.keys(settings).sort();
+        grid.innerHTML = keys.map(key => {
+            const id = `setting-${key}`;
+            const value = settings[key];
+            const label = key.replace(/_/g, ' ');
+            let input;
+            if (key === 'traceability_config') {
+                input = `<textarea id="${id}" rows="5" disabled>${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
+            } else if (typeof value === 'boolean') {
+                input = `<input type="checkbox" id="${id}" ${value ? 'checked' : ''}>`;
+            } else if (typeof value === 'number') {
+                input = `<input type="number" id="${id}" value="${value}">`;
+            } else if (typeof value === 'string') {
+                input = `<input type="text" id="${id}" value="${escapeHtml(value)}">`;
+            } else {
+                input = `<textarea id="${id}" data-json="true" rows="4">${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
+            }
+            const save = key === 'traceability_config'
+                ? '<span class="text-muted" style="font-size: 0.75rem;">Use the Traceability tab to change this setting.</span>'
+                : `<button class="btn btn-xs btn-primary" data-action="save-setting" data-key="${escapeHtml(key)}">Save</button>`;
+            return `<div class="setting-item">
+                <div class="setting-key">${escapeHtml(key)}</div>
+                <div class="setting-desc">${escapeHtml(label)}</div>
+                ${input}
+                <div style="margin-top: 0.5rem;">${save}</div>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        grid.innerHTML = `<p class="text-danger">Failed to load runtime settings: ${escapeHtml(err)}</p>`;
+    }
+}
+
 async function saveSetting(key) {
     const input = document.getElementById(`setting-${key}`);
     if (!input) return;
-    let value = input.value;
-    if (input.type === 'number') value = parseInt(value, 10);
-    else if (input.type === 'checkbox') value = input.checked;
+    let value;
+    if (input.type === 'number') {
+        value = Number(input.value);
+        if (!Number.isFinite(value)) {
+            alert('Please enter a valid number.');
+            return;
+        }
+    } else if (input.type === 'checkbox') {
+        value = input.checked;
+    } else if (input.dataset.json === 'true') {
+        try {
+            value = JSON.parse(input.value);
+        } catch (e) {
+            alert('Invalid JSON: ' + e);
+            return;
+        }
+    } else {
+        value = input.value;
+    }
 
     try {
-        await fetch('/admin/api/settings', {
+        const res = await fetch('/admin/api/settings', {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ [key]: value })
         });
-        alert(`Setting "${key}" updated!`);
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            throw new Error(body.error?.message || `HTTP ${res.status}`);
+        }
+        await loadAdminSettings();
     } catch (e) {
         alert('Failed to update setting: ' + e);
     }
 }
+
+let usageChart = null;
+
+async function loadUsageChart() {
+    const container = document.getElementById('uplot-chart');
+    if (!container || typeof uPlot === 'undefined') return;
+    try {
+        const [summaryRes, eventsRes] = await Promise.all([
+            fetch('/admin/api/usage/summary'),
+            fetch('/admin/api/usage/events?limit=500')
+        ]);
+        const summary = summaryRes.ok ? await summaryRes.json() : {};
+        const eventPayload = eventsRes.ok ? await eventsRes.json() : { events: [] };
+        const byDay = new Map();
+        for (const event of eventPayload.events || []) {
+            const day = Math.floor(Number(event.ts || 0) / 86_400_000) * 86_400_000;
+            byDay.set(day, (byDay.get(day) || 0) + Number(event.cost_micro_usd || 0));
+        }
+        let xs = [...byDay.keys()].sort((a, b) => a - b).map(ms => Math.floor(ms / 1000));
+        let ys = xs.map(seconds => (byDay.get(seconds * 1000) || 0) / 1_000_000);
+        if (xs.length === 0) {
+            xs = [Math.floor(Date.now() / 1000)];
+            ys = [Number(summary.total_cost_micro_usd || 0) / 1_000_000];
+        }
+
+        const summaryEl = document.getElementById('uplot-summary');
+        if (summaryEl) {
+            summaryEl.textContent = `${Number(summary.total_requests || 0).toLocaleString()} requests • $${(Number(summary.total_cost_micro_usd || 0) / 1_000_000).toFixed(4)} total spend`;
+        }
+
+        if (usageChart) {
+            usageChart.destroy();
+            usageChart = null;
+        }
+        container.innerHTML = '';
+        container.style.display = 'block';
+        usageChart = new uPlot({
+            width: container.clientWidth || 640,
+            height: 240,
+            scales: { x: { time: true } },
+            series: [
+                {},
+                {
+                    label: 'USD',
+                    stroke: '#38bdf8',
+                    width: 2,
+                    fill: 'rgba(56, 189, 248, 0.12)'
+                }
+            ],
+            axes: [
+                { stroke: '#94a3b8', grid: { stroke: 'rgba(148, 163, 184, 0.15)' } },
+                { stroke: '#94a3b8', grid: { stroke: 'rgba(148, 163, 184, 0.15)' } }
+            ]
+        }, [xs, ys], container);
+    } catch (err) {
+        container.innerHTML = `<span class="text-muted">Usage chart unavailable: ${escapeHtml(err)}</span>`;
+    }
+}
+
+window.addEventListener('resize', () => {
+    const container = document.getElementById('uplot-chart');
+    if (usageChart && container) {
+        usageChart.setSize({ width: container.clientWidth || 640, height: 240 });
+    }
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadAdminSettings();
+    loadAdminAliases();
+    loadUsageChart();
+});
 
 async function openChatPreview(sessionHash) {
     const modal = document.getElementById('modal-chat-preview');

@@ -446,6 +446,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_handle.notification_sender(),
         reloader_handle.version_receiver(),
     );
+    api_state.attach_pin_store(pin_store.clone());
     let (discovery_tx, _discovery_task) =
         llmroller_server::discovery_poller::start_discovery_poller(
             llmroller_server::discovery_poller::DiscoveryPollerDeps {

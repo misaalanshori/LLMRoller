@@ -364,6 +364,24 @@ impl PinStore {
         });
     }
 
+    /// Removes the exact session pin addressed by an owner-scoped control-plane action.
+    ///
+    /// Returns `true` when a live entry was evicted (SEC-17, Section 10.4).
+    pub fn remove(&self, pin_key: &PinKey) -> bool {
+        self.entries.remove(pin_key).is_some()
+    }
+
+    /// Removes every live pin for a session hash, returning the number evicted.
+    ///
+    /// Used by the admin-wide session unpin route after the durable rows are
+    /// deleted (SEC-17, AUD-1, Section 10.4).
+    pub fn remove_by_session_hash(&self, session_hash: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|pin_key, _| pin_key.session_hash != session_hash);
+        before.saturating_sub(self.entries.len())
+    }
+
     /// Insert an already-confirmed pin loaded from SQLite at startup (RTE-10).
     pub fn insert_hydrated(&self, pin_key: PinKey, entry: PinEntry) {
         if self.entries.len() >= self.max_active_pins {
