@@ -5,6 +5,7 @@
 use sqlx::{Row as _, SqlitePool};
 use std::collections::HashMap;
 
+use futures_util::TryStreamExt as _;
 use llmroller_core::accumulators::{BudgetScopeId, MonthlyAccumulatorRegistry, UtcYearMonth};
 use llmroller_core::ids::{ClientKeyId, ShareId, UpstreamKeyId, UserId};
 use llmroller_core::windows::RollingRing;
@@ -34,62 +35,106 @@ pub async fn reconstruct_budgets_from_rollups(
 ) -> Result<RebuiltState, sqlx::Error> {
     let cutoff_ms = now_ms - max_window_period_ms - 300_000;
 
-    let rows = sqlx::query(
-        r#"SELECT bucket_ms, upstream_key_id, client_key_id, owner_user_id, provider_scope, share_id, cost_micro_usd
-           FROM usage_rollups_5min
-           WHERE bucket_ms >= ?"#,
-    )
-    .bind(cutoff_ms)
-    .fetch_all(pool)
-    .await?;
-
+    let bucket_width_ms = RollingRing::new(max_window_period_ms).bucket_width_ms;
     let mut key_rings: HashMap<UpstreamKeyId, RollingRing> = HashMap::new();
-    let monthly_accumulators = MonthlyAccumulatorRegistry::new();
 
-    for r in rows {
-        let bucket_ms: i64 = r.try_get("bucket_ms")?;
-        let upstream_key_id_str: String = r.try_get("upstream_key_id")?;
-        let client_key_id_str: String = r.try_get("client_key_id")?;
-        let owner_user_id_str: String = r.try_get("owner_user_id")?;
-        let provider_scope: String = r.try_get("provider_scope")?;
-        let share_id_str: String = r.try_get("share_id")?;
-        let cost_micro_usd: i64 = r.try_get("cost_micro_usd")?;
+    // Aggregate source 5-minute rows into the ring's native bucket width in
+    // SQLite. This keeps startup work proportional to distinct rings, not to
+    // every raw rollup row, and mirrors RollingRing::record's positive-only
+    // accounting exactly.
+    let mut ring_rows = sqlx::query(
+        r#"SELECT upstream_key_id,
+                  ((bucket_ms + 150000) / ?) * ? AS ring_bucket_ms,
+                  SUM(CASE WHEN cost_micro_usd > 0 THEN cost_micro_usd ELSE 0 END)
+           FROM usage_rollups_5min
+           WHERE bucket_ms >= ? AND upstream_key_id <> ''
+           GROUP BY upstream_key_id, ring_bucket_ms
+           ORDER BY ring_bucket_ms"#,
+    )
+    .bind(bucket_width_ms)
+    .bind(bucket_width_ms)
+    .bind(cutoff_ms)
+    .fetch(pool);
 
-        // 1. Fold into key ring at bucket midpoint (bucket_ms + 150_000)
-        if let Ok(key_id) = UpstreamKeyId::parse(&upstream_key_id_str) {
+    while let Some(r) = ring_rows.try_next().await? {
+        let upstream_key_id_str: &str = r.try_get(0)?;
+        let ring_bucket_ms: i64 = r.try_get(1)?;
+        let cost_micro_usd: i64 = r.try_get(2)?;
+        if let Ok(key_id) = UpstreamKeyId::parse(upstream_key_id_str) {
             let ring = key_rings
                 .entry(key_id)
                 .or_insert_with(|| RollingRing::new(max_window_period_ms));
-            ring.record(bucket_ms + 150_000, cost_micro_usd);
+            ring.record(ring_bucket_ms, cost_micro_usd);
         }
+    }
 
-        // 2. Fold into monthly accumulators
-        let month = UtcYearMonth::from_epoch_millis(bucket_ms);
+    let monthly_accumulators = MonthlyAccumulatorRegistry::new();
 
-        if let Ok(client_id) = ClientKeyId::parse(&client_key_id_str) {
-            let acc =
-                monthly_accumulators.get_or_create(month, BudgetScopeId::ClientKey(client_id));
-            acc.used_micro_usd
-                .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
-        }
+    // Calendar-month totals are also aggregated in SQLite. Grouping by UTC
+    // epoch day keeps SQLite's per-row work small; each day maps to exactly one
+    // calendar month via UtcYearMonth::from_epoch_millis.
+    let mut client_rows = sqlx::query(
+        r#"SELECT client_key_id, bucket_ms / 86400000 AS epoch_day, SUM(cost_micro_usd)
+           FROM usage_rollups_5min
+           WHERE bucket_ms >= ?
+           GROUP BY client_key_id, epoch_day"#,
+    )
+    .bind(cutoff_ms)
+    .fetch(pool);
+    while let Some(r) = client_rows.try_next().await? {
+        let client_key_id_str: &str = r.try_get(0)?;
+        let epoch_day: i64 = r.try_get(1)?;
+        let cost_micro_usd: i64 = r.try_get(2)?;
+        let Ok(client_id) = ClientKeyId::parse(client_key_id_str) else {
+            continue;
+        };
+        let month = UtcYearMonth::from_epoch_millis(epoch_day.saturating_mul(86_400_000));
+        let acc = monthly_accumulators.get_or_create(month, BudgetScopeId::ClientKey(client_id));
+        acc.used_micro_usd
+            .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
+    }
 
-        // Only global provider spend counts toward user monthly budget (USR-5)
-        if provider_scope == "global"
-            && let Ok(user_id) = UserId::parse(&owner_user_id_str)
-        {
-            let acc = monthly_accumulators.get_or_create(month, BudgetScopeId::User(user_id));
-            acc.used_micro_usd
-                .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
-        }
+    // Only global provider spend counts toward user monthly budget (USR-5).
+    let mut user_rows = sqlx::query(
+        r#"SELECT owner_user_id, bucket_ms / 86400000 AS epoch_day, SUM(cost_micro_usd)
+           FROM usage_rollups_5min
+           WHERE bucket_ms >= ? AND provider_scope = 'global'
+           GROUP BY owner_user_id, epoch_day"#,
+    )
+    .bind(cutoff_ms)
+    .fetch(pool);
+    while let Some(r) = user_rows.try_next().await? {
+        let owner_user_id_str: &str = r.try_get(0)?;
+        let epoch_day: i64 = r.try_get(1)?;
+        let cost_micro_usd: i64 = r.try_get(2)?;
+        let Ok(user_id) = UserId::parse(owner_user_id_str) else {
+            continue;
+        };
+        let month = UtcYearMonth::from_epoch_millis(epoch_day.saturating_mul(86_400_000));
+        let acc = monthly_accumulators.get_or_create(month, BudgetScopeId::User(user_id));
+        acc.used_micro_usd
+            .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
+    }
 
-        if !share_id_str.is_empty()
-            && let Ok(share_id) = ShareId::parse(&share_id_str)
-        {
-            let acc =
-                monthly_accumulators.get_or_create(month, BudgetScopeId::ProviderShare(share_id));
-            acc.used_micro_usd
-                .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
-        }
+    let mut share_rows = sqlx::query(
+        r#"SELECT share_id, bucket_ms / 86400000 AS epoch_day, SUM(cost_micro_usd)
+           FROM usage_rollups_5min
+           WHERE bucket_ms >= ? AND share_id <> ''
+           GROUP BY share_id, epoch_day"#,
+    )
+    .bind(cutoff_ms)
+    .fetch(pool);
+    while let Some(r) = share_rows.try_next().await? {
+        let share_id_str: &str = r.try_get(0)?;
+        let epoch_day: i64 = r.try_get(1)?;
+        let cost_micro_usd: i64 = r.try_get(2)?;
+        let Ok(share_id) = ShareId::parse(share_id_str) else {
+            continue;
+        };
+        let month = UtcYearMonth::from_epoch_millis(epoch_day.saturating_mul(86_400_000));
+        let acc = monthly_accumulators.get_or_create(month, BudgetScopeId::ProviderShare(share_id));
+        acc.used_micro_usd
+            .fetch_add(cost_micro_usd, std::sync::atomic::Ordering::Relaxed);
     }
 
     Ok(RebuiltState {
