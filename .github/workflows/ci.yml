@@ -153,3 +153,35 @@ jobs:
           test "$(docker image inspect llmroller:ci-runtime-distroless --format '{{.Config.User}}')" = "65532:65532"
           test "$(docker image inspect llmroller:ci-runtime-distroless --format '{{join .Config.Entrypoint " "}}')" = "/usr/local/bin/llmroller"
         continue-on-error: false
+
+      - name: Verify production image size, readiness, and SIGTERM drain
+        if: matrix.stage == 'runtime-distroless'
+        run: |
+          set -euo pipefail
+          image="llmroller:ci-runtime-distroless"
+          size="$(docker image inspect "$image" --format '{{.Size}}')"
+          test "$size" -lt $((50 * 1024 * 1024))
+
+          master_key="$(head -c 32 /dev/urandom | base64)"
+          docker run --detach --name llmroller-smoke \
+            --publish 127.0.0.1:18080:8080 \
+            --env LLMROLLER_MASTER_KEY="$master_key" \
+            --env LLMROLLER_MASTER_KEY_ID=ci-smoke \
+            "$image"
+
+          cleanup() { docker rm --force llmroller-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/readyz; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker logs llmroller-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker stop --time 30 llmroller-smoke
+          test "$(docker inspect llmroller-smoke --format '{{.State.ExitCode}}')" = "0"

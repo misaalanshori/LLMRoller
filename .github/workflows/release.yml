@@ -35,6 +35,23 @@ jobs:
       - name: Run verification script
         run: bash scripts/verify_release_package.sh
 
+      - name: Generate CycloneDX SBOMs
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo cyclonedx --manifest-path crates/server/Cargo.toml --format json --override-filename llmroller.cdx
+          mkdir -p target/sbom
+          for file in crates/*/llmroller.cdx.json xtask/llmroller.cdx.json; do
+            component="$(basename "$(dirname "$file")")"
+            cp "$file" "target/sbom/${component}.cdx.json"
+          done
+
+      - name: Upload CycloneDX SBOMs
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
+        with:
+          name: llmroller-sbom
+          path: target/sbom/*.cdx.json
+          if-no-files-found: error
+
   build-binaries:
     name: build (${{ matrix.target }})
     needs: verify
@@ -98,4 +115,34 @@ jobs:
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
         with:
           name: llmroller-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/llmroller*
+          path: |
+            target/${{ matrix.target }}/release/llmroller*
+            target/${{ matrix.target }}/release/SHA256SUMS
+          if-no-files-found: error
+
+  sign-release:
+    name: sign-release-artifacts
+    needs: [verify, build-binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download unsigned artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign every release artifact with cosign
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            cosign sign-blob --yes --bundle "${file}.bundle" "$file"
+          done < <(find dist -type f ! -name '*.bundle' -print0)
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4
+        with:
+          name: llmroller-release-signed
+          path: dist
+          if-no-files-found: error

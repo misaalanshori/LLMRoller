@@ -67,7 +67,18 @@ else
     cargo run --bin llmroller -- generate-master-key >/dev/null
 fi
 
-# 4. Verify supply-chain and governance gates
+# 4. Verify release supply-chain wiring (SBOM + cosign)
+echo "Checking release SBOM and signature gates..."
+grep -q "cargo cyclonedx --manifest-path crates/server/Cargo.toml" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not generate a CycloneDX SBOM" >&2
+    exit 1
+}
+grep -q "cosign sign-blob --yes --bundle" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not cosign-sign artifacts" >&2
+    exit 1
+}
+
+# 5. Verify supply-chain and governance gates
 echo "Checking governance gates..."
 cargo xtask doc-consistency
 cargo xtask docs-bundle --check

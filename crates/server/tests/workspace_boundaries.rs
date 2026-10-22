@@ -379,8 +379,30 @@ fn ci_matrix_covers_all_por1_targets_and_gates() {
         "cargo test --workspace --all-targets",
         "docker compose config --quiet",
         "stage: [runtime-distroless, runtime-dev]",
+        "50 * 1024 * 1024",
+        "llmroller-smoke",
+        "http://127.0.0.1:18080/readyz",
     ] {
         assert!(workflow.contains(gate), "CI workflow must run {gate}");
+    }
+}
+
+#[test]
+#[doc = "Spec: SEC-11, POR-1"]
+fn release_workflow_emits_sbom_and_signs_every_artifact() {
+    let workflow = read(".github/workflows/release.yml");
+    for gate in [
+        "cargo-cyclonedx --locked --version 0.5.9",
+        "cargo cyclonedx --manifest-path crates/server/Cargo.toml",
+        "name: llmroller-sbom",
+        "cosign sign-blob --yes --bundle",
+        "name: llmroller-release-signed",
+        "SHA256SUMS",
+    ] {
+        assert!(
+            workflow.contains(gate),
+            "release workflow must include {gate}"
+        );
     }
 }
 
