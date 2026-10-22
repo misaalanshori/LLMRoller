@@ -7,7 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
-use axum::extract::{Extension, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
@@ -21,6 +21,10 @@ use llmroller_core::seams::Clock as _;
 
 /// Build the data plane router serving `/v1/*`, `/healthz`, and `/readyz`.
 pub fn data_plane_router(state: ProxyAuthState) -> Router {
+    let max_body_bytes = state
+        .budget_semaphore
+        .max_body_mb
+        .saturating_mul(1024 * 1024);
     let authed_v1 = Router::new()
         .route("/v1/models", get(v1_models_handler))
         .route(
@@ -72,6 +76,7 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
         .route("/healthz", get(healthz_handler))
         .route("/readyz", get(readyz_handler))
         .merge(authed_v1)
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 

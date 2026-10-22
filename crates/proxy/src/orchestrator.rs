@@ -1955,7 +1955,7 @@ fn gate_error_response(error: &llmroller_core::accumulators::GateG7Error) -> Res
     response
 }
 
-/// Request content prepared once at request start and shared by either response path.
+/// Request content prepared when the turn finalizes, off the TTFB path (PERF-5).
 struct PreparedTraceRequest {
     skeleton: serde_json::Value,
     blocks: Vec<(String, Vec<u8>)>,
@@ -1964,19 +1964,25 @@ struct PreparedTraceRequest {
     expires_at: i64,
 }
 
-/// Streaming collector paired with the prepared request until the turn finalizes.
+/// Streaming collector paired with the original request bytes until the turn finalizes.
+/// Preparation is deliberately deferred so trace mode does not add TTFB work.
 struct TraceCapture {
-    prepared: PreparedTraceRequest,
+    request_body: Bytes,
+    retention_days: i64,
     tap: TraceTap,
 }
 
 impl TraceCapture {
-    fn new(prepared: PreparedTraceRequest, first_chunk: Option<&Bytes>) -> Self {
+    fn new(request_body: Bytes, retention_days: i64, first_chunk: Option<&Bytes>) -> Self {
         let (mut tap, _receiver) = TraceTap::new();
         if let Some(chunk) = first_chunk {
             tap.feed_sse_chunk(chunk);
         }
-        Self { prepared, tap }
+        Self {
+            request_body,
+            retention_days,
+            tap,
+        }
     }
 }
 
@@ -2263,27 +2269,35 @@ impl StreamFinalizer {
                 Some(finished_ms - self.started_ms),
             );
             if let Some(trace) = self.trace.take() {
-                let accepted = submit_trace_job(
-                    &self.state,
-                    TraceJobMeta {
-                        usage_event_id: &event.id,
-                        request_id: self.usage.request_id,
-                        ts: finished_ms,
-                        owner_user_id: self.usage.owner_user_id,
-                        client_key_id: self.usage.client_key_id,
-                        session_hash: self.usage.session_hash.as_deref().unwrap_or_default(),
-                        thread_id: &self.thread_id,
-                        canonical_id: &self.usage.canonical_model,
-                        protocol: &self.usage.endpoint_str,
-                        response_raw: None,
-                    },
-                    trace.prepared,
-                    &trace.tap.output,
-                    trace
-                        .tap
-                        .trace_dropped
-                        .load(std::sync::atomic::Ordering::Acquire),
-                );
+                let accepted =
+                    prepare_trace_request(&trace.request_body, trace.retention_days, finished_ms)
+                        .is_some_and(|prepared| {
+                            submit_trace_job(
+                                &self.state,
+                                TraceJobMeta {
+                                    usage_event_id: &event.id,
+                                    request_id: self.usage.request_id,
+                                    ts: finished_ms,
+                                    owner_user_id: self.usage.owner_user_id,
+                                    client_key_id: self.usage.client_key_id,
+                                    session_hash: self
+                                        .usage
+                                        .session_hash
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                    thread_id: &self.thread_id,
+                                    canonical_id: &self.usage.canonical_model,
+                                    protocol: &self.usage.endpoint_str,
+                                    response_raw: None,
+                                },
+                                prepared,
+                                &trace.tap.output,
+                                trace
+                                    .tap
+                                    .trace_dropped
+                                    .load(std::sync::atomic::Ordering::Acquire),
+                            )
+                        });
                 event.trace_dropped = !accepted;
             }
             writer
@@ -2570,11 +2584,12 @@ pub async fn handle_inference_request(
             &model.canonical_id,
             now,
         );
-    let mut trace_prepared = if trace_enabled {
-        prepare_trace_request(&body, trace_config.retention_days, now)
+    let mut trace_request = if trace_enabled {
+        Some(body.clone())
     } else {
         None
     };
+    let trace_retention_days = trace_config.retention_days;
     let trace_thread_id = extract_trace_thread_id(&headers);
     // 5. Response-link session inheritance and HardKey affinity (RTE-12, Section 11.1.2).
     let hard_link: Option<ResponseLinkRow> = if matches!(endpoint, EndpointKind::Responses) {
@@ -3462,9 +3477,9 @@ pub async fn handle_inference_request(
                     failovers,
                     error_code: None,
                 };
-                let trace = trace_prepared
-                    .take()
-                    .map(|prepared| TraceCapture::new(prepared, first_chunk.as_ref()));
+                let trace = trace_request.clone().map(|request_body| {
+                    TraceCapture::new(request_body, trace_retention_days, first_chunk.as_ref())
+                });
                 let finalizer = StreamFinalizer {
                     state: state.clone(),
                     usage,
@@ -3737,10 +3752,10 @@ pub async fn handle_inference_request(
             "actual",
         ));
 
-        let trace_output = trace_prepared.take().map(|prepared| {
+        let trace_output = trace_request.take().map(|request_body| {
             let (mut tap, _receiver) = TraceTap::new();
             tap.feed_json_response(&json_value);
-            (prepared, tap)
+            (request_body, tap)
         });
 
         if let Some(writer) = &state.writer {
@@ -3774,29 +3789,34 @@ pub async fn handle_inference_request(
                 None,
                 Some(now_ms() - attempt_started),
             );
-            if let Some((prepared, tap)) = trace_output {
+            if let Some((request_body, tap)) = trace_output {
                 let raw_size = serde_json::to_vec(&json_value).map_or(usize::MAX, |raw| raw.len());
                 let response_raw = (raw_size
                     <= llmroller_proto::trace_tap::MAX_RESPONSE_OUTPUT_BYTES)
                     .then(|| json_value.clone());
-                let accepted = submit_trace_job(
-                    &state,
-                    TraceJobMeta {
-                        usage_event_id: &event.id,
-                        request_id,
-                        ts: now,
-                        owner_user_id: caller.owner_user_id,
-                        client_key_id: caller.id,
-                        session_hash: pin_key.as_ref().map_or("", |key| key.session_hash.as_str()),
-                        thread_id: &trace_thread_id,
-                        canonical_id: &model.canonical_id,
-                        protocol: endpoint_str,
-                        response_raw,
-                    },
-                    prepared,
-                    &tap.output,
-                    tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire),
-                );
+                let accepted = prepare_trace_request(&request_body, trace_retention_days, now)
+                    .is_some_and(|prepared| {
+                        submit_trace_job(
+                            &state,
+                            TraceJobMeta {
+                                usage_event_id: &event.id,
+                                request_id,
+                                ts: now,
+                                owner_user_id: caller.owner_user_id,
+                                client_key_id: caller.id,
+                                session_hash: pin_key
+                                    .as_ref()
+                                    .map_or("", |key| key.session_hash.as_str()),
+                                thread_id: &trace_thread_id,
+                                canonical_id: &model.canonical_id,
+                                protocol: endpoint_str,
+                                response_raw,
+                            },
+                            prepared,
+                            &tap.output,
+                            tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    });
                 event.trace_dropped = !accepted;
             }
             writer

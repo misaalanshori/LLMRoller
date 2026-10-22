@@ -24,6 +24,7 @@ use llmroller_core::rbac::{ActorScope, OwnershipScope, SystemSeal, SystemTask};
 use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_bytes, secret_string};
 use llmroller_proxy::auth::ProxyAuthState;
 use llmroller_proxy::listeners::data_plane_router;
+use llmroller_proxy::orchestrator::PreflightBudgetSemaphore;
 use llmroller_server::reloader::load_initial_snapshot;
 use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
 use llmroller_store::crypto::MasterKey;
@@ -597,6 +598,14 @@ async fn seed_provider_route(
 }
 
 async fn build_wire_app(pool: &sqlx::SqlitePool, master_key: &MasterKey) -> Router {
+    build_wire_app_with_max_body(pool, master_key, 32).await
+}
+
+async fn build_wire_app_with_max_body(
+    pool: &sqlx::SqlitePool,
+    master_key: &MasterKey,
+    max_body_mb: usize,
+) -> Router {
     let (reloader_tx, _reloader_rx) = tokio::sync::mpsc::channel(100);
     let (writer, _writer_task) = start_writer(pool.clone(), reloader_tx);
     let snapshot = load_initial_snapshot(pool).await.expect("load snapshot");
@@ -606,7 +615,56 @@ async fn build_wire_app(pool: &sqlx::SqlitePool, master_key: &MasterKey) -> Rout
     proxy_auth_state.is_ready.store(true, Ordering::SeqCst);
     proxy_auth_state.writer = Some(writer);
     proxy_auth_state.session_hmac_secret = Some(secret_bytes(vec![0x5A; 32]));
+    proxy_auth_state.budget_semaphore = Arc::new(PreflightBudgetSemaphore::new(819, max_body_mb));
     data_plane_router(proxy_auth_state)
+}
+
+#[tokio::test]
+#[doc = "Spec: SEC-8 - data-plane requests up to the configured maximum are read, and larger bodies are rejected before routing"]
+async fn test_data_plane_body_limit_matches_configured_maximum() {
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("body_limit.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xDD; 32]);
+    seed_base(&pool, &master_key).await;
+
+    let entropy = OsEntropy;
+    let mut tx = pool.begin().await.expect("begin");
+    let (_user_id, token) =
+        seed_user_with_client_key(&mut tx, "body_limit_user", None, &entropy).await;
+    tx.commit().await.expect("commit");
+
+    let prefix = r#"{"model":"not-in-catalog","messages":[{"role":"user","content":""#;
+    let suffix = r#""}]}"#;
+    let padding = 2 * 1024 * 1024 - prefix.len() - suffix.len();
+    let body = format!("{prefix}{}{suffix}", "x".repeat(padding));
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .expect("request")
+    };
+
+    let app = build_wire_app_with_max_body(&pool, &master_key, 32).await;
+    let response = app.oneshot(request()).await.expect("2 MiB response");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a 2 MiB body must pass the default 32 MiB data-plane limit and reach model resolution"
+    );
+
+    let app = build_wire_app_with_max_body(&pool, &master_key, 1).await;
+    let response = app.oneshot(request()).await.expect("oversize response");
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body above the configured maximum must be rejected by the data-plane limit"
+    );
 }
 
 fn chat_request(token: &str) -> Request<Body> {
