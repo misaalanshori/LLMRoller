@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use llmroller_core::chat_preview::escape_html;
 use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope};
@@ -1349,6 +1350,16 @@ async fn get_admin_session_preview_handler(
     get_session_preview_internal(&state, &session_hash, None).await
 }
 
+/// Escape every string leaf so preview JSON never carries executable markup (SEC-19).
+fn escape_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = escape_html(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(escape_json_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(escape_json_strings),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 async fn get_session_preview_internal(
     state: &ApiAppState,
     session_hash: &str,
@@ -1543,22 +1554,29 @@ async fn get_session_preview_internal(
             .response
             .get("assistant_reasoning")
             .and_then(|v| v.as_str())
-            .map(ToString::to_string);
+            .map(escape_html);
 
-        let assistant_tool_calls = turn_trace
+        let mut assistant_tool_calls = turn_trace
             .response
             .get("assistant_tool_calls")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        for call in &mut assistant_tool_calls {
+            escape_json_strings(call);
+        }
+
+        for message in &mut new_input_messages {
+            escape_json_strings(message);
+        }
 
         timeline.push(serde_json::json!({
             "ordinal": idx + 1,
-            "request_id": req_id,
+            "request_id": escape_html(&req_id),
             "ts": ts,
-            "thread_id": thread_id,
-            "canonical_model": canonical_model,
-            "protocol": protocol,
+            "thread_id": escape_html(&thread_id),
+            "canonical_model": escape_html(&canonical_model),
+            "protocol": escape_html(&protocol),
             "truncated_content": truncated_content,
             "new_input_messages": new_input_messages,
             "assistant_text": sanitized_assistant,
@@ -1582,17 +1600,17 @@ async fn get_session_preview_internal(
     let mut current_pins = Vec::new();
     for pr in pin_rows {
         current_pins.push(serde_json::json!({
-            "upstream_key_id": pr.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default(),
-            "canonical_id": pr.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+            "upstream_key_id": pr.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default().map(|value| escape_html(&value)),
+            "canonical_id": pr.try_get::<Option<String>, _>("canonical_id").unwrap_or_default().map(|value| escape_html(&value)),
             "pool_tier": pr.try_get::<i64, _>("pool_tier").unwrap_or(1),
-            "key_label": pr.try_get::<Option<String>, _>("key_label").unwrap_or_default(),
+            "key_label": pr.try_get::<Option<String>, _>("key_label").unwrap_or_default().map(|value| escape_html(&value)),
         }));
     }
 
     Ok(Json(serde_json::json!({
-        "session_hash": session_hash,
-        "owner_user_id": first_owner_user_id,
-        "client_key_id": first_client_key_id,
+        "session_hash": escape_html(session_hash),
+        "owner_user_id": escape_html(&first_owner_user_id),
+        "client_key_id": escape_html(&first_client_key_id),
         "total_turns": timeline.len(),
         "current_pins": current_pins,
         "timeline": timeline,
@@ -3429,16 +3447,20 @@ async fn get_partial_pins_handler(
     for r in rows {
         let hash: String = r.try_get("session_hash").unwrap_or_default();
         let short_hash = if hash.len() > 12 { &hash[..12] } else { &hash };
+        let short_hash = escape_html(short_hash);
         let clk: String = r.try_get("client_key_id").unwrap_or_default();
         let short_clk = if clk.len() > 10 { &clk[..10] } else { &clk };
+        let short_clk = escape_html(short_clk);
         let model: String = r
             .try_get::<Option<String>, _>("canonical_id")
             .unwrap_or_default()
             .unwrap_or_else(|| "unresolved".to_string());
+        let model = escape_html(&model);
         let key_label: String = r
             .try_get::<Option<String>, _>("key_label")
             .unwrap_or_default()
             .unwrap_or_else(|| "key".to_string());
+        let key_label = escape_html(&key_label);
         let pool_tier: i64 = r.try_get("pool_tier").unwrap_or(1);
         let last_used: i64 = r.try_get("last_used_at").unwrap_or(0);
         let time_str = format!(
@@ -3507,6 +3529,10 @@ async fn get_partial_client_keys_handler(
         let prefix: String = r.try_get("prefix").unwrap_or_default();
         let label: String = r.try_get("label").unwrap_or_default();
         let scope: String = r.try_get("routing_scope").unwrap_or_default();
+        let id = escape_html(&id);
+        let prefix = escape_html(&prefix);
+        let label = escape_html(&label);
+        let scope = escape_html(&scope);
         let rpm: Option<i64> = r.try_get("rate_limit_rpm").unwrap_or_default();
         let rpm_str = rpm.map_or_else(|| "Unlimited".to_string(), |v| format!("{v} RPM"));
         let budget: Option<i64> = r.try_get("budget_micro_usd_month").unwrap_or_default();
@@ -3563,6 +3589,10 @@ async fn get_partial_providers_handler(
         let name: String = p.try_get("name").unwrap_or_default();
         let kind: String = p.try_get("kind").unwrap_or_default();
         let base_url: String = p.try_get("base_url").unwrap_or_default();
+        let pid = escape_html(&pid);
+        let name = escape_html(&name);
+        let kind = escape_html(&kind);
+        let base_url = escape_html(&base_url);
 
         let key_rows = sqlx::query(
             "SELECT id, label, secret_last4, priority, strict_tier, enabled FROM upstream_keys WHERE provider_id = ?",
@@ -3581,7 +3611,10 @@ async fn get_partial_providers_handler(
                 let kid: String = k.try_get("id").unwrap_or_default();
                 let klabel: String = k.try_get("label").unwrap_or_default();
                 let last4: Option<String> = k.try_get("secret_last4").unwrap_or_default();
+                let kid = escape_html(&kid);
+                let klabel = escape_html(&klabel);
                 let mask = last4.map_or_else(|| "sealed".to_string(), |l| format!("••••{l}"));
+                let mask = escape_html(&mask);
                 let prio: i64 = k.try_get("priority").unwrap_or(100);
                 let tier: i64 = k.try_get("strict_tier").unwrap_or(1);
                 let enabled: bool = k.try_get::<i64, _>("enabled").unwrap_or(1) == 1;
@@ -3658,8 +3691,11 @@ async fn get_partial_shares_outgoing_handler(
         } else {
             &grantee
         };
+        let short_grantee = escape_html(short_grantee);
+        let id = escape_html(&id);
         let models: Option<String> = r.try_get("allowed_models").unwrap_or_default();
         let models_str = models.unwrap_or_else(|| "All".to_string());
+        let models_str = escape_html(&models_str);
         let cap: Option<i64> = r.try_get("max_monthly_micro_usd").unwrap_or_default();
         let cap_str = cap.map_or_else(
             || "No Cap".to_string(),
@@ -3715,20 +3751,26 @@ async fn get_partial_shares_incoming_handler(
     let mut html = String::new();
     for r in rows {
         let id: String = r.try_get("id").unwrap_or_default();
+        let id = escape_html(&id);
         let pname: String = r.try_get("provider_name").unwrap_or_default();
+        let pname = escape_html(&pname);
         let pkind: String = r.try_get("provider_kind").unwrap_or_default();
+        let pkind = escape_html(&pkind);
         let owner: String = r.try_get("owner_user_id").unwrap_or_default();
         let short_owner = if owner.len() > 10 {
             &owner[..10]
         } else {
             &owner
         };
+        let short_owner = escape_html(short_owner);
         let models: Option<String> = r.try_get("allowed_models").unwrap_or_default();
         let models_str = models.unwrap_or_else(|| "All".to_string());
+        let models_str = escape_html(&models_str);
         let accepted_fp: Option<String> =
             r.try_get("accepted_config_fingerprint").unwrap_or_default();
         let current_fp: String = r.try_get("current_fingerprint").unwrap_or_default();
         let is_matching = accepted_fp.as_deref() == Some(&current_fp);
+        let current_fp = escape_html(&current_fp);
 
         let action_btn = if is_matching {
             "<span class=\"text-muted\">Active</span>".to_string()
@@ -3780,9 +3822,11 @@ async fn get_partial_matrix_handler(
     let mut html = String::new();
     for m in arr {
         let cid = m["canonical_id"].as_str().unwrap_or("unknown");
+        let cid = escape_html(cid);
         let strategy = m["routing_strategy"]
             .as_str()
             .unwrap_or("smooth_weighted_rr");
+        let strategy = escape_html(strategy);
         let own_keys = m["own_keys"].as_array().map_or("—".to_string(), |keys| {
             if keys.is_empty() {
                 "—".to_string()
@@ -3815,6 +3859,8 @@ async fn get_partial_matrix_handler(
                     .join(", ")
             }
         });
+        let own_keys = escape_html(&own_keys);
+        let shared_keys = escape_html(&shared_keys);
         let global_avail = m["global_pool"]["available"].as_bool().unwrap_or(false);
         let global_html = if global_avail {
             "<span class=\"badge badge-success\">Global pool</span>"
@@ -3920,8 +3966,11 @@ async fn get_partial_admin_users_handler(
     let mut html = String::new();
     for r in rows {
         let id: String = r.try_get("id").unwrap_or_default();
+        let id = escape_html(&id);
         let username: String = r.try_get("username").unwrap_or_default();
+        let username = escape_html(&username);
         let role: String = r.try_get("role").unwrap_or_default();
+        let role = escape_html(&role);
         let can_use: bool = r.try_get::<i64, _>("can_use_global_providers").unwrap_or(1) == 1;
         let budget: Option<i64> = r
             .try_get("global_budget_micro_usd_month")
@@ -3991,6 +4040,10 @@ async fn get_partial_admin_providers_handler(
         let name: String = p.try_get("name").unwrap_or_default();
         let kind: String = p.try_get("kind").unwrap_or_default();
         let base_url: String = p.try_get("base_url").unwrap_or_default();
+        let pid = escape_html(&pid);
+        let name = escape_html(&name);
+        let kind = escape_html(&kind);
+        let base_url = escape_html(&base_url);
 
         let key_rows = sqlx::query(
             "SELECT id, label, secret_last4, priority, strict_tier, enabled FROM upstream_keys WHERE provider_id = ?",
@@ -4009,7 +4062,10 @@ async fn get_partial_admin_providers_handler(
                 let kid: String = k.try_get("id").unwrap_or_default();
                 let klabel: String = k.try_get("label").unwrap_or_default();
                 let last4: Option<String> = k.try_get("secret_last4").unwrap_or_default();
+                let kid = escape_html(&kid);
+                let klabel = escape_html(&klabel);
                 let mask = last4.map_or_else(|| "sealed".to_string(), |l| format!("••••{l}"));
+                let mask = escape_html(&mask);
                 let prio: i64 = k.try_get("priority").unwrap_or(100);
                 let tier: i64 = k.try_get("strict_tier").unwrap_or(1);
                 let enabled: bool = k.try_get::<i64, _>("enabled").unwrap_or(1) == 1;
@@ -4076,11 +4132,15 @@ async fn get_partial_admin_catalog_handler(
     let mut html = String::new();
     for r in model_rows {
         let pk: String = r.try_get("model_pk").unwrap_or_default();
+        let pk = escape_html(&pk);
         let cid: String = r.try_get("canonical_id").unwrap_or_default();
+        let cid = escape_html(&cid);
         let origin: String = r.try_get("origin").unwrap_or_default();
+        let origin = escape_html(&origin);
         let exposed: Option<i64> = r.try_get("exposed").unwrap_or_default();
         let is_exposed = exposed != Some(0);
         let merge_state: String = r.try_get("merge_state").unwrap_or_default();
+        let merge_state = escape_html(&merge_state);
         let count: i64 = r.try_get("route_count").unwrap_or(0);
 
         let confirm_btn = if merge_state == "pending_review" {
@@ -4148,7 +4208,9 @@ async fn get_partial_admin_audit_handler(
                 a.to_string()
             }
         });
+        let actor_str = escape_html(&actor_str);
         let action: String = r.try_get("action").unwrap_or_default();
+        let action = escape_html(&action);
         let target_type: String = r
             .try_get::<Option<String>, _>("target_type")
             .unwrap_or_default()
@@ -4158,7 +4220,9 @@ async fn get_partial_admin_audit_handler(
             let short = if tid.len() > 8 { &tid[..8] } else { &tid };
             format!("{target_type} ({short})")
         });
+        let target_str = escape_html(&target_str);
         let payload: String = r.try_get("detail_json").unwrap_or_default();
+        let payload = escape_html(&payload);
 
         html.push_str(&format!(
             "<tr>\

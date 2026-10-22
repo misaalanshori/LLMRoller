@@ -43,6 +43,13 @@ function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, ch => replacements[ch]);
 }
 
+// Preview fields arrive HTML-escaped from the server (SEC-19). Pass them
+// through unchanged, but neutralize any raw tag if a field ever regresses.
+function previewText(value) {
+    const text = String(value ?? '');
+    return /[<>]/.test(text) ? escapeHtml(text) : text;
+}
+
 function onProviderKindChange(kind, selectId) {
     const isGlobal = selectId === 'gp-kind';
     const urlInput = document.getElementById(isGlobal ? 'gp-url' : 'prov-url');
@@ -74,6 +81,9 @@ document.addEventListener('click', function(e) {
         if (provId) {
             const targetInput = document.getElementById('target-provider-id');
             if (targetInput) targetInput.value = provId;
+        }
+        if (modalId === 'modal-new-share') {
+            populateShareProviders();
         }
         openModal(modalId);
         return;
@@ -272,12 +282,49 @@ async function handleCreateUpstreamKey(e) {
     }
 }
 
+async function populateShareProviders() {
+    const select = document.getElementById('share-provider-select');
+    if (!select) return;
+    select.replaceChildren();
+    try {
+        const res = await fetch('/api/user/providers');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const providers = await res.json();
+        const own = (providers || []).filter(p => p.ownership_scope === 'personal' && p.enabled);
+        if (own.length === 0) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = 'No personal providers available';
+            opt.disabled = true;
+            select.appendChild(opt);
+            return;
+        }
+        own.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.name;
+            select.appendChild(opt);
+        });
+    } catch (err) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = 'Failed to load providers';
+        opt.disabled = true;
+        select.appendChild(opt);
+    }
+}
+
 async function handleCreateShare(e) {
     e.preventDefault();
     const grantee_user_id = document.getElementById('share-grantee').value.trim();
     const provider_id = document.getElementById('share-provider-select').value;
     const capVal = document.getElementById('share-cap').value;
     const modelsVal = document.getElementById('share-models').value.trim();
+
+    if (!provider_id) {
+        alert('Select a personal provider first.');
+        return;
+    }
 
     const payload = {
         grantee_user_id,
@@ -288,11 +335,12 @@ async function handleCreateShare(e) {
     };
 
     try {
-        await fetch('/api/user/shares', {
+        const res = await fetch('/api/user/shares', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify(payload)
         });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         closeModal('modal-new-share');
         document.getElementById('form-new-share').reset();
 
@@ -627,7 +675,7 @@ async function openChatPreview(sessionHash) {
     openModal('modal-chat-preview');
 
     try {
-        const res = await fetch(`/api/user/sessions/${sessionHash}/chat`);
+        const res = await fetch(`/api/user/sessions/${encodeURIComponent(sessionHash)}/chat`);
         if (!res.ok) {
             container.innerHTML = '<p class="text-muted">No stored trace turns found for this session (traceability may be disabled or retention expired).</p>';
             return;
@@ -642,28 +690,28 @@ async function openChatPreview(sessionHash) {
             const inputHtml = (turn.new_input_messages || []).map(m => `
                 <div class="chat-msg user-msg">
                     <div class="chat-role">User</div>
-                    <pre class="chat-content">${m.content ? m.content : JSON.stringify(m)}</pre>
+                    <pre class="chat-content">${previewText(m.content ? m.content : JSON.stringify(m))}</pre>
                 </div>
             `).join('');
 
             const reasoningHtml = turn.assistant_reasoning ? `
                 <details class="chat-reasoning">
                     <summary>Thinking / Reasoning</summary>
-                    <pre>${turn.assistant_reasoning}</pre>
+                    <pre>${previewText(turn.assistant_reasoning)}</pre>
                 </details>
             ` : '';
 
             const toolCallsHtml = (turn.assistant_tool_calls || []).map(tc => `
                 <div class="chat-tool-call">
-                    <span class="badge badge-warning">Tool Call: ${tc.name || tc.id}</span>
-                    <pre>${JSON.stringify(tc.arguments || tc.parameters || tc, null, 2)}</pre>
+                    <span class="badge badge-warning">Tool Call: ${previewText(tc.name || tc.id)}</span>
+                    <pre>${previewText(JSON.stringify(tc.arguments || tc.parameters || tc, null, 2))}</pre>
                 </div>
             `).join('');
 
             return `
                 <div class="chat-turn-card">
                     <div class="chat-turn-header">
-                        <span>Turn #${turn.ordinal} (${turn.canonical_model})</span>
+                        <span>Turn #${previewText(turn.ordinal)} (${previewText(turn.canonical_model)})</span>
                         <span class="text-muted">${new Date(turn.ts).toLocaleTimeString()}</span>
                     </div>
                     ${inputHtml}
@@ -677,6 +725,6 @@ async function openChatPreview(sessionHash) {
             `;
         }).join('');
     } catch (e) {
-        container.innerHTML = `<p class="text-danger">Failed to load chat preview: ${e}</p>`;
+        container.innerHTML = `<p class="text-danger">Failed to load chat preview: ${escapeHtml(e && e.message ? e.message : e)}</p>`;
     }
 }

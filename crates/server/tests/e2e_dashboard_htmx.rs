@@ -63,6 +63,19 @@ async fn setup_dashboard_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, Mast
     (dir, writer_pool, master_key, admin.id)
 }
 
+/// Assert an HTMX partial rendered user-controlled text as inert markup (SEC-19).
+fn assert_no_raw_user_markup(body: &str, context: &str) {
+    assert!(
+        !body.contains("<script"),
+        "{context} leaked a raw <script> tag"
+    );
+    assert!(!body.contains("<img"), "{context} leaked a raw <img> tag");
+    assert!(
+        body.contains("&lt;script&gt;"),
+        "{context} did not render the payload escaped"
+    );
+}
+
 #[doc = "Spec: UI-1, UI-2, UI-4, TRC-6, AUTH-4, USR-5, MDL-3, MDL-4, AUD-1, SEC-6, TRC-5, TRC-8, TRC-9, SEC-19"]
 #[tokio::test]
 async fn test_htmx_dashboards_key_projection_and_chat_preview() {
@@ -125,6 +138,14 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     assert!(app_js.contains("adm-settings-grid"));
     assert!(app_js.contains("adm-aliases-body"));
     assert!(app_js.contains("new uPlot("));
+    assert!(
+        app_html.contains("id=\"share-provider-select\""),
+        "F05: the create-share modal must expose a provider selector"
+    );
+    assert!(
+        app_js.contains("populateShareProviders"),
+        "F05: the create-share modal must populate personal providers"
+    );
 
     // 3. UI-4: Global traceability status banner
     let base_html = include_str!("../../../crates/admin/templates/base.html");
@@ -651,18 +672,21 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     let admin_cookie = format!("llmroller_session={raw_admin}");
 
     // Insert client key and pin for Dave
+    let malicious = "<script>alert('xss')</script><img src=x onerror=alert(1)>";
     let clk_id = ClientKeyId::generate();
     let prov_id = llmroller_core::ids::ProviderId::generate();
     let uk_id = llmroller_core::ids::UpstreamKeyId::generate();
     let model_pk = llmroller_core::ids::ModelPk::generate();
+    let global_prov_id = llmroller_core::ids::ProviderId::generate();
 
     let mut tx = pool.begin().await.expect("tx");
     sqlx::query(
         "INSERT INTO client_keys (id, owner_user_id, prefix, key_hash, label, routing_scope, created_at)
-         VALUES (?, ?, 'llr_dave', 'dummyhash123', 'Dave Laptop', 'personal_first', ?)"
+         VALUES (?, ?, 'llr_dave', 'dummyhash123', ?, 'personal_first', ?)"
     )
     .bind(clk_id.to_string())
     .bind(dave.id.to_string())
+    .bind(format!("Dave {malicious}"))
     .bind(now_ms)
     .execute(&mut *tx)
     .await
@@ -670,9 +694,11 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
 
     sqlx::query(
         "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, owner_user_id, created_at)
-         VALUES (?, 'dave_prov', 'custom', 'https://dave.ai', '{}', 'personal', ?, ?)"
+         VALUES (?, ?, 'custom', ?, '{}', 'personal', ?, ?)"
     )
     .bind(prov_id.to_string())
+    .bind(format!("dave_prov {malicious}"))
+    .bind(format!("https://dave.ai/{malicious}"))
     .bind(dave.id.to_string())
     .bind(now_ms)
     .execute(&mut *tx)
@@ -681,15 +707,29 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
 
     sqlx::query(
         "INSERT INTO upstream_keys (id, provider_id, owner_user_id, label, secret_enc, secret_last4, master_key_id, created_at)
-         VALUES (?, ?, ?, 'dave_key', X'00', '1234', 'key-0', ?)"
+         VALUES (?, ?, ?, ?, X'00', '1234', 'key-0', ?)"
     )
     .bind(uk_id.to_string())
     .bind(prov_id.to_string())
     .bind(dave.id.to_string())
+    .bind(format!("dave_key {malicious}"))
     .bind(now_ms)
     .execute(&mut *tx)
     .await
     .expect("insert upstream key");
+
+    // Admin-owned global provider with the same hostile display fields.
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, owner_user_id, created_at)
+         VALUES (?, ?, 'custom', ?, '{}', 'global', NULL, ?)"
+    )
+    .bind(global_prov_id.to_string())
+    .bind(format!("global_prov {malicious}"))
+    .bind(format!("https://global.ai/{malicious}"))
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .expect("insert global provider");
 
     sqlx::query(
         "INSERT INTO models (model_pk, canonical_id)
@@ -732,6 +772,7 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     assert!(pins_html.contains(&format!(
         "hx-delete=\"/api/user/pins/{clk_id}/dave-active-hash/claude-sonnet-4.6\""
     )));
+    assert_no_raw_user_markup(pins_html, "/app/partials/pins");
 
     // 2. GET /app/partials/client-keys: returns rendered HTML rows with HTMX Revoke action
     let clk_req = Request::builder()
@@ -745,8 +786,44 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     assert_eq!(clk_res.status(), StatusCode::OK);
     let clk_body = clk_res.into_body().collect().await.expect("b").to_bytes();
     let clk_html = std::str::from_utf8(&clk_body).expect("utf8");
-    assert!(clk_html.contains("Dave Laptop"));
+    assert!(clk_html.contains("Dave &lt;script&gt;"));
     assert!(clk_html.contains(&format!("hx-delete=\"/api/user/client-keys/{clk_id}\"")));
+    assert_no_raw_user_markup(clk_html, "/app/partials/client-keys");
+
+    // 2b. GET /app/partials/providers: personal provider and key labels are inert.
+    let prov_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/providers")
+        .header(header::COOKIE, &dave_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let prov_res = app.clone().oneshot(prov_req).await.expect("res");
+    assert_eq!(prov_res.status(), StatusCode::OK);
+    let prov_body = prov_res.into_body().collect().await.expect("b").to_bytes();
+    let prov_html = std::str::from_utf8(&prov_body).expect("utf8");
+    assert!(prov_html.contains("dave_prov &lt;script&gt;"));
+    assert_no_raw_user_markup(prov_html, "/app/partials/providers");
+
+    // 2c. GET /admin/partials/providers: global provider fields are inert.
+    let admin_prov_req = Request::builder()
+        .method("GET")
+        .uri("/admin/partials/providers")
+        .header(header::COOKIE, &admin_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let admin_prov_res = app.clone().oneshot(admin_prov_req).await.expect("res");
+    assert_eq!(admin_prov_res.status(), StatusCode::OK);
+    let admin_prov_body = admin_prov_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
+    let admin_prov_html = std::str::from_utf8(&admin_prov_body).expect("utf8");
+    assert!(admin_prov_html.contains("global_prov &lt;script&gt;"));
+    assert_no_raw_user_markup(admin_prov_html, "/admin/partials/providers");
 
     // 3. HTMX Unpin action: owner-scoped DELETE /api/user/pins/... with hx-request returns 200 OK
     let unpin_req = Request::builder()

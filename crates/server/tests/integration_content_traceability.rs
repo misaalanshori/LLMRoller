@@ -622,8 +622,13 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
             }),
             block_refs: vec!["blk_charlie_prompt".to_string()],
             response: serde_json::json!({
-                "assistant_text": "Hello Charlie! How can I help you?",
-                "assistant_reasoning": "User greeted warmly."
+                "assistant_text": "Hello Charlie! <script>alert('xss')</script><img src=x onerror=alert(1)>",
+                "assistant_reasoning": "<script>alert('reason')</script>",
+                "assistant_tool_calls": [{
+                    "id": "call_1",
+                    "name": "<script>alert('tool')</script>",
+                    "arguments": {"q": "<img src=x onerror=alert(1)>"}
+                }]
             }),
             response_raw: None,
             truncation: None,
@@ -632,7 +637,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
             "blk_charlie_prompt".to_string(),
             serde_json::to_vec(&serde_json::json!({
                 "role": "user",
-                "content": "Hello! Can you help me write Rust?"
+                "content": "Hello! <script>alert('prompt')</script><img src=x onerror=alert(1)>"
             }))
             .expect("block bytes"),
         )],
@@ -666,7 +671,10 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
     let timeline = chat_json["timeline"].as_array().expect("timeline array");
     assert_eq!(timeline.len(), 1);
     assert_eq!(timeline[0]["canonical_model"], "claude-sonnet-4.6");
-    assert_eq!(timeline[0]["assistant_reasoning"], "User greeted warmly.");
+    assert_eq!(
+        timeline[0]["assistant_reasoning"],
+        "&lt;script&gt;alert(&#39;reason&#39;)&lt;/script&gt;"
+    );
     assert!(
         timeline[0]["assistant_text"]
             .as_str()
@@ -682,8 +690,27 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         messages[0]["content"]
             .as_str()
             .expect("content str")
-            .contains("Hello! Can you help me write Rust?")
+            .contains("Hello! &lt;script&gt;alert(")
     );
+
+    // SEC-19: every preview field is inert, including prose, reasoning and tool payloads.
+    let raw_chat = std::str::from_utf8(&chat_bytes).expect("utf8 preview");
+    assert!(
+        !raw_chat.contains("<script") && !raw_chat.contains("<img"),
+        "chat preview leaked executable markup: {raw_chat}"
+    );
+    assert!(raw_chat.contains("&lt;script&gt;alert"));
+    let tool_name = timeline[0]["assistant_tool_calls"][0]["name"]
+        .as_str()
+        .expect("tool name");
+    assert_eq!(
+        tool_name,
+        "&lt;script&gt;alert(&#39;tool&#39;)&lt;/script&gt;"
+    );
+    let tool_arg = timeline[0]["assistant_tool_calls"][0]["arguments"]["q"]
+        .as_str()
+        .expect("tool argument");
+    assert_eq!(tool_arg, "&lt;img src=x onerror=alert(1)&gt;");
 
     // 2. Single turn raw JSON drawer: GET /api/user/traces/{request_id}
     let req_single = Request::builder()
