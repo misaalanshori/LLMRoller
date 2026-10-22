@@ -103,6 +103,11 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     let app_js = include_str!("../../../crates/admin/static/app.js");
     assert!(app_js.contains("open_design_amr"));
     assert!(app_js.contains("https://amr-link.open-design.ai/v1"));
+    assert!(app_js.contains("https://api.commandcode.ai/provider/v1"));
+    assert!(
+        !app_js.contains("https://commandcode.ai/alpha"),
+        "PRV-2: Command Code must use the current Provider API base URL"
+    );
     assert!(admin_html.contains("Projected Disk Usage"));
     assert!(admin_html.contains("uplot-container"));
     assert!(admin_html.contains("id=\"uplot-summary\""));

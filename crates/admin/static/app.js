@@ -49,7 +49,7 @@ function onProviderKindChange(kind, selectId) {
     if (!urlInput) return;
     if (kind === 'openrouter') urlInput.value = 'https://openrouter.ai/api/v1';
     else if (kind === 'opencode_go') urlInput.value = 'https://opencode.ai/zen/go/v1';
-    else if (kind === 'command_code') urlInput.value = 'https://commandcode.ai/alpha';
+    else if (kind === 'command_code') urlInput.value = 'https://api.commandcode.ai/provider/v1';
     else if (kind === 'open_design_amr') urlInput.value = 'https://amr-link.open-design.ai/v1';
     else if (kind === 'custom') urlInput.value = '';
 }
