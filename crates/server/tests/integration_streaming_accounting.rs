@@ -28,6 +28,7 @@ use llmroller_core::pricing::Rates;
 use llmroller_core::provider::ProviderKind;
 use llmroller_core::rbac::{ActorScope, OwnershipScope, SystemSeal, SystemTask};
 use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_string};
+use llmroller_core::strategy::{RouteId, RouteLoadTracker};
 use llmroller_proxy::auth::ProxyAuthState;
 use llmroller_proxy::listeners::data_plane_router;
 use llmroller_server::reloader::load_initial_snapshot;
@@ -355,7 +356,23 @@ async fn seed_price(harness: &Harness) {
 }
 
 async fn build_app(harness: &Harness) -> Router {
-    build_app_with_shutdown(harness, None, None).await
+    build_app_with_runtime(harness).await.0
+}
+
+/// Build the data-plane router and expose the runtime state for hot-path assertions.
+async fn build_app_with_runtime(
+    harness: &Harness,
+) -> (Router, Arc<llmroller_core::runtime_state::RuntimeState>) {
+    let snapshot = load_initial_snapshot(&harness.pool)
+        .await
+        .expect("load snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
+    let state = ProxyAuthState::new(shared_snapshot, harness.pool.clone(), vec![])
+        .with_master_key(harness.master_key.clone())
+        .with_writer(harness.writer.clone());
+    state.is_ready.store(true, Ordering::SeqCst);
+    let runtime = state.runtime_state.clone();
+    (data_plane_router(state), runtime)
 }
 
 async fn build_app_with_shutdown(
@@ -419,6 +436,45 @@ async fn single_key_route_with_config(
     let model_pk = insert_model(harness, "gpt-4o", Some("smooth_weighted_rr")).await;
     insert_route(harness, key, model_pk, "gpt-4o").await;
     (provider, key, model_pk)
+}
+
+#[tokio::test]
+async fn test_in_flight_tracks_active_stream_lifetime() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "in-flight").await;
+    let (mock_addr, _) = spawn_mock(MockMode::StreamStall).await;
+    let (_provider, key_id, model_pk) =
+        single_key_route(&harness, mock_addr, "in-flight", 100).await;
+    let token = create_client_key(&harness, user, "in-flight-key").await;
+    let (app, runtime) = build_app_with_runtime(&harness).await;
+    let route_id = RouteId {
+        upstream_key_id: key_id,
+        model_pk,
+    };
+
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        runtime.load_tracker.in_flight(&route_id),
+        1,
+        "P2C must see the active streaming route while its body is open (RTE-3)"
+    );
+
+    drop(response);
+    for _ in 0..100 {
+        if runtime.load_tracker.in_flight(&route_id) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        runtime.load_tracker.in_flight(&route_id),
+        0,
+        "dropping the client response must release the in-flight slot"
+    );
 }
 
 #[tokio::test]

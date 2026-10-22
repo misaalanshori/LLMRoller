@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -143,8 +143,14 @@ impl KeyHealthEntry {
 /// Lock-free in-flight and EWMA latency tracker for Power of Two Choices.
 #[derive(Debug, Default)]
 pub struct LoadTracker {
-    in_flight: DashMap<RouteId, u32>,
-    ewma_ttfb_ms: DashMap<RouteId, f64>,
+    routes: DashMap<RouteId, Arc<AtomicRouteLoad>>,
+}
+
+/// Per-route counters updated without taking a shard write lock on the hot path.
+#[derive(Debug, Default)]
+struct AtomicRouteLoad {
+    in_flight: AtomicU32,
+    ewma_ttfb_bits: AtomicU64,
 }
 
 impl LoadTracker {
@@ -153,31 +159,56 @@ impl LoadTracker {
         Self::default()
     }
 
-    pub fn begin(&self, route: RouteId) {
-        *self.in_flight.entry(route).or_insert(0) += 1;
+    fn entry(&self, route: RouteId) -> Arc<AtomicRouteLoad> {
+        self.routes.entry(route).or_default().clone()
     }
 
+    /// Mark one request as in flight on `route`.
+    pub fn begin(&self, route: RouteId) {
+        self.entry(route).in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Release one in-flight request, saturating at zero for defensive safety.
     pub fn end(&self, route: RouteId) {
-        if let Some(mut entry) = self.in_flight.get_mut(&route) {
-            *entry = entry.saturating_sub(1);
+        if let Some(entry) = self.routes.get(&route) {
+            let _ = entry
+                .in_flight
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(1))
+                });
         }
     }
 
     pub fn record_ttfb(&self, route: RouteId, ttfb_ms: u64, weight: f64) {
-        let mut entry = self.ewma_ttfb_ms.entry(route).or_insert(ttfb_ms as f64);
-        *entry = (*entry * (1.0 - weight)) + (ttfb_ms as f64 * weight);
+        let entry = self.entry(route);
+        let mut current = entry.ewma_ttfb_bits.load(Ordering::Relaxed);
+        loop {
+            let previous = f64::from_bits(current);
+            let next = (previous * (1.0 - weight)) + (ttfb_ms as f64 * weight);
+            match entry.ewma_ttfb_bits.compare_exchange_weak(
+                current,
+                next.to_bits(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
 impl RouteLoadTracker for LoadTracker {
     fn in_flight(&self, route: &RouteId) -> u32 {
-        self.in_flight.get(route).map_or(0, |entry| *entry)
+        self.routes
+            .get(route)
+            .map_or(0, |entry| entry.in_flight.load(Ordering::Relaxed))
     }
 
     fn ewma_ttfb_ms(&self, route: &RouteId) -> u64 {
-        self.ewma_ttfb_ms
-            .get(route)
-            .map_or(0, |entry| (*entry).round() as u64)
+        self.routes.get(route).map_or(0, |entry| {
+            f64::from_bits(entry.ewma_ttfb_bits.load(Ordering::Relaxed)).round() as u64
+        })
     }
 }
 

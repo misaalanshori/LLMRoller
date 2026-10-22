@@ -2570,6 +2570,25 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
+/// Holds one in-flight slot on the selected route until the attempt or stream finishes.
+struct InFlightGuard {
+    tracker: Arc<llmroller_core::runtime_state::LoadTracker>,
+    route: RouteId,
+}
+
+impl InFlightGuard {
+    fn new(tracker: Arc<llmroller_core::runtime_state::LoadTracker>, route: RouteId) -> Self {
+        tracker.begin(route);
+        Self { tracker, route }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.tracker.end(self.route);
+    }
+}
+
 fn upstream_content_encoding(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CONTENT_ENCODING)
@@ -2634,6 +2653,8 @@ struct StreamState {
     shutdown_notify: Option<Arc<tokio::sync::Notify>>,
     /// Held for exactly the lifetime of the response body stream.
     _stream_guard: ActiveStreamGuard,
+    /// Keeps P2C in-flight load accurate until the response body ends.
+    _in_flight: InFlightGuard,
     done: bool,
 }
 
@@ -3322,6 +3343,13 @@ pub async fn handle_inference_request(
             continue;
         };
 
+        // Count the attempt on the selected route for the whole upstream call. Streaming
+        // responses move this guard into StreamState so P2C sees load until the body ends.
+        let mut in_flight = Some(InFlightGuard::new(
+            Arc::clone(&state.runtime_state.load_tracker),
+            candidate.route_id(),
+        ));
+
         // Only Chat Completions understands `stream_options`; native Messages and
         // Responses streams must pass through byte-identically (`API-4`, `TRN-2`).
         let chat_stream_mode = if is_streaming && endpoint == EndpointKind::Chat {
@@ -3898,6 +3926,7 @@ pub async fn handle_inference_request(
                     shutdown_cut: state.shutdown_cut.clone(),
                     shutdown_notify: state.shutdown_notify.clone(),
                     _stream_guard: ActiveStreamGuard::acquire(state.open_streams.clone()),
+                    _in_flight: in_flight.take().expect("in-flight guard"),
                     done: false,
                 };
                 let metered = stream::unfold(stream_state, |mut stream_state| async move {
