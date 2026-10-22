@@ -15,8 +15,10 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use futures_util::StreamExt as _;
 use tempfile::tempdir;
 use tower::ServiceExt as _;
 
@@ -100,14 +102,29 @@ async fn mock_gzip_chat() -> Response {
         .into_response()
 }
 
+/// Emit one gzip stream split across three independent HTTP chunks so the proxy must keep
+/// decoder state across chunk boundaries (TRN-3, audit F18).
 async fn mock_gzip_sse() -> Response {
+    let compressed = gzip(GZIP_SSE.as_bytes());
+    let split = compressed.len() / 3;
+    let parts = [
+        Bytes::copy_from_slice(&compressed[..split]),
+        Bytes::copy_from_slice(&compressed[split..split * 2]),
+        Bytes::copy_from_slice(&compressed[split * 2..]),
+    ];
+    let stream = futures_util::stream::iter(parts.into_iter().map(Ok::<_, std::io::Error>)).then(
+        |part| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            part
+        },
+    );
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CONTENT_ENCODING, "gzip"),
         ],
-        gzip(GZIP_SSE.as_bytes()),
+        Body::from_stream(stream),
     )
         .into_response()
 }
