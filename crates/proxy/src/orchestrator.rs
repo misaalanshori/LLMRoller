@@ -287,8 +287,18 @@ fn hard_route_checks(
                 if provider.owner_user_id == Some(caller.owner_user_id) {
                     scope.allows_tier(PoolTier::Own)
                 } else {
+                    let grantor_disabled = provider.owner_user_id.is_none_or(|owner| {
+                        snapshot.users.get(&owner).is_none_or(|user| user.disabled)
+                    });
                     let shared = snapshot
-                        .effective_share(caller.owner_user_id, provider.id, key.id)
+                        .effective_share(
+                            caller.owner_user_id,
+                            provider.id,
+                            key.id,
+                            provider.kind,
+                            &provider.share_config_fingerprint,
+                            grantor_disabled,
+                        )
                         .is_some_and(|share| {
                             share.allowed_models.as_ref().is_none_or(|allowed| {
                                 model.is_some_and(|model| allowed.contains(&model.canonical_id))
@@ -312,13 +322,35 @@ fn hard_route_checks(
     });
 
     let c4 = model.is_some_and(|model| {
-        model.exposed != Some(false)
-            && (provider.is_some_and(|provider| {
-                provider.ownership_scope == llmroller_core::rbac::OwnershipScope::Global
-            }) || snapshot
-                .user_route_prefs
-                .get(&(caller.owner_user_id, model.id))
-                .is_none_or(|pref| pref.enabled))
+        if model.exposed == Some(false) {
+            return false;
+        }
+        if route.is_some_and(|route| is_conflict_minority(model, route)) {
+            return false;
+        }
+        let is_global = provider.is_some_and(|provider| {
+            provider.ownership_scope == llmroller_core::rbac::OwnershipScope::Global
+        });
+        if is_global {
+            if model.exposed.is_none()
+                && snapshot.settings.global_exposure_mode
+                    == llmroller_core::settings::GlobalExposureMode::Intersection
+                && !present_on_all_global_providers(snapshot, model)
+            {
+                return false;
+            }
+        } else {
+            let pref_enabled = key.is_some_and(|key| {
+                snapshot
+                    .user_route_prefs
+                    .get(&(caller.owner_user_id, key.id, model.id))
+                    .is_none_or(|preference| preference.enabled)
+            });
+            if !pref_enabled {
+                return false;
+            }
+        }
+        true
     });
 
     let c5 = route.is_some_and(|route| {
@@ -391,13 +423,74 @@ fn candidate_tier(
             if provider.owner_user_id == Some(caller_user_id) {
                 Some((CandidatePoolTier::Own, None))
             } else {
-                // A foreign personal key without a share grant is invisible (SEC-17).
+                let grantor_disabled = provider.owner_user_id.is_none_or(|owner| {
+                    snapshot.users.get(&owner).is_none_or(|user| user.disabled)
+                });
+                // A foreign personal key without an eligible share grant is invisible (SEC-17).
                 snapshot
-                    .effective_share(caller_user_id, provider.id, key.id)
+                    .effective_share(
+                        caller_user_id,
+                        provider.id,
+                        key.id,
+                        provider.kind,
+                        &provider.share_config_fingerprint,
+                        grantor_disabled,
+                    )
                     .map(|share| (CandidatePoolTier::Shared, Some(share.share_id)))
             }
         }
     }
+}
+
+/// Whether a pending-review route belongs to a minority vendor prefix (MDL-2, `C4`).
+fn is_conflict_minority(model: &SnapshotModel, route: &SnapshotModelRoute) -> bool {
+    model.merge_state == llmroller_core::catalog::MergeState::PendingReview
+        && route.vendor_prefix.as_ref() != model.majority_vendor_prefix.as_ref()
+}
+
+/// Whether every enabled global provider with a usable key serves the model (MDL-3).
+fn present_on_all_global_providers(snapshot: &ConfigSnapshot, model: &SnapshotModel) -> bool {
+    let usable_global_providers: HashSet<ProviderId> = snapshot
+        .providers
+        .values()
+        .filter(|provider| {
+            provider.enabled
+                && provider.ownership_scope == llmroller_core::rbac::OwnershipScope::Global
+        })
+        .filter(|provider| {
+            snapshot
+                .upstream_keys
+                .values()
+                .any(|key| key.provider_id == provider.id && key.enabled && key.health != "invalid")
+        })
+        .map(|provider| provider.id)
+        .collect();
+
+    if usable_global_providers.is_empty() {
+        return false;
+    }
+
+    let served: HashSet<ProviderId> = snapshot
+        .routes_by_model
+        .get(&model.id)
+        .into_iter()
+        .flatten()
+        .filter(|route| {
+            route.enabled && route.status == llmroller_core::catalog::RouteStatus::Active
+        })
+        .filter_map(|route| snapshot.upstream_keys.get(&route.upstream_key_id))
+        .filter(|key| key.enabled)
+        .filter_map(|key| snapshot.providers.get(&key.provider_id))
+        .filter(|provider| {
+            provider.enabled
+                && provider.ownership_scope == llmroller_core::rbac::OwnershipScope::Global
+        })
+        .map(|provider| provider.id)
+        .collect();
+
+    usable_global_providers
+        .iter()
+        .all(|provider_id| served.contains(provider_id))
 }
 
 /// Build the single hard-route candidate for a durable response link (RTE-12).
@@ -996,7 +1089,40 @@ pub(crate) fn collect_visible_candidates(
     scope: RoutingScope,
     now: i64,
 ) -> Vec<RouteCandidate> {
-    collect_routes(snapshot, model, caller, scope, now, false)
+    if model.exposed == Some(false) {
+        return Vec::new();
+    }
+
+    let intersection_blocked = model.exposed.is_none()
+        && snapshot.settings.global_exposure_mode
+            == llmroller_core::settings::GlobalExposureMode::Intersection
+        && !present_on_all_global_providers(snapshot, model);
+
+    let mut candidates = collect_routes(snapshot, model, caller, scope, now, false);
+    candidates.retain(|candidate| {
+        if intersection_blocked && candidate.pool_tier == CandidatePoolTier::Global {
+            return false;
+        }
+        if matches!(
+            candidate.pool_tier,
+            CandidatePoolTier::Own | CandidatePoolTier::Shared
+        ) && snapshot
+            .user_route_prefs
+            .get(&(caller.owner_user_id, candidate.upstream_key_id, model.id))
+            .is_some_and(|preference| !preference.enabled)
+        {
+            return false;
+        }
+        let minority = snapshot
+            .routes_by_model
+            .get(&model.id)
+            .into_iter()
+            .flatten()
+            .find(|route| route.upstream_key_id == candidate.upstream_key_id)
+            .is_some_and(|route| is_conflict_minority(model, route));
+        !minority
+    });
+    candidates
 }
 
 fn collect_routes(
@@ -1042,6 +1168,16 @@ fn collect_routes(
             continue;
         }
 
+        // `RTE-5`: user preferences override weights only on Own/Shared routes.
+        let user_priority = if matches!(tier, CandidatePoolTier::Own | CandidatePoolTier::Shared) {
+            snapshot
+                .user_route_prefs
+                .get(&(caller.owner_user_id, key.id, model.id))
+                .map(|preference| preference.priority_override)
+        } else {
+            None
+        };
+
         candidates.push(RouteCandidate {
             upstream_key_id: key.id,
             provider_id: provider.id,
@@ -1052,8 +1188,8 @@ fn collect_routes(
             config: provider.config.clone(),
             pool_tier: tier,
             ownership_scope: provider.ownership_scope,
-            priority: route
-                .priority_override
+            priority: user_priority
+                .or(route.priority_override)
                 .unwrap_or(key.priority)
                 .clamp(1, 1000),
             provider_kind: provider.kind,
@@ -1414,9 +1550,9 @@ fn eligibility_route(
         ),
         user_pref_enabled: snapshot
             .user_route_prefs
-            .get(&(caller.owner_user_id, model.id))
-            .filter(|pref| pref.upstream_key_id == candidate.upstream_key_id)
+            .get(&(caller.owner_user_id, candidate.upstream_key_id, model.id))
             .map(|pref| pref.enabled),
+        is_conflict_minority: route.is_some_and(|route| is_conflict_minority(model, route)),
         priority: candidate.priority,
         budget_admitted: windows_admitted && !tier_cap_exhausted,
         budget_exhausted_due_to_monthly_cap: tier_cap_exhausted,
@@ -2458,6 +2594,8 @@ pub async fn handle_inference_request(
             owner_disabled,
             model_exposed: model.exposed,
             merge_state: model.merge_state,
+            present_on_all_global_providers: present_on_all_global_providers(&snapshot, &model),
+            global_exposure_mode: snapshot.settings.global_exposure_mode,
             inbound_protocol: protocol,
             model_canonical_id: &model.canonical_id,
         };

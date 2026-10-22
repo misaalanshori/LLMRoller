@@ -33,6 +33,45 @@ pub enum IneligibleReason {
     ModelNotAllowed,
 }
 
+/// Resolves the effective share for a key per SRDD Section 10.1.
+///
+/// A key-level grant takes strict precedence over a provider-level grant. A grant
+/// that is disabled, revoked, suspended by a fingerprint change, or awaiting admin
+/// approval for a custom provider does not shadow a lower-precedence eligible grant.
+/// Model restrictions are deliberately checked by `C2` after selection so an active
+/// key-level grant remains authoritative even when it excludes the requested model.
+pub fn effective_share<'a>(
+    shares: &'a [ShareConfig],
+    grantee_user_id: UserId,
+    provider_id: ProviderId,
+    key_id: UpstreamKeyId,
+    provider_kind: ProviderKind,
+    current_provider_fingerprint: &str,
+    grantor_disabled: bool,
+) -> Option<&'a ShareConfig> {
+    let eligible = |share: &ShareConfig| {
+        share.grantee_user_id == grantee_user_id
+            && share.provider_id == provider_id
+            && is_share_eligible(
+                share,
+                provider_kind,
+                current_provider_fingerprint,
+                grantor_disabled,
+                None,
+            )
+            .is_ok()
+    };
+
+    shares
+        .iter()
+        .find(|share| share.upstream_key_id == Some(key_id) && eligible(share))
+        .or_else(|| {
+            shares
+                .iter()
+                .find(|share| share.upstream_key_id.is_none() && eligible(share))
+        })
+}
+
 /// Evaluates whether a share is eligible for a given request.
 pub fn is_share_eligible(
     share: &ShareConfig,

@@ -99,9 +99,21 @@ fn accessible_key<'a>(
         OwnershipScope::Personal if provider.owner_user_id == Some(caller.owner_user_id) => {
             Some(key)
         }
-        OwnershipScope::Personal => snapshot
-            .effective_share(caller.owner_user_id, provider.id, key.id)
-            .map(|_| key),
+        OwnershipScope::Personal => {
+            let grantor_disabled = provider
+                .owner_user_id
+                .is_none_or(|owner| snapshot.users.get(&owner).is_none_or(|user| user.disabled));
+            snapshot
+                .effective_share(
+                    caller.owner_user_id,
+                    provider.id,
+                    key.id,
+                    provider.kind,
+                    &provider.share_config_fingerprint,
+                    grantor_disabled,
+                )
+                .map(|_| key)
+        }
     }
 }
 
@@ -150,13 +162,6 @@ fn resolve_usage_key(
         }
         if let Some(allowed) = &caller.allowed_models
             && !allowed.iter().any(|entry| entry == &model.canonical_id)
-        {
-            continue;
-        }
-        if snapshot
-            .user_route_prefs
-            .get(&(caller.owner_user_id, model.id))
-            .is_some_and(|preference| !preference.enabled)
         {
             continue;
         }

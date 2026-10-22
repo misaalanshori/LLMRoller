@@ -167,7 +167,11 @@ struct DomainArcs {
     >,
     user_route_prefs: Arc<
         HashMap<
-            (llmroller_core::ids::UserId, llmroller_core::ids::ModelPk),
+            (
+                llmroller_core::ids::UserId,
+                llmroller_core::ids::UpstreamKeyId,
+                llmroller_core::ids::ModelPk,
+            ),
             llmroller_core::snapshot::SnapshotRoutePreference,
         >,
     >,

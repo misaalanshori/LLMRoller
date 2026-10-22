@@ -88,6 +88,8 @@ pub struct SnapshotModel {
     pub display_name: Option<String>,
     pub exposed: Option<bool>,
     pub merge_state: MergeState,
+    /// Majority `vendor_prefix` across routes when `merge_state = pending_review`.
+    pub majority_vendor_prefix: Option<String>,
     pub distribution: String,
     pub routing_strategy: Option<RoutingStrategy>,
     pub origin: ModelOrigin,
@@ -100,6 +102,7 @@ pub struct SnapshotModelRoute {
     pub upstream_key_id: UpstreamKeyId,
     pub model_pk: ModelPk,
     pub upstream_model_id: String,
+    pub vendor_prefix: Option<String>,
     pub protocols: Vec<String>,
     pub status: RouteStatus,
     pub enabled: bool,
@@ -188,7 +191,7 @@ pub struct ConfigSnapshot {
     pub redirects: Arc<HashMap<String, ModelPk>>,
     pub routes_by_model: Arc<HashMap<ModelPk, Vec<SnapshotModelRoute>>>,
     pub shares_by_grantee: Arc<HashMap<UserId, Vec<ShareConfig>>>,
-    pub user_route_prefs: Arc<HashMap<(UserId, ModelPk), SnapshotRoutePreference>>,
+    pub user_route_prefs: Arc<HashMap<(UserId, UpstreamKeyId, ModelPk), SnapshotRoutePreference>>,
     pub prices: Arc<HashMap<PriceKey, PriceEntry>>,
     pub budget_windows: Arc<HashMap<UpstreamKeyId, Vec<SnapshotBudgetWindow>>>,
 }
@@ -287,25 +290,29 @@ impl ConfigSnapshot {
 
     /// Resolves `effective_share(grantee, provider, key)` per SRDD Section 10.1.
     ///
-    /// A key-specific grant always wins over a provider-wide grant, regardless of order.
+    /// A key-level grant takes strict precedence over a provider-wide grant, but only
+    /// when that grant is currently eligible. Disabled, fingerprint-suspended, or
+    /// unapproved custom-provider key grants fall back to an eligible provider grant.
     #[must_use]
     pub fn effective_share(
         &self,
         grantee: UserId,
         provider_id: ProviderId,
         key_id: UpstreamKeyId,
+        provider_kind: ProviderKind,
+        current_provider_fingerprint: &str,
+        grantor_disabled: bool,
     ) -> Option<&ShareConfig> {
         let grants = self.shares_by_grantee.get(&grantee)?;
-        grants
-            .iter()
-            .find(|s| {
-                s.provider_id == provider_id && s.upstream_key_id == Some(key_id) && s.enabled
-            })
-            .or_else(|| {
-                grants.iter().find(|s| {
-                    s.provider_id == provider_id && s.upstream_key_id.is_none() && s.enabled
-                })
-            })
+        crate::shares::effective_share(
+            grants,
+            grantee,
+            provider_id,
+            key_id,
+            provider_kind,
+            current_provider_fingerprint,
+            grantor_disabled,
+        )
     }
 
     /// Look up the price entry for a route, preferring a provider-specific row.
@@ -367,6 +374,7 @@ mod tests {
             display_name: None,
             exposed: None,
             merge_state: MergeState::Confirmed,
+            majority_vendor_prefix: None,
             distribution: "weighted".to_string(),
             routing_strategy: None,
             origin: ModelOrigin::Global,
@@ -406,7 +414,7 @@ mod tests {
             upstream_key_id: key_id,
             allowed_models: None,
             max_monthly_micro_usd: None,
-            accepted_config_fingerprint: None,
+            accepted_config_fingerprint: Some("fp-provider".to_string()),
             admin_approved_at: None,
             enabled,
         };
@@ -415,9 +423,33 @@ mod tests {
             vec![make_share(None, false), make_share(Some(key), true)],
         );
         let share = snapshot
-            .effective_share(user, provider, key)
+            .effective_share(
+                user,
+                provider,
+                key,
+                ProviderKind::Openrouter,
+                "fp-provider",
+                false,
+            )
             .expect("key-specific grant");
         assert!(share.enabled);
         assert_eq!(share.upstream_key_id, Some(key));
+
+        // A disabled key-level grant must not shadow an active provider-wide grant.
+        Arc::make_mut(&mut snapshot.shares_by_grantee).insert(
+            user,
+            vec![make_share(None, true), make_share(Some(key), false)],
+        );
+        let share = snapshot
+            .effective_share(
+                user,
+                provider,
+                key,
+                ProviderKind::Openrouter,
+                "fp-provider",
+                false,
+            )
+            .expect("provider-wide fallback");
+        assert_eq!(share.upstream_key_id, None);
     }
 }

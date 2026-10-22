@@ -124,15 +124,6 @@ fn visible_models(
         {
             continue;
         }
-        // `C4`: a disabled per-user route preference hides the model.
-        if snapshot
-            .user_route_prefs
-            .get(&(client_key.owner_user_id, model.id))
-            .is_some_and(|preference| !preference.enabled)
-        {
-            continue;
-        }
-
         let has_routes = snapshot
             .routes_by_model
             .get(&model.id)

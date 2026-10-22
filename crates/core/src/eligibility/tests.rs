@@ -30,6 +30,7 @@ fn make_valid_candidate(
         route_health_ok: true,
         breaker_closed: true,
         user_pref_enabled: None,
+        is_conflict_minority: false,
         priority: 100,
         budget_admitted: true,
         budget_exhausted_due_to_monthly_cap: false,
@@ -48,6 +49,8 @@ fn test_candidate_checks_c1_through_c8_toggled_individually() {
         owner_disabled: false,
         model_exposed: None,
         merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
         inbound_protocol: "chat",
         model_canonical_id: "test-model",
     };
@@ -91,6 +94,8 @@ fn test_candidate_checks_c1_through_c8_toggled_individually() {
         owner_disabled: false,
         model_exposed: None,
         merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
         inbound_protocol: "chat",
         model_canonical_id: "test-model",
     };
@@ -201,6 +206,8 @@ fn test_three_tier_pool_selector_personal_first_ordering_and_caps() {
         owner_disabled: false,
         model_exposed: None,
         merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
         inbound_protocol: "chat",
         model_canonical_id: "deepseek-v4.1-flash",
     };
@@ -295,6 +302,8 @@ fn test_c2_key_specific_share_beats_provider_wide_share_regardless_of_order() {
         owner_disabled: false,
         model_exposed: None,
         merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
         inbound_protocol: "chat",
         model_canonical_id: "test-model",
     };
@@ -351,15 +360,78 @@ fn test_c2_key_specific_share_beats_provider_wide_share_regardless_of_order() {
     );
 }
 
-#[doc = "Spec: MDL-2, MDL-3, RTE-2"]
+#[doc = "Spec: SHR-1, RTE-3"]
 #[test]
-fn test_c4_pending_review_model_is_restricted_to_own_tier() {
+fn test_c2_disabled_key_share_falls_back_to_active_provider_share() {
     let alice = UserId::generate();
     let bob = UserId::generate();
     let model_pk = ModelPk::generate();
+    let route = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
+    let ctx = CallerContext {
+        caller_user_id: &bob,
+        can_use_global: true,
+        owner_disabled: false,
+        model_exposed: None,
+        merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: false,
+        global_exposure_mode: GlobalExposureMode::Union,
+        inbound_protocol: "chat",
+        model_canonical_id: "test-model",
+    };
+    let share = |key_id: Option<UpstreamKeyId>, enabled: bool| ShareConfig {
+        share_id: ShareId::generate(),
+        grantor_user_id: alice,
+        grantee_user_id: bob,
+        provider_id: route.provider_id,
+        upstream_key_id: key_id,
+        allowed_models: None,
+        max_monthly_micro_usd: None,
+        accepted_config_fingerprint: Some("fp-test".to_string()),
+        admin_approved_at: None,
+        enabled,
+    };
 
-    let own_route = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
-    let global_route = make_valid_candidate(bob, OwnershipScope::Global, model_pk);
+    // A disabled key-level grant must not shadow an active provider-wide grant.
+    assert_eq!(
+        evaluate_candidate(
+            &route,
+            &ctx,
+            &[share(Some(route.upstream_key_id), false), share(None, true)],
+        ),
+        Ok(CandidatePoolTier::Shared)
+    );
+
+    // A key-level grant suspended by a fingerprint change falls back as well.
+    let mut stale = share(Some(route.upstream_key_id), true);
+    stale.accepted_config_fingerprint = Some("old-fingerprint".to_string());
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[stale, share(None, true)]),
+        Ok(CandidatePoolTier::Shared)
+    );
+
+    // When both grants are ineligible the route is denied.
+    assert_eq!(
+        evaluate_candidate(
+            &route,
+            &ctx,
+            &[
+                share(Some(route.upstream_key_id), false),
+                share(None, false)
+            ],
+        ),
+        Err(CheckFailure::C2TierNotAuthorized)
+    );
+}
+
+#[doc = "Spec: MDL-2, MDL-3, RTE-3"]
+#[test]
+fn test_c4_pending_review_permits_majority_vendor_and_blocks_minority() {
+    let alice = UserId::generate();
+    let model_pk = ModelPk::generate();
+
+    let majority = make_valid_candidate(alice, OwnershipScope::Global, model_pk);
+    let mut minority = majority.clone();
+    minority.is_conflict_minority = true;
 
     let mut ctx = CallerContext {
         caller_user_id: &alice,
@@ -367,22 +439,80 @@ fn test_c4_pending_review_model_is_restricted_to_own_tier() {
         owner_disabled: false,
         model_exposed: None,
         merge_state: MergeState::PendingReview,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
         inbound_protocol: "chat",
-        model_canonical_id: "test-model",
+        model_canonical_id: "gpt-4o",
     };
 
     assert_eq!(
-        evaluate_candidate(&own_route, &ctx, &[]),
-        Ok(CandidatePoolTier::Own)
+        evaluate_candidate(&majority, &ctx, &[]),
+        Ok(CandidatePoolTier::Global)
     );
     assert_eq!(
-        evaluate_candidate(&global_route, &ctx, &[]),
+        evaluate_candidate(&minority, &ctx, &[]),
         Err(CheckFailure::C4ModelNotExposedOrKilled)
     );
 
     ctx.merge_state = MergeState::Confirmed;
     assert_eq!(
-        evaluate_candidate(&global_route, &ctx, &[]),
+        evaluate_candidate(&minority, &ctx, &[]),
         Ok(CandidatePoolTier::Global)
+    );
+}
+
+#[doc = "Spec: MDL-3, RTE-3"]
+#[test]
+fn test_c4_intersection_mode_blocks_partial_provider_model() {
+    let alice = UserId::generate();
+    let model_pk = ModelPk::generate();
+    let route = make_valid_candidate(alice, OwnershipScope::Global, model_pk);
+
+    let mut ctx = CallerContext {
+        caller_user_id: &alice,
+        can_use_global: true,
+        owner_disabled: false,
+        model_exposed: None,
+        merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: false,
+        global_exposure_mode: GlobalExposureMode::Intersection,
+        inbound_protocol: "chat",
+        model_canonical_id: "partial-model",
+    };
+
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[]),
+        Err(CheckFailure::C4ModelNotExposedOrKilled)
+    );
+
+    // Union mode still exposes a model served by any usable global provider.
+    ctx.global_exposure_mode = GlobalExposureMode::Union;
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[]),
+        Ok(CandidatePoolTier::Global)
+    );
+
+    // Intersection passes once every usable global provider serves the model.
+    ctx.global_exposure_mode = GlobalExposureMode::Intersection;
+    ctx.present_on_all_global_providers = true;
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[]),
+        Ok(CandidatePoolTier::Global)
+    );
+
+    // Admin force-exposure bypasses the automatic intersection rule.
+    ctx.present_on_all_global_providers = false;
+    ctx.model_exposed = Some(true);
+    assert_eq!(
+        evaluate_candidate(&route, &ctx, &[]),
+        Ok(CandidatePoolTier::Global)
+    );
+
+    // Personal tiers are unaffected by global exposure mode.
+    let own = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
+    ctx.model_exposed = None;
+    assert_eq!(
+        evaluate_candidate(&own, &ctx, &[]),
+        Ok(CandidatePoolTier::Own)
     );
 }

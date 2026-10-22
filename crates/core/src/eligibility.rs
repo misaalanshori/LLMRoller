@@ -6,7 +6,8 @@
 use crate::catalog::{MergeState, RouteStatus};
 use crate::ids::{ModelPk, ProviderId, UpstreamKeyId, UserId};
 use crate::rbac::{OwnershipScope, RoutingScope};
-use crate::shares::{ShareConfig, is_share_eligible};
+use crate::settings::GlobalExposureMode;
+use crate::shares::{ShareConfig, effective_share, is_share_eligible};
 
 /// Failure code for a candidate route failing eligibility checks C1 through C8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,9 @@ pub struct CandidateRoute {
     pub route_health_ok: bool,
     pub breaker_closed: bool,
     pub user_pref_enabled: Option<bool>,
+    /// True when `merge_state = pending_review` and this route's vendor prefix is
+    /// not the model's majority vendor prefix (`MDL-2`, `C4`).
+    pub is_conflict_minority: bool,
     pub priority: i64,
     pub budget_admitted: bool,
     pub budget_exhausted_due_to_monthly_cap: bool,
@@ -72,6 +76,9 @@ pub struct CallerContext<'a> {
     pub owner_disabled: bool,
     pub model_exposed: Option<bool>,
     pub merge_state: MergeState,
+    /// True when every enabled global provider with a usable key serves the model.
+    pub present_on_all_global_providers: bool,
+    pub global_exposure_mode: GlobalExposureMode,
     pub inbound_protocol: &'a str,
     pub model_canonical_id: &'a str,
 }
@@ -104,22 +111,18 @@ pub fn evaluate_candidate(
             if route.provider_owner_id == Some(*ctx.caller_user_id) {
                 CandidatePoolTier::Own
             } else {
-                // Must have an active share. A key-specific share strictly takes
-                // precedence over a provider-wide share regardless of row order (SHR-1).
-                let matching_share = shares
-                    .iter()
-                    .find(|s| {
-                        s.grantee_user_id == *ctx.caller_user_id
-                            && s.provider_id == route.provider_id
-                            && s.upstream_key_id == Some(route.upstream_key_id)
-                    })
-                    .or_else(|| {
-                        shares.iter().find(|s| {
-                            s.grantee_user_id == *ctx.caller_user_id
-                                && s.provider_id == route.provider_id
-                                && s.upstream_key_id.is_none()
-                        })
-                    });
+                // Must have an active share. An eligible key-specific share strictly
+                // takes precedence over a provider-wide share (SHR-1), but an
+                // ineligible key grant falls back to an eligible provider-wide grant.
+                let matching_share = effective_share(
+                    shares,
+                    *ctx.caller_user_id,
+                    route.provider_id,
+                    route.upstream_key_id,
+                    route.provider_kind,
+                    &route.provider_fingerprint,
+                    ctx.owner_disabled,
+                );
 
                 match matching_share {
                     Some(s) => {
@@ -153,16 +156,28 @@ pub fn evaluate_candidate(
         return Err(CheckFailure::C3GrantorDisabled);
     }
 
-    // C4: Model exposure and kill switch
+    // C4: Model exposure and merge review.
     if ctx.model_exposed == Some(false) {
         return Err(CheckFailure::C4ModelNotExposedOrKilled);
     }
-    // A cross-vendor model still awaiting merge confirmation is routable only on
-    // the caller's own personal keys until an admin confirms the merge (MDL-2, RTE-2).
-    if ctx.merge_state == MergeState::PendingReview && tier != CandidatePoolTier::Own {
+    // While a cross-vendor merge awaits confirmation, only routes matching the
+    // model's majority vendor prefix remain routable (MDL-2, C4).
+    if ctx.merge_state == MergeState::PendingReview && route.is_conflict_minority {
         return Err(CheckFailure::C4ModelNotExposedOrKilled);
     }
-    if route.user_pref_enabled == Some(false) {
+    // Global exposure follows models.exposed, otherwise the configured union or
+    // intersection rule over enabled global providers with usable keys (MDL-3).
+    if tier == CandidatePoolTier::Global
+        && ctx.model_exposed.is_none()
+        && ctx.global_exposure_mode == GlobalExposureMode::Intersection
+        && !ctx.present_on_all_global_providers
+    {
+        return Err(CheckFailure::C4ModelNotExposedOrKilled);
+    }
+    // Per-user route preferences apply only to Own and Shared tiers (RTE-5, C4).
+    if matches!(tier, CandidatePoolTier::Own | CandidatePoolTier::Shared)
+        && route.user_pref_enabled == Some(false)
+    {
         return Err(CheckFailure::C4ModelNotExposedOrKilled);
     }
 

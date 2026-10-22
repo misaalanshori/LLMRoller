@@ -408,7 +408,7 @@ pub struct CatalogSnapshot {
     pub routes_by_model:
         HashMap<llmroller_core::ids::ModelPk, Vec<llmroller_core::snapshot::SnapshotModelRoute>>,
     pub user_route_prefs: HashMap<
-        (UserId, llmroller_core::ids::ModelPk),
+        (UserId, UpstreamKeyId, llmroller_core::ids::ModelPk),
         llmroller_core::snapshot::SnapshotRoutePreference,
     >,
 }
@@ -458,6 +458,7 @@ pub async fn load_catalog_snapshot_tx(
             } else {
                 MergeState::Confirmed
             },
+            majority_vendor_prefix: None,
             distribution,
             routing_strategy: strategy_str
                 .and_then(|s| s.parse::<llmroller_core::strategy::RoutingStrategy>().ok()),
@@ -495,7 +496,7 @@ pub async fn load_catalog_snapshot_tx(
     }
 
     let routes = sqlx::query(
-        "SELECT upstream_key_id, model_pk, upstream_model_id, protocols, status,
+        "SELECT upstream_key_id, model_pk, upstream_model_id, vendor_prefix, protocols, status,
                 enabled, priority_override, route_health, route_health_until
          FROM model_routes",
     )
@@ -524,6 +525,7 @@ pub async fn load_catalog_snapshot_tx(
             upstream_key_id: key_id,
             model_pk,
             upstream_model_id: row.try_get("upstream_model_id")?,
+            vendor_prefix: row.try_get("vendor_prefix").unwrap_or(None),
             protocols,
             status,
             enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
@@ -538,6 +540,34 @@ pub async fn load_catalog_snapshot_tx(
             .entry(model_pk)
             .or_default()
             .push(route);
+    }
+
+    // Resolve the majority vendor prefix for pending-review models (MDL-2, `C4`).
+    // Ties resolve to the lexicographically smallest prefix so routing is stable
+    // across snapshot reloads.
+    let mut vendor_counts: HashMap<ModelPk, HashMap<String, usize>> = HashMap::new();
+    for (model_pk, routes) in &snapshot.routes_by_model {
+        for route in routes {
+            if route.enabled
+                && route.status == llmroller_core::catalog::RouteStatus::Active
+                && let Some(prefix) = &route.vendor_prefix
+            {
+                *vendor_counts
+                    .entry(*model_pk)
+                    .or_default()
+                    .entry(prefix.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    for (model_pk, counts) in vendor_counts {
+        let majority = counts
+            .into_iter()
+            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+            .map(|(prefix, _)| prefix);
+        if let Some(model) = snapshot.models.get_mut(&model_pk) {
+            model.majority_vendor_prefix = majority;
+        }
     }
 
     let prefs = sqlx::query(
@@ -558,7 +588,7 @@ pub async fn load_catalog_snapshot_tx(
             continue;
         };
         snapshot.user_route_prefs.insert(
-            (user_id, model_pk),
+            (user_id, key_id, model_pk),
             llmroller_core::snapshot::SnapshotRoutePreference {
                 user_id,
                 upstream_key_id: key_id,
