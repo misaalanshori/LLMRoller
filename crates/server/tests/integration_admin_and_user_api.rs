@@ -492,3 +492,46 @@ async fn test_audit_log_captures_authenticated_actor_user_id_on_mutations() {
         "audit detail must retain the request path"
     );
 }
+
+#[doc = "Spec: CLK-4 — the client-key sessions drawer reports live session pins, not a stub"]
+#[tokio::test]
+async fn test_client_key_sessions_report_live_session_pins() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+
+    // Pin-only session: no trace_records row exists, so the listing must still
+    // surface the session (union of pins and trace records) with its live pin.
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/user/client-keys/{}/sessions",
+            harness.alice_key.client_key_id
+        ))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("sessions request");
+    let response = app.oneshot(request).await.expect("sessions response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    let sessions = body["data"].as_array().expect("data array");
+    assert_eq!(sessions.len(), 1, "the pinned session must be listed");
+    assert_eq!(sessions[0]["session_hash"], "shared-session-hash");
+    let pins = sessions[0]["current_pins"]
+        .as_array()
+        .expect("current_pins array");
+    assert_eq!(
+        pins.len(),
+        1,
+        "the hardcoded empty current_pins stub must be gone"
+    );
+    assert_eq!(
+        pins[0]["upstream_key_id"],
+        harness.alice_key.upstream_key_id.to_string()
+    );
+    assert_eq!(pins[0]["canonical_id"], "gpt-4o");
+    assert_eq!(pins[0]["key_label"], "alice-upstream");
+    assert_eq!(pins[0]["pool_tier"], 1);
+}

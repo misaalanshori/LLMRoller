@@ -53,6 +53,90 @@ pub fn record_request_metric(
     metrics::counter!("llmroller_requests_total", "endpoint" => endpoint, "status_class" => status_class, "outcome" => outcome).increment(1);
 }
 
+/// Maximum number of distinct canonical model IDs tracked as their own
+/// `model_bucket`; everything else is grouped under `"other"` (OBS-1).
+const MAX_MODEL_BUCKETS: usize = 50;
+
+/// Map a canonical model ID onto a bounded `model_bucket` label (OBS-1).
+///
+/// The first [`MAX_MODEL_BUCKETS`] distinct IDs seen become buckets so that a
+/// long tail of ephemeral model IDs can never explode Prometheus cardinality.
+fn model_bucket(model_id: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static BUCKETS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let buckets = BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = buckets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(count) = guard.get_mut(model_id) {
+        *count += 1;
+        return model_id.to_owned();
+    }
+    if guard.len() < MAX_MODEL_BUCKETS {
+        guard.insert(model_id.to_owned(), 1);
+        return model_id.to_owned();
+    }
+    "other".to_owned()
+}
+
+/// Record one route selection with the closed allow-list labels required by
+/// SRDD Section 10.3.3 step 4 (`OBS-1`).
+pub fn record_routing_selection(
+    provider_kind: &str,
+    provider_id: &str,
+    protocol: &str,
+    outcome: &str,
+    strategy: &str,
+    model_id: &str,
+) {
+    let _ = get_or_init_prometheus_recorder();
+    let bucket = model_bucket(model_id);
+    let labels = [
+        ("provider_kind", provider_kind),
+        ("provider_id", provider_id),
+        ("protocol", protocol),
+        ("outcome", outcome),
+        ("strategy", strategy),
+        ("model_bucket", bucket.as_str()),
+    ];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!(
+        "llmroller_routing_selections_total",
+        "provider_kind" => provider_kind.to_owned(),
+        "provider_id" => provider_id.to_owned(),
+        "protocol" => protocol.to_owned(),
+        "outcome" => outcome.to_owned(),
+        "strategy" => strategy.to_owned(),
+        "model_bucket" => bucket,
+    )
+    .increment(1);
+}
+
+/// Mark a supervised background job as permanently failed (Section 5.5.3).
+///
+/// `job` is one of the closed set of static job names ("discovery", "usage_poller",
+/// "retention", "reloader", "maintenance"), never user input (OBS-1).
+pub fn record_job_failed(job: &'static str) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("job", job)];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!("llmroller_job_failed", "job" => job).increment(1);
+}
+
+/// Publish the current WAL size in bytes (`REL-2`, `OBS-1`).
+pub fn record_wal_bytes(bytes: u64) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::gauge!("llmroller_wal_bytes").set(bytes as f64);
+}
+
+/// Record a failed upstream attempt that triggered failover (RTE-8).
+pub fn record_failover() {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!("llmroller_failovers_total").increment(1);
+}
+
 /// Record an upstream 403 that did not match any classified error pattern (API-8).
 pub fn record_unclassified_403(provider_id: &str) {
     let _ = get_or_init_prometheus_recorder();

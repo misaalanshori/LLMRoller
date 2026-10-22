@@ -1749,6 +1749,7 @@ fn select_next_candidate(
     strategy: RoutingStrategy,
     caller: UserId,
     model_pk: ModelPk,
+    canonical_id: &str,
     protocol: &str,
     tier: CandidatePoolTier,
     eligible: &[RouteCandidate],
@@ -1778,10 +1779,21 @@ fn select_next_candidate(
         &OsEntropy,
         Some(runtime.load_tracker.as_ref()),
     )?;
-    eligible
+    let candidate = eligible
         .iter()
-        .find(|candidate| candidate.upstream_key_id == selected.upstream_key_id)
-        .cloned()
+        .find(|candidate| candidate.upstream_key_id == selected.upstream_key_id)?
+        .clone();
+    // Every route selection increments the bounded-cardinality counter from
+    // SRDD Section 10.3.3 step 4 (`OBS-1`).
+    crate::metrics::record_routing_selection(
+        candidate.provider_kind.as_str(),
+        &candidate.provider_id.to_string(),
+        protocol,
+        "selected",
+        strategy.as_str(),
+        canonical_id,
+    );
+    Some(candidate)
 }
 
 /// Immutable routing context needed to reselect a pin after a pre-first-byte failure.
@@ -1790,6 +1802,7 @@ struct PinFailureContext<'a> {
     strategy: RoutingStrategy,
     caller: UserId,
     model_pk: ModelPk,
+    canonical_id: &'a str,
     protocol: &'a str,
     selected_tier: CandidatePoolTier,
     tier_candidates: &'a [RouteCandidate],
@@ -1804,6 +1817,7 @@ impl PinFailureContext<'_> {
             self.strategy,
             self.caller,
             self.model_pk,
+            self.canonical_id,
             self.protocol,
             self.selected_tier,
             self.tier_candidates,
@@ -3170,6 +3184,7 @@ pub async fn handle_inference_request(
                     strategy,
                     caller.owner_user_id,
                     model.id,
+                    &model.canonical_id,
                     protocol,
                     selected_tier,
                     &tier_candidates,
@@ -3197,6 +3212,7 @@ pub async fn handle_inference_request(
         strategy,
         caller: caller.owner_user_id,
         model_pk: model.id,
+        canonical_id: &model.canonical_id,
         protocol,
         selected_tier,
         tier_candidates: &tier_candidates,
@@ -3227,6 +3243,7 @@ pub async fn handle_inference_request(
                 strategy,
                 caller.owner_user_id,
                 model.id,
+                &model.canonical_id,
                 protocol,
                 selected_tier,
                 &tier_candidates,
@@ -3460,6 +3477,7 @@ pub async fn handle_inference_request(
                     pin_ticket = Some(replacement);
                 }
                 failovers += 1;
+                crate::metrics::record_failover();
                 try_outcomes.push(TryOutcome::HostFailure);
                 continue;
             }
@@ -3729,6 +3747,7 @@ pub async fn handle_inference_request(
                 pin_ticket = Some(replacement);
             }
             failovers += 1;
+            crate::metrics::record_failover();
             continue;
         }
 
@@ -3820,6 +3839,7 @@ pub async fn handle_inference_request(
                         pin_ticket = Some(replacement);
                     }
                     failovers += 1;
+                    crate::metrics::record_failover();
                     try_outcomes.push(TryOutcome::HostFailure);
                     continue;
                 }
@@ -4105,6 +4125,7 @@ pub async fn handle_inference_request(
                     "none",
                 ));
                 failovers += 1;
+                crate::metrics::record_failover();
                 try_outcomes.push(TryOutcome::HostFailure);
                 continue;
             }
@@ -4124,6 +4145,7 @@ pub async fn handle_inference_request(
                     "none",
                 ));
                 failovers += 1;
+                crate::metrics::record_failover();
                 try_outcomes.push(TryOutcome::HostFailure);
                 continue;
             }

@@ -298,7 +298,7 @@ async fn test_pin_store_evicts_on_key_provider_client_key_and_share_invalidation
             vec![ConfigDomain::UpstreamKeys],
             vec![CacheInvalidationEvent::UpstreamKeyChanged(key_id)],
             PatchKeyOp {
-                actor: admin_actor.clone(),
+                actor: admin_actor,
                 key_id,
                 patch: UpstreamKeyPatch {
                     enabled: Some(false),
@@ -321,7 +321,7 @@ async fn test_pin_store_evicts_on_key_provider_client_key_and_share_invalidation
             vec![ConfigDomain::UpstreamKeys],
             vec![CacheInvalidationEvent::UpstreamKeyChanged(key_id)],
             PatchKeyOp {
-                actor: admin_actor.clone(),
+                actor: admin_actor,
                 key_id,
                 patch: UpstreamKeyPatch {
                     enabled: Some(true),
@@ -338,7 +338,7 @@ async fn test_pin_store_evicts_on_key_provider_client_key_and_share_invalidation
             vec![ConfigDomain::UpstreamKeys],
             vec![CacheInvalidationEvent::UpstreamKeyChanged(key_id)],
             DeleteKeyOp {
-                actor: admin_actor.clone(),
+                actor: admin_actor,
                 key_id,
             },
         )
@@ -384,7 +384,7 @@ async fn test_pin_store_evicts_on_key_provider_client_key_and_share_invalidation
             vec![ConfigDomain::Providers],
             vec![CacheInvalidationEvent::ProviderChanged(second_key_provider)],
             PatchProviderOp {
-                actor: admin_actor.clone(),
+                actor: admin_actor,
                 provider_id: second_key_provider,
                 patch: ProviderPatch {
                     enabled: Some(false),
@@ -413,7 +413,7 @@ async fn test_pin_store_evicts_on_key_provider_client_key_and_share_invalidation
             vec![ConfigDomain::ClientKeys],
             vec![CacheInvalidationEvent::ClientKeyChanged(client_key_id)],
             PatchClientKeyOp {
-                actor: admin_actor.clone(),
+                actor: admin_actor,
                 client_key_id,
                 patch: ClientKeyPatch {
                     disabled: Some(true),

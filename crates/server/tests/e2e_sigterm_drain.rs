@@ -356,10 +356,12 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     let job_task = tokio::spawn(async move {
-        job.run_supervised(stop_rx, move || {
+        job.run_supervised(stop_rx, move |_job_stop| {
             let c = panic_clone.fetch_add(1, Ordering::SeqCst);
-            if c < 3 {
-                panic!("simulated transient panic in background job");
+            async move {
+                if c < 3 {
+                    panic!("simulated transient panic in background job");
+                }
             }
         })
         .await;

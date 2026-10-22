@@ -1683,6 +1683,94 @@ async fn upsert_price_internal(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+/// Parse the provider price catalogue served by `price_sync_catalog_url`.
+///
+/// Expected shape: `{ <provider>: { models: { <upstream_id>: { cost: { input, output,
+/// cache_read, cache_write, input_over_200k?, output_over_200k?, cache_read_over_200k?,
+/// cache_write_over_200k? }, alias?, aliases? } } } }`. Returns one insert template per
+/// upstream model ID plus every alias the catalogue declares for it (F012).
+fn parse_catalog_prices(
+    catalog: &serde_json::Value,
+) -> (
+    HashMap<String, llmroller_store::prices::UpsertPriceParams>,
+    HashMap<String, Vec<String>>,
+) {
+    let micro = |usd_per_mtok: f64| (usd_per_mtok * 1_000_000.0).round() as i64;
+    let mut model_costs: HashMap<String, llmroller_store::prices::UpsertPriceParams> =
+        HashMap::new();
+    let mut catalog_aliases: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(providers) = catalog.as_object() {
+        for provider in providers.values() {
+            let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+            for (model_id, model) in models {
+                // Catalog aliases (`alias` or `aliases`) are imported into
+                // `model_aliases` so clients can call the upstream spelling (F012).
+                let mut aliases = Vec::new();
+                if let Some(alias) = model.get("alias").and_then(serde_json::Value::as_str) {
+                    aliases.push(alias.to_string());
+                }
+                if let Some(list) = model.get("aliases").and_then(serde_json::Value::as_array) {
+                    aliases.extend(
+                        list.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+                if !aliases.is_empty() {
+                    catalog_aliases
+                        .entry(model_id.clone())
+                        .or_default()
+                        .extend(aliases);
+                }
+
+                let Some(cost) = model.get("cost") else {
+                    continue;
+                };
+                let read = |key: &str| cost.get(key).and_then(serde_json::Value::as_f64);
+                // Context-length tiers: providers publish `*_over_200k` rates for
+                // prompts above the standard context window (`USG-3`, Section 9.3.2).
+                let mut tiers = Vec::new();
+                if let (Some(input_over), Some(output_over)) =
+                    (read("input_over_200k"), read("output_over_200k"))
+                {
+                    tiers.push(llmroller_core::pricing::ContextTier {
+                        min_total_input_tokens: 200_000,
+                        max_total_input_tokens: None,
+                        input_per_mtok_micro_usd: micro(input_over),
+                        output_per_mtok_micro_usd: micro(output_over),
+                        cache_read_per_mtok_micro_usd: read("cache_read_over_200k")
+                            .map_or(0, micro),
+                        cache_write_per_mtok_micro_usd: read("cache_write_over_200k")
+                            .map_or(0, micro),
+                    });
+                }
+                let entry = model_costs.entry(model_id.clone()).or_insert_with(|| {
+                    llmroller_store::prices::UpsertPriceParams {
+                        provider_id: String::new(),
+                        provider_kind: String::new(),
+                        upstream_model_id: model_id.clone(),
+                        rates: llmroller_core::pricing::Rates::default(),
+                        tiers: Vec::new(),
+                        schedules: Vec::new(),
+                        source: "synced".to_string(),
+                        now_ms: 0,
+                    }
+                });
+                entry.rates = llmroller_core::pricing::Rates {
+                    input_per_mtok_micro_usd: micro(read("input").unwrap_or(0.0)),
+                    output_per_mtok_micro_usd: micro(read("output").unwrap_or(0.0)),
+                    cache_read_per_mtok_micro_usd: micro(read("cache_read").unwrap_or(0.0)),
+                    cache_write_per_mtok_micro_usd: micro(read("cache_write").unwrap_or(0.0)),
+                };
+                entry.tiers = tiers;
+            }
+        }
+    }
+    (model_costs, catalog_aliases)
+}
+
 async fn post_admin_prices_sync_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -1717,30 +1805,11 @@ async fn post_admin_prices_sync_handler(
         .await
         .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?;
 
-    let mut model_costs: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
-    if let Some(providers) = catalog.as_object() {
-        for provider in providers.values() {
-            let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
-                continue;
-            };
-            for (model_id, model) in models {
-                let Some(cost) = model.get("cost") else {
-                    continue;
-                };
-                let read = |key: &str| cost.get(key).and_then(serde_json::Value::as_f64);
-                model_costs.entry(model_id.clone()).or_insert((
-                    read("input").unwrap_or(0.0),
-                    read("output").unwrap_or(0.0),
-                    read("cache_read").unwrap_or(0.0),
-                    read("cache_write").unwrap_or(0.0),
-                ));
-            }
-        }
-    }
+    let (model_costs, catalog_aliases) = parse_catalog_prices(&catalog);
 
     use sqlx::Row as _;
     let routes = sqlx::query(
-        "SELECT k.provider_id, p.kind, r.upstream_model_id
+        "SELECT k.provider_id, p.kind, r.upstream_model_id, r.model_pk
          FROM model_routes r
          JOIN upstream_keys k ON r.upstream_key_id = k.id
          JOIN providers p ON k.provider_id = p.id",
@@ -1756,6 +1825,7 @@ async fn post_admin_prices_sync_handler(
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut synced = 0_usize;
+    let mut imported_aliases = 0_usize;
     let mut seen = std::collections::HashSet::new();
     for route in routes {
         let provider_id: String = route.try_get("provider_id").unwrap_or_default();
@@ -1764,7 +1834,37 @@ async fn post_admin_prices_sync_handler(
         if !seen.insert((provider_id.clone(), kind.clone(), model_id.clone())) {
             continue;
         }
-        let Some(&(input, output, cache_read, cache_write)) = model_costs.get(&model_id) else {
+
+        // Import confirmed aliases for models that carry them in the catalog. The
+        // alias must not collide with a canonical ID or an existing alias (MDL-6).
+        if let Some(aliases) = catalog_aliases.get(&model_id) {
+            let model_pk: String = route.try_get("model_pk").unwrap_or_default();
+            for alias in aliases {
+                if alias == &model_id {
+                    continue;
+                }
+                let collides: Option<i64> =
+                    sqlx::query_scalar("SELECT 1 FROM models WHERE canonical_id = ?")
+                        .bind(alias)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                if collides.is_some() {
+                    continue;
+                }
+                let result = sqlx::query(
+                    "INSERT OR IGNORE INTO model_aliases (alias, model_pk, confirmed) VALUES (?, ?, 1)",
+                )
+                .bind(alias)
+                .bind(&model_pk)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                imported_aliases += usize::try_from(result.rows_affected()).unwrap_or(0);
+            }
+        }
+
+        let Some(template) = model_costs.get(&model_id) else {
             continue;
         };
         let manual: Option<String> = sqlx::query_scalar(
@@ -1776,24 +1876,18 @@ async fn post_admin_prices_sync_handler(
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if manual.as_deref() == Some("manual") {
+        if matches!(manual.as_deref(), Some("manual" | "admin" | "user")) {
             continue;
         }
-        let micro = |usd_per_mtok: f64| (usd_per_mtok * 1_000_000.0).round() as i64;
         llmroller_store::prices::upsert_price_tx(
             &mut tx,
             llmroller_store::prices::UpsertPriceParams {
                 provider_id,
                 provider_kind: kind,
                 upstream_model_id: model_id,
-                rates: llmroller_core::pricing::Rates {
-                    input_per_mtok_micro_usd: micro(input),
-                    output_per_mtok_micro_usd: micro(output),
-                    cache_read_per_mtok_micro_usd: micro(cache_read),
-                    cache_write_per_mtok_micro_usd: micro(cache_write),
-                },
-                tiers: Vec::new(),
-                schedules: Vec::new(),
+                rates: template.rates,
+                tiers: template.tiers.clone(),
+                schedules: template.schedules.clone(),
                 source: "synced".to_string(),
                 now_ms: chrono_like_now_ms(),
             },
@@ -1809,7 +1903,7 @@ async fn post_admin_prices_sync_handler(
     Ok(Json(serde_json::json!({
         "synced": true,
         "prices_synced": synced,
-        "imported_aliases": 0
+        "imported_aliases": imported_aliases
     })))
 }
 
@@ -1861,24 +1955,86 @@ async fn list_client_key_sessions_internal(
            LIMIT 50"#,
     )
     .bind(client_key_id.to_string())
-    .fetch_all(&state.auth.pool)
+    .fetch_all(&state.auth.reader_pool)
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let mut sessions = Vec::new();
+    // Live pins are read from the durable `pins` table (not the hot-path store, which
+    // is keyed for routing) so the drawer can show exactly which upstream key and
+    // canonical model each traced session is pinned to (`USG-9`, Section 14.t).
+    let now_ms = state.auth.clock.now_ms();
+    let pin_rows = sqlx::query(
+        r#"SELECT p.session_hash, p.upstream_key_id, m.canonical_id, p.pool_tier,
+                  p.last_used_at, k.label AS key_label
+           FROM pins p
+           JOIN models m ON m.model_pk = p.model_pk
+           JOIN upstream_keys k ON k.id = p.upstream_key_id
+           WHERE p.client_key_id = ? AND p.expires_at > ?
+           ORDER BY p.last_used_at DESC"#,
+    )
+    .bind(client_key_id.to_string())
+    .bind(now_ms)
+    .fetch_all(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut pins_by_session: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    let mut pin_last_used: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    for pin in pin_rows {
+        let session_hash: String = pin.try_get("session_hash").unwrap_or_default();
+        let upstream_key_id: String = pin.try_get("upstream_key_id").unwrap_or_default();
+        let canonical_id: String = pin.try_get("canonical_id").unwrap_or_default();
+        let key_label: String = pin.try_get("key_label").unwrap_or_default();
+        let pool_tier: i64 = pin.try_get("pool_tier").unwrap_or(0);
+        let last_used_at: i64 = pin.try_get("last_used_at").unwrap_or(0);
+        pin_last_used.insert(session_hash.clone(), last_used_at);
+        pins_by_session
+            .entry(session_hash)
+            .or_default()
+            .push(serde_json::json!({
+                "upstream_key_id": upstream_key_id,
+                "canonical_id": canonical_id,
+                "pool_tier": pool_tier,
+                "key_label": key_label,
+            }));
+    }
+
+    // Union both sources: a session that already holds a live pin but has not been
+    // traced yet (traceability disabled, or the first turn still in flight) must still
+    // appear in the drawer with its pin, and a traced session must keep its history.
+    let mut sessions: std::collections::BTreeMap<String, (i64, i64)> =
+        std::collections::BTreeMap::new();
     for r in rows {
         let session_hash: String = r.try_get("session_hash").unwrap_or_default();
         let last_active_at: i64 = r.try_get("last_active_at").unwrap_or(0);
         let traced_turn_count: i64 = r.try_get("traced_turn_count").unwrap_or(0);
-        sessions.push(serde_json::json!({
-            "session_hash": session_hash,
-            "last_active_at": last_active_at,
-            "traced_turn_count": traced_turn_count,
-            "current_pins": []
-        }));
+        sessions.insert(session_hash, (last_active_at, traced_turn_count));
     }
+    for session_hash in pins_by_session.keys() {
+        let last_used_at = pin_last_used.get(session_hash).copied().unwrap_or(0);
+        sessions
+            .entry(session_hash.clone())
+            .or_insert((last_used_at, 0));
+    }
+    let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+    sessions.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    sessions.truncate(50);
 
-    Ok(Json(serde_json::json!({ "data": sessions })))
+    let data = sessions
+        .into_iter()
+        .map(|(session_hash, (last_active_at, traced_turn_count))| {
+            let current_pins = pins_by_session.remove(&session_hash).unwrap_or_default();
+            serde_json::json!({
+                "session_hash": session_hash,
+                "last_active_at": last_active_at,
+                "traced_turn_count": traced_turn_count,
+                "current_pins": current_pins
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({ "data": data })))
 }
 
 async fn get_user_session_preview_handler(
@@ -5248,4 +5404,60 @@ pub fn router(state: ApiAppState) -> Router {
             control_mutation_barrier,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod catalog_sync_tests {
+    use super::parse_catalog_prices;
+
+    /// `price_sync_catalog_url` catalogues publish context-length tiers and aliases;
+    /// the sync handler must import both instead of reporting a hardcoded zero (F012).
+    #[test]
+    fn parses_context_tiers_and_aliases_from_the_catalogue() {
+        let catalog = serde_json::json!({
+            "openrouter": {
+                "models": {
+                    "vendor/model-a": {
+                        "cost": {
+                            "input": 3.0,
+                            "output": 15.0,
+                            "cache_read": 0.3,
+                            "cache_write": 3.75,
+                            "input_over_200k": 6.0,
+                            "output_over_200k": 22.5
+                        },
+                        "alias": "model-a",
+                        "aliases": ["model-a-latest", "model-a"]
+                    }
+                }
+            }
+        });
+        let (prices, aliases) = parse_catalog_prices(&catalog);
+        let price = prices.get("vendor/model-a").expect("price template");
+        assert_eq!(price.rates.input_per_mtok_micro_usd, 3_000_000);
+        assert_eq!(price.rates.output_per_mtok_micro_usd, 15_000_000);
+        assert_eq!(price.tiers.len(), 1);
+        let tier = &price.tiers[0];
+        assert_eq!(tier.min_total_input_tokens, 200_000);
+        assert_eq!(tier.input_per_mtok_micro_usd, 6_000_000);
+        assert_eq!(tier.output_per_mtok_micro_usd, 22_500_000);
+        assert_eq!(
+            aliases.get("vendor/model-a").cloned().unwrap_or_default(),
+            vec!["model-a".to_string(), "model-a-latest".to_string(), "model-a".to_string()]
+        );
+    }
+
+    /// Models without a `cost` block are not priced, and the catalogue shape is
+    /// tolerated defensively (no `models` key, non-object roots).
+    #[test]
+    fn ignores_entries_without_cost_and_tolerates_unknown_shapes() {
+        let catalog = serde_json::json!({
+            "provider": { "models": { "unpriced": { "alias": "u" } } },
+            "broken": 7
+        });
+        let (prices, aliases) = parse_catalog_prices(&catalog);
+        assert!(prices.is_empty());
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases["unpriced"], vec!["u".to_string()]);
+    }
 }

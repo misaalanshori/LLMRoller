@@ -206,6 +206,18 @@ pub struct JobSupervisor {
     panics: Mutex<Vec<i64>>,
 }
 
+/// Map a job name onto the closed set of static `job` metric labels (OBS-1).
+fn job_label(name: &str) -> &'static str {
+    match name {
+        "discovery" => "discovery",
+        "usage_poller" => "usage_poller",
+        "retention" => "retention",
+        "reloader" => "reloader",
+        "maintenance" => "maintenance",
+        _ => "other",
+    }
+}
+
 impl JobSupervisor {
     #[must_use]
     pub fn new(job_name: impl Into<String>) -> Self {
@@ -216,18 +228,27 @@ impl JobSupervisor {
         }
     }
 
-    /// Run a task function inside `catch_unwind` with automatic panic recovery.
-    pub async fn run_supervised<F>(&self, mut stop_rx: watch::Receiver<bool>, mut task_fn: F)
+    /// Run an async job under `catch_unwind` with automatic panic recovery.
+    ///
+    /// `task_fn` is called once per attempt with its own shutdown receiver, so a
+    /// restarted job observes the same drain signal as the original spawn. The
+    /// returned future is polled on the current task and its panic is converted into
+    /// a restart with exponential backoff (1 s ..= 300 s), matching Section 5.5.3.
+    pub async fn run_supervised<F, Fut>(&self, mut stop_rx: watch::Receiver<bool>, mut task_fn: F)
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send,
     {
+        use futures_util::FutureExt as _;
+
         while !*stop_rx.borrow() {
             if self.failed.load(Ordering::SeqCst) {
                 tracing::error!("job {} permanently stopped after 3 panics", self.job_name);
                 break;
             }
 
-            let result = std::panic::catch_unwind(AssertUnwindSafe(&mut task_fn));
+            let job_stop = stop_rx.clone();
+            let result = AssertUnwindSafe(task_fn(job_stop)).catch_unwind().await;
 
             if let Err(_panic_err) = result {
                 let now_ms = SystemTime::now()
@@ -245,6 +266,7 @@ impl JobSupervisor {
                             "job {} failed: 3 panics within 10 minutes (marking failed)",
                             self.job_name
                         );
+                        llmroller_proxy::metrics::record_job_failed(job_label(&self.job_name));
                         (panics.len(), 0, true)
                     } else {
                         let retries = panics.len();
@@ -265,11 +287,13 @@ impl JobSupervisor {
                 );
 
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(backoff_secs * 10)) => {},
+                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {},
                     _ = stop_rx.changed() => break,
                 }
             } else {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // The job returned on its own: either it observed the shutdown signal
+                // or it finished its work. Both are terminal, so do not spin.
+                break;
             }
         }
     }

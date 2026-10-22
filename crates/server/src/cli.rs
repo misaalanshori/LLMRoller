@@ -14,7 +14,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use llmroller_core::seams::{Clock, ExposeSecret, OsEntropy, SystemClock};
 use llmroller_server::reloader::{load_initial_snapshot, start_reloader_with_pin_store};
-use llmroller_server::shutdown::ShutdownSupervisor;
+use llmroller_server::shutdown::{JobSupervisor, ShutdownSupervisor};
 use llmroller_store::crypto::{MasterKey, load_master_key_from_env, load_master_key_id_from_env};
 use llmroller_store::instance::load_or_initialize;
 use llmroller_store::migrations::migrate;
@@ -616,35 +616,53 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let bg_snapshot = shared_snapshot.clone();
     let bg_pin_store = pin_store.clone();
     let wal_path = format!("{}-wal", database.display());
+    // The maintenance tick is supervised so a panic in the checkpoint/retention path
+    // restarts the job with exponential backoff instead of silently losing it for the
+    // lifetime of the process (Section 5.5.3, `REL-2`).
+    let maintenance_job = JobSupervisor::new("maintenance");
     let _bg_jobs = tokio::spawn(async move {
-        let wal_supervisor = llmroller_store::checkpoint::WalCheckpointSupervisor::new(bg_ready);
-        let mut stop_rx = stop_rx_bg;
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        while !*stop_rx.borrow_and_update() {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
-                    let _ = wal_supervisor.run_checkpoint(&bg_pool, wal_bytes).await;
-                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-                    if let Ok(mut tx) = bg_pool.begin().await {
-                        let _ = llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await;
-                        let _ = llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await;
-                        let _ = tx.commit().await;
+        maintenance_job
+            .run_supervised(stop_rx_bg, move |mut stop_rx| {
+                let bg_pool = bg_pool.clone();
+                let bg_ready = bg_ready.clone();
+                let bg_snapshot = bg_snapshot.clone();
+                let bg_pin_store = bg_pin_store.clone();
+                let wal_path = wal_path.clone();
+                async move {
+                    let wal_supervisor =
+                        llmroller_store::checkpoint::WalCheckpointSupervisor::new(bg_ready);
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    while !*stop_rx.borrow_and_update() {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+                                llmroller_proxy::metrics::record_wal_bytes(wal_bytes);
+                                let _ = wal_supervisor.run_checkpoint(&bg_pool, wal_bytes).await;
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_millis() as i64);
+                                if let Ok(mut tx) = bg_pool.begin().await {
+                                    let _ = llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await;
+                                    let _ = llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await;
+                                    let _ = tx.commit().await;
+                                }
+                                let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
+                                bg_pin_store.sweep(now_ms);
+                                let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
+                                let snapshot = bg_snapshot.load();
+                                let retention_days = snapshot.settings.usage_events_retention_days.max(1);
+                                let max_rows = snapshot.settings.usage_events_max_rows.max(1);
+                                let cutoff = now_ms - retention_days.saturating_mul(86_400_000);
+                                let _ = llmroller_store::retention::sweep_expired_usage_events(&bg_pool, cutoff, 5_000).await;
+                                let _ = llmroller_store::retention::enforce_max_usage_events_rows_pool(&bg_pool, max_rows, 5_000).await;
+                                let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
+                            }
+                            _ = stop_rx.changed() => break,
+                        }
                     }
-                    let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
-                    bg_pin_store.sweep(now_ms);
-                    let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
-                    let snapshot = bg_snapshot.load();
-                    let retention_days = snapshot.settings.usage_events_retention_days.max(1);
-                    let max_rows = snapshot.settings.usage_events_max_rows.max(1);
-                    let cutoff = now_ms - retention_days.saturating_mul(86_400_000);
-                    let _ = llmroller_store::retention::sweep_expired_usage_events(&bg_pool, cutoff, 5_000).await;
-                    let _ = llmroller_store::retention::enforce_max_usage_events_rows_pool(&bg_pool, max_rows, 5_000).await;
-                    let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
                 }
-                _ = stop_rx.changed() => break,
-            }
-        }
+            })
+            .await;
     });
 
     wait_for_shutdown_signal().await;
