@@ -41,6 +41,9 @@ CREATE TABLE users (
   global_budget_micro_usd_month INTEGER,
   default_routing_scope TEXT NOT NULL DEFAULT 'personal_first'
     CHECK (default_routing_scope IN ('personal_first', 'blended', 'personal_only', 'own_only', 'global_only')),
+  ui_theme TEXT NOT NULL DEFAULT 'dark' CHECK (ui_theme IN ('dark', 'light', 'system')),
+  ui_nav_layout TEXT NOT NULL DEFAULT 'top_tabs' CHECK (ui_nav_layout IN ('top_tabs', 'sidebar')),
+  ui_locale TEXT NOT NULL DEFAULT 'en',
   disabled INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   last_login_at INTEGER
@@ -65,9 +68,24 @@ CREATE TABLE web_sessions (
 CREATE INDEX idx_web_sessions_user ON web_sessions(user_id);
 CREATE INDEX idx_web_sessions_expires ON web_sessions(expires_at);
 
+CREATE TABLE service_accounts (
+  id TEXT PRIMARY KEY, -- 26-char ULID (displayed with svcacct_<ULID> subtext in UI)
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_scope TEXT NOT NULL DEFAULT 'personal' CHECK (workspace_scope IN ('personal', 'global')),
+  name TEXT NOT NULL,
+  description TEXT,
+  allowed_cidrs TEXT, -- JSON array of up to 64 IPv4/IPv6 addresses or CIDRs, or NULL for Unrestricted
+  disabled INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_service_accounts_owner ON service_accounts(owner_user_id);
+CREATE UNIQUE INDEX uq_service_accounts_owner_name ON service_accounts(owner_user_id, workspace_scope, name);
+
 CREATE TABLE client_keys (
   id TEXT PRIMARY KEY,
   owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service_account_id TEXT REFERENCES service_accounts(id) ON DELETE CASCADE,
   label TEXT NOT NULL,
   prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
@@ -83,14 +101,26 @@ CREATE TABLE client_keys (
   constant_session_mode TEXT NOT NULL DEFAULT 'flag'
     CHECK (constant_session_mode IN ('flag', 'fingerprint_generic_ids')),
   disabled INTEGER NOT NULL DEFAULT 0,
+  paused_at INTEGER, -- Non-null when paused via inline 'Pause key' action (CLK-7)
   revoked_at INTEGER,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
   last_used_at INTEGER
 );
 CREATE INDEX idx_client_keys_owner ON client_keys(owner_user_id);
+CREATE INDEX idx_client_keys_service_account ON client_keys(service_account_id);
 CREATE UNIQUE INDEX uq_client_keys_prev_hash ON client_keys(prev_key_hash)
   WHERE prev_key_hash IS NOT NULL;
+
+CREATE TRIGGER trg_client_keys_sa_owner_ins BEFORE INSERT ON client_keys
+WHEN NEW.service_account_id IS NOT NULL
+ AND NEW.owner_user_id IS NOT (SELECT owner_user_id FROM service_accounts WHERE id = NEW.service_account_id)
+BEGIN SELECT RAISE(ABORT, 'client_keys.owner_user_id must equal service_accounts.owner_user_id'); END;
+
+CREATE TRIGGER trg_client_keys_sa_owner_upd BEFORE UPDATE OF owner_user_id, service_account_id ON client_keys
+WHEN NEW.service_account_id IS NOT NULL
+ AND NEW.owner_user_id IS NOT (SELECT owner_user_id FROM service_accounts WHERE id = NEW.service_account_id)
+BEGIN SELECT RAISE(ABORT, 'client_keys.owner_user_id must equal service_accounts.owner_user_id'); END;
 
 CREATE TRIGGER trg_client_keys_hash_disjoint_ins BEFORE INSERT ON client_keys
 WHEN EXISTS (
@@ -388,11 +418,21 @@ CREATE TABLE usage_events (
   cache_write_tokens INTEGER,
   output_tokens INTEGER,
   reasoning_tokens INTEGER,
+  list_cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+  plan_multiplier_bps INTEGER NOT NULL DEFAULT 10000,
+  billing_coverage_mode TEXT NOT NULL DEFAULT 'pay_as_you_go'
+    CHECK (billing_coverage_mode IN ('subscription_plan', 'pay_as_you_go', 'shared_grant', 'free_tier')),
   cost_micro_usd INTEGER NOT NULL,
   cost_source TEXT NOT NULL
     CHECK (cost_source IN ('provider', 'price_book', 'fallback_rate', 'estimated_incomplete', 'estimated_attempt')),
   latency_ms INTEGER,
   ttfb_ms INTEGER,
+  stop_reason TEXT,
+  service_account_id TEXT,
+  client_user_agent TEXT,
+  client_location TEXT,
+  request_headers_json TEXT, -- Sanitized allow-list request headers JSON for Request Detail Drawer (SEC-6, USG-9)
+  metadata_json TEXT, -- Optional sanitized request metadata JSON for Request Detail Drawer (USG-9)
   pin_outcome TEXT
     CHECK (pin_outcome IN ('new_pin', 'followed', 'repin', 'repin_recovery', 'unpinned_stateless', 'unpinned_capacity', 'response_link')),
   failovers INTEGER NOT NULL DEFAULT 0,
@@ -401,6 +441,8 @@ CREATE TABLE usage_events (
 CREATE INDEX idx_usage_ts ON usage_events(ts);
 CREATE INDEX idx_usage_owner_ts ON usage_events(owner_user_id, ts);
 CREATE INDEX idx_usage_client_key_ts ON usage_events(client_key_id, ts);
+CREATE INDEX idx_usage_service_account_ts ON usage_events(service_account_id, ts)
+  WHERE service_account_id IS NOT NULL;
 CREATE INDEX idx_usage_client_key_session_ts ON usage_events(client_key_id, session_hash, ts DESC)
   WHERE session_hash IS NOT NULL;
 
@@ -518,6 +560,22 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX idx_audit_ts ON audit_log(ts DESC);
 CREATE INDEX idx_audit_actor ON audit_log(actor_user_id, ts DESC);
+
+CREATE TABLE control_plane_logs (
+  id TEXT PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  workspace_scope TEXT NOT NULL DEFAULT 'personal' CHECK (workspace_scope IN ('personal', 'global')),
+  method TEXT NOT NULL CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE')),
+  path TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  ip_addr TEXT,
+  user_agent TEXT
+);
+CREATE INDEX idx_cp_logs_ts ON control_plane_logs(ts DESC);
+CREATE INDEX idx_cp_logs_actor_ts ON control_plane_logs(actor_user_id, ts DESC);
 
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,

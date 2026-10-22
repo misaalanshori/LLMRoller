@@ -18,6 +18,7 @@ pub mod prices;
 pub mod providers;
 pub mod retention;
 pub mod rotation;
+pub mod service_accounts;
 pub mod settings;
 pub mod shares;
 pub mod traces;

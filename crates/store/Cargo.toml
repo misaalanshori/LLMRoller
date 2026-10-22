@@ -21,6 +21,7 @@ futures-util.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 indexmap.workspace = true
+ipnet.workspace = true
 llmroller-core = { path = "../core" }
 parking_lot.workspace = true
 secrecy.workspace = true

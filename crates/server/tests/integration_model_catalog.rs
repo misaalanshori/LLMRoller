@@ -412,6 +412,7 @@ async fn test_v1_models_endpoint_openai_and_anthropic_formats() {
         admin_id,
         NewClientKey {
             label: "Test Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,

@@ -453,7 +453,7 @@ pub async fn create_user_tx(
          ) VALUES (?, ?, ?, ?, ?, 0, 1, 0, ?)",
     )
     .bind(id.to_string())
-    .bind(&username)
+    .bind(username)
     .bind(password_hash)
     .bind(new_user.role.as_str())
     .bind(i64::from(new_user.must_change_password))

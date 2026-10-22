@@ -139,6 +139,11 @@ define_ulid_id! {
 }
 
 define_ulid_id! {
+    /// Identifier of a machine principal Service Account (`CLK-6`).
+    ServiceAccountId
+}
+
+define_ulid_id! {
     /// Immutable surrogate key of a canonical model.
     ModelPk
 }
@@ -151,6 +156,17 @@ define_ulid_id! {
 define_ulid_id! {
     /// Identifier of one finalized usage event.
     UsageEventId
+}
+
+/// Validate that a string is a canonical 26-character Crockford base32 ULID.
+///
+/// # Errors
+///
+/// Returns [`IdParseError`] when the input is not a canonical ULID.
+pub fn validate_ulid(value: &str) -> Result<(), IdParseError> {
+    Ulid::from_string(value)
+        .map(|_| ())
+        .map_err(IdParseError::from_decode)
 }
 
 #[cfg(test)]

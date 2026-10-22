@@ -223,13 +223,13 @@ tests = ["crates/core/src/accumulators/tests.rs", "crates/server/tests/integrati
 priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.2"
-tests = ["crates/server/tests/integration_client_keys.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = ["crates/store/src/service_accounts/tests.rs", "crates/server/tests/integration_service_accounts_and_pause.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
 
 [requirements.CLK-7]
 priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.2"
-tests = ["crates/server/tests/integration_client_keys.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = ["crates/server/tests/integration_service_accounts_and_pause.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
 
 # --- 6.6 Model catalog and discovery (MDL) ---
 [requirements.MDL-1]
@@ -585,20 +585,20 @@ priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.1"
 partial_subphases = ["6.2", "6.3"]
-tests = ["crates/server/tests/security_csrf_and_headers.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = ["crates/server/tests/security_csrf_and_headers.rs", "crates/server/tests/integration_service_accounts_and_pause.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
 
 [requirements.UI-6]
 priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.4"
-tests = ["crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = ["crates/server/tests/e2e_dashboard_htmx.rs", "crates/server/tests/integration_service_accounts_and_pause.rs"]
 
 [requirements.AUD-2]
 priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.3"
 partial_subphases = ["6.4"]
-tests = ["crates/store/src/audit/tests.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = ["crates/store/src/audit/tests.rs", "crates/server/tests/integration_service_accounts_and_pause.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
 
 # --- 7. Non-functional requirements (PERF, REL, TRN, COM, POR, MNT, OBS, PRIV) ---
 [requirements.PERF-1]

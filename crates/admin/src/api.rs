@@ -21,7 +21,7 @@ use llmroller_core::seams::secret_string;
 use llmroller_core::snapshot::ConfigDomain;
 use llmroller_store::client_keys::{
     ClientKey, ClientKeyError, ClientKeyPatch, NewClientKey, create_client_key, delete_client_key,
-    list_client_keys, patch_client_key,
+    list_client_keys, patch_client_key, set_client_key_pause_tx,
 };
 use llmroller_store::crypto::MasterKey;
 use llmroller_store::providers::{
@@ -30,15 +30,19 @@ use llmroller_store::providers::{
     get_provider, get_upstream_key, list_providers, list_upstream_keys, patch_provider,
     patch_upstream_key,
 };
+use llmroller_store::service_accounts::{
+    NewServiceAccount, ServiceAccountError, ServiceAccountPatch, create_service_account_tx,
+    delete_service_account, list_service_accounts, patch_service_account,
+};
 use llmroller_store::settings::{
     RuntimeSettings, SettingsError, load_settings, update_setting, validate_setting,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::{Connection as _, Sqlite, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use sqlx::{Connection as _, Sqlite, Transaction};
 
 use crate::auth::{AuthAppState, AuthError, authenticate_session};
 
@@ -50,6 +54,10 @@ tokio::task_local! {
     /// Audit metadata for the mutation currently executing inside the control
     /// plane. Set by `control_mutation_barrier` before dispatch (F09).
     static CURRENT_MUTATION_AUDIT: Option<MutationAuditContext>;
+    /// Set by `execute_atomic_mutation` when a handler already wrote its entity
+    /// SQL, `audit_log` row, and `config_version` bump atomically. The barrier
+    /// then skips its fallback audit/version publication.
+    static MUTATION_HANDLED: std::sync::atomic::AtomicBool;
 }
 
 #[derive(Debug, Clone)]
@@ -76,27 +84,23 @@ async fn execute_atomic_mutation<T, F>(
 ) -> Result<T, MutationResponseError>
 where
     T: Send + 'static,
-    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, T>
-        + Send
-        + 'static,
+    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, T> + Send + 'static,
 {
     use llmroller_core::seams::ExposeSecret as _;
 
-    let audit = CURRENT_MUTATION_AUDIT
-        .try_with(Clone::clone)
-        .ok()
-        .flatten();
+    let _ = MUTATION_HANDLED.try_with(|flag| {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let audit = CURRENT_MUTATION_AUDIT.try_with(Clone::clone).ok().flatten();
     let fallback = llmroller_store::crypto::sha256_hex(state.master_key.as_bytes());
-    let audit_key: Vec<u8> = state
-        .audit_hmac_key
-        .as_ref()
-        .map_or_else(|| fallback.into_bytes(), |secret| secret.expose_secret().to_vec());
-    let slot = Arc::new(StdMutex::new(
-        None::<Result<T, MutationResponseError>>,
-    ));
+    let audit_key: Vec<u8> = state.audit_hmac_key.as_ref().map_or_else(
+        || fallback.into_bytes(),
+        |secret| secret.expose_secret().to_vec(),
+    );
+    let slot = Arc::new(StdMutex::new(None::<Result<T, MutationResponseError>>));
     let slot_for_op = slot.clone();
 
-    let op = move |tx: &mut Transaction<'_, Sqlite>| -> MutationFuture<'_, ()> {
+    let op: MutationRunner = Box::new(move |tx| {
         Box::pin(async move {
             match run(tx).await {
                 Ok(value) => {
@@ -110,21 +114,15 @@ where
                 }
                 Err(error) => {
                     *slot_for_op.lock().expect("mutation result lock") = Some(Err(error));
-                    Err(llmroller_store::writer::WriterError::Execution(
-                        "control mutation aborted".to_string(),
-                    ))
+                    Err(writer_busy_error())
                 }
             }
         })
-    };
+    });
 
     if let Some(writer) = &state.writer {
         let result = writer
-            .execute_control(
-                domains,
-                Vec::new(),
-                AdminControlOp { run: Some(op) },
-            )
+            .execute_control(domains, Vec::new(), AdminControlOp { run: Some(op) })
             .await;
         if let Ok(version) = result {
             await_published_version(state, version).await;
@@ -149,12 +147,10 @@ where
         tx.commit().await.map_err(|_| writer_busy_error())?;
     }
 
-    let result = slot
-        .lock()
+    slot.lock()
         .expect("mutation result lock")
         .take()
-        .ok_or_else(writer_busy_error)?;
-    result
+        .ok_or_else(writer_busy_error)?
 }
 
 /// Record a control-plane action that has no entity SQL of its own (for
@@ -178,35 +174,37 @@ fn writer_busy_error() -> MutationResponseError {
     )
 }
 
-struct AdminControlOp<F> {
-    run: Option<F>,
+/// Boxed higher-ranked mutation closure executed by the writer actor.
+type MutationRunner = Box<
+    dyn for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, ()> + Send + 'static,
+>;
+
+struct AdminControlOp {
+    run: Option<MutationRunner>,
 }
 
-impl<F> llmroller_store::writer::ControlOp for AdminControlOp<F>
-where
-    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, ()>
-        + Send
-        + 'static,
-{
+impl llmroller_store::writer::ControlOp for AdminControlOp {
     fn call<'a>(
         self: Box<Self>,
         tx: &'a mut Transaction<'_, Sqlite>,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<(), llmroller_store::writer::WriterError>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<(), llmroller_store::writer::WriterError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let run = self.run.expect("control mutation executed twice");
-            run(tx).await
+            run(tx).await.map_err(|_| {
+                llmroller_store::writer::WriterError::Execution(
+                    "control mutation aborted".to_string(),
+                )
+            })
         })
     }
 }
 
-async fn scan_mutation_audit(tx: &mut Transaction<'_, Sqlite>, key: &[u8], audit: &MutationAuditContext) -> Result<(), sqlx::Error> {
+async fn scan_mutation_audit(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &[u8],
+    audit: &MutationAuditContext,
+) -> Result<(), sqlx::Error> {
     let audit_id = llmroller_core::ids::RequestId::generate().to_string();
     llmroller_store::audit::append(
         tx,
@@ -223,6 +221,7 @@ async fn scan_mutation_audit(tx: &mut Transaction<'_, Sqlite>, key: &[u8], audit
         },
     )
     .await
+    .map(|_| ())
     .map_err(|_| sqlx::Error::Protocol("audit append failed".to_string()))
 }
 
@@ -302,6 +301,25 @@ impl ApiAppState {
         self.published_version = Some(published_version);
     }
 
+    /// Publish a committed control-plane mutation: bump `instance_meta.config_version`
+    /// and wake the reloader so changed slices are visible within 1 s (`REL-4`).
+    ///
+    /// Mutations routed through [`execute_atomic_mutation`] already publish via the
+    /// writer actor; this barrier remains the safety net for legacy direct-SQL
+    /// handlers that do not use the writer.
+    pub async fn publish_control_change(&self, domains: Vec<ConfigDomain>) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let result = writer
+            .execute_control(domains, Vec::new(), VersionBumpOp)
+            .await;
+        match result {
+            Ok(version) => await_published_version(self, version).await,
+            Err(error) => tracing::error!("control change publish failed: {error}"),
+        }
+    }
+
     /// Queue a `/models` discovery refresh, or a no-op when no worker is attached (MDL-1).
     pub fn trigger_discovery(&self, target: llmroller_proto::discovery::DiscoveryTarget) {
         let Some(discovery_tx) = &self.discovery_tx else {
@@ -311,7 +329,19 @@ impl ApiAppState {
             tracing::warn!(?target, "model discovery worker is not running");
         }
     }
+}
 
+/// No-op control transaction used to publish a config-version bump (`REL-4`).
+struct VersionBumpOp;
+
+impl llmroller_store::writer::ControlOp for VersionBumpOp {
+    fn call<'a>(
+        self: Box<Self>,
+        _tx: &'a mut Transaction<'_, Sqlite>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), llmroller_store::writer::WriterError>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
@@ -509,15 +539,44 @@ async fn control_mutation_barrier(
             .to_string()
     });
 
-    let response = next.run(request).await;
-    if is_mutation && response.status().is_success() {
-        state.publish_control_change(domains).await;
-        let audit = classify_mutation(&method, &path);
-        let detail = serde_json::json!({
-            "method": method.as_str(),
-            "path": path,
+    let audit = classify_mutation(&method, &path);
+    let detail = serde_json::json!({
+        "method": method.as_str(),
+        "path": path,
+    })
+    .to_string();
+    let audit_context = if is_mutation {
+        Some(MutationAuditContext {
+            ts: chrono_like_now_ms(),
+            actor_user_id: actor_user_id.clone(),
+            ip_addr: ip_addr.clone(),
+            action: audit.action.clone(),
+            target_type: audit.target_type.to_string(),
+            target_id: audit.target_id.clone(),
+            detail_json: detail.clone(),
         })
-        .to_string();
+    } else {
+        None
+    };
+
+    let (response, handled) = if let Some(context) = audit_context {
+        CURRENT_MUTATION_AUDIT
+            .scope(
+                Some(context),
+                MUTATION_HANDLED.scope(std::sync::atomic::AtomicBool::new(false), async {
+                    let response = next.run(request).await;
+                    let handled = MUTATION_HANDLED
+                        .with(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+                    (response, handled)
+                }),
+            )
+            .await
+    } else {
+        (next.run(request).await, false)
+    };
+
+    if is_mutation && response.status().is_success() && !handled {
+        state.publish_control_change(domains).await;
         let _ = append_audit_entry_helper(
             &state,
             chrono_like_now_ms(),
@@ -694,6 +753,7 @@ pub struct PatchKeyRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateClientKeyRequest {
     pub label: String,
+    pub service_account_id: Option<String>,
     pub routing_scope: Option<String>,
     pub allowed_models: Option<Vec<String>>,
     pub rate_limit_rpm: Option<i64>,
@@ -929,6 +989,7 @@ async fn post_user_client_key_handler(
 
     let new_key = NewClientKey {
         label: payload.label,
+        service_account_id: payload.service_account_id,
         routing_scope: payload.routing_scope,
         allowed_models: payload.allowed_models,
         rate_limit_rpm: payload.rate_limit_rpm,
@@ -987,6 +1048,354 @@ async fn delete_user_client_key_handler(
     } else {
         Ok(StatusCode::NO_CONTENT)
     }
+}
+
+/// `POST /api/user/client-keys/{id}/pause` (`CLK-7`).
+async fn post_pause_client_key_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ClientKeyId>,
+) -> Result<Json<ClientKey>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let key = execute_atomic_mutation(&state, vec![ConfigDomain::ClientKeys], move |tx| {
+        Box::pin(async move {
+            set_client_key_pause_tx(tx, &actor, id, true, now_ms)
+                .await
+                .map_err(map_client_key_error)
+        })
+    })
+    .await?;
+    Ok(Json(key))
+}
+
+/// `POST /api/user/client-keys/{id}/resume` (`CLK-7`).
+async fn post_resume_client_key_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ClientKeyId>,
+) -> Result<Json<ClientKey>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let key = execute_atomic_mutation(&state, vec![ConfigDomain::ClientKeys], move |tx| {
+        Box::pin(async move {
+            set_client_key_pause_tx(tx, &actor, id, false, now_ms)
+                .await
+                .map_err(map_client_key_error)
+        })
+    })
+    .await?;
+    Ok(Json(key))
+}
+
+fn map_service_account_error(err: ServiceAccountError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code) = match &err {
+        ServiceAccountError::Forbidden => (StatusCode::FORBIDDEN, "permission_denied"),
+        ServiceAccountError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+        ServiceAccountError::NameTaken => (StatusCode::CONFLICT, "service_account_name_taken"),
+        ServiceAccountError::Validation(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "validation_error")
+        }
+        ServiceAccountError::Sqlx(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    };
+    (
+        status,
+        Json(serde_json::json!({"error": {"code": code, "message": err.to_string()}})),
+    )
+}
+
+/// `GET /api/user/service-accounts` (`CLK-6`, Section 14.j).
+async fn get_user_service_accounts_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<llmroller_store::service_accounts::ServiceAccount>>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let accounts = list_service_accounts(&state.auth.pool, &actor, Some("personal"), None)
+        .await
+        .map_err(map_service_account_error)?;
+    Ok(Json(accounts))
+}
+
+/// `POST /api/user/service-accounts` (`CLK-6`, Section 14.j.4).
+async fn post_user_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<NewServiceAccount>,
+) -> Result<
+    (
+        StatusCode,
+        Json<llmroller_store::service_accounts::ServiceAccount>,
+    ),
+    MutationResponseError,
+> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let owner = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            create_service_account_tx(tx, &actor, owner, payload, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+/// `GET /api/user/service-accounts/{id}` (`CLK-6`).
+async fn get_user_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let account =
+        llmroller_store::service_accounts::get_service_account(&state.auth.pool, &actor, &id)
+            .await
+            .map_err(map_service_account_error)?;
+    Ok(Json(account))
+}
+
+/// `PATCH /api/user/service-accounts/{id}` (`CLK-6`).
+async fn patch_user_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<ServiceAccountPatch>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let account = patch_service_account(&state.auth.pool, &actor, &id, payload, now_ms)
+        .await
+        .map_err(map_service_account_error)?;
+    Ok(Json(account))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct IpRestrictionsRequest {
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+    /// Textarea form alternative accepted by HTMX clients (Section 14.k.4).
+    #[serde(default)]
+    pub allowed_cidrs_text: Option<String>,
+}
+
+/// `PUT /api/user/service-accounts/{id}/ip-restrictions` (`CLK-6`, Section 14.k.4).
+async fn put_user_service_account_ip_restrictions_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<IpRestrictionsRequest>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let cidrs = if let Some(text) = payload.allowed_cidrs_text {
+        llmroller_store::service_accounts::parse_cidrs_text(&text)
+            .map_err(map_service_account_error)?
+    } else if payload.allowed_cidrs.is_empty() {
+        None
+    } else {
+        Some(payload.allowed_cidrs)
+    };
+    let now_ms = state.auth.clock.now_ms();
+    let account = llmroller_store::service_accounts::set_service_account_cidrs(
+        &state.auth.pool,
+        &actor,
+        &id,
+        cidrs,
+        now_ms,
+    )
+    .await
+    .map_err(map_service_account_error)?;
+    Ok(Json(account))
+}
+
+/// `DELETE /api/user/service-accounts/{id}` (`CLK-6`).
+async fn delete_user_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    delete_service_account(&state.auth.pool, &actor, &id)
+        .await
+        .map_err(map_service_account_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdatePreferencesRequest {
+    pub ui_theme: Option<String>,
+    pub ui_nav_layout: Option<String>,
+    pub ui_locale: Option<String>,
+    pub default_routing_scope: Option<String>,
+}
+
+/// `PATCH /api/user/preferences` (`UI-5`, `UI-6`).
+async fn patch_user_preferences_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdatePreferencesRequest>,
+) -> Result<Json<serde_json::Value>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    if let Some(theme) = &payload.ui_theme
+        && !matches!(theme.as_str(), "dark" | "light" | "system")
+    {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid ui_theme: {theme:?}"),
+        ));
+    }
+    if let Some(layout) = &payload.ui_nav_layout
+        && !matches!(layout.as_str(), "top_tabs" | "sidebar")
+    {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid ui_nav_layout: {layout:?}"),
+        ));
+    }
+    if let Some(scope) = &payload.default_routing_scope
+        && !matches!(
+            scope.as_str(),
+            "personal_first" | "blended" | "personal_only" | "own_only" | "global_only"
+        )
+    {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid default_routing_scope: {scope:?}"),
+        ));
+    }
+    if let Some(locale) = &payload.ui_locale
+        && !matches!(locale.as_str(), "en" | "id" | "zh-CN")
+    {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("unsupported ui_locale: {locale:?}"),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE users SET
+            ui_theme = COALESCE(?, ui_theme),
+            ui_nav_layout = COALESCE(?, ui_nav_layout),
+            ui_locale = COALESCE(?, ui_locale),
+            default_routing_scope = COALESCE(?, default_routing_scope)
+         WHERE id = ?",
+    )
+    .bind(payload.ui_theme.as_deref())
+    .bind(payload.ui_nav_layout.as_deref())
+    .bind(payload.ui_locale.as_deref())
+    .bind(payload.default_routing_scope.as_deref())
+    .bind(user_id.to_string())
+    .execute(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "updated",
+        "ui_theme": payload.ui_theme,
+        "ui_nav_layout": payload.ui_nav_layout,
+        "ui_locale": payload.ui_locale,
+        "default_routing_scope": payload.default_routing_scope,
+    })))
+}
+
+/// `GET /api/user/web-sessions` (`AUTH-7`, `F011`).
+async fn get_user_web_sessions_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+
+    let cookie_header = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let current_token =
+        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
+            .unwrap_or("");
+    let current_hash = llmroller_store::crypto::sha256_hex(current_token.as_bytes());
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id_hash, ip_addr, user_agent, created_at, last_seen_at, expires_at
+         FROM web_sessions WHERE user_id = ? AND expires_at > ?
+         ORDER BY last_seen_at DESC LIMIT 100",
+    )
+    .bind(user_id.to_string())
+    .bind(now_ms)
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                let id_hash: String = row.try_get("id_hash").unwrap_or_default();
+                serde_json::json!({
+                    "id_prefix": id_hash.chars().take(12).collect::<String>(),
+                    "ip_addr": row.try_get::<Option<String>, _>("ip_addr").unwrap_or_default(),
+                    "user_agent": row.try_get::<Option<String>, _>("user_agent").unwrap_or_default(),
+                    "created_at": row.try_get::<i64, _>("created_at").unwrap_or_default(),
+                    "last_seen_at": row.try_get::<i64, _>("last_seen_at").unwrap_or_default(),
+                    "expires_at": row.try_get::<i64, _>("expires_at").unwrap_or_default(),
+                    "is_current": id_hash == current_hash,
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// `GET /api/user/audit-log` (`AUD-2`).
+///
+/// Returns only rows attributable to the authenticated actor; admins use
+/// `/admin/api/audit-log` for the instance-wide chain.
+async fn get_user_audit_log_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, MutationResponseError> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT seq, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json, prev_hash, hash
+         FROM audit_log WHERE actor_user_id = ? ORDER BY seq DESC LIMIT 200",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(
+        rows.iter()
+            .map(|row| {
+                serde_json::json!({
+                    "seq": row.try_get::<i64, _>("seq").unwrap_or_default(),
+                    "ts": row.try_get::<i64, _>("ts").unwrap_or_default(),
+                    "actor_user_id": row.try_get::<Option<String>, _>("actor_user_id").unwrap_or_default(),
+                    "ip_addr": row.try_get::<Option<String>, _>("ip_addr").unwrap_or_default(),
+                    "action": row.try_get::<String, _>("action").unwrap_or_default(),
+                    "target_type": row.try_get::<String, _>("target_type").unwrap_or_default(),
+                    "target_id": row.try_get::<Option<String>, _>("target_id").unwrap_or_default(),
+                    "detail_json": row.try_get::<Option<String>, _>("detail_json").unwrap_or_default(),
+                    "prev_hash": row.try_get::<String, _>("prev_hash").unwrap_or_default(),
+                    "hash": row.try_get::<String, _>("hash").unwrap_or_default(),
+                })
+            })
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,6 +2853,7 @@ async fn post_admin_models_refresh_handler(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
+    record_control_mutation(&state, vec![ConfigDomain::Models]).await?;
     state.trigger_discovery(llmroller_proto::discovery::DiscoveryTarget::AllEnabled);
     Ok((
         StatusCode::ACCEPTED,
@@ -4522,6 +4932,34 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/client-keys/{id}/rotate",
             post(post_rotate_client_key_handler),
         )
+        .route(
+            "/api/user/client-keys/{id}/pause",
+            post(post_pause_client_key_handler),
+        )
+        .route(
+            "/api/user/client-keys/{id}/resume",
+            post(post_resume_client_key_handler),
+        )
+        .route(
+            "/api/user/service-accounts",
+            get(get_user_service_accounts_handler).post(post_user_service_account_handler),
+        )
+        .route(
+            "/api/user/service-accounts/{id}",
+            get(get_user_service_account_handler)
+                .patch(patch_user_service_account_handler)
+                .delete(delete_user_service_account_handler),
+        )
+        .route(
+            "/api/user/service-accounts/{id}/ip-restrictions",
+            put(put_user_service_account_ip_restrictions_handler),
+        )
+        .route(
+            "/api/user/preferences",
+            patch(patch_user_preferences_handler),
+        )
+        .route("/api/user/web-sessions", get(get_user_web_sessions_handler))
+        .route("/api/user/audit-log", get(get_user_audit_log_handler))
         .route(
             "/api/user/shares",
             get(get_user_shares_handler).post(post_user_share_handler),

@@ -20,6 +20,7 @@ use llmroller_store::prices::load_price_entries_tx;
 use llmroller_store::providers::{
     ProviderError, load_provider_records_tx, load_upstream_key_records_tx,
 };
+use llmroller_store::service_accounts::{ServiceAccountError, load_service_account_records_tx};
 use llmroller_store::settings::{SettingsError, load_settings_tx};
 use llmroller_store::shares::load_share_configs_tx;
 use llmroller_store::users::{UserError, load_user_records_tx};
@@ -41,6 +42,8 @@ pub enum ReloaderError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     ClientKey(#[from] ClientKeyError),
+    #[error(transparent)]
+    ServiceAccount(#[from] ServiceAccountError),
     #[error("reloader version notification timed out")]
     Timeout,
     #[error("reloader channel closed")]
@@ -243,6 +246,7 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
     let providers = load_provider_records_tx(&mut tx).await?;
     let upstream_keys = load_upstream_key_records_tx(&mut tx).await?;
     let client_keys = load_client_key_records_tx(&mut tx, now_ms).await?;
+    let service_accounts = load_service_account_records_tx(&mut tx).await?;
     let slices = load_domain_slices(&mut tx).await?;
     tx.commit().await?;
 
@@ -254,6 +258,7 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
         Arc::new(providers),
         Arc::new(upstream_keys),
         Arc::new(client_keys),
+        Arc::new(service_accounts),
         DomainArcs::from_slices(slices),
     ))
 }
@@ -279,6 +284,7 @@ fn assemble_snapshot(
             ),
         >,
     >,
+    service_accounts: Arc<HashMap<String, llmroller_core::snapshot::ServiceAccountRecord>>,
     slices: DomainArcs,
 ) -> ConfigSnapshot {
     ConfigSnapshot {
@@ -289,6 +295,7 @@ fn assemble_snapshot(
         providers,
         upstream_keys,
         client_keys_by_hash: client_keys,
+        service_accounts,
         models: slices.models,
         models_by_canonical: slices.models_by_canonical,
         aliases: slices.aliases,
@@ -444,6 +451,23 @@ pub fn start_reloader(
                         current.client_keys_by_hash.clone()
                     };
 
+                let next_service_accounts = if reload_all
+                    || changed_domains.contains(&ConfigDomain::ClientKeys)
+                    || changed_domains.contains(&ConfigDomain::ServiceAccounts)
+                {
+                    match load_service_account_records_tx(&mut tx).await {
+                        Ok(accounts) => Arc::new(accounts),
+                        Err(err) => {
+                            tracing::error!(
+                                "reloader failed to load service_accounts slice: {err}"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    current.service_accounts.clone()
+                };
+
                 let next_slices = if reload_catalog {
                     match load_domain_slices(&mut tx).await {
                         Ok(slices) => DomainArcs::from_slices(slices),
@@ -476,6 +500,7 @@ pub fn start_reloader(
                     next_providers,
                     next_upstream_keys,
                     next_client_keys,
+                    next_service_accounts,
                     next_slices,
                 );
 

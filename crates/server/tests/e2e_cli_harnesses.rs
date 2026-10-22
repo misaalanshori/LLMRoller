@@ -169,6 +169,7 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         user_id,
         NewClientKey {
             label: "CLI Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,

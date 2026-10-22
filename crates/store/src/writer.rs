@@ -334,9 +334,7 @@ async fn execute_single_control_task(
 ///
 /// Control-plane mutations use this together with their entity write and
 /// `audit_log` append so all three become visible atomically (AUD-1, F09).
-pub async fn bump_config_version_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> Result<i64, sqlx::Error> {
+pub async fn bump_config_version_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<i64, sqlx::Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
@@ -545,12 +543,8 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .execute(&mut *transaction)
             .await;
         let master_key_id = trace.master_key_id.clone();
-        let result = crate::traces::insert_sealed_trace_tx(
-            &mut transaction,
-            &trace,
-            &master_key_id,
-        )
-        .await;
+        let result =
+            crate::traces::insert_sealed_trace_tx(&mut transaction, &trace, &master_key_id).await;
         match result {
             Ok(()) => {
                 let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))

@@ -39,6 +39,7 @@ pub enum ClientKeyError {
 pub struct ClientKey {
     pub id: ClientKeyId,
     pub owner_user_id: UserId,
+    pub service_account_id: Option<String>,
     pub label: String,
     pub prefix: String,
     pub key_hash: String,
@@ -52,6 +53,7 @@ pub struct ClientKey {
     pub constant_session_flagged_at: Option<i64>,
     pub constant_session_mode: String,
     pub disabled: bool,
+    pub paused_at: Option<i64>,
     pub revoked_at: Option<i64>,
     pub expires_at: Option<i64>,
     pub created_at: i64,
@@ -62,6 +64,7 @@ pub struct ClientKey {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NewClientKey {
     pub label: String,
+    pub service_account_id: Option<String>,
     pub routing_scope: Option<String>,
     pub allowed_models: Option<Vec<String>>,
     pub rate_limit_rpm: Option<i64>,
@@ -88,6 +91,7 @@ pub struct ClientKeyPatch {
     pub budget_micro_usd_month: Option<Option<i64>>,
     pub allowed_cidrs: Option<Option<Vec<String>>>,
     pub constant_session_mode: Option<String>,
+    pub service_account_id: Option<Option<String>>,
     pub disabled: Option<bool>,
     pub expires_at: Option<Option<i64>>,
 }
@@ -143,15 +147,16 @@ pub async fn create_client_key_tx(
 
     sqlx::query(
         "INSERT INTO client_keys (
-            id, owner_user_id, label, prefix, key_hash, prev_key_hash,
+            id, owner_user_id, service_account_id, label, prefix, key_hash, prev_key_hash,
             prev_key_expires_at, routing_scope, allowed_models, rate_limit_rpm,
             budget_micro_usd_month, allowed_cidrs, constant_session_flagged_at,
-            constant_session_mode, disabled, revoked_at, expires_at, created_at,
+            constant_session_mode, disabled, paused_at, revoked_at, expires_at, created_at,
             last_used_at
-        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, 0, NULL, ?, ?, NULL)",
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, 0, NULL, NULL, ?, ?, NULL)",
     )
     .bind(id.to_string())
     .bind(owner_user_id.to_string())
+    .bind(new_key.service_account_id.as_deref())
     .bind(&new_key.label)
     .bind(&prefix)
     .bind(&key_hash)
@@ -169,6 +174,7 @@ pub async fn create_client_key_tx(
     let client_key = ClientKey {
         id,
         owner_user_id,
+        service_account_id: new_key.service_account_id,
         label: new_key.label,
         prefix,
         key_hash,
@@ -182,6 +188,7 @@ pub async fn create_client_key_tx(
         constant_session_flagged_at: None,
         constant_session_mode,
         disabled: false,
+        paused_at: None,
         revoked_at: None,
         expires_at: new_key.expires_at,
         created_at: now_ms,
@@ -292,12 +299,15 @@ pub async fn patch_client_key_tx(
 
     let new_disabled = patch.disabled.unwrap_or(existing.disabled);
     let new_expires_at = patch.expires_at.unwrap_or(existing.expires_at);
+    let new_service_account_id = patch
+        .service_account_id
+        .unwrap_or(existing.service_account_id.clone());
 
     sqlx::query(
         "UPDATE client_keys SET
             label = ?, routing_scope = ?, allowed_models = ?, rate_limit_rpm = ?,
             budget_micro_usd_month = ?, allowed_cidrs = ?, constant_session_mode = ?,
-            disabled = ?, expires_at = ?
+            service_account_id = ?, disabled = ?, expires_at = ?
          WHERE id = ?",
     )
     .bind(&new_label)
@@ -307,6 +317,7 @@ pub async fn patch_client_key_tx(
     .bind(new_budget)
     .bind(allowed_cidrs_json)
     .bind(&new_constant_mode)
+    .bind(new_service_account_id.as_deref())
     .bind(if new_disabled { 1i64 } else { 0i64 })
     .bind(new_expires_at)
     .bind(id.to_string())
@@ -316,6 +327,7 @@ pub async fn patch_client_key_tx(
     Ok(ClientKey {
         id,
         owner_user_id: existing.owner_user_id,
+        service_account_id: new_service_account_id,
         label: new_label,
         prefix: existing.prefix,
         key_hash: existing.key_hash,
@@ -329,6 +341,7 @@ pub async fn patch_client_key_tx(
         constant_session_flagged_at: existing.constant_session_flagged_at,
         constant_session_mode: new_constant_mode,
         disabled: new_disabled,
+        paused_at: existing.paused_at,
         revoked_at: existing.revoked_at,
         expires_at: new_expires_at,
         created_at: existing.created_at,
@@ -407,6 +420,7 @@ pub async fn rotate_client_key_tx(
     let updated = ClientKey {
         id,
         owner_user_id: existing.owner_user_id,
+        service_account_id: existing.service_account_id,
         label: existing.label,
         prefix: new_prefix,
         key_hash: new_hash,
@@ -420,6 +434,7 @@ pub async fn rotate_client_key_tx(
         constant_session_flagged_at: existing.constant_session_flagged_at,
         constant_session_mode: existing.constant_session_mode,
         disabled: existing.disabled,
+        paused_at: existing.paused_at,
         revoked_at: existing.revoked_at,
         expires_at: existing.expires_at,
         created_at: existing.created_at,
@@ -447,6 +462,52 @@ pub async fn rotate_client_key(
     Ok(res)
 }
 
+/// Reversibly pause a client key (`CLK-7`) inside an active transaction.
+///
+/// Pausing sets `paused_at = now_ms` and `disabled = 1` without deleting pins;
+/// resuming clears both. Gate `G2` reports `client_key_paused` while paused.
+pub async fn set_client_key_pause_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    actor: &ActorScope,
+    id: ClientKeyId,
+    paused: bool,
+    now_ms: i64,
+) -> Result<ClientKey, ClientKeyError> {
+    let existing = get_client_key_tx(tx, actor, id).await?;
+    if existing.revoked_at.is_some() {
+        return Err(ClientKeyError::Validation(
+            "revoked client keys cannot be paused or resumed".to_string(),
+        ));
+    }
+    let paused_at = if paused { Some(now_ms) } else { None };
+    let disabled = if paused { 1_i64 } else { 0_i64 };
+    sqlx::query("UPDATE client_keys SET paused_at = ?, disabled = ? WHERE id = ?")
+        .bind(paused_at)
+        .bind(disabled)
+        .bind(id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(ClientKey {
+        paused_at,
+        disabled: paused,
+        ..existing
+    })
+}
+
+/// Reversibly pause or resume a client key (`CLK-7`).
+pub async fn set_client_key_pause(
+    pool: &SqlitePool,
+    actor: &ActorScope,
+    id: ClientKeyId,
+    paused: bool,
+    now_ms: i64,
+) -> Result<ClientKey, ClientKeyError> {
+    let mut tx = pool.begin().await?;
+    let key = set_client_key_pause_tx(&mut tx, actor, id, paused, now_ms).await?;
+    tx.commit().await?;
+    Ok(key)
+}
+
 /// Load all client keys into in-memory projections mapped by binary SHA-256 hash.
 pub async fn load_client_key_records_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
@@ -465,6 +526,7 @@ pub async fn load_client_key_records_tx(
         let record = ClientKeyRecord {
             id: k.id,
             owner_user_id: k.owner_user_id,
+            service_account_id: k.service_account_id.clone(),
             label: k.label,
             prefix: k.prefix,
             key_hash: key_hash_bytes,
@@ -477,6 +539,7 @@ pub async fn load_client_key_records_tx(
             allowed_cidrs: k.allowed_cidrs,
             constant_session_mode: k.constant_session_mode,
             disabled: k.disabled,
+            paused_at: k.paused_at,
             revoked_at: k.revoked_at,
             expires_at: k.expires_at,
         };
@@ -528,6 +591,7 @@ fn client_key_from_row(row: &SqliteRow) -> Result<ClientKey, ClientKeyError> {
     Ok(ClientKey {
         id,
         owner_user_id,
+        service_account_id: row.try_get("service_account_id")?,
         label: row.try_get("label")?,
         prefix: row.try_get("prefix")?,
         key_hash: row.try_get("key_hash")?,
@@ -541,6 +605,7 @@ fn client_key_from_row(row: &SqliteRow) -> Result<ClientKey, ClientKeyError> {
         constant_session_flagged_at: row.try_get("constant_session_flagged_at")?,
         constant_session_mode: row.try_get("constant_session_mode")?,
         disabled: disabled != 0,
+        paused_at: row.try_get("paused_at")?,
         revoked_at: row.try_get("revoked_at")?,
         expires_at: row.try_get("expires_at")?,
         created_at: row.try_get("created_at")?,

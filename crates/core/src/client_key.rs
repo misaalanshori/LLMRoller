@@ -47,7 +47,9 @@ pub struct ClientKeyRecord {
     pub budget_micro_usd_month: Option<i64>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub constant_session_mode: String,
+    pub service_account_id: Option<String>,
     pub disabled: bool,
+    pub paused_at: Option<i64>,
     pub revoked_at: Option<i64>,
     pub expires_at: Option<i64>,
 }
@@ -59,6 +61,10 @@ pub enum GateFailure {
     G1AuthenticationError,
     /// G2: Client key is disabled, revoked, or expired.
     G2KeyDisabledOrExpired,
+    /// G2: Client key was reversibly paused (`paused_at IS NOT NULL`).
+    G2ClientKeyPaused,
+    /// G2: Parent Service Account is disabled (`CLK-6`).
+    G2ServiceAccountDisabled,
     /// G3: Owner user account is disabled.
     G3OwnerDisabled,
     /// G4: Client IP address falls outside allowed CIDRs.
@@ -183,12 +189,27 @@ pub fn evaluate_request_gates(
         }
     }
 
-    // Gate G2: Client key disabled, revoked, or expired
+    // Gate G2: reversible pause takes precedence over terminal key states so the
+    // control plane can surface `client_key_paused` for a paused key (`CLK-7`).
+    if key_record.paused_at.is_some() {
+        return Err(GateFailure::G2ClientKeyPaused);
+    }
     if key_record.disabled
         || key_record.revoked_at.is_some()
         || key_record.expires_at.is_some_and(|exp| now_ms >= exp)
     {
         return Err(GateFailure::G2KeyDisabledOrExpired);
+    }
+
+    // Gate G2: parent Service Account disabled (`CLK-6`).
+    let service_account = key_record
+        .service_account_id
+        .as_ref()
+        .and_then(|id| snapshot.service_accounts.get(id));
+    if let Some(sa) = service_account
+        && sa.disabled
+    {
+        return Err(GateFailure::G2ServiceAccountDisabled);
     }
 
     // Gate G3: Owner user account disabled
@@ -199,24 +220,29 @@ pub fn evaluate_request_gates(
         return Err(GateFailure::G3OwnerDisabled);
     }
 
-    // Gate G4: Client IP within allowed CIDRs
-    if let Some(ref allowed_cidrs) = key_record.allowed_cidrs
-        && !allowed_cidrs.is_empty()
+    // Gate G4: Client IP within the inherited Service Account CIDRs and the
+    // key-level CIDR list. Both lists must admit the caller when non-empty
+    // (`CLK-6`, SRDD Section 10.0).
+    let inherited_cidrs = service_account.and_then(|sa| sa.allowed_cidrs.as_ref());
+    let key_cidrs = key_record.allowed_cidrs.as_ref();
+    if [inherited_cidrs, key_cidrs]
+        .into_iter()
+        .flatten()
+        .any(|cidrs| !cidrs.is_empty())
     {
         let Some(ip) = client_ip else {
             return Err(GateFailure::G4CidrForbidden);
         };
-        let mut matches_any = false;
-        for cidr_str in allowed_cidrs {
-            if let Ok(net) = IpNet::from_str(cidr_str)
-                && net.contains(&ip)
-            {
-                matches_any = true;
-                break;
+        for allowed_cidrs in [inherited_cidrs, key_cidrs].into_iter().flatten() {
+            if allowed_cidrs.is_empty() {
+                continue;
             }
-        }
-        if !matches_any {
-            return Err(GateFailure::G4CidrForbidden);
+            let matches_any = allowed_cidrs
+                .iter()
+                .any(|cidr_str| IpNet::from_str(cidr_str).is_ok_and(|net| net.contains(&ip)));
+            if !matches_any {
+                return Err(GateFailure::G4CidrForbidden);
+            }
         }
     }
 

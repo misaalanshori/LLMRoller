@@ -314,6 +314,7 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         user_id,
         NewClientKey {
             label: "wire_key".to_string(),
+            service_account_id: None,
             allowed_models: Some(vec!["gpt-4o".to_string()]), // Gate G6: only gpt-4o allowed
             routing_scope: None,
             rate_limit_rpm: None,
@@ -345,6 +346,7 @@ async fn test_orchestrator_forwards_to_mock_upstream_and_enforces_gates() {
         admin_user_id,
         NewClientKey {
             label: "wire_admin_key".to_string(),
+            service_account_id: None,
             allowed_models: Some(vec!["gpt-4o".to_string()]),
             routing_scope: None,
             rate_limit_rpm: None,
@@ -609,6 +611,7 @@ async fn seed_user_with_client_key(
         user_id,
         NewClientKey {
             label: format!("{username}_key"),
+            service_account_id: None,
             allowed_models: Some(vec!["gpt-4o".to_string()]),
             routing_scope: None,
             rate_limit_rpm: None,

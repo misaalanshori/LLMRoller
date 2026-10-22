@@ -215,6 +215,7 @@ async fn create_client_key(harness: &Harness, user_id: UserId, label: &str) -> S
         user_id,
         NewClientKey {
             label: label.to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,

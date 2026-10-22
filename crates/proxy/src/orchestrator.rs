@@ -4577,7 +4577,9 @@ mod tests {
             budget_micro_usd_month: None,
             allowed_cidrs: None,
             constant_session_mode: mode.to_string(),
+            service_account_id: None,
             disabled: false,
+            paused_at: None,
             revoked_at: None,
             expires_at: None,
         }

@@ -189,6 +189,7 @@ async fn setup_test_context() -> (
         user.id,
         NewClientKey {
             label: "client_agent".to_string(),
+            service_account_id: None,
             routing_scope: Some("personal_first".to_string()),
             allowed_models: None,
             rate_limit_rpm: None,

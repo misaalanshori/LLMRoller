@@ -250,6 +250,7 @@ async fn create_client_key(harness: &Harness, user_id: UserId, label: &str) -> S
         user_id,
         NewClientKey {
             label: label.to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,
@@ -482,6 +483,8 @@ async fn test_state_bound_input_items_and_cancel_use_upstream_and_mark_incomplet
         .await
         .expect("cancel");
     assert_eq!(cancel.status(), StatusCode::OK);
+    // State-bound mutations are write-behind through the durable queue (`REL-2`).
+    flush(&harness).await;
 
     let status: String =
         sqlx::query_scalar("SELECT status FROM response_links WHERE response_id = 'resp_up_1'")
@@ -518,6 +521,8 @@ async fn test_state_bound_delete_forwards_and_removes_link() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = response_json(response).await;
     assert_eq!(json["deleted"], true);
+    // The delete is queued in `durable_state` and committed by the writer actor.
+    flush(&harness).await;
 
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM response_links WHERE response_id = 'resp_up_1'")

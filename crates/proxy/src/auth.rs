@@ -350,6 +350,26 @@ pub async fn client_key_auth_middleware(
                 )
                     .into_response()
             }
+            GateFailure::G2ClientKeyPaused => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "client_key_paused",
+                        "message": "client key is paused; resume it in the control plane"
+                    }
+                })),
+            )
+                .into_response(),
+            GateFailure::G2ServiceAccountDisabled => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "service_account_disabled",
+                        "message": "parent service account is disabled"
+                    }
+                })),
+            )
+                .into_response(),
             GateFailure::G3OwnerDisabled => {
                 state
                     .record_failure(client_ip, "owner_disabled", now_ms)

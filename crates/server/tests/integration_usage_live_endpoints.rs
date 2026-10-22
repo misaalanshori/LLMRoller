@@ -205,6 +205,7 @@ async fn create_client_key(
         user_id,
         NewClientKey {
             label: label.to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: routing_scope.map(ToString::to_string),
             rate_limit_rpm: Some(60),

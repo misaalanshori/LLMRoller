@@ -187,6 +187,7 @@ async fn test_trace_pipeline_persists_streaming_and_non_streaming_turns() {
         user_id,
         NewClientKey {
             label: "trace_key".to_string(),
+            service_account_id: None,
             allowed_models: Some(vec!["gpt-4o".to_string()]),
             routing_scope: None,
             rate_limit_rpm: None,

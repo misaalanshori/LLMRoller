@@ -16,7 +16,7 @@ use crate::client_key::{
 use crate::ids::{ClientKeyId, UserId};
 use crate::rbac::Role;
 use crate::seams::DeterministicRng;
-use crate::snapshot::{ConfigSnapshot, UserRecord};
+use crate::snapshot::{ConfigSnapshot, ServiceAccountRecord, UserRecord};
 
 fn setup_test_snapshot(
     user_id: UserId,
@@ -96,7 +96,9 @@ fn test_client_key_grace_rotation() {
         budget_micro_usd_month: None,
         allowed_cidrs: None,
         constant_session_mode: "flag".to_string(),
+        service_account_id: None,
         disabled: false,
+        paused_at: None,
         revoked_at: None,
         expires_at: None,
     };
@@ -181,7 +183,9 @@ fn test_request_gates_g1_through_g6_ordering() {
         budget_micro_usd_month: None,
         allowed_cidrs: Some(vec!["192.168.1.0/24".to_string()]),
         constant_session_mode: "flag".to_string(),
+        service_account_id: None,
         disabled: false,
+        paused_at: None,
         revoked_at: None,
         expires_at: Some(now_ms + 100_000),
     };
@@ -310,4 +314,136 @@ fn test_request_gates_g1_through_g6_ordering() {
     .expect("all gates must pass");
     assert_eq!(key_rec.id, base_record.id);
     assert_eq!(role, HashRole::Current);
+}
+
+fn record_with_service_account(
+    user_id: UserId,
+    service_account_id: &str,
+    key_cidrs: Option<Vec<String>>,
+) -> ClientKeyRecord {
+    ClientKeyRecord {
+        id: ClientKeyId::generate(),
+        owner_user_id: user_id,
+        label: "sa-key".to_string(),
+        prefix: "llr_sa".to_string(),
+        key_hash: [7; 32],
+        prev_key_hash: None,
+        prev_key_expires_at: None,
+        routing_scope: "inherit".to_string(),
+        allowed_models: None,
+        rate_limit_rpm: None,
+        budget_micro_usd_month: None,
+        allowed_cidrs: key_cidrs,
+        constant_session_mode: "flag".to_string(),
+        service_account_id: Some(service_account_id.to_string()),
+        disabled: false,
+        paused_at: None,
+        revoked_at: None,
+        expires_at: None,
+    }
+}
+
+#[test]
+#[doc = "Spec: CLK-6, Spec: SEC-17"]
+fn service_account_cidrs_are_inherited_and_combined_with_key_cidrs() {
+    let user_id = UserId::generate();
+    let record =
+        record_with_service_account(user_id, "sa-1", Some(vec!["203.0.113.0/25".to_string()]));
+    let hash = record.key_hash;
+    let mut snapshot = setup_test_snapshot(user_id, false, record, HashRole::Current, hash);
+
+    let mut accounts = HashMap::new();
+    accounts.insert(
+        "sa-1".to_string(),
+        ServiceAccountRecord {
+            id: "sa-1".to_string(),
+            owner_user_id: user_id,
+            workspace_scope: "personal".to_string(),
+            name: "agents".to_string(),
+            description: None,
+            allowed_cidrs: Some(vec!["203.0.113.0/24".to_string()]),
+            disabled: false,
+        },
+    );
+    snapshot.service_accounts = Arc::new(accounts);
+
+    // Inside both the inherited /24 and the key-level /25.
+    evaluate_request_gates(
+        &hash,
+        Some("203.0.113.9".parse().expect("valid ip")),
+        None,
+        None,
+        &snapshot,
+        None,
+        1,
+    )
+    .expect("IP inside both CIDR lists must pass G4");
+
+    // Inside the inherited /24 but outside the key-level /25.
+    let err = evaluate_request_gates(
+        &hash,
+        Some("203.0.113.200".parse().expect("valid ip")),
+        None,
+        None,
+        &snapshot,
+        None,
+        1,
+    )
+    .expect_err("IP outside the key-level CIDR must fail G4");
+    assert_eq!(err, GateFailure::G4CidrForbidden);
+
+    // Outside the inherited /24 even though it would satisfy nothing else.
+    let err = evaluate_request_gates(
+        &hash,
+        Some("198.51.100.9".parse().expect("valid ip")),
+        None,
+        None,
+        &snapshot,
+        None,
+        1,
+    )
+    .expect_err("IP outside the inherited CIDR must fail G4");
+    assert_eq!(err, GateFailure::G4CidrForbidden);
+}
+
+#[test]
+#[doc = "Spec: CLK-6, Spec: CLK-7"]
+fn paused_keys_and_disabled_service_accounts_fail_g2_with_distinct_codes() {
+    let user_id = UserId::generate();
+    let mut record = record_with_service_account(user_id, "sa-1", None);
+    record.allowed_cidrs = None;
+    let hash = record.key_hash;
+    let mut snapshot = setup_test_snapshot(user_id, false, record.clone(), HashRole::Current, hash);
+
+    let mut accounts = HashMap::new();
+    accounts.insert(
+        "sa-1".to_string(),
+        ServiceAccountRecord {
+            id: "sa-1".to_string(),
+            owner_user_id: user_id,
+            workspace_scope: "personal".to_string(),
+            name: "agents".to_string(),
+            description: None,
+            allowed_cidrs: None,
+            disabled: true,
+        },
+    );
+    snapshot.service_accounts = Arc::new(accounts);
+
+    let err = evaluate_request_gates(&hash, None, None, None, &snapshot, None, 1)
+        .expect_err("disabled service account must fail G2");
+    assert_eq!(err, GateFailure::G2ServiceAccountDisabled);
+
+    snapshot.service_accounts = Arc::new(HashMap::new());
+    let paused = ClientKeyRecord {
+        paused_at: Some(1_000),
+        disabled: true,
+        ..record
+    };
+    let mut keys = HashMap::new();
+    keys.insert(hash, (paused, HashRole::Current));
+    snapshot.client_keys_by_hash = Arc::new(keys);
+    let err = evaluate_request_gates(&hash, None, None, None, &snapshot, None, 2_000)
+        .expect_err("paused key must fail G2 as paused");
+    assert_eq!(err, GateFailure::G2ClientKeyPaused);
 }

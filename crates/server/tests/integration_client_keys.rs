@@ -84,6 +84,7 @@ async fn test_client_key_lifecycle_and_rotation_grace() {
         user_id,
         NewClientKey {
             label: "coding_agent".to_string(),
+            service_account_id: None,
             routing_scope: Some("personal_first".to_string()),
             allowed_models: Some(vec!["claude-sonnet-4.6".to_string()]),
             rate_limit_rpm: Some(100),
@@ -152,6 +153,7 @@ async fn test_client_key_request_gates_and_owner_disable() {
         user_id,
         NewClientKey {
             label: "gate_test_key".to_string(),
+            service_account_id: None,
             routing_scope: Some("inherit".to_string()),
             allowed_models: Some(vec!["gpt-4o".to_string()]),
             rate_limit_rpm: None,
@@ -272,6 +274,7 @@ async fn test_client_key_auth_middleware_and_listeners() {
         user_id,
         NewClientKey {
             label: "proxy_agent".to_string(),
+            service_account_id: None,
             routing_scope: Some("personal_first".to_string()),
             allowed_models: None,
             rate_limit_rpm: None,

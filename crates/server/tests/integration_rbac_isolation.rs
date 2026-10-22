@@ -224,6 +224,7 @@ async fn test_cross_tenant_existence_oracle_and_mutation_guards() {
         alice_id,
         NewClientKey {
             label: "alice_client_key".to_string(),
+            service_account_id: None,
             routing_scope: None,
             allowed_models: None,
             rate_limit_rpm: None,

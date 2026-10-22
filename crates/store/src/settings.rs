@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 pub use llmroller_core::settings::*;
 use llmroller_core::strategy::RoutingStrategy;
-use sqlx::{Row as _, SqlitePool, Transaction};
+use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 
 /// Settings errors mapped to HTTP 422 Unprocessable Entity.

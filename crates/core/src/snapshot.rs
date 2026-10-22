@@ -26,6 +26,7 @@ pub enum ConfigDomain {
     Settings,
     Providers,
     UpstreamKeys,
+    ServiceAccounts,
     ClientKeys,
     Prices,
     BudgetWindows,
@@ -78,6 +79,19 @@ pub struct UpstreamKeyRecord {
     pub strict_tier: i64,
     pub health: String,
     pub health_version: i64,
+}
+
+/// In-memory projection of a Service Account machine principal (`CLK-6`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAccountRecord {
+    pub id: String,
+    pub owner_user_id: UserId,
+    pub workspace_scope: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// Inherited CIDR allow-list applied at Gate `G4` for every child key.
+    pub allowed_cidrs: Option<Vec<String>>,
+    pub disabled: bool,
 }
 
 /// In-memory projection of a catalog model.
@@ -185,6 +199,7 @@ pub struct ConfigSnapshot {
     pub providers: Arc<HashMap<ProviderId, ProviderRecord>>,
     pub upstream_keys: Arc<HashMap<UpstreamKeyId, UpstreamKeyRecord>>,
     pub client_keys_by_hash: Arc<HashMap<[u8; 32], (ClientKeyRecord, HashRole)>>,
+    pub service_accounts: Arc<HashMap<String, ServiceAccountRecord>>,
     pub models: Arc<HashMap<ModelPk, SnapshotModel>>,
     pub models_by_canonical: Arc<HashMap<String, ModelPk>>,
     pub aliases: Arc<HashMap<String, ModelPk>>,
@@ -349,6 +364,7 @@ impl Default for ConfigSnapshot {
             providers: Arc::new(HashMap::new()),
             upstream_keys: Arc::new(HashMap::new()),
             client_keys_by_hash: Arc::new(HashMap::new()),
+            service_accounts: Arc::new(HashMap::new()),
             models: Arc::new(HashMap::new()),
             models_by_canonical: Arc::new(HashMap::new()),
             aliases: Arc::new(HashMap::new()),

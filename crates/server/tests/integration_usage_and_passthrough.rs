@@ -244,6 +244,7 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
         user_id,
         NewClientKey {
             label: "Usage Client Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: Some(60),
@@ -433,6 +434,7 @@ async fn test_v1_usage_key_and_raw_passthrough_endpoints() {
         bob_id,
         NewClientKey {
             label: "Bob Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,
@@ -529,6 +531,7 @@ async fn test_usage_fresh_roles_stale_header_and_missing_snapshot_404() {
         user_id,
         NewClientKey {
             label: "Live Usage Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,

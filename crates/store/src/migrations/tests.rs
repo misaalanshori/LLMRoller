@@ -167,7 +167,7 @@ async fn insert_share(
 
 #[tokio::test]
 #[doc = "Spec: SEC-17"]
-async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
+async fn schema_creates_exactly_33_application_tables_and_expected_indexes() {
     let (_directory, pool) = migrated_database().await;
 
     let tables: Vec<String> = sqlx::query_scalar(
@@ -186,6 +186,7 @@ async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
         "users",
         "deleted_users",
         "web_sessions",
+        "service_accounts",
         "client_keys",
         "providers",
         "upstream_keys",
@@ -211,13 +212,14 @@ async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
         "trace_records",
         "trace_record_blocks",
         "audit_log",
+        "control_plane_logs",
         "settings",
     ]
     .into_iter()
     .collect();
     let actual: BTreeSet<&str> = tables.iter().map(String::as_str).collect();
     assert_eq!(actual, expected);
-    assert_eq!(tables.len() - 1, 31, "31 application tables plus schema");
+    assert_eq!(tables.len() - 1, 33, "33 application tables plus schema");
 
     let triggers: Vec<String> =
         sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
@@ -228,6 +230,8 @@ async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
     let expected_triggers: BTreeSet<&str> = [
         "trg_client_keys_hash_disjoint_ins",
         "trg_client_keys_hash_disjoint_upd",
+        "trg_client_keys_sa_owner_ins",
+        "trg_client_keys_sa_owner_upd",
         "trg_upstream_keys_owner_ins",
         "trg_upstream_keys_owner_upd",
         "trg_shares_integrity_ins",
@@ -251,6 +255,7 @@ async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
     let indexes: BTreeSet<String> = indexes.into_iter().collect();
     for required in [
         "uq_client_keys_prev_hash",
+        "uq_service_accounts_owner_name",
         "uq_providers_global_name",
         "uq_providers_personal_name",
         "uq_share_key_active",
@@ -283,7 +288,7 @@ async fn schema_creates_exactly_31_application_tables_and_expected_indexes() {
     .fetch_one(&pool)
     .await
     .expect("table count must be readable");
-    assert_eq!(count, 32);
+    assert_eq!(count, 34);
 
     pool.close().await;
 }
@@ -336,6 +341,74 @@ async fn newer_schema_and_non_incremental_vacuum_exit_codes_are_stable() {
 
 #[tokio::test]
 #[doc = "Partial: SEC-17, Partial: USR-3"]
+async fn service_account_ownership_and_name_uniqueness_are_enforced() {
+    let (_directory, pool) = migrated_database().await;
+    insert_user(&pool, USER_A, "alice").await;
+    insert_user(&pool, USER_B, "bob").await;
+
+    sqlx::query(
+        "INSERT INTO service_accounts (id, owner_user_id, name, created_at, updated_at) \
+         VALUES ('sa-a', ?, 'agents', 1, 1)",
+    )
+    .bind(USER_A)
+    .execute(&pool)
+    .await
+    .expect("service account insert must succeed");
+
+    let duplicate_name = sqlx::query(
+        "INSERT INTO service_accounts (id, owner_user_id, name, created_at, updated_at) \
+         VALUES ('sa-dup', ?, 'agents', 1, 1)",
+    )
+    .bind(USER_A)
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate_name.is_err(),
+        "duplicate (owner, workspace, name) must be rejected"
+    );
+
+    sqlx::query(
+        "INSERT INTO client_keys \
+         (id, owner_user_id, service_account_id, label, prefix, key_hash, created_at) \
+         VALUES ('key-sa', ?, 'sa-a', 'sa key', 'llr_sa', 'hash-sa', 1)",
+    )
+    .bind(USER_A)
+    .execute(&pool)
+    .await
+    .expect("owner-matching service account key must succeed");
+
+    let cross_owner = sqlx::query(
+        "INSERT INTO client_keys \
+         (id, owner_user_id, service_account_id, label, prefix, key_hash, created_at) \
+         VALUES ('key-bad', ?, 'sa-a', 'bad', 'llr_bad', 'hash-bad', 1)",
+    )
+    .bind(USER_B)
+    .execute(&pool)
+    .await;
+    assert_trigger(
+        cross_owner,
+        "client_keys.owner_user_id must equal service_accounts.owner_user_id",
+    );
+
+    let paused: Option<i64> =
+        sqlx::query_scalar("SELECT paused_at FROM client_keys WHERE id = 'key-sa'")
+            .fetch_one(&pool)
+            .await
+            .expect("paused_at column must exist");
+    assert_eq!(paused, None);
+
+    let theme: String = sqlx::query_scalar("SELECT ui_theme FROM users WHERE id = ?")
+        .bind(USER_A)
+        .fetch_one(&pool)
+        .await
+        .expect("ui_theme column must exist");
+    assert_eq!(theme, "dark");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[doc = "Partial: SEC-17, Partial: USR-2"]
 async fn client_key_hash_disjoint_trigger_rejects_cross_collisions() {
     let (_directory, pool) = migrated_database().await;
     insert_user(&pool, USER_A, "alice").await;

@@ -90,6 +90,7 @@ async fn setup() -> TestContext {
         admin.id,
         NewClientKey {
             label: "f07".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,

@@ -414,6 +414,7 @@ async fn build_harness(mock_address: SocketAddr, trace_enabled: bool) -> Harness
         user_id,
         NewClientKey {
             label: "Bench Client Key".to_owned(),
+            service_account_id: None,
             routing_scope: None,
             allowed_models: None,
             rate_limit_rpm: None,

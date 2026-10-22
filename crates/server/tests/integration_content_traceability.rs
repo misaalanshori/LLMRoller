@@ -343,6 +343,7 @@ async fn test_rbac_isolated_sessions_and_preview() {
         bob.id,
         NewClientKey {
             label: "Bob Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,
@@ -557,6 +558,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         charlie.id,
         NewClientKey {
             label: "Charlie Key".to_string(),
+            service_account_id: None,
             allowed_models: None,
             routing_scope: None,
             rate_limit_rpm: None,
