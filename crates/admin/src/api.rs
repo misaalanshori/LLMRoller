@@ -3236,6 +3236,7 @@ async fn get_user_routes_handler(
             "SELECT r.upstream_key_id, r.priority_override as route_prio_override,
                     k.priority, k.strict_tier,
                     k.label as key_label, k.owner_user_id, p.ownership_scope,
+                    p.id as provider_id,
                     p.name as provider_name, p.kind as provider_kind
              FROM model_routes r
              JOIN upstream_keys k ON r.upstream_key_id = k.id
@@ -3283,6 +3284,7 @@ async fn get_user_routes_handler(
                 .try_get::<Option<String>, _>("owner_user_id")
                 .unwrap_or_default();
             let label: String = r.try_get::<String, _>("key_label").unwrap_or_default();
+            let provider_id: String = r.try_get::<String, _>("provider_id").unwrap_or_default();
             let priority: i64 = r.try_get::<i64, _>("priority").unwrap_or(100);
             let strict_tier: i64 = r.try_get::<i64, _>("strict_tier").unwrap_or(1);
             let weight: i64 = priority;
@@ -3302,12 +3304,29 @@ async fn get_user_routes_handler(
             } else if scope == "global" {
                 global_count += 1;
             } else {
+                // A provider-level grant covers only keys of THAT provider, must be
+                // accepted against the current fingerprint, and must still have an
+                // active grantor (`SEC-17`, F042).
                 let is_shared = sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM provider_shares WHERE grantee_user_id = ? AND (upstream_key_id = ? OR upstream_key_id IS NULL) AND enabled = 1 AND revoked_at IS NULL LIMIT 1",
+                    "SELECT 1 FROM provider_shares s
+                     JOIN providers p ON p.id = s.provider_id
+                     JOIN users u ON u.id = s.owner_user_id
+                     WHERE s.grantee_user_id = ? AND s.provider_id = ?
+                       AND s.enabled = 1 AND s.revoked_at IS NULL
+                       AND s.accepted_at IS NOT NULL
+                       AND s.accepted_config_fingerprint IS NOT NULL
+                       AND s.accepted_config_fingerprint = p.share_config_fingerprint
+                       AND u.disabled = 0
+                       AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
+                       AND (s.allowed_models IS NULL OR EXISTS (
+                            SELECT 1 FROM json_each(s.allowed_models) WHERE value = ?))
+                     LIMIT 1",
                 )
                 .bind(user_id.to_string())
+                .bind(&provider_id)
                 .bind(&key_id)
-                .fetch_optional(&state.auth.pool)
+                .bind(&canonical_id)
+                .fetch_optional(&state.auth.reader_pool)
                 .await
                 .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
                 .is_some();
@@ -3357,7 +3376,8 @@ async fn put_user_route_preference_handler(
 
     use sqlx::Row as _;
     let key_info = sqlx::query(
-        "SELECT k.owner_user_id, p.ownership_scope
+        "SELECT k.owner_user_id, p.id as provider_id, p.ownership_scope,
+                p.share_config_fingerprint
          FROM upstream_keys k
          JOIN providers p ON k.provider_id = p.id
          WHERE k.id = ?",
@@ -3369,11 +3389,49 @@ async fn put_user_route_preference_handler(
     .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "upstream key not found"))?;
 
     let scope: String = key_info.try_get("ownership_scope").unwrap_or_default();
+    let owner_user_id: Option<String> = key_info.try_get("owner_user_id").unwrap_or_default();
+    let provider_id: String = key_info.try_get("provider_id").unwrap_or_default();
     if scope == "global" && !actor.is_admin() {
         return Err(map_price_error(
             StatusCode::FORBIDDEN,
             "cannot configure route preference on global key",
         ));
+    }
+    let user_id_str = user_id.to_string();
+    let is_owner = owner_user_id.as_deref() == Some(user_id_str.as_str());
+    if scope == "personal" && !actor.is_admin() && !actor.is_system() && !is_owner {
+        // The caller may only mutate a route preference on a personal key they
+        // own or that was explicitly shared with them (`SEC-17`, `USR-3`, F043).
+        // Unknown and unauthorized keys both return 404 to avoid an existence oracle.
+        let share_fingerprint: String = key_info
+            .try_get("share_config_fingerprint")
+            .unwrap_or_default();
+        let is_shared = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM provider_shares s
+             JOIN users u ON u.id = s.owner_user_id
+             WHERE s.grantee_user_id = ? AND s.provider_id = ?
+               AND s.enabled = 1 AND s.revoked_at IS NULL
+               AND s.accepted_at IS NOT NULL
+               AND s.accepted_config_fingerprint IS NOT NULL
+               AND s.accepted_config_fingerprint = ?
+               AND u.disabled = 0
+               AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
+             LIMIT 1",
+        )
+        .bind(&user_id_str)
+        .bind(&provider_id)
+        .bind(&share_fingerprint)
+        .bind(key_id.to_string())
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some();
+        if !is_shared {
+            return Err(map_price_error(
+                StatusCode::NOT_FOUND,
+                "upstream key not found",
+            ));
+        }
     }
 
     let model_pk: String = if let Some(m) =
@@ -3394,6 +3452,39 @@ async fn put_user_route_preference_handler(
     } else {
         return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
     };
+
+    if scope == "personal" && !actor.is_admin() && !actor.is_system() && !is_owner {
+        let canonical: String =
+            sqlx::query_scalar("SELECT canonical_id FROM models WHERE model_pk = ?")
+                .bind(&model_pk)
+                .fetch_one(&state.auth.reader_pool)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let allowed = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM provider_shares s
+             WHERE s.grantee_user_id = ? AND s.provider_id = ?
+               AND s.enabled = 1 AND s.revoked_at IS NULL
+               AND s.accepted_at IS NOT NULL
+               AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
+               AND (s.allowed_models IS NULL OR EXISTS (
+                    SELECT 1 FROM json_each(s.allowed_models) WHERE value = ?))
+             LIMIT 1",
+        )
+        .bind(&user_id_str)
+        .bind(&provider_id)
+        .bind(key_id.to_string())
+        .bind(&canonical)
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some();
+        if !allowed {
+            return Err(map_price_error(
+                StatusCode::NOT_FOUND,
+                "model is not shared with this user",
+            ));
+        }
+    }
 
     let priority_override = payload.priority_override.unwrap_or(100).clamp(1, 1000) as i64;
     let enabled = if payload.enabled.unwrap_or(true) {
@@ -3545,16 +3636,61 @@ async fn post_user_totp_verify_handler(
 async fn post_user_totp_disable_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
-    Json(_payload): Json<DisableTotpRequest>,
+    Json(payload): Json<DisableTotpRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, true).await?;
     let user_id = actor
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-    llmroller_store::users::clear_totp(&state.auth.pool, &actor, user_id)
+    // Re-authentication is mandatory before removing a second factor (`AUTH-9`,
+    // `SEC-4`). Argon2id verification is bounded by the SEC-4 semaphore and runs
+    // off the Tokio worker threads (F098).
+    let password = payload
+        .password
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            map_price_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "current password is required to disable TOTP",
+            )
+        })?;
+    use sqlx::Row as _;
+    let password_hash: Option<String> = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
+        .bind(user_id.to_string())
+        .fetch_optional(&state.auth.reader_pool)
         .await
-        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map(|row| row.try_get("password_hash").unwrap_or_default());
+    let password_hash =
+        password_hash.ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "user not found"))?;
+
+    let _permit = state
+        .auth
+        .argon2_semaphore
+        .acquire()
+        .await
+        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+    let verified = tokio::task::spawn_blocking(move || {
+        llmroller_store::users::verify_password(&password, &password_hash)
+    })
+    .await
+    .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "verification failed"))?;
+    if !verified {
+        return Err(map_price_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid current password",
+        ));
+    }
+
+    execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
+        Box::pin(async move {
+            llmroller_store::users::clear_totp_tx(tx, &actor, user_id)
+                .await
+                .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))
+        })
+    })
+    .await?;
 
     Ok(StatusCode::OK)
 }

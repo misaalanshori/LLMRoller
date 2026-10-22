@@ -33,6 +33,8 @@ pub const MAX_AUTH_FAILURES_PER_IP_MINUTE: usize = 20;
 pub struct ProxyAuthState {
     pub snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     pub pool: SqlitePool,
+    /// Eight-connection read-only pool for data-plane reads (`REL-2`, F036).
+    pub reader_pool: SqlitePool,
     pub rpm_limiter: Arc<ClientKeyRpmLimiter>,
     pub ip_failures: Arc<Mutex<HashMap<IpAddr, Vec<i64>>>>,
     pub trusted_proxies: Vec<String>,
@@ -75,6 +77,7 @@ impl ProxyAuthState {
     ) -> Self {
         Self {
             snapshot,
+            reader_pool: pool.clone(),
             pool,
             rpm_limiter: Arc::new(ClientKeyRpmLimiter::new()),
             ip_failures: Arc::new(Mutex::new(HashMap::new())),
@@ -127,6 +130,13 @@ impl ProxyAuthState {
     #[must_use]
     pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Attach the read-only connection pool used by control-plane and usage reads.
+    #[must_use]
+    pub fn with_reader_pool(mut self, reader_pool: SqlitePool) -> Self {
+        self.reader_pool = reader_pool;
         self
     }
 

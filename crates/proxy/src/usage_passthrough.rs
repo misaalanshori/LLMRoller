@@ -239,7 +239,7 @@ async fn load_instance_id(state: &ProxyAuthState) -> Result<[u8; 16], String> {
     }
     let bytes: Vec<u8> =
         sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
-            .fetch_one(&state.pool)
+            .fetch_one(&state.reader_pool)
             .await
             .map_err(|error| format!("cannot read instance id: {error}"))?;
     bytes
@@ -322,12 +322,12 @@ async fn load_usage_snapshot(
     let rows = if let Some(key_id) = key_id {
         sqlx::query(SNAPSHOT_FOR_KEY)
             .bind(key_id.to_string())
-            .fetch_all(&state.pool)
+            .fetch_all(&state.reader_pool)
             .await
             .map_err(|error| format!("cannot query usage snapshots: {error}"))?
     } else {
         sqlx::query(SNAPSHOT_RECENT)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.reader_pool)
             .await
             .map_err(|error| format!("cannot query usage snapshots: {error}"))?
     };

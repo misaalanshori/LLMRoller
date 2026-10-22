@@ -3929,17 +3929,10 @@ pub async fn handle_inference_request(
                     finalized: false,
                 };
 
-                let mut pending = VecDeque::new();
-                if let Some(bytes) = first_chunk {
-                    for part in SseChunkForwarder::new(strip_injected_usage).process_chunk(&bytes) {
-                        pending.push_back(part);
-                    }
-                }
-
                 let lifecycle = RequestLifecycle::new(request_id, attempt_started, None);
-                let stream_state = StreamState {
+                let mut stream_state = StreamState {
                     upstream,
-                    pending,
+                    pending: VecDeque::new(),
                     forwarder: SseChunkForwarder::new(strip_injected_usage),
                     finalizer: Some(finalizer),
                     lifecycle,
@@ -3950,6 +3943,14 @@ pub async fn handle_inference_request(
                     _in_flight: in_flight.take().expect("in-flight guard"),
                     done: false,
                 };
+                // Feed the pre-commit chunk through the SAME forwarder that owns the
+                // stream state. A temporary forwarder would discard an incomplete
+                // trailing frame, corrupting the first client-visible SSE event (F015).
+                if let Some(bytes) = first_chunk {
+                    for part in stream_state.forwarder.process_chunk(&bytes) {
+                        stream_state.pending.push_back(part);
+                    }
+                }
                 let metered = stream::unfold(stream_state, |mut stream_state| async move {
                     loop {
                         if let Some(bytes) = stream_state.pending.pop_front() {

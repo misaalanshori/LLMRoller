@@ -35,6 +35,8 @@ struct TestContext {
     _dir: TempDir,
     app: axum::Router,
     pool: sqlx::SqlitePool,
+    admin_id: llmroller_core::ids::UserId,
+    user_id: llmroller_core::ids::UserId,
 }
 
 async fn setup() -> TestContext {
@@ -132,7 +134,8 @@ async fn setup() -> TestContext {
         clock: Arc::new(SystemClock::new()),
         entropy: Arc::new(DeterministicRng::new(4)),
     };
-    let mut api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let mut api_state =
+        ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     api_state.writer = Some(writer);
     api_state.attach_reloader(snapshot.notification_sender(), snapshot.version_receiver());
     api_state.audit_hmac_key = Some(llmroller_core::seams::secret_bytes(vec![0x24; 32]));
@@ -141,6 +144,8 @@ async fn setup() -> TestContext {
         _dir: dir,
         app: control_plane_router_full(setup_state, auth_state, api_state),
         pool,
+        admin_id: admin.id,
+        user_id: user.id,
     }
 }
 
@@ -374,7 +379,48 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         ("light".to_string(), "sidebar".to_string(), "en".to_string())
     );
 
-    // 8. Unsupported locale is rejected with 422.
+    // 8. Disabling TOTP requires the current password (`AUTH-9`, `SEC-4`).
+    let wrong_password = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("POST", "/api/user/totp/disable", ADMIN_SESSION, ADMIN_CSRF)
+                .body(Body::from(
+                    serde_json::json!({"password": "wrong-password"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("wrong password response");
+    assert_eq!(wrong_password.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_password = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("POST", "/api/user/totp/disable", ADMIN_SESSION, ADMIN_CSRF)
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("missing password response");
+    assert_eq!(missing_password.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let disabled = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("POST", "/api/user/totp/disable", ADMIN_SESSION, ADMIN_CSRF)
+                .body(Body::from(
+                    serde_json::json!({"password": "Password12345!#"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("disable response");
+    assert_eq!(disabled.status(), StatusCode::OK);
+
+    // 9. Unsupported locale is rejected with 422.
     let invalid = ctx
         .app
         .clone()
@@ -388,4 +434,215 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         .await
         .expect("invalid prefs response");
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[doc = "Spec: SEC-17, Spec: USR-3, Spec: SHR-1"]
+async fn provider_level_shares_do_not_expose_unrelated_tenant_keys() {
+    let ctx = setup().await;
+    let admin_id = ctx.admin_id.to_string();
+    let user_id = ctx.user_id.to_string();
+
+    let provider_shared = "01ARZ3NDEKTSV4RRFFQ69G5PA1";
+    let provider_other = "01ARZ3NDEKTSV4RRFFQ69G5PA2";
+    let key_shared = "01ARZ3NDEKTSV4RRFFQ69G5PK1";
+    let key_other = "01ARZ3NDEKTSV4RRFFQ69G5PK2";
+    let model_pk = "01ARZ3NDEKTSV4RRFFQ69G5PM1";
+
+    for (provider_id, name) in [
+        (provider_shared, "shared-provider"),
+        (provider_other, "other-provider"),
+    ] {
+        sqlx::query(
+            "INSERT INTO providers (id, ownership_scope, owner_user_id, kind, name, base_url,
+                config_json, share_config_fingerprint, usage_url_cross_origin_ack,
+                allow_private_network, enabled, created_at)
+             VALUES (?, 'personal', ?, 'custom', ?, 'http://127.0.0.1:9', '{}', 'fp-a', 0, 1, 1, 1000)",
+        )
+        .bind(provider_id)
+        .bind(&admin_id)
+        .bind(name)
+        .execute(&ctx.pool)
+        .await
+        .expect("insert provider");
+    }
+    for (key_id, provider_id, label) in [
+        (key_shared, provider_shared, "shared-key"),
+        (key_other, provider_other, "other-key"),
+    ] {
+        sqlx::query(
+            "INSERT INTO upstream_keys (id, provider_id, owner_user_id, label, secret_enc,
+                master_key_id, secret_last4, created_at)
+             VALUES (?, ?, ?, ?, X'00', 'key-0', '0000', 1000)",
+        )
+        .bind(key_id)
+        .bind(provider_id)
+        .bind(&admin_id)
+        .bind(label)
+        .execute(&ctx.pool)
+        .await
+        .expect("insert upstream key");
+    }
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk)
+        .execute(&ctx.pool)
+        .await
+        .expect("insert model");
+    for key_id in [key_shared, key_other] {
+        sqlx::query(
+            "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols,
+                status, enabled, discovered_at)
+             VALUES (?, ?, 'gpt-4o', '[\"chat\"]', 'active', 1, 1000)",
+        )
+        .bind(key_id)
+        .bind(model_pk)
+        .execute(&ctx.pool)
+        .await
+        .expect("insert route");
+    }
+
+    // A provider-level grant for `provider_other` must not make `key_shared`
+    // (a different provider) visible to the grantee (F042).
+    sqlx::query(
+        "INSERT INTO provider_shares (id, provider_id, upstream_key_id, owner_user_id,
+            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS1', ?, NULL, ?, ?, 1000, 'fp-a', 1, 1000)",
+    )
+    .bind(provider_other)
+    .bind(&admin_id)
+    .bind(&user_id)
+    .execute(&ctx.pool)
+    .await
+    .expect("insert provider share");
+
+    let routes = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/api/user/routes", USER_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("routes response");
+    assert_eq!(routes.status(), StatusCode::OK);
+    let routes = json_body(routes).await;
+    let model = routes["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .find(|model| model["canonical_id"] == "gpt-4o")
+        .expect("gpt-4o model");
+    let initially_shared = model["shared_keys"].as_array().expect("shared keys");
+    assert!(
+        initially_shared
+            .iter()
+            .all(|key| key["upstream_key_id"] != key_shared),
+        "a provider-level grant must not expose keys from another provider"
+    );
+    assert!(
+        initially_shared
+            .iter()
+            .any(|key| key["upstream_key_id"] == key_other),
+        "the grant's own provider key must remain shared"
+    );
+
+    // Mutating a route preference on the unrelated personal key must 404 (F043).
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PUT",
+                &format!("/api/user/routes/{key_shared}/gpt-4o"),
+                USER_SESSION,
+                USER_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({"priority_override": 200}).to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("denied preference response");
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+
+    // A key-level accepted grant for `key_shared` makes exactly that key visible
+    // and mutable by the grantee.
+    sqlx::query(
+        "INSERT INTO provider_shares (id, provider_id, upstream_key_id, owner_user_id,
+            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS2', ?, ?, ?, ?, 1000, 'fp-a', 1, 1000)",
+    )
+    .bind(provider_shared)
+    .bind(key_shared)
+    .bind(&admin_id)
+    .bind(&user_id)
+    .execute(&ctx.pool)
+    .await
+    .expect("insert key share");
+
+    let routes = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/api/user/routes", USER_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("routes response");
+    let routes = json_body(routes).await;
+    let model = routes["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .find(|model| model["canonical_id"] == "gpt-4o")
+        .expect("gpt-4o model");
+    let shared = model["shared_keys"].as_array().expect("shared keys");
+    assert_eq!(shared.len(), 2);
+    assert!(
+        shared
+            .iter()
+            .any(|key| key["upstream_key_id"] == key_shared)
+    );
+
+    let allowed = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PUT",
+                &format!("/api/user/routes/{key_shared}/gpt-4o"),
+                USER_SESSION,
+                USER_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({"priority_override": 200}).to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("allowed preference response");
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    // The key covered by the provider-level grant remains mutable.
+    let denied_other = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PUT",
+                &format!("/api/user/routes/{key_other}/gpt-4o"),
+                USER_SESSION,
+                USER_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({"priority_override": 200}).to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("shared other response");
+    assert_eq!(denied_other.status(), StatusCode::OK);
 }

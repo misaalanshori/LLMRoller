@@ -403,6 +403,10 @@ fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
 #[derive(Clone)]
 pub struct AuthAppState {
     pub pool: SqlitePool,
+    /// Read-only connection pool (`SELECT` paths) kept separate from the single
+    /// serialized writer connection (`REL-2`, F036). Defaults to `pool` when no
+    /// reader pool is attached (unit tests and CLI commands).
+    pub reader_pool: SqlitePool,
     pub limiter: Arc<ThreeTierLoginLimiter>,
     pub config: AuthConfig,
     pub clock: Arc<dyn Clock>,
@@ -429,6 +433,7 @@ impl AuthAppState {
             .unwrap_or(2)
             .max(2);
         Self {
+            reader_pool: pool.clone(),
             pool,
             limiter: Arc::new(ThreeTierLoginLimiter::new()),
             config,
@@ -438,6 +443,14 @@ impl AuthAppState {
             master_key: None,
             master_key_id: String::new(),
         }
+    }
+
+    /// Attach the eight-connection read-only pool used for session and login reads
+    /// so they no longer serialize behind the writer actor (F036, REL-2).
+    #[must_use]
+    pub fn with_reader_pool(mut self, reader_pool: SqlitePool) -> Self {
+        self.reader_pool = reader_pool;
+        self
     }
 
     /// Verify a login TOTP or single-use recovery code, advancing replay state.
@@ -517,7 +530,7 @@ pub fn router(state: AuthAppState) -> Router {
 
 #[doc = "Spec: AUTH-1, Spec: AUTH-3, Spec: UI-1"]
 async fn get_root_redirect(State(state): State<AuthAppState>, headers: HeaderMap) -> Response {
-    let count = count_users(&state.pool).await.unwrap_or(0);
+    let count = count_users(&state.reader_pool).await.unwrap_or(0);
     if count == 0 {
         return (StatusCode::SEE_OTHER, [("location", "/setup")]).into_response();
     }
@@ -734,7 +747,7 @@ async fn post_login(
         .map_err(|_| AuthError::Internal)?;
 
     // 4. Lookup user and verify password
-    let record = find_login_record(&state.pool, &payload.username)
+    let record = find_login_record(&state.reader_pool, &payload.username)
         .await
         .map_err(|_| AuthError::Internal)?
         .ok_or(AuthError::InvalidCredentials)?;
@@ -898,7 +911,7 @@ pub async fn authenticate_session(
     };
 
     let id_hash = sha256_hex(token.as_bytes());
-    let session = load_web_session(&state.pool, &id_hash)
+    let session = load_web_session(&state.reader_pool, &id_hash)
         .await
         .map_err(|_| AuthError::Internal)?
         .ok_or(AuthError::Unauthorized)?;

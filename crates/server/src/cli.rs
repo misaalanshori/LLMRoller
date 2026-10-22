@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use llmroller_core::seams::{Clock, ExposeSecret, OsEntropy, SystemClock};
-use llmroller_server::reloader::{load_initial_snapshot, start_reloader};
+use llmroller_server::reloader::{load_initial_snapshot, start_reloader_with_pin_store};
 use llmroller_server::shutdown::ShutdownSupervisor;
 use llmroller_store::crypto::{MasterKey, load_master_key_from_env, load_master_key_id_from_env};
 use llmroller_store::instance::load_or_initialize;
@@ -240,6 +240,11 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         let code = u8::try_from(error.exit_code()).unwrap_or(13);
         return Err(CliFailure::new(code, error.to_string()));
     }
+    // Eight read-only, `query_only = ON` connections so control-plane and
+    // usage reads never serialize behind the single writer connection (F036).
+    let reader_pool = open_pool(&database, Role::Reader)
+        .await
+        .map_err(|e| CliFailure::new(13, format!("cannot open reader database: {e}")))?;
 
     // 4. Load or initialize instance meta and instance secrets
     let clock = Arc::new(SystemClock::new());
@@ -283,10 +288,15 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let shared_snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(initial_snapshot));
 
     let runtime_state = Arc::new(llmroller_core::runtime_state::RuntimeState::new());
-    let (reloader_handle, _reloader_task) = start_reloader(
-        pool.clone(),
+    // The reloader owns pin eviction so every publication (disable, delete, share
+    // revocation, user disable) can drop unroutable session pins immediately
+    // (PRV-8, CLK-4, SHR-5).
+    let pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
+    let (reloader_handle, _reloader_task) = start_reloader_with_pin_store(
+        reader_pool.clone(),
         shared_snapshot.clone(),
         runtime_state.clone(),
+        pin_store.clone(),
         reloader_rx,
         reloader_tx.clone(),
     );
@@ -374,7 +384,6 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     }
 
     // 8. Preload unexpired confirmed pins
-    let pin_store = Arc::new(llmroller_core::pins::PinStore::new(250_000));
     let active_pins = llmroller_store::pins::load_active_pins(&pool, clock.now_ms())
         .await
         .map_err(|error| CliFailure::new(13, format!("cannot preload session pins: {error}")))?;
@@ -453,6 +462,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.shutdown_notify = Some(shutdown_notify.clone());
     proxy_auth_state.pin_store = pin_store.clone();
     proxy_auth_state.runtime_state = runtime_state.clone();
+    proxy_auth_state.reader_pool = reader_pool.clone();
     proxy_auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     proxy_auth_state.writer = Some(writer_handle.clone());
     proxy_auth_state.master_key = Some(master_key.clone());
@@ -466,7 +476,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         require_tls,
         trusted_proxies: trusted_proxies_vec.clone(),
     };
-    let mut auth_state = llmroller_admin::AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = llmroller_admin::AuthAppState::new(pool.clone(), auth_config)
+        .with_reader_pool(reader_pool.clone());
     auth_state.master_key = Some(master_key.clone());
     auth_state.master_key_id = master_key_id.clone();
     let setup_state = llmroller_admin::SetupAppState {

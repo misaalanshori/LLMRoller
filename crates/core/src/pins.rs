@@ -368,6 +368,32 @@ impl PinStore {
         });
     }
 
+    /// Invalidates every pin that belongs to a revoked, paused, or disabled client key.
+    ///
+    /// `CLK-4` / `CLK-7`: once a key is no longer eligible to authenticate, no live
+    /// session pin may keep routing traffic for it. Returns the number evicted.
+    pub fn invalidate_client_key(&self, target_client_key_id: &ClientKeyId) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|pin_key, _| pin_key.client_key_id != *target_client_key_id);
+        before.saturating_sub(self.entries.len())
+    }
+
+    /// Batch form of [`PinStore::invalidate_client_key`] used by the reloader when a
+    /// snapshot publication invalidates several client keys at once (`CLK-4`, `SHR-5`).
+    pub fn invalidate_client_keys(
+        &self,
+        targets: &std::collections::HashSet<ClientKeyId>,
+    ) -> usize {
+        if targets.is_empty() {
+            return 0;
+        }
+        let before = self.entries.len();
+        self.entries
+            .retain(|pin_key, _| !targets.contains(&pin_key.client_key_id));
+        before.saturating_sub(self.entries.len())
+    }
+
     /// Removes the exact session pin addressed by an owner-scoped control-plane action.
     ///
     /// Returns `true` when a live entry was evicted (SEC-17, Section 10.4).

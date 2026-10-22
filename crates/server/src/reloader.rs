@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use llmroller_core::pins::PinStore;
 use llmroller_core::runtime_state::RuntimeState;
-use llmroller_core::snapshot::{ConfigDomain, ConfigSnapshot};
+use llmroller_core::snapshot::{CacheInvalidationEvent, ConfigDomain, ConfigSnapshot};
 use llmroller_store::budgets::load_budget_windows_tx;
 use llmroller_store::client_keys::{ClientKeyError, load_client_key_records_tx};
 use llmroller_store::models::{CatalogSnapshot, load_catalog_snapshot_tx};
@@ -308,11 +309,125 @@ fn assemble_snapshot(
     }
 }
 
+/// Evicts every live pin that the newly published snapshot made unroutable.
+///
+/// Called immediately after `ArcSwap::store` so a deleted or disabled upstream
+/// key, provider, client key, or share can never keep serving a pinned session
+/// (`PRV-8`, `CLK-4`, `SHR-5`). Pins whose key merely changed priority/label are
+/// deliberately kept: they are still valid routes.
+fn evict_invalidated_pins(
+    store: &PinStore,
+    previous: &ConfigSnapshot,
+    next: &ConfigSnapshot,
+    invalidations: &[CacheInvalidationEvent],
+) {
+    use std::collections::HashSet;
+
+    let mut invalid_keys = HashSet::new();
+    let mut invalid_client_keys = HashSet::new();
+
+    for (key_id, key) in next.upstream_keys.iter() {
+        let provider_live = next
+            .providers
+            .get(&key.provider_id)
+            .is_some_and(|provider| provider.enabled);
+        if !key.enabled || !provider_live {
+            invalid_keys.insert(*key_id);
+        }
+    }
+    for key_id in previous.upstream_keys.keys() {
+        if !next.upstream_keys.contains_key(key_id) {
+            invalid_keys.insert(*key_id);
+        }
+    }
+
+    let live_client_keys: HashSet<_> = next
+        .client_keys_by_hash
+        .values()
+        .filter(|(record, _)| {
+            !record.disabled && record.paused_at.is_none() && record.revoked_at.is_none()
+        })
+        .map(|(record, _)| record.id)
+        .collect();
+    for (record, _) in previous.client_keys_by_hash.values() {
+        if !live_client_keys.contains(&record.id) {
+            invalid_client_keys.insert(record.id);
+        }
+    }
+
+    // A share revocation/disabling or a user disable changes which keys the
+    // grantee may pin to, so drop every session pin owned by that user's keys.
+    let affected_users: HashSet<_> = invalidations
+        .iter()
+        .filter_map(|inv| match inv {
+            CacheInvalidationEvent::ShareChanged(user_id)
+            | CacheInvalidationEvent::UserChanged(user_id)
+            | CacheInvalidationEvent::OwnerDisabled(user_id) => Some(*user_id),
+            _ => None,
+        })
+        .collect();
+    if !affected_users.is_empty() {
+        for (record, _) in next.client_keys_by_hash.values() {
+            if affected_users.contains(&record.owner_user_id) {
+                invalid_client_keys.insert(record.id);
+            }
+        }
+        for (record, _) in previous.client_keys_by_hash.values() {
+            if affected_users.contains(&record.owner_user_id) {
+                invalid_client_keys.insert(record.id);
+            }
+        }
+    }
+
+    for key_id in &invalid_keys {
+        store.invalidate_key(key_id);
+    }
+    store.invalidate_client_keys(&invalid_client_keys);
+}
+
 /// Spawn the single versioned [`Reloader`] background actor per SRDD Section 21.6.2.
 pub fn start_reloader(
     pool: SqlitePool,
     shared_snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     runtime_state: Arc<RuntimeState>,
+    reloader_rx: mpsc::Receiver<ReloadNotification>,
+    reloader_tx: mpsc::Sender<ReloadNotification>,
+) -> (ReloaderHandle, tokio::task::JoinHandle<()>) {
+    start_reloader_inner(
+        pool,
+        shared_snapshot,
+        runtime_state,
+        None,
+        reloader_rx,
+        reloader_tx,
+    )
+}
+
+/// Spawn the reloader with the shared [`PinStore`] attached so every publication
+/// evicts pins that the new snapshot invalidated (`PRV-8`, `CLK-4`, `SHR-5`).
+pub fn start_reloader_with_pin_store(
+    pool: SqlitePool,
+    shared_snapshot: Arc<ArcSwap<ConfigSnapshot>>,
+    runtime_state: Arc<RuntimeState>,
+    pin_store: Arc<PinStore>,
+    reloader_rx: mpsc::Receiver<ReloadNotification>,
+    reloader_tx: mpsc::Sender<ReloadNotification>,
+) -> (ReloaderHandle, tokio::task::JoinHandle<()>) {
+    start_reloader_inner(
+        pool,
+        shared_snapshot,
+        runtime_state,
+        Some(pin_store),
+        reloader_rx,
+        reloader_tx,
+    )
+}
+
+fn start_reloader_inner(
+    pool: SqlitePool,
+    shared_snapshot: Arc<ArcSwap<ConfigSnapshot>>,
+    runtime_state: Arc<RuntimeState>,
+    pin_store: Option<Arc<PinStore>>,
     mut reloader_rx: mpsc::Receiver<ReloadNotification>,
     reloader_tx: mpsc::Sender<ReloadNotification>,
 ) -> (ReloaderHandle, tokio::task::JoinHandle<()>) {
@@ -509,6 +624,11 @@ pub fn start_reloader(
 
                 // Apply CacheInvalidationEvents after arc_swap.store per REL-4
                 runtime_state.apply_invalidations(&invalidations, &new_snapshot, now_ms);
+
+                // Evict live pins that the published snapshot invalidated (PRV-8, CLK-4, SHR-5).
+                if let Some(store) = pin_store.as_deref() {
+                    evict_invalidated_pins(store, &current, &new_snapshot, &invalidations);
+                }
 
                 // Notify waiting control handlers
                 let _ = published_version_tx.send_replace(db_version);

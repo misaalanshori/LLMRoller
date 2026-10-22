@@ -502,3 +502,55 @@ fn test_remove_by_session_hash_keeps_other_sessions() {
     assert!(store.entries.contains_key(&other));
     assert_eq!(store.remove_by_session_hash("session-target"), 0);
 }
+
+#[doc = "Spec: PRV-8, CLK-4, SHR-5"]
+#[test]
+fn test_invalidate_client_key_evicts_only_that_keys_pins() {
+    let store = PinStore::new(10_000);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let upstream_key_id = UpstreamKeyId::generate();
+
+    let revoked_client_key = ClientKeyId::generate();
+    let live_client_key = ClientKeyId::generate();
+    let mut keys = Vec::new();
+    for (client_key_id, canonical_id) in [
+        (revoked_client_key, "model-a"),
+        (revoked_client_key, "model-b"),
+        (live_client_key, "model-a"),
+    ] {
+        let pin_key = PinKey {
+            client_key_id,
+            canonical_id: canonical_id.to_string(),
+            session_hash: "shared-session".to_string(),
+        };
+        store
+            .acquire(
+                &pin_key,
+                &clock,
+                86_400_000,
+                false,
+                300,
+                RoutingScope::PersonalFirst,
+                Some(CandidatePoolTier::Own),
+                |_| true,
+                |_| Some((upstream_key_id, CandidatePoolTier::Own)),
+            )
+            .expect("ticket");
+        keys.push(pin_key);
+    }
+
+    assert_eq!(store.len(), 3);
+    assert_eq!(store.invalidate_client_key(&revoked_client_key), 2);
+    assert_eq!(store.len(), 1);
+    assert!(store.entries.contains_key(&keys[2]));
+    assert_eq!(store.invalidate_client_key(&revoked_client_key), 0);
+
+    let mut batch = std::collections::HashSet::new();
+    batch.insert(live_client_key);
+    assert_eq!(store.invalidate_client_keys(&batch), 1);
+    assert!(store.is_empty());
+    assert_eq!(
+        store.invalidate_client_keys(&std::collections::HashSet::new()),
+        0
+    );
+}
