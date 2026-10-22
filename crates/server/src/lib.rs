@@ -6,6 +6,7 @@
 
 pub mod backup;
 pub mod discovery_poller;
+pub mod limits;
 pub mod reloader;
 pub mod shutdown;
 pub mod usage_poller;

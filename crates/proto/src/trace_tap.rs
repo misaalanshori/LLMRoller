@@ -16,7 +16,10 @@ pub const MAX_REQUEST_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB per block
 pub const MAX_TURN_NEW_BLOCKS_BYTES: usize = 4 * 1024 * 1024; // 4 MiB per turn, newest kept
 pub const MAX_RESPONSE_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const HALF_RESPONSE_OUTPUT_BYTES: usize = 512 * 1024; // 512 KiB
-pub const GLOBAL_TRACE_BUDGET_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+pub const GLOBAL_TRACE_BUDGET_DEFAULT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+/// Global accumulator budget, sized at startup as `min(256 MiB, 10% of memory_limit)` (PERF-5).
+pub static GLOBAL_TRACE_BUDGET_BYTES: AtomicUsize =
+    AtomicUsize::new(GLOBAL_TRACE_BUDGET_DEFAULT_BYTES);
 pub const MAX_INFLIGHT_TRACE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB per turn
 /// Retained for callers that used the old per-turn name; the authoritative
 /// per-turn cap is [`MAX_TURN_NEW_BLOCKS_BYTES`] (TRC-2, Section 12.6).
@@ -25,6 +28,17 @@ pub const MAX_SSE_PENDING_BYTES: usize = 2 * 1024 * 1024; // incomplete frame gu
 
 /// Global accumulator tracking trace memory usage across all active streams (PERF-5).
 pub static GLOBAL_TRACE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Size the global trace accumulator from the deployment memory limit (PERF-5).
+///
+/// Values above the 256 MiB ceiling are clamped; a zero budget is ignored so a
+/// misconfigured ceiling can never disable traceability entirely.
+pub fn set_global_trace_budget_bytes(bytes: usize) {
+    let bounded = bytes.min(GLOBAL_TRACE_BUDGET_DEFAULT_BYTES);
+    if bounded > 0 {
+        GLOBAL_TRACE_BUDGET_BYTES.store(bounded, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AssembledToolCall {
@@ -782,7 +796,7 @@ impl TraceTap {
 
         let chunk_len = chunk.len();
         let curr_global = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
-        if curr_global + chunk_len > GLOBAL_TRACE_BUDGET_BYTES {
+        if curr_global + chunk_len > GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed) {
             self.trace_dropped.store(true, Ordering::Release);
             return false;
         }

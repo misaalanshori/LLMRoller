@@ -288,7 +288,7 @@ cargo build --release --bin llmroller
 # 2. Generate master key
 export LLMROLLER_MASTER_KEY=$(target/release/llmroller generate-master-key)
 export LLMROLLER_MASTER_KEY_ID="key-v1"
-export LLMROLLER_DATABASE_PATH="./llmroller.db"
+export LLMROLLER_DATA_DIR="./data"
 
 # 3. Start daemon
 target/release/llmroller serve

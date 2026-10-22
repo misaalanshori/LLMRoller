@@ -226,6 +226,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         let code = u8::try_from(error.exit_code()).unwrap_or(3);
         CliFailure::new(code, error.to_string())
     })?;
+    let limits = llmroller_server::limits::ProxyLimits::from_env()
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
+    let default_routing_strategy = llmroller_server::limits::routing_strategy_from_env()
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
 
     // 3. Connect SQLite pool (Role::Writer) and run forward-only migrations
     let database = data_dir.join("llmroller.db");
@@ -252,7 +256,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         let code = u8::try_from(e.exit_code()).unwrap_or(3);
         CliFailure::new(code, e.to_string())
     })?;
-    seed_defaults(&pool, None, clock.now_ms())
+    seed_defaults(&pool, default_routing_strategy, clock.now_ms())
         .await
         .map_err(|e| CliFailure::new(13, e.to_string()))?;
 
@@ -414,6 +418,15 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         shared_snapshot.clone(),
         pool.clone(),
         trusted_proxies_vec.clone(),
+    );
+    proxy_auth_state.budget_semaphore = Arc::new(
+        llmroller_proxy::orchestrator::PreflightBudgetSemaphore::new(
+            limits.preflight_body_budget_mb,
+            limits.max_body_mb,
+        ),
+    );
+    llmroller_proto::trace_tap::set_global_trace_budget_bytes(
+        limits.trace_accumulator_budget_bytes(),
     );
     proxy_auth_state.is_ready = is_ready.clone();
     proxy_auth_state.open_streams = open_streams.clone();

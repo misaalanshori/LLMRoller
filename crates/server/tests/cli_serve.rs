@@ -227,6 +227,76 @@ async fn test_serve_honors_listener_environment_and_cli_precedence() {
     let _ = flag_child.kill().await;
 }
 
+#[doc = "Spec: SEC-8, PERF-3, Section 5.5.1"]
+#[tokio::test]
+async fn test_serve_fails_closed_on_invalid_memory_and_body_limit_environment() {
+    let key_b64 = BASE64.encode([0x45; 32]);
+
+    for (variable, value) in [
+        ("LLMROLLER_MEMORY_LIMIT_MB", "255"),
+        ("LLMROLLER_MAX_BODY_MB", "129"),
+        ("LLMROLLER_MAX_BODY_MB", "not-a-number"),
+        ("LLMROLLER_PREFLIGHT_BODY_BUDGET_MB", "0"),
+    ] {
+        let dir = tempdir().expect("temp dir");
+        let output = tokio::process::Command::new(llmroller_binary())
+            .arg("serve")
+            .arg("--data-dir")
+            .arg(dir.path())
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .arg("--admin-listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .arg("--metrics-listen")
+            .arg(format!("127.0.0.1:{}", get_available_port()))
+            .env("LLMROLLER_MASTER_KEY", &key_b64)
+            .env("LLMROLLER_MASTER_KEY_ID", "key-limits-test")
+            .env(variable, value)
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .expect("run serve with invalid limits");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{variable}={value} must exit 2 per SEC-8"
+        );
+    }
+}
+
+#[doc = "Spec: RTE-14, Section 5.5.1"]
+#[tokio::test]
+async fn test_serve_rejects_invalid_default_routing_strategy_environment() {
+    let key_b64 = BASE64.encode([0x46; 32]);
+    let dir = tempdir().expect("temp dir");
+    let output = tokio::process::Command::new(llmroller_binary())
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .arg("--admin-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .arg("--metrics-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .env("LLMROLLER_MASTER_KEY", &key_b64)
+        .env("LLMROLLER_MASTER_KEY_ID", "key-strategy-test")
+        .env("LLMROLLER_DEFAULT_ROUTING_STRATEGY", "unknown_strategy")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .expect("run serve with invalid routing strategy");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid LLMROLLER_DEFAULT_ROUTING_STRATEGY must exit 2 per RTE-14"
+    );
+}
+
 #[doc = "Spec: SEC-2, Section 5.5.1"]
 #[tokio::test]
 async fn test_serve_fails_closed_when_master_key_id_is_missing_or_empty() {
