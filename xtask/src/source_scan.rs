@@ -16,6 +16,7 @@ const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "mutants.out"];
 pub(crate) struct Scan {
     spec: BTreeMap<String, BTreeSet<PathBuf>>,
     partial: BTreeMap<String, BTreeSet<PathBuf>>,
+    unjustified_mutants_skips: Vec<String>,
     pub(crate) files_scanned: usize,
 }
 
@@ -64,6 +65,16 @@ impl Scan {
             .map(PathBuf::as_path)
     }
 
+    pub(crate) fn reject_unjustified_mutants_skips(&self) -> Result<(), String> {
+        if self.unjustified_mutants_skips.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "every #[mutants::skip] requires an `equivalent:` reason comment:\n  {}",
+            self.unjustified_mutants_skips.join("\n  ")
+        ))
+    }
+
     fn walk(&mut self, directory: &Path) -> Result<(), String> {
         let entries = fs::read_dir(directory)
             .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
@@ -91,12 +102,27 @@ impl Scan {
         let contents = fs::read_to_string(path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         self.files_scanned += 1;
-        for line in contents.lines() {
+        let lines = contents.lines().collect::<Vec<_>>();
+        for line in &lines {
             let Some(value) = doc_attribute_value(line) else {
                 continue;
             };
             for (id, full_spec) in parse_annotation(value) {
                 self.record(&id, full_spec, path.to_path_buf());
+            }
+        }
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("#[mutants::skip]") {
+                continue;
+            }
+            let start = index.saturating_sub(1);
+            let end = (index + 2).min(lines.len());
+            let justified = lines[start..end]
+                .iter()
+                .any(|candidate| candidate.contains("equivalent:"));
+            if !justified {
+                self.unjustified_mutants_skips
+                    .push(format!("{}:{}", path.display(), index + 1));
             }
         }
         Ok(())
@@ -208,6 +234,34 @@ mod tests {
         assert_eq!(scan.spec_links("SEC-1"), 1);
         assert_eq!(scan.partial_links("SEC-2"), 1);
         assert_eq!(scan.spec_links("SEC-3"), 0);
+    }
+
+    #[test]
+    fn flags_mutants_skip_without_an_equivalent_reason() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        fs::create_dir_all(root.join("crates/core/src")).expect("source dir");
+        fs::write(
+            root.join("crates/core/src/lib.rs"),
+            concat!(
+                "#[mutants::skip]\n",
+                "fn unjustified() {}\n",
+                "#[mutants::skip] // equivalent: only reachable after abort\n",
+                "fn same_line() {}\n",
+                "#[mutants::skip]\n",
+                "// equivalent: generated code\n",
+                "fn next_line() {}\n",
+                "const MENTION: &str = \"#[mutants::skip]\";\n",
+            ),
+        )
+        .expect("source file");
+
+        let scan = Scan::scan_workspace(root).expect("scan");
+        let error = scan
+            .reject_unjustified_mutants_skips()
+            .expect_err("unjustified skip must fail");
+        assert!(error.contains(":1"), "{error}");
+        assert!(error.contains("every #[mutants::skip]"), "{error}");
     }
 
     #[test]

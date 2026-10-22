@@ -34,7 +34,30 @@ impl Registry {
         let path = root.join("docs/srdd/requirements.toml");
         let text = fs::read_to_string(&path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        Self::parse(&text)
+        let registry = Self::parse(&text)?;
+        registry.validate_test_targets(root)?;
+        Ok(registry)
+    }
+
+    fn validate_test_targets(&self, root: &Path) -> Result<(), String> {
+        let missing = self
+            .requirements
+            .values()
+            .flat_map(|requirement| {
+                requirement
+                    .tests
+                    .iter()
+                    .filter(|target| !root.join(target).is_file())
+                    .map(move |target| format!("{} -> {target}", requirement.id))
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "requirements.toml references missing test targets:\n  {}",
+            missing.join("\n  ")
+        ))
     }
 
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
@@ -128,6 +151,7 @@ impl Registry {
         scan: &Scan,
         out: &mut impl Write,
     ) -> Result<(), String> {
+        scan.reject_unjustified_mutants_skips()?;
         self.reject_unknown_annotations(scan)?;
 
         let selected = self.milestone(milestone);
@@ -379,6 +403,32 @@ tests = ["crates/core/src/wrr/proptests.rs"]
             String::from_utf8(output)
                 .expect("utf-8 report")
                 .contains("2/2 requirements")
+        );
+    }
+
+    #[test]
+    fn load_rejects_registered_test_targets_that_do_not_exist() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        fs::create_dir_all(root.join("docs/srdd")).expect("srdd dir");
+        fs::write(
+            root.join("docs/srdd/requirements.toml"),
+            r#"
+schema_version = 1
+
+[requirements.AUTH-1]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.4"
+tests = ["crates/server/tests/does_not_exist.rs"]
+"#,
+        )
+        .expect("requirements");
+
+        let error = Registry::load(root).expect_err("missing test target must fail");
+        assert!(
+            error.contains("crates/server/tests/does_not_exist.rs"),
+            "{error}"
         );
     }
 
