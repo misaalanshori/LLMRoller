@@ -139,9 +139,15 @@ impl Registry {
     }
 
     pub(crate) fn milestone(&self, milestone: &str) -> Vec<&Requirement> {
+        let Some(target_rank) = milestone_rank(milestone) else {
+            return Vec::new();
+        };
+        // Milestone gates are cumulative: `--milestone M4` verifies M0..=M4 (F16).
         self.requirements
             .values()
-            .filter(|requirement| requirement.milestone == milestone)
+            .filter(|requirement| {
+                milestone_rank(&requirement.milestone).is_some_and(|rank| rank <= target_rank)
+            })
             .collect()
     }
 
@@ -238,6 +244,25 @@ impl Registry {
             "Rust annotations reference requirement IDs absent from requirements.toml: {details}"
         ))
     }
+}
+
+/// Rank a milestone label for cumulative comparisons (`M3b` sorts after `M3`).
+fn milestone_rank(milestone: &str) -> Option<u32> {
+    let rest = milestone.strip_prefix('M')?;
+    let digits = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits == 0 {
+        return None;
+    }
+    let base = rest.get(..digits)?.parse::<u32>().ok()?;
+    let suffix = rest.get(digits..)?;
+    let offset = match suffix {
+        "" => 0,
+        "b" | "B" => 5,
+        _ => return None,
+    };
+    base.checked_mul(10)?.checked_add(offset)
 }
 
 fn required_string(
@@ -356,8 +381,22 @@ tests = ["crates/core/src/wrr/proptests.rs"]
         assert_eq!(registry.schema_version, 1);
         assert_eq!(registry.requirements.len(), 3);
         assert_eq!(registry.milestone("M0").len(), 2);
-        assert_eq!(registry.milestone("M2").len(), 1);
-        assert!(registry.milestone("M1").is_empty());
+        assert_eq!(registry.milestone("M1").len(), 2);
+        assert_eq!(registry.milestone("M2").len(), 3);
+        assert!(registry.milestone("nonsense").is_empty());
+    }
+
+    #[test]
+    #[doc = "Spec: MNT-1"]
+    fn milestone_filter_is_cumulative_including_sub_milestones() {
+        let registry = Registry::parse(REGISTRY).expect("registry must parse");
+        assert_eq!(registry.milestone("M0").len(), 2);
+        assert_eq!(registry.milestone("M2").len(), 3);
+        assert_eq!(milestone_rank("M3"), Some(30));
+        assert_eq!(milestone_rank("M3b"), Some(35));
+        assert_eq!(milestone_rank("M4"), Some(40));
+        assert_eq!(milestone_rank("M4c"), None);
+        assert_eq!(milestone_rank("M"), None);
     }
 
     #[test]

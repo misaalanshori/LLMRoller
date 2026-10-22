@@ -67,14 +67,30 @@ else
     cargo run --bin llmroller -- generate-master-key >/dev/null
 fi
 
-# 4. Verify release supply-chain wiring (SBOM + cosign)
-echo "Checking release SBOM and signature gates..."
+# 4. Verify release supply-chain wiring (SBOM + cosign + container gates)
+echo "Checking release SBOM, signature, and container gates..."
 grep -q "cargo cyclonedx --manifest-path crates/server/Cargo.toml" .github/workflows/release.yml || {
     echo "ERROR: release workflow does not generate a CycloneDX SBOM" >&2
     exit 1
 }
 grep -q "cosign sign-blob --yes --bundle" .github/workflows/release.yml || {
     echo "ERROR: release workflow does not cosign-sign artifacts" >&2
+    exit 1
+}
+grep -q "target: runtime-distroless" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not build the distroless container image" >&2
+    exit 1
+}
+grep -q "50 \* 1024 \* 1024" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not enforce the < 50 MB image size gate" >&2
+    exit 1
+}
+grep -q "/v1/models" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not smoke-test the /v1/models endpoint" >&2
+    exit 1
+}
+grep -q "docker stop --time 30" .github/workflows/release.yml || {
+    echo "ERROR: release workflow does not exercise the SIGTERM drain gate" >&2
     exit 1
 }
 
