@@ -18,3 +18,6 @@ responses_compact = false
 
 [usage_reporting]
 chat_stream = "inject"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]

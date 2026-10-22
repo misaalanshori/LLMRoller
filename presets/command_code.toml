@@ -20,5 +20,9 @@ responses_compact = true
 [usage_reporting]
 chat_stream = "native"
 
+[session_profile]
+headers = ["x-session-affinity", "x-session-id"]
+body_field = "prompt_cache_key"
+
 [aliases]
 "claude-sonnet-4-6" = "claude-sonnet-4.6"

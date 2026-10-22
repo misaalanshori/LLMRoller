@@ -20,4 +20,8 @@ responses_compact = false
 [usage_reporting]
 chat_stream = "inject"
 
+[session_profile]
+headers = ["x-session-affinity", "x-session-id"]
+body_field = "prompt_cache_key"
+
 [aliases]

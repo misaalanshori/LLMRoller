@@ -61,6 +61,36 @@ fn test_provider_adapter_contracts() {
             }
             _ => assert_eq!(stream_mode, ChatStreamMode::Native),
         }
+
+        // 3. Per-preset outbound session profile (Section 11.2)
+        let profile = adapter.default_session_profile();
+        match kind {
+            ProviderKind::OpencodeGo => {
+                assert_eq!(profile.headers, vec!["x-opencode-session".to_string()]);
+                assert_eq!(profile.body_field, None);
+            }
+            ProviderKind::Openrouter => {
+                assert_eq!(profile.headers, vec!["x-session-id".to_string()]);
+                assert_eq!(profile.body_field.as_deref(), Some("session_id"));
+            }
+            ProviderKind::CommandCode | ProviderKind::OpenDesignAmr => {
+                assert_eq!(
+                    profile.headers,
+                    vec!["x-session-affinity".to_string(), "x-session-id".to_string()]
+                );
+                assert_eq!(profile.body_field.as_deref(), Some("prompt_cache_key"));
+            }
+            ProviderKind::Custom => {
+                assert_eq!(
+                    profile.headers,
+                    vec!["x-session-id".to_string(), "x-session-affinity".to_string()]
+                );
+                assert_eq!(
+                    profile.body_field, None,
+                    "custom providers must opt in to body affinity edits"
+                );
+            }
+        }
     }
 }
 

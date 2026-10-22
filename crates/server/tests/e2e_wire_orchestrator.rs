@@ -1174,6 +1174,191 @@ async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() 
 }
 
 #[tokio::test]
+#[doc = "Spec: SEC-16, RTE-1, TRN-1 — F02 pooled keys receive only the tenant-salted affinity token"]
+async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f02_pooled.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF2; 32]);
+    seed_base(&pool, &master_key).await;
+
+    let entropy = OsEntropy;
+    let mut tx = pool.begin().await.expect("begin");
+    let (user_id, token) =
+        seed_user_with_client_key(&mut tx, "f02_global_user", None, &entropy).await;
+    let config = r#"{"session_profile":{"headers":["x-session-id"],"body_field":"session_id"}}"#;
+    seed_provider_route(
+        &mut tx,
+        &master_key,
+        &entropy,
+        mock_addr,
+        OwnershipScope::Global,
+        None,
+        config,
+    )
+    .await;
+    tx.commit().await.expect("commit");
+
+    let raw_session = "client-claude-session";
+    let expected_token = llmroller_proto::affinity::compute_salted_affinity_token(
+        &[0x5A; 32],
+        &user_id,
+        raw_session,
+    );
+
+    let app = build_wire_app(&pool, &master_key).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-session-id", "lower-precedence-session")
+        .header("x-claude-code-session-id", raw_session)
+        .header("x-opencode-session", "client-opencode-session")
+        .header("x-claude-code-agent-id", "agent-1")
+        .header("x-claude-code-parent-agent-id", "parent-1")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"session_id":"body-session","prompt_cache_key":"body-cache-key"}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_token.as_str()),
+        "pooled keys must receive the tenant-salted affinity token"
+    );
+    for stripped in [
+        "x-claude-code-session-id",
+        "x-opencode-session",
+        "x-session-affinity",
+    ] {
+        assert!(
+            !recorded.headers.contains_key(stripped),
+            "recognized client session header {stripped} must be stripped on pooled keys"
+        );
+    }
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-claude-code-agent-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("agent-1"),
+        "subagent identity headers must be preserved"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-claude-code-parent-agent-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("parent-1"),
+        "parent subagent identity headers must be preserved"
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_str(&recorded.body).expect("recorded body is JSON");
+    assert_eq!(
+        body.get("session_id").and_then(|value| value.as_str()),
+        Some(expected_token.as_str()),
+        "the configured body affinity field must carry the salted token"
+    );
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "every recognized client body session carrier must be removed on pooled keys"
+    );
+    assert!(!recorded.body.contains("body-session"));
+    assert!(!recorded.body.contains("body-cache-key"));
+    assert!(
+        !recorded.body.contains(raw_session),
+        "the raw client session must never reach a pooled upstream"
+    );
+    assert!(!recorded.body.contains("lower-precedence-session"));
+    assert!(!recorded.body.contains("client-opencode-session"));
+}
+
+#[tokio::test]
+#[doc = "Spec: SEC-16, RTE-1, TRN-1 — F02 Own keys preserve the client raw session"]
+async fn test_own_outbound_session_affinity_forwards_raw_session() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f02_own.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF3; 32]);
+    seed_base(&pool, &master_key).await;
+
+    let entropy = OsEntropy;
+    let mut tx = pool.begin().await.expect("begin");
+    let (user_id, token) = seed_user_with_client_key(&mut tx, "f02_own_user", None, &entropy).await;
+    let config = r#"{"session_profile":{"headers":["x-session-id"],"body_field":"session_id"}}"#;
+    seed_provider_route(
+        &mut tx,
+        &master_key,
+        &entropy,
+        mock_addr,
+        OwnershipScope::Personal,
+        Some(user_id),
+        config,
+    )
+    .await;
+    tx.commit().await.expect("commit");
+
+    let raw_session = "own-raw-session";
+    let app = build_wire_app(&pool, &master_key).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-claude-code-session-id", raw_session)
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(raw_session),
+        "Own keys must write the raw client session into absent profile headers"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-claude-code-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(raw_session),
+        "Own keys must forward the client's native session header verbatim"
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_str(&recorded.body).expect("recorded body is JSON");
+    assert_eq!(
+        body.get("session_id").and_then(|value| value.as_str()),
+        Some(raw_session),
+        "Own keys must write the raw client session into an absent body field"
+    );
+    assert!(
+        !recorded.body.contains("llr_"),
+        "Own keys must not replace a client-supplied raw session with a salted token"
+    );
+}
+
+#[tokio::test]
 #[doc = "Spec: API-2, PRV-3 — F03 supports per-protocol x-api-key authentication"]
 async fn test_messages_auth_scheme_uses_configured_x_api_key() {
     let (mock_addr, mock_state) = spawn_mock_upstream().await;

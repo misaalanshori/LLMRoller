@@ -116,6 +116,19 @@ pub struct ProviderAuxEndpoints {
     pub responses_compact: Option<bool>,
 }
 
+/// Outbound provider session hint profile (SRDD Section 11.2).
+///
+/// `headers` are written with the resolved affinity token, and `body_field` is
+/// inserted into the surgical JSON body when the endpoint supports it. Missing
+/// configuration falls back to the adapter preset default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProfile {
+    #[serde(default)]
+    pub headers: Vec<String>,
+    #[serde(default)]
+    pub body_field: Option<String>,
+}
+
 /// Header name and value prefix used to inject an upstream credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthScheme {
@@ -244,6 +257,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub ua_policy: Option<UaPolicySetting>,
     #[serde(default)]
+    pub session_profile: Option<SessionProfile>,
+    #[serde(default)]
     pub error_classifiers: ErrorClassifiers,
 }
 
@@ -252,5 +267,38 @@ impl ProviderConfig {
     #[must_use]
     pub fn from_json(config_json: &str) -> Self {
         serde_json::from_str(config_json).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[doc = "Spec: PRV-3, SEC-16 - session_profile is editable and absence falls back to preset defaults"]
+    #[test]
+    fn provider_config_parses_optional_session_profile() {
+        let configured = ProviderConfig::from_json(
+            r#"{"session_profile":{"headers":["x-session-id"],"body_field":"session_id"}}"#,
+        );
+        assert_eq!(
+            configured.session_profile,
+            Some(SessionProfile {
+                headers: vec!["x-session-id".to_string()],
+                body_field: Some("session_id".to_string()),
+            })
+        );
+
+        let absent = ProviderConfig::from_json("{}");
+        assert_eq!(
+            absent.session_profile, None,
+            "missing session_profile must fall back to the adapter preset default"
+        );
+
+        let off = ProviderConfig::from_json(r#"{"session_profile":{"headers":[]}}"#);
+        assert_eq!(
+            off.session_profile,
+            Some(SessionProfile::default()),
+            "an explicit empty profile disables affinity injection"
+        );
     }
 }

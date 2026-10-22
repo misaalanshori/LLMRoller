@@ -20,5 +20,8 @@ responses_compact = false
 [usage_reporting]
 chat_stream = "native"
 
+[session_profile]
+headers = ["x-opencode-session"]
+
 [aliases]
 "claude-sonnet-4-6" = "claude-sonnet-4.6"

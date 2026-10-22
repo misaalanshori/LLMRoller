@@ -50,6 +50,7 @@ use llmroller_core::windows::{Reservation, estimate_reservation_cost_micro_usd};
 use llmroller_proto::adapters::{
     EndpointKind, ErrorClass, classify_error_with_classifiers, get_adapter,
 };
+use llmroller_proto::affinity::{apply_outbound_session_affinity, compute_salted_affinity_token};
 use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
@@ -878,6 +879,7 @@ pub async fn post_messages_count_tokens(
             &candidate,
             &secret,
             EndpointKind::CountTokens,
+            None,
         ) {
             Ok(headers) => headers,
             Err(response) => return *response,
@@ -1032,6 +1034,14 @@ impl RouteCandidate {
             CandidatePoolTier::Global => PoolTier::Global,
             CandidatePoolTier::Blended => PoolTier::Blended,
         }
+    }
+
+    /// Configured session hint profile, falling back to the provider preset default.
+    fn session_profile(&self) -> llmroller_core::provider::SessionProfile {
+        self.config
+            .session_profile
+            .clone()
+            .unwrap_or_else(|| get_adapter(self.provider_kind).default_session_profile())
     }
 }
 
@@ -1324,6 +1334,7 @@ fn build_upstream_headers(
     candidate: &RouteCandidate,
     secret: &str,
     endpoint: EndpointKind,
+    session: Option<&ResolvedSession>,
 ) -> Result<HeaderMap, Box<Response>> {
     use llmroller_proto::headers::{
         HeaderPipelineError, UaPolicy, apply_request_header_pipeline, resolve_user_agent,
@@ -1400,6 +1411,20 @@ fn build_upstream_headers(
             continue;
         };
         outbound.insert(name, value);
+    }
+
+    // Section 11.2: write the provider's affinity fields. On Own-tier keys the
+    // client's raw session is forwarded and profile fields are written only when
+    // absent; Shared/Global keys always receive the tenant-salted token (SEC-16).
+    if let Some(session) = session {
+        let profile = candidate.session_profile();
+        apply_outbound_session_affinity(
+            &mut outbound,
+            candidate.pool_tier(),
+            &profile,
+            &session.salted_token,
+            &session.raw_session,
+        );
     }
 
     if matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens) {
@@ -1801,16 +1826,35 @@ struct SessionPinContext<'a> {
     now_ms: i64,
 }
 
+/// Resolved inbound session plus its tenant-salted outbound affinity token.
+struct ResolvedSession {
+    pin_key: PinKey,
+    raw_session: String,
+    salted_token: String,
+}
+
+impl ResolvedSession {
+    /// The token written to provider affinity fields for the chosen tier.
+    fn outbound_token(&self, tier: PoolTier) -> &str {
+        if tier == PoolTier::Own && !self.raw_session.is_empty() {
+            &self.raw_session
+        } else {
+            &self.salted_token
+        }
+    }
+}
+
 /// Deterministic in-memory pin key; the raw session string never leaves the process.
 ///
 /// Implements the eight-step inbound session precedence (`RTE-1`), the Step 8
 /// canonical opening-message fingerprint fallback, and the 21-slot constant
-/// session detector for generic session sources (`RTE-1`, `RTE-2`).
-fn session_pin_key(
+/// session detector for generic session sources (`RTE-1`, `RTE-2`). It also
+/// derives the outbound affinity token used by SRDD Section 11.2.
+fn resolve_session(
     headers: &HeaderMap,
     body: &[u8],
     context: &SessionPinContext<'_>,
-) -> Option<PinKey> {
+) -> Option<ResolvedSession> {
     let SessionPinContext {
         client_key,
         canonical_id,
@@ -1884,11 +1928,45 @@ fn session_pin_key(
         raw_hash?
     };
 
-    Some(PinKey {
-        client_key_id: client_key.id,
-        canonical_id: canonical_id.to_string(),
-        session_hash,
+    // Step 8 has no client-supplied seed, so the canonical fingerprint is the
+    // affinity seed. This also applies when a generic client ID is deliberately
+    // fingerprinted via `constant_session_mode == "fingerprint_generic_ids"`.
+    // The instance secret is always present in production; an empty key keeps
+    // unit-level fixtures deterministic.
+    let affinity_seed = if use_step8 {
+        session_hash.as_str()
+    } else {
+        raw_session.as_str()
+    };
+    let salted_token = compute_salted_affinity_token(
+        session_hmac_secret.unwrap_or(b""),
+        &client_key.owner_user_id,
+        affinity_seed,
+    );
+    let outbound_raw_session = if use_step8 {
+        String::new()
+    } else {
+        raw_session
+    };
+
+    Some(ResolvedSession {
+        pin_key: PinKey {
+            client_key_id: client_key.id,
+            canonical_id: canonical_id.to_string(),
+            session_hash,
+        },
+        raw_session: outbound_raw_session,
+        salted_token,
     })
+}
+
+#[cfg(test)]
+fn session_pin_key(
+    headers: &HeaderMap,
+    body: &[u8],
+    context: &SessionPinContext<'_>,
+) -> Option<PinKey> {
+    resolve_session(headers, body, context).map(|session| session.pin_key)
 }
 
 /// Extract a `Retry-After` delay in milliseconds from an upstream response.
@@ -2866,7 +2944,7 @@ pub async fn handle_inference_request(
         .session_hmac_secret
         .as_ref()
         .map(|secret| secret.expose_secret());
-    let mut pin_key = session_pin_key(
+    let resolved_session = resolve_session(
         &headers,
         &body,
         &SessionPinContext {
@@ -2878,6 +2956,9 @@ pub async fn handle_inference_request(
             now_ms: now,
         },
     );
+    let mut pin_key = resolved_session
+        .as_ref()
+        .map(|session| session.pin_key.clone());
     let pin_ttl_ms = snapshot.settings.pin_ttl_secs.saturating_mul(1000);
     let clock = SystemClock::new();
     let mut pin_ticket: Option<PinTicket> = None;
@@ -3131,19 +3212,33 @@ pub async fn handle_inference_request(
         } else {
             ChatStreamMode::Native
         };
+        let session_profile = candidate.session_profile();
+        let session_token = resolved_session
+            .as_ref()
+            .map(|session| session.outbound_token(candidate.pool_tier()));
+        let session_field = session_profile
+            .body_field
+            .as_deref()
+            .zip(session_token)
+            .filter(|_| matches!(endpoint, EndpointKind::Chat | EndpointKind::Responses));
         let (edited_body, strip_injected_usage) = match edit_body(
             body.clone(),
             candidate.pool_tier(),
             Some(&candidate.upstream_model_id),
             chat_stream_mode,
-            None,
+            session_field,
         ) {
             Ok(edited) => edited,
             Err(_) => (body.clone(), false),
         };
 
-        let outbound_headers = match build_upstream_headers(&headers, &candidate, &secret, endpoint)
-        {
+        let outbound_headers = match build_upstream_headers(
+            &headers,
+            &candidate,
+            &secret,
+            endpoint,
+            resolved_session.as_ref(),
+        ) {
             Ok(headers) => headers,
             Err(response) => return *response,
         };
@@ -4250,6 +4345,56 @@ mod tests {
                 now_ms,
             },
         )
+    }
+
+    fn test_resolved_session(
+        key: &ClientKeyRecord,
+        body: &[u8],
+        runtime: &RuntimeState,
+    ) -> Option<ResolvedSession> {
+        resolve_session(
+            &HeaderMap::new(),
+            body,
+            &SessionPinContext {
+                client_key: key,
+                canonical_id: "gpt-4o",
+                protocol: "chat",
+                session_hmac_secret: Some(b"instance-session-secret-32-bytes"),
+                runtime_state: runtime,
+                now_ms: 1_000,
+            },
+        )
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-1, SEC-16 - forced Step 8 affinity is salted even on Own tier"]
+    fn fingerprint_generic_ids_uses_salted_affinity_not_the_raw_client_id() {
+        let runtime = RuntimeState::new();
+        let key = session_test_key("fingerprint_generic_ids");
+
+        let resolved = test_resolved_session(
+            &key,
+            &session_body(Some("generic-cache-key"), "opening one"),
+            &runtime,
+        )
+        .expect("generic session must resolve");
+
+        assert!(
+            resolved.pin_key.session_hash.starts_with("fp:"),
+            "fingerprint_generic_ids must switch the pin to Step 8"
+        );
+        assert!(
+            resolved.raw_session.is_empty(),
+            "a Step 8 affinity must not forward the raw generic client ID"
+        );
+        assert!(
+            resolved.salted_token.starts_with("llr_"),
+            "Step 8 must always write the tenant-salted token"
+        );
+        assert_eq!(
+            resolved.outbound_token(PoolTier::Own),
+            resolved.salted_token
+        );
     }
 
     #[test]

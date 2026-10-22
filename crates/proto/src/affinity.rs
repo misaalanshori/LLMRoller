@@ -6,19 +6,11 @@ use hmac::{Hmac, KeyInit, Mac};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::PoolTier;
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+pub use llmroller_core::provider::SessionProfile;
 
-/// Session profile configured in provider's config_json.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionProfile {
-    #[serde(default)]
-    pub headers: Vec<String>,
-    #[serde(default)]
-    pub body_field: Option<String>,
-}
+type HmacSha256 = Hmac<Sha256>;
 
 /// Base32 lowercase unpadded encoding per RFC 4648.
 pub fn encode_base32_lower(bytes: &[u8]) -> String {

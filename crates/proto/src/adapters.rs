@@ -7,7 +7,7 @@
 //! Spec: ./docs/srdd/10. SRDD - Routing Design.md#1052-normative-timeout-and-failover-eligibility-tables
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#26-sub-phase-26-built-in-provideradapter-implementations-5-class-error-classifier-and-preset-toml-files
 
-use llmroller_core::provider::ProviderKind;
+use llmroller_core::provider::{ProviderKind, SessionProfile};
 
 pub use llmroller_core::provider::ErrorClassifiers;
 
@@ -162,6 +162,8 @@ pub trait ProviderAdapter: Send + Sync {
     fn default_chat_stream_mode(&self) -> ChatStreamMode;
     /// Default User-Agent policy.
     fn default_ua_policy(&self) -> UaPolicy;
+    /// Default outbound session hint profile (SRDD Section 11.2).
+    fn default_session_profile(&self) -> SessionProfile;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +201,13 @@ impl ProviderAdapter for OpencodeGoAdapter {
 
     fn default_ua_policy(&self) -> UaPolicy {
         UaPolicy::Label
+    }
+
+    fn default_session_profile(&self) -> SessionProfile {
+        SessionProfile {
+            headers: vec!["x-opencode-session".to_string()],
+            body_field: None,
+        }
     }
 }
 
@@ -238,6 +247,13 @@ impl ProviderAdapter for CommandCodeAdapter {
     fn default_ua_policy(&self) -> UaPolicy {
         UaPolicy::Pass
     }
+
+    fn default_session_profile(&self) -> SessionProfile {
+        SessionProfile {
+            headers: vec!["x-session-affinity".to_string(), "x-session-id".to_string()],
+            body_field: Some("prompt_cache_key".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -275,6 +291,13 @@ impl ProviderAdapter for OpenDesignAmrAdapter {
 
     fn default_ua_policy(&self) -> UaPolicy {
         UaPolicy::Pass
+    }
+
+    fn default_session_profile(&self) -> SessionProfile {
+        SessionProfile {
+            headers: vec!["x-session-affinity".to_string(), "x-session-id".to_string()],
+            body_field: Some("prompt_cache_key".to_string()),
+        }
     }
 }
 
@@ -314,6 +337,13 @@ impl ProviderAdapter for OpenrouterAdapter {
     fn default_ua_policy(&self) -> UaPolicy {
         UaPolicy::Pass
     }
+
+    fn default_session_profile(&self) -> SessionProfile {
+        SessionProfile {
+            headers: vec!["x-session-id".to_string()],
+            body_field: Some("session_id".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,6 +381,13 @@ impl ProviderAdapter for CustomAdapter {
 
     fn default_ua_policy(&self) -> UaPolicy {
         UaPolicy::Pass
+    }
+
+    fn default_session_profile(&self) -> SessionProfile {
+        SessionProfile {
+            headers: vec!["x-session-id".to_string(), "x-session-affinity".to_string()],
+            body_field: None,
+        }
     }
 }
 
