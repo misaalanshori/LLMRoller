@@ -1,0 +1,2 @@
+data: {"id":"chatcmpl-truncated","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"partial reply"},"finish_reason":null}]}
+

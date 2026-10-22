@@ -239,9 +239,9 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         .header("x-claude-code-session-id", "claude-sess-001")
         .header("x-claude-code-agent-id", "agent-sub-1")
         .header("content-type", "application/json")
-        .body(Body::from(
-            r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}]}"#,
-        ))
+        .body(Body::from(include_str!(
+            "../../../fixtures/harnesses/claude_code.json"
+        )))
         .expect("req");
     let claude_res = app.clone().oneshot(claude_req).await.expect("res");
     assert_eq!(claude_res.status(), StatusCode::OK);
@@ -264,7 +264,9 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         .uri("/v1/responses")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"model":"claude-3-5-sonnet","input":"turn 2","previous_response_id":"resp_codex_prev_1"}"#))
+        .body(Body::from(include_str!(
+            "../../../fixtures/harnesses/codex_cli.json"
+        )))
         .expect("req");
     let codex_res = app.clone().oneshot(codex_req).await.expect("res");
     assert_eq!(codex_res.status(), StatusCode::OK);
@@ -276,7 +278,9 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header("x-opencode-session", "opencode-sess-100")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"opencode ping"}]}"#))
+        .body(Body::from(include_str!(
+            "../../../fixtures/harnesses/opencode.json"
+        )))
         .expect("req");
     let opencode_res = app.oneshot(opencode_req).await.expect("res");
     assert_eq!(opencode_res.status(), StatusCode::OK);

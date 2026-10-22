@@ -88,10 +88,21 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     let app_html = include_str!("../../../crates/admin/templates/app.html");
     assert!(app_html.contains("Personal Workspace"));
     assert!(app_html.contains("Global pool"));
+    assert!(
+        app_html.contains("value=\"open_design_amr\""),
+        "PRV-2: personal provider selector must expose every built-in preset"
+    );
 
     // 2. UI-1, UI-2: Admin Console template rendering with A6 disk meter and uPlot chart
     let admin_html = include_str!("../../../crates/admin/templates/admin.html");
     assert!(admin_html.contains("Admin Console"));
+    assert!(
+        admin_html.contains("value=\"open_design_amr\""),
+        "PRV-2: global provider selector must expose every built-in preset"
+    );
+    let app_js = include_str!("../../../crates/admin/static/app.js");
+    assert!(app_js.contains("open_design_amr"));
+    assert!(app_js.contains("https://amr-link.open-design.ai/v1"));
     assert!(admin_html.contains("Projected Disk Usage"));
     assert!(admin_html.contains("uplot-container"));
     assert!(admin_html.contains("id=\"uplot-summary\""));

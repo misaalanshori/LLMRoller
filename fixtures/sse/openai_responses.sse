@@ -1,0 +1,9 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture","usage":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture","usage":{"input_tokens":200,"output_tokens":60,"input_tokens_details":{"cached_tokens":50,"cache_write_tokens":50},"output_tokens_details":{"reasoning_tokens":25}}}}
+
