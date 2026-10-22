@@ -6,7 +6,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::body::{Body, to_bytes};
@@ -15,8 +16,11 @@ use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use bytes::Bytes;
 use futures_util::StreamExt as _;
+use futures_util::stream;
 use tempfile::tempdir;
+use tokio::sync::Notify;
 use tower::ServiceExt as _;
 
 use llmroller_core::ids::{ModelPk, UpstreamKeyId, UserId};
@@ -56,10 +60,19 @@ const SSE_OVERLOADED: &str = concat!(
     "data: {\"error\":{\"message\":\"overloaded\",\"code\":529}}\n\n",
 );
 
+/// One complete frame, then the upstream never sends another byte or closes.
+const SSE_STALL_AFTER_FIRST_FRAME: &str = concat!(
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",",
+    "\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,",
+    "\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},",
+    "\"finish_reason\":null}]}\n\n",
+);
+
 #[derive(Clone, Copy)]
 enum MockMode {
     StreamOk,
     StreamOverloaded,
+    StreamStall,
     ChatJson,
     Chat429,
 }
@@ -84,6 +97,18 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
     match state.mode {
         MockMode::StreamOk => sse_response(SSE_OK),
         MockMode::StreamOverloaded => sse_response(SSE_OVERLOADED),
+        MockMode::StreamStall => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(
+                stream::once(async {
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        SSE_STALL_AFTER_FIRST_FRAME.as_bytes(),
+                    ))
+                })
+                .chain(stream::pending()),
+            ))
+            .expect("stall response"),
         MockMode::ChatJson => (
             StatusCode::OK,
             [("content-type", "application/json")],
@@ -211,6 +236,15 @@ async fn create_provider(
     name: &str,
     base_url: String,
 ) -> llmroller_core::ids::ProviderId {
+    create_provider_with_config(harness, name, base_url, "{}").await
+}
+
+async fn create_provider_with_config(
+    harness: &Harness,
+    name: &str,
+    base_url: String,
+    config_json: &str,
+) -> llmroller_core::ids::ProviderId {
     let mut tx = harness.pool.begin().await.expect("begin");
     let provider = create_provider_tx(
         &mut tx,
@@ -219,7 +253,7 @@ async fn create_provider(
             name: name.to_string(),
             kind: ProviderKind::Custom,
             base_url,
-            config_json: "{}".to_string(),
+            config_json: config_json.to_string(),
             ownership_scope: OwnershipScope::Global,
             owner_user_id: None,
             usage_url_cross_origin_ack: false,
@@ -321,13 +355,24 @@ async fn seed_price(harness: &Harness) {
 }
 
 async fn build_app(harness: &Harness) -> Router {
+    build_app_with_shutdown(harness, None, None).await
+}
+
+async fn build_app_with_shutdown(
+    harness: &Harness,
+    cut: Option<Arc<AtomicBool>>,
+    notify: Option<Arc<Notify>>,
+) -> Router {
     let snapshot = load_initial_snapshot(&harness.pool)
         .await
         .expect("load snapshot");
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
-    let state = ProxyAuthState::new(shared_snapshot, harness.pool.clone(), vec![])
+    let mut state = ProxyAuthState::new(shared_snapshot, harness.pool.clone(), vec![])
         .with_master_key(harness.master_key.clone())
         .with_writer(harness.writer.clone());
+    if let (Some(cut), Some(notify)) = (cut, notify) {
+        state = state.with_shutdown_signal(cut, notify);
+    }
     state.is_ready.store(true, Ordering::SeqCst);
     data_plane_router(state)
 }
@@ -358,7 +403,18 @@ async fn single_key_route(
     label: &str,
     priority: i64,
 ) -> (llmroller_core::ids::ProviderId, UpstreamKeyId, ModelPk) {
-    let provider = create_provider(harness, label, format!("http://{addr}")).await;
+    single_key_route_with_config(harness, addr, label, priority, "{}").await
+}
+
+async fn single_key_route_with_config(
+    harness: &Harness,
+    addr: SocketAddr,
+    label: &str,
+    priority: i64,
+    config_json: &str,
+) -> (llmroller_core::ids::ProviderId, UpstreamKeyId, ModelPk) {
+    let provider =
+        create_provider_with_config(harness, label, format!("http://{addr}"), config_json).await;
     let key = create_upstream_key(harness, provider, label, priority).await;
     let model_pk = insert_model(harness, "gpt-4o", Some("smooth_weighted_rr")).await;
     insert_route(harness, key, model_pk, "gpt-4o").await;
@@ -768,6 +824,116 @@ async fn test_non_streaming_429_then_served_persists_both_attempts_and_real_cost
     );
     assert_eq!(events[0].2, 1000);
     assert_eq!(events[0].3, 500);
+}
+
+#[doc = "Spec: API-6, API-7, REL-1 - a stalled upstream after the first frame must close and record idle_timeout"]
+#[tokio::test]
+async fn test_post_first_frame_upstream_stall_records_idle_timeout() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "stalled").await;
+    let (mock_addr, mock_state) = spawn_mock(MockMode::StreamStall).await;
+    single_key_route_with_config(
+        &harness,
+        mock_addr,
+        "stall-a",
+        100,
+        r#"{"timeouts":{"stream_idle_timeout_ms":200}}"#,
+    )
+    .await;
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "stall-key").await;
+    let app = build_app(&harness).await;
+
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("the idle timeout must close the response body")
+    .expect("collect stream");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(
+        text.contains("\"content\":\"hello\""),
+        "the frame sent before the stall must reach the client"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "a stalled upstream never sends a completion sentinel"
+    );
+    assert_eq!(
+        mock_state.calls.load(Ordering::SeqCst),
+        1,
+        "a stream that already committed must not fail over"
+    );
+    flush(&harness).await;
+
+    let (termination, incomplete, stream_flag): (String, i64, i64) =
+        sqlx::query_as("SELECT termination, incomplete, stream FROM usage_events")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("usage event");
+    assert_eq!(termination, "idle_timeout");
+    assert_eq!(incomplete, 1, "idle timeouts are incomplete streams");
+    assert_eq!(stream_flag, 1);
+}
+
+#[doc = "Spec: API-6, REL-1 - a live stream must observe the shutdown cut and record shutdown_cut"]
+#[tokio::test]
+async fn test_shutdown_cut_terminates_live_stream_and_records_shutdown_cut() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "draining").await;
+    let (mock_addr, _mock_state) = spawn_mock(MockMode::StreamStall).await;
+    single_key_route_with_config(
+        &harness,
+        mock_addr,
+        "drain-a",
+        100,
+        r#"{"timeouts":{"stream_idle_timeout_ms":60000}}"#,
+    )
+    .await;
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "drain-key").await;
+
+    let cut = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let app = build_app_with_shutdown(&harness, Some(cut.clone()), Some(notify.clone())).await;
+
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.expect("first chunk").expect("chunk");
+    assert!(
+        String::from_utf8_lossy(&first).contains("\"content\":\"hello\""),
+        "the first frame must arrive before the cut"
+    );
+
+    // Mirrors ShutdownSupervisor step 4: set the flag, then wake parked streams.
+    cut.store(true, Ordering::SeqCst);
+    notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("stream chunk");
+        }
+    })
+    .await
+    .expect("the shutdown cut must close the stream");
+
+    flush(&harness).await;
+    let (termination, incomplete): (String, i64) =
+        sqlx::query_as("SELECT termination, incomplete FROM usage_events")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("usage event");
+    assert_eq!(termination, "shutdown_cut");
+    assert_eq!(incomplete, 1);
 }
 
 // Keep the writer handle reachable for the duration of each test.

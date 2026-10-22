@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arc_swap::ArcSwap;
 use axum::Json;
@@ -38,6 +39,11 @@ pub struct ProxyAuthState {
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Number of live SSE response bodies, drained during graceful shutdown (REL-1).
     pub open_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by the shutdown supervisor once the drain deadline expires so streams
+    /// that were not parked on the notify cannot miss the cut (REL-1).
+    pub shutdown_cut: Arc<AtomicBool>,
+    /// Wakes parked SSE streams when the shutdown supervisor cuts them (REL-1).
+    pub shutdown_notify: Option<Arc<tokio::sync::Notify>>,
     pub budget_semaphore: Arc<crate::orchestrator::PreflightBudgetSemaphore>,
     pub pin_store: Arc<llmroller_core::pins::PinStore>,
     pub runtime_state: Arc<llmroller_core::runtime_state::RuntimeState>,
@@ -75,6 +81,8 @@ impl ProxyAuthState {
             trusted_proxies,
             is_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             open_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_cut: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: None,
             budget_semaphore: Arc::new(crate::orchestrator::PreflightBudgetSemaphore::new(819, 32)),
             pin_store: Arc::new(llmroller_core::pins::PinStore::new(250_000)),
             runtime_state: Arc::new(llmroller_core::runtime_state::RuntimeState::new()),
@@ -119,6 +127,18 @@ impl ProxyAuthState {
     #[must_use]
     pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Attach the graceful-shutdown cut signal observed by live SSE bodies (REL-1).
+    #[must_use]
+    pub fn with_shutdown_signal(
+        mut self,
+        cut: Arc<AtomicBool>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.shutdown_cut = cut;
+        self.shutdown_notify = Some(notify);
         self
     }
 

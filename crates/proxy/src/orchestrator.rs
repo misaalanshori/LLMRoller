@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_compression::tokio::bufread::{
@@ -2627,9 +2627,33 @@ struct StreamState {
     forwarder: SseChunkForwarder,
     finalizer: Option<StreamFinalizer>,
     lifecycle: RequestLifecycle,
+    /// Gap allowed between upstream bytes after the first valid frame.
+    idle_timeout: Duration,
+    /// Set by the shutdown supervisor before it wakes parked streams.
+    shutdown_cut: Arc<AtomicBool>,
+    shutdown_notify: Option<Arc<tokio::sync::Notify>>,
     /// Held for exactly the lifetime of the response body stream.
     _stream_guard: ActiveStreamGuard,
     done: bool,
+}
+
+impl StreamState {
+    /// Finalize accounting and the lifecycle guard exactly once for a terminal step.
+    fn finish(&mut self, termination: Termination) {
+        if let Some(finalizer) = &mut self.finalizer {
+            finalizer.finalize(termination);
+        }
+        self.lifecycle.set_termination(termination);
+        self.lifecycle.finalize();
+        self.done = true;
+    }
+}
+
+/// Outcome of one post-first-frame poll of the upstream body.
+enum StreamStep {
+    Item(Option<Result<Bytes, std::io::Error>>),
+    Idle,
+    Shutdown,
 }
 
 /// Core inference request handler coordinating admission, editing, and forwarding.
@@ -3870,6 +3894,9 @@ pub async fn handle_inference_request(
                     forwarder: SseChunkForwarder::new(strip_injected_usage),
                     finalizer: Some(finalizer),
                     lifecycle,
+                    idle_timeout: Duration::from_millis(candidate.config.stream_idle_timeout_ms()),
+                    shutdown_cut: state.shutdown_cut.clone(),
+                    shutdown_notify: state.shutdown_notify.clone(),
                     _stream_guard: ActiveStreamGuard::acquire(state.open_streams.clone()),
                     done: false,
                 };
@@ -3882,8 +3909,50 @@ pub async fn handle_inference_request(
                         if stream_state.done {
                             return None;
                         }
-                        match stream_state.upstream.next().await {
-                            Some(Ok(chunk)) => {
+
+                        let step = {
+                            let next = stream_state.upstream.next();
+                            tokio::pin!(next);
+                            let idle = tokio::time::sleep(stream_state.idle_timeout);
+                            tokio::pin!(idle);
+
+                            if let Some(notify) = stream_state.shutdown_notify.clone() {
+                                let notified = notify.notified();
+                                tokio::pin!(notified);
+                                // Register before re-checking the flag so a cut that lands
+                                // between the check and the select is never lost.
+                                let _ = notified.as_mut().enable();
+                                if stream_state.shutdown_cut.load(Ordering::Acquire) {
+                                    StreamStep::Shutdown
+                                } else {
+                                    tokio::select! {
+                                        biased;
+                                        _ = &mut notified => StreamStep::Shutdown,
+                                        item = &mut next => StreamStep::Item(item),
+                                        _ = &mut idle => StreamStep::Idle,
+                                    }
+                                }
+                            } else if stream_state.shutdown_cut.load(Ordering::Acquire) {
+                                StreamStep::Shutdown
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    item = &mut next => StreamStep::Item(item),
+                                    _ = &mut idle => StreamStep::Idle,
+                                }
+                            }
+                        };
+
+                        match step {
+                            StreamStep::Shutdown => {
+                                stream_state.finish(Termination::ShutdownCut);
+                                return None;
+                            }
+                            StreamStep::Idle => {
+                                stream_state.finish(Termination::IdleTimeout);
+                                return None;
+                            }
+                            StreamStep::Item(Some(Ok(chunk))) => {
                                 if let Some(finalizer) = &mut stream_state.finalizer {
                                     finalizer.tap.feed_chunk(&chunk);
                                     if let Some(trace) = &mut finalizer.trace {
@@ -3893,20 +3962,15 @@ pub async fn handle_inference_request(
                                 let parts = stream_state.forwarder.process_chunk(&chunk);
                                 stream_state.pending.extend(parts);
                             }
-                            Some(Err(_)) => {
-                                if let Some(finalizer) = &mut stream_state.finalizer {
-                                    finalizer.finalize(Termination::UpstreamTruncated);
-                                }
+                            StreamStep::Item(Some(Err(_))) => {
+                                stream_state.finish(Termination::UpstreamTruncated);
                                 return None;
                             }
-                            None => {
+                            StreamStep::Item(None) => {
                                 if let Some(tail) = stream_state.forwarder.finish() {
                                     stream_state.pending.push_back(tail);
                                 }
-                                if let Some(finalizer) = &mut stream_state.finalizer {
-                                    finalizer.finalize(Termination::Completed);
-                                }
-                                stream_state.done = true;
+                                stream_state.finish(Termination::Completed);
                                 if let Some(bytes) = stream_state.pending.pop_front() {
                                     return Some((
                                         Ok::<Bytes, std::io::Error>(bytes),

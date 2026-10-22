@@ -412,6 +412,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let is_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let open_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let trusted_proxies_vec: Vec<String> = if trusted_proxies.trim().is_empty() {
         vec![]
@@ -448,6 +449,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     );
     proxy_auth_state.is_ready = is_ready.clone();
     proxy_auth_state.open_streams = open_streams.clone();
+    proxy_auth_state.shutdown_cut = shutdown_cut.clone();
+    proxy_auth_state.shutdown_notify = Some(shutdown_notify.clone());
     proxy_auth_state.pin_store = pin_store.clone();
     proxy_auth_state.runtime_state = runtime_state.clone();
     proxy_auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
@@ -674,6 +677,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         Duration::from_secs(5),
     )
     .with_writer(writer_handle.clone())
+    .with_shutdown_cut(shutdown_cut.clone())
     .with_background_stop(stop_tx.clone())
     .with_sealer_pool(sealer_pool.clone())
     .with_runtime_state(runtime_state.clone());

@@ -29,6 +29,9 @@ pub struct ShutdownSupervisor {
     pub is_ready: Arc<AtomicBool>,
     pub open_streams_counter: Arc<AtomicUsize>,
     pub shutdown_notify: Arc<Notify>,
+    /// Set before `shutdown_notify` fires so streams that are not parked on the
+    /// notify cannot miss the cut (REL-1).
+    pub shutdown_cut: Option<Arc<AtomicBool>>,
     pub pool: SqlitePool,
     pub drain_grace_duration: Duration,
     pub drain_timeout_duration: Duration,
@@ -52,6 +55,7 @@ impl ShutdownSupervisor {
             is_ready,
             open_streams_counter,
             shutdown_notify,
+            shutdown_cut: None,
             pool,
             drain_grace_duration,
             drain_timeout_duration,
@@ -60,6 +64,13 @@ impl ShutdownSupervisor {
             sealer_pool: None,
             runtime_state: None,
         }
+    }
+
+    /// Attach the flag observed by live streams when the drain deadline expires (REL-1).
+    #[must_use]
+    pub fn with_shutdown_cut(mut self, cut: Arc<AtomicBool>) -> Self {
+        self.shutdown_cut = Some(cut);
+        self
     }
 
     /// Attach the writer whose queues must be flushed before the final checkpoint.
@@ -107,7 +118,6 @@ impl ShutdownSupervisor {
         }
 
         // Step 2: Stop accepting new TCP connections (signaled via is_ready)
-        self.shutdown_notify.notify_waiters();
 
         // Step 3: Wait for in-flight streams to complete naturally up to drain_timeout
         let start = Instant::now();
@@ -120,6 +130,9 @@ impl ShutdownSupervisor {
 
         // Step 4: Cancel any remaining open streams with Termination::ShutdownCut
         if self.open_streams_counter.load(Ordering::SeqCst) > 0 {
+            if let Some(cut) = &self.shutdown_cut {
+                cut.store(true, Ordering::SeqCst);
+            }
             self.shutdown_notify.notify_waiters();
         }
 

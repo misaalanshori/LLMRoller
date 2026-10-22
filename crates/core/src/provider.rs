@@ -231,6 +231,18 @@ impl ErrorClassifiers {
     }
 }
 
+/// Per-provider timeout overrides (SRDD Section 10, `stream_idle_timeout_ms`).
+///
+/// A missing or non-positive value falls back to the 300,000 ms default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTimeouts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_ms: Option<i64>,
+}
+
+/// Default gap allowed between bytes after the first valid streaming frame.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: i64 = 300_000;
+
 /// Parsed `providers.config_json` projection used by the data plane (`PRV-3`).
 ///
 /// Unknown keys are preserved by the database but ignored here so older or newer
@@ -260,6 +272,8 @@ pub struct ProviderConfig {
     pub session_profile: Option<SessionProfile>,
     #[serde(default)]
     pub error_classifiers: ErrorClassifiers,
+    #[serde(default)]
+    pub timeouts: ProviderTimeouts,
 }
 
 impl ProviderConfig {
@@ -267,6 +281,15 @@ impl ProviderConfig {
     #[must_use]
     pub fn from_json(config_json: &str) -> Self {
         serde_json::from_str(config_json).unwrap_or_default()
+    }
+
+    /// Effective post-first-frame SSE idle timeout in milliseconds.
+    #[must_use]
+    pub fn stream_idle_timeout_ms(&self) -> u64 {
+        self.timeouts
+            .stream_idle_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map_or(DEFAULT_STREAM_IDLE_TIMEOUT_MS as u64, |ms| ms as u64)
     }
 }
 
@@ -299,6 +322,27 @@ mod tests {
             off.session_profile,
             Some(SessionProfile::default()),
             "an explicit empty profile disables affinity injection"
+        );
+    }
+
+    #[doc = "Spec: API-6, API-7 - a provider may override the post-first-frame idle timeout"]
+    #[test]
+    fn provider_config_reads_stream_idle_timeout_override() {
+        assert_eq!(
+            ProviderConfig::from_json("{}").stream_idle_timeout_ms(),
+            300_000,
+            "missing timeouts must use the SRDD default"
+        );
+        assert_eq!(
+            ProviderConfig::from_json(r#"{"timeouts":{"stream_idle_timeout_ms":200}}"#)
+                .stream_idle_timeout_ms(),
+            200
+        );
+        assert_eq!(
+            ProviderConfig::from_json(r#"{"timeouts":{"stream_idle_timeout_ms":0}}"#)
+                .stream_idle_timeout_ms(),
+            300_000,
+            "non-positive overrides must not disable the timeout"
         );
     }
 }
