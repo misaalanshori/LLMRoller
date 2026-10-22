@@ -735,29 +735,53 @@ async fn test_count_tokens_forwards_native_anthropic_request() {
 }
 
 #[tokio::test]
-async fn test_count_tokens_unsupported_upstream_returns_local_not_found() {
+async fn test_count_tokens_unsupported_upstream_returns_local_not_implemented_and_caches() {
     let harness = harness().await;
     let user = insert_user(&harness.pool, "counter-unsupported").await;
     let token = create_client_key(&harness, user, "counter-unsupported-key").await;
-    let (addr, _mock) = spawn_mock(true).await;
+    let (addr, mock) = spawn_mock(true).await;
     let provider = create_provider(&harness, "anthropic-404", format!("http://{addr}")).await;
     let key = create_upstream_key(&harness, provider, "anthropic-404", 100).await;
     let model = insert_model(&harness, "claude-sonnet").await;
     insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
 
     let app = build_app(&harness).await;
+    let body = r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(body),
+        ))
+        .await
+        .expect("count tokens");
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "unsupported_aux_endpoint"
+    );
+
+    // The negative probe is cached: a second request must not reach upstream.
     let response = app
         .oneshot(request(
             "POST",
             "/v1/messages/count_tokens",
             &token,
-            Some(r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}]}"#),
+            Some(body),
         ))
         .await
         .expect("count tokens");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
-        response_json(response).await["error"]["code"],
-        "not_found_error"
+        mock.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|call| call.path == "/messages/count_tokens")
+            .count(),
+        1,
+        "a cached unsupported probe must short-circuit before dispatch"
     );
 }

@@ -82,6 +82,9 @@ const ERROR_CLASSIFY_BYTES: usize = 8 * 1024;
 /// Fallback lifetime of a `PlanRestricted` route block until the next `/models` refresh.
 const PROTOCOL_BLOCK_MS: i64 = 6 * 60 * 60 * 1_000;
 
+/// How long an auxiliary endpoint probe result is cached (API-8).
+const AUX_UNSUPPORTED_TTL_MS: i64 = 60 * 60 * 1_000;
+
 /// Maximum idle time while waiting for an upstream chunk.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -821,8 +824,19 @@ pub async fn post_messages_count_tokens(
             })
             .collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+    let had_candidates = !candidates.is_empty();
+    candidates.retain(|candidate| {
+        !state.runtime_state.is_aux_endpoint_unsupported(
+            candidate.upstream_key_id,
+            "count_tokens",
+            now,
+        )
+    });
 
     if candidates.is_empty() {
+        if had_candidates {
+            return aux_endpoint_unsupported_error();
+        }
         return json_error(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -830,6 +844,7 @@ pub async fn post_messages_count_tokens(
         );
     }
 
+    let mut aux_unsupported_seen = false;
     for candidate in candidates {
         let Some(key) = snapshot
             .upstream_keys
@@ -890,6 +905,12 @@ pub async fn post_messages_count_tokens(
             status,
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
         ) {
+            state.runtime_state.mark_aux_endpoint_unsupported(
+                candidate.upstream_key_id,
+                "count_tokens",
+                now.saturating_add(AUX_UNSUPPORTED_TTL_MS),
+            );
+            aux_unsupported_seen = true;
             continue;
         }
         let content_type = response.headers().get(CONTENT_TYPE).cloned();
@@ -904,6 +925,10 @@ pub async fn post_messages_count_tokens(
         return builder
             .body(Body::from(bytes))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    if aux_unsupported_seen {
+        return aux_endpoint_unsupported_error();
     }
 
     json_error(
@@ -922,7 +947,7 @@ pub async fn post_responses_compact(
 ) -> Response {
     handle_inference_request(
         state,
-        EndpointKind::Responses,
+        EndpointKind::ResponsesCompact,
         headers,
         body,
         client_key.map(|e| e.0),
@@ -1013,6 +1038,23 @@ impl RouteCandidate {
 /// Compute the Unix wall-clock time in milliseconds.
 fn now_ms() -> i64 {
     SystemClock::new().now_ms()
+}
+
+/// Auxiliary endpoints are probed and cached independently from primary inference routes (API-8).
+const fn aux_endpoint_label(endpoint: EndpointKind) -> Option<&'static str> {
+    match endpoint {
+        EndpointKind::ResponsesCompact => Some("responses_compact"),
+        EndpointKind::CountTokens => Some("count_tokens"),
+        _ => None,
+    }
+}
+
+fn aux_endpoint_unsupported_error() -> Response {
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "unsupported_aux_endpoint",
+        "no eligible upstream supports this auxiliary endpoint",
+    )
 }
 
 /// Interpret an out-of-band `GET /models` verification probe response (API-8).
@@ -2426,10 +2468,16 @@ pub async fn handle_inference_request(
     let endpoint_str = match endpoint {
         EndpointKind::Chat => "chat",
         EndpointKind::Responses => "responses",
+        EndpointKind::ResponsesCompact => "responses_compact",
         EndpointKind::Messages => "messages",
         _ => "chat",
     };
-    let protocol = endpoint_str;
+    let protocol = match endpoint {
+        // The compact endpoint speaks the Responses wire protocol but has its own upstream path.
+        EndpointKind::ResponsesCompact => "responses",
+        _ => endpoint_str,
+    };
+    let aux_label = aux_endpoint_label(endpoint);
 
     // 1. Acquire preflight memory budget permit (up to 2,000 ms)
     let permit = match state
@@ -2486,7 +2534,10 @@ pub async fn handle_inference_request(
             .into_response();
     };
 
-    let is_streaming = scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
+    // Compaction is a one-shot operation; force the non-streaming path even if the
+    // client supplied `stream: true` (API-1).
+    let is_streaming = endpoint != EndpointKind::ResponsesCompact
+        && scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
     let store_flag = response_store_flag(&scan, &body);
     let now = now_ms();
     let request_id = RequestId::generate();
@@ -2647,8 +2698,24 @@ pub async fn handle_inference_request(
         }
     } else {
         let candidates = collect_candidates(&snapshot, &model, &caller, scope, now);
+        let had_candidates = !candidates.is_empty();
+        let candidates: Vec<RouteCandidate> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                aux_label.is_none_or(|label| {
+                    !state.runtime_state.is_aux_endpoint_unsupported(
+                        candidate.upstream_key_id,
+                        label,
+                        now,
+                    )
+                })
+            })
+            .collect();
         if candidates.is_empty() {
             crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+            if aux_label.is_some() && had_candidates {
+                return aux_endpoint_unsupported_error();
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -2893,6 +2960,7 @@ pub async fn handle_inference_request(
 
     let mut attempts: Vec<UsageAttemptRecord> = Vec::new();
     let mut try_outcomes: Vec<TryOutcome> = Vec::new();
+    let mut aux_unsupported_seen = false;
     let mut last_retry_after_ms: Option<i64> = None;
     let mut last_cap_error: Option<GateG7Error> = None;
     let mut failovers = 0_i64;
@@ -3126,6 +3194,36 @@ pub async fn handle_inference_request(
             last_retry_after_ms = retry_after_ms(response.headers());
             let upstream_headers = response.headers().clone();
             let error_body = read_bounded_error_body(response).await;
+            // Auxiliary endpoints have independent support. A 404/405/501 means this
+            // key does not implement the endpoint; cache that fact without treating it
+            // as a credential or host failure (API-8).
+            if let Some(label) = aux_label
+                && matches!(
+                    status,
+                    StatusCode::NOT_FOUND
+                        | StatusCode::METHOD_NOT_ALLOWED
+                        | StatusCode::NOT_IMPLEMENTED
+                )
+            {
+                state.runtime_state.mark_aux_endpoint_unsupported(
+                    candidate.upstream_key_id,
+                    label,
+                    now.saturating_add(AUX_UNSUPPORTED_TTL_MS),
+                );
+                aux_unsupported_seen = true;
+                attempts.push(attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
+                    Some(status.as_u16()),
+                    body.len(),
+                    0,
+                    "none",
+                ));
+                continue;
+            }
             let classify_prefix = &error_body[..error_body.len().min(ERROR_CLASSIFY_BYTES)];
             let class = classify_error_with_classifiers(
                 status.as_u16(),
@@ -3843,7 +3941,16 @@ pub async fn handle_inference_request(
     }
 
     let (terminal_status, terminal_code, terminal_retry_after, terminal_body) =
-        select_terminal_error(&try_outcomes);
+        if aux_unsupported_seen {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_aux_endpoint",
+                None,
+                None,
+            )
+        } else {
+            select_terminal_error(&try_outcomes)
+        };
     let status_class = if terminal_status.is_client_error() {
         "4xx"
     } else {

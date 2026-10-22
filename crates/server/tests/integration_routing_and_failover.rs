@@ -424,6 +424,10 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     };
     use tower::ServiceExt as _;
 
+    let responses_calls = Arc::new(AtomicUsize::new(0));
+    let compact_calls = Arc::new(AtomicUsize::new(0));
+    let reject_compact = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let mock_app = axum::Router::new()
         .route(
             "/chat/completions",
@@ -437,13 +441,47 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         )
         .route(
             "/responses",
-            axum::routing::post(|| async {
-                (
-                    StatusCode::OK,
-                    [("content-type", "application/json")],
-                    r#"{"id":"resp-1","output":"ok"}"#,
-                )
-            }),
+            {
+                let calls = responses_calls.clone();
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            r#"{"id":"resp-1","output":"ok"}"#,
+                        )
+                    }
+                })
+            },
+        )
+        .route(
+            "/responses/compact",
+            {
+                let calls = compact_calls.clone();
+                let reject = reject_compact.clone();
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    let reject = reject.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if reject.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::NOT_FOUND,
+                                [("content-type", "application/json")],
+                                r#"{"error":{"code":"not_found","message":"no compact here"}}"#,
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "application/json")],
+                                r#"{"id":"compact-1","output":"compacted"}"#,
+                            )
+                        }
+                    }
+                })
+            },
         )
         .route(
             "/responses/{id}",
@@ -625,6 +663,7 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     auth_state
         .is_ready
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    let runtime_state = auth_state.runtime_state.clone();
     let app = data_plane_router(auth_state);
 
     // 1. POST /v1/chat/completions
@@ -680,7 +719,7 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert!(json["input_tokens"].as_i64().is_some());
 
-    // 5. POST /v1/responses/compact
+    // 5. POST /v1/responses/compact must use the dedicated upstream path.
     let req_compact = Request::builder()
         .method("POST")
         .uri("/v1/responses/compact")
@@ -690,6 +729,58 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         .expect("req");
     let resp = app.clone().oneshot(req_compact).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["output"], "compacted");
+    assert_eq!(responses_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(compact_calls.load(Ordering::SeqCst), 1);
+
+    // A 404 from the compact endpoint is cached without failing the key, and a
+    // second request short-circuits without another upstream probe (API-8).
+    reject_compact.store(true, Ordering::SeqCst);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses/compact")
+                .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-4o","input":"compact me"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["error"]["code"], "unsupported_aux_endpoint");
+    assert_eq!(compact_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(responses_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        runtime_state.key_health_entry(upstream_key.id).healthy,
+        "an unsupported auxiliary endpoint must not degrade key health"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses/compact")
+                .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-4o","input":"compact me"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        compact_calls.load(Ordering::SeqCst),
+        2,
+        "the cached negative probe must short-circuit before dispatch"
+    );
 
     // 6. State-bound endpoints: GET/DELETE /v1/responses/{id}, /input_items, /cancel
     let req_get = Request::builder()

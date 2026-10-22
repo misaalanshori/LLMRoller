@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 
 use crate::accumulators::MonthlyAccumulatorRegistry;
 use crate::breaker::{OriginBreaker, OriginKey, OriginProbeGuard};
-use crate::health::{CredentialStrikeVerifier, RouteProtocolBlocks, StrikeResult};
+use crate::health::{AuxUnsupported, CredentialStrikeVerifier, RouteProtocolBlocks, StrikeResult};
 use crate::ids::{ClientKeyId, ModelPk, UpstreamKeyId};
 use crate::session::ConstantSessionDetector;
 use crate::snapshot::{CacheInvalidationEvent, ConfigSnapshot, SnapshotBudgetWindow};
@@ -246,6 +246,8 @@ pub struct RuntimeState {
     pub credential_probes_in_flight: DashMap<UpstreamKeyId, ()>,
     /// `(upstream key, model, protocol)` blocks written by `PlanRestricted` errors (API-8).
     pub route_protocol_blocks: RouteProtocolBlocks,
+    /// Negative cache for auxiliary endpoint probes (`API-8`).
+    pub aux_unsupported: AuxUnsupported,
     pub load_tracker: Arc<LoadTracker>,
     pub selectors: RouteSelectorSet,
     pub window_counters: DashMap<String, Arc<AtomicBudgetCounter>>,
@@ -286,6 +288,7 @@ impl RuntimeState {
             strike_verifier: CredentialStrikeVerifier::new(),
             credential_probes_in_flight: DashMap::new(),
             route_protocol_blocks: RouteProtocolBlocks::new(),
+            aux_unsupported: AuxUnsupported::new(),
             load_tracker: Arc::new(LoadTracker::new()),
             selectors: RouteSelectorSet::default(),
             window_counters: DashMap::new(),
@@ -465,6 +468,29 @@ impl RuntimeState {
     ) -> bool {
         self.route_protocol_blocks
             .is_blocked(key_id, model_pk, protocol, now_ms)
+    }
+
+    /// Cache a negative auxiliary-endpoint probe for one key (`API-8`).
+    pub fn mark_aux_endpoint_unsupported(
+        &self,
+        key_id: UpstreamKeyId,
+        endpoint: &str,
+        until_ms: i64,
+    ) {
+        self.aux_unsupported
+            .mark_unsupported(key_id, endpoint, until_ms);
+    }
+
+    /// Whether an auxiliary endpoint is cached as unsupported for one key.
+    #[must_use]
+    pub fn is_aux_endpoint_unsupported(
+        &self,
+        key_id: UpstreamKeyId,
+        endpoint: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.aux_unsupported
+            .is_unsupported(key_id, endpoint, now_ms)
     }
 
     /// Exhaust a key's upstream quota window without recording a credential strike.
