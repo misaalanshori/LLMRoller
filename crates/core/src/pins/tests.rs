@@ -51,7 +51,10 @@ fn test_concurrent_turn1_and_first_valid_frame_confirmation() {
             assert_eq!(ticket.upstream_key_id, k1);
 
             // Confirm first valid frame
-            if st.first_valid_frame(&pk, &ticket, clk.now_ms(), 86_400_000) {
+            if st
+                .first_valid_frame(&pk, &ticket, clk.now_ms(), 86_400_000)
+                .is_some()
+            {
                 cc.fetch_add(1, Ordering::SeqCst);
             }
         }));
@@ -273,7 +276,7 @@ fn test_provisional_pin_expiration_and_admin_move_safety() {
     // Stale FirstValidFrame arriving from earlier ticket_move (generation 1 on k1) must NOT revert to k1!
     let reverted = store.first_valid_frame(&pin_key, &ticket_move, clock.now_ms(), 86_400_000);
     assert!(
-        !reverted,
+        reverted.is_none(),
         "stale FirstValidFrame must be rejected after admin move"
     );
 

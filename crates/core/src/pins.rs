@@ -264,13 +264,17 @@ impl PinStore {
     }
 
     /// Transitions a pin to Confirmed on first valid frame arrival (RTE-7).
+    ///
+    /// Returns the confirmed projection so the caller can write it behind the
+    /// durable queue. A stale ticket whose generation was superseded returns
+    /// `None` and leaves the live pin untouched.
     pub fn first_valid_frame(
         &self,
         pin_key: &PinKey,
         ticket: &PinTicket,
         now_ms: i64,
         pin_ttl_ms: i64,
-    ) -> bool {
+    ) -> Option<PinEntry> {
         if let Some(entry_arc) = self.entries.get(pin_key) {
             let mut entry = entry_arc.lock();
             if ticket.generation == entry.generation
@@ -280,10 +284,10 @@ impl PinStore {
                 entry.last_used_ms = now_ms;
                 entry.expires_ms = now_ms + pin_ttl_ms;
                 entry.tried_this_generation.clear();
-                return true;
+                return Some(entry.clone());
             }
         }
-        false
+        None
     }
 
     /// Handles failover before first byte with race-free winner adoption (RTE-8).

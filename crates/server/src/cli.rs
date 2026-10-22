@@ -326,7 +326,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     .fetch_all(&pool)
     .await
     {
-        for (id, health, health_until, _version) in rows {
+        let mut max_health_version = 0_u64;
+        for (id, health, health_until, version) in rows {
+            max_health_version = max_health_version.max(u64::try_from(version).unwrap_or(0));
             if let Ok(key_id) = llmroller_core::ids::UpstreamKeyId::parse(&id) {
                 let healthy = health == "healthy";
                 runtime_state.key_health.insert(
@@ -352,6 +354,22 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                     },
                 );
             }
+        }
+        runtime_state.health.observe_version(max_health_version);
+    }
+
+    // Seed durable PlanRestricted protocol blocks so restart cannot resurrect
+    // a route the last discovery pass already cleared (API-8, REL-1).
+    if let Ok(blocks) =
+        llmroller_store::health::load_active_route_protocol_blocks(&pool, clock.now_ms()).await
+    {
+        for block in blocks {
+            runtime_state.route_protocol_blocks.block_protocol(
+                block.upstream_key_id,
+                block.model_pk,
+                &block.protocol,
+                block.until_ms,
+            );
         }
     }
 

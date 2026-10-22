@@ -81,9 +81,12 @@ impl std::fmt::Debug for ControlTask {
 /// Key for deduplicating in-flight durable ops.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DurableKey {
-    Pin(String),
+    Pin(String, String, String),
     ResponseLink(String),
     HealthVersion(String),
+    RouteHealth(String, String),
+    RouteProtocolBlock(String, String, String),
+    RouteProtocolClear(String),
 }
 
 /// Durable operation executed in SQLite with per-item SAVEPOINT.
@@ -98,6 +101,7 @@ pub enum DurableOp {
         created_at: i64,
         last_used_at: i64,
         expires_at: i64,
+        repin_count: i64,
     },
     ResponseLinkUpsert(crate::pins::ResponseLinkRow),
     HealthVersionUpdate {
@@ -106,6 +110,24 @@ pub enum DurableOp {
         health_until: Option<i64>,
         health_version: i64,
         last_error: Option<String>,
+    },
+    RouteHealthUpdate {
+        upstream_key_id: String,
+        model_pk: String,
+        route_health: String,
+        route_health_until: Option<i64>,
+        health_version: i64,
+        last_error: Option<String>,
+    },
+    RouteProtocolBlockUpsert {
+        upstream_key_id: String,
+        model_pk: String,
+        protocol: String,
+        reason: String,
+        until_ms: i64,
+    },
+    RouteProtocolBlockClear {
+        upstream_key_id: String,
     },
 }
 
@@ -333,17 +355,19 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 created_at,
                 last_used_at,
                 expires_at,
+                repin_count,
             } => sqlx::query(
                 r#"INSERT INTO pins (
                            client_key_id, session_hash, model_pk, upstream_key_id,
-                           pool_tier, created_at, last_used_at, expires_at
+                           pool_tier, created_at, last_used_at, expires_at, repin_count
                        )
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (client_key_id, session_hash, model_pk) DO UPDATE SET
                            upstream_key_id = excluded.upstream_key_id,
                            pool_tier = excluded.pool_tier,
                            last_used_at = excluded.last_used_at,
-                           expires_at = excluded.expires_at"#,
+                           expires_at = excluded.expires_at,
+                           repin_count = excluded.repin_count"#,
             )
             .bind(client_key_id)
             .bind(session_hash)
@@ -353,6 +377,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .bind(created_at)
             .bind(last_used_at)
             .bind(expires_at)
+            .bind(repin_count)
             .execute(&mut *transaction)
             .await
             .map(|_| ()),
@@ -374,6 +399,57 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .bind(health_until)
             .bind(health_version)
             .bind(last_error)
+            .bind(upstream_key_id)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
+            DurableOp::RouteHealthUpdate {
+                upstream_key_id,
+                model_pk,
+                route_health,
+                route_health_until,
+                health_version,
+                last_error,
+            } => sqlx::query(
+                r#"UPDATE model_routes SET
+                           route_health = ?, route_health_until = ?, health_version = ?, last_error = ?
+                       WHERE upstream_key_id = ? AND model_pk = ?"#,
+            )
+            .bind(route_health)
+            .bind(route_health_until)
+            .bind(health_version)
+            .bind(last_error)
+            .bind(upstream_key_id)
+            .bind(model_pk)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
+            DurableOp::RouteProtocolBlockUpsert {
+                upstream_key_id,
+                model_pk,
+                protocol,
+                reason,
+                until_ms,
+            } => sqlx::query(
+                r#"INSERT INTO route_protocol_blocks (
+                           upstream_key_id, model_pk, protocol, reason, until_ms
+                       )
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT (upstream_key_id, model_pk, protocol) DO UPDATE SET
+                           reason = excluded.reason,
+                           until_ms = excluded.until_ms"#,
+            )
+            .bind(upstream_key_id)
+            .bind(model_pk)
+            .bind(protocol)
+            .bind(reason)
+            .bind(until_ms)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
+            DurableOp::RouteProtocolBlockClear { upstream_key_id } => sqlx::query(
+                "DELETE FROM route_protocol_blocks WHERE upstream_key_id = ?",
+            )
             .bind(upstream_key_id)
             .execute(&mut *transaction)
             .await

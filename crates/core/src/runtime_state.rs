@@ -47,6 +47,12 @@ impl HealthState {
     pub fn current_version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
     }
+
+    /// Seed the counter from persisted state so write-behind versions never
+    /// move backwards across a restart (`REL-1`).
+    pub fn observe_version(&self, persisted: u64) {
+        self.version.fetch_max(persisted, Ordering::SeqCst);
+    }
 }
 
 /// Hot-path health status for one upstream key.
@@ -549,6 +555,9 @@ impl RuntimeState {
         now_ms: i64,
     ) {
         self.key_health.insert(key_id, KeyHealthEntry::default());
+        // A success can clear a previous cooldown, so it is a health transition
+        // that must be visible to the write-behind durable projection (REL-1).
+        self.health.bump_version();
         if let Some(breaker) = self.origin_breakers.get(origin) {
             breaker.lock().record_success(now_ms);
         }

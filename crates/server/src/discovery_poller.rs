@@ -19,7 +19,7 @@ use llmroller_proto::discovery::{
 };
 use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sealer};
 use llmroller_store::models::{is_valid_upstream_model_id, upsert_discovered_models_tx};
-use llmroller_store::writer::{ControlOp, WriterError, WriterHandle};
+use llmroller_store::writer::{ControlOp, DurableKey, DurableOp, WriterError, WriterHandle};
 use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -281,8 +281,15 @@ async fn discover_key(
         .map_err(|error| error.to_string())?;
 
     // A successful refresh supersedes any PlanRestricted route blocks written
-    // between discovery passes (`API-8`).
+    // between discovery passes (`API-8`). The in-memory clear is paired with a
+    // durable delete so restart cannot resurrect a superseded block.
     runtime_state.clear_route_protocol_blocks(key.id);
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteProtocolClear(key.id.to_string()),
+        DurableOp::RouteProtocolBlockClear {
+            upstream_key_id: key.id.to_string(),
+        },
+    );
     Ok(())
 }
 

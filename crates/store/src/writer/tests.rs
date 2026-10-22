@@ -178,6 +178,16 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
     .await
     .expect("insert upstream_key");
 
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+         VALUES (?, ?, 'gpt-4o', '[\"chat\"]', 'active', 1000)",
+    )
+    .bind(upstream_key_id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert model_route");
+
     // 1. Enqueue DurableOp (ResponseLinkUpsert)
     writer.queues.durable_state.lock().insert(
         DurableKey::ResponseLink("resp-test-1".to_string()),
@@ -194,6 +204,53 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
             updated_at: 1_000,
             expires_at: 10_000,
         }),
+    );
+
+    // 1b. Enqueue a confirmed pin with a non-zero repin count.
+    writer.queues.durable_state.lock().insert(
+        DurableKey::Pin(
+            client_key_id.to_string(),
+            "sess-hash-test".to_string(),
+            model_pk.to_string(),
+        ),
+        DurableOp::PinUpsert {
+            client_key_id: client_key_id.to_string(),
+            session_hash: "sess-hash-test".to_string(),
+            model_pk: model_pk.to_string(),
+            upstream_key_id: upstream_key_id.to_string(),
+            pool_tier: 1,
+            created_at: 1_000,
+            last_used_at: 2_000,
+            expires_at: 10_000,
+            repin_count: 2,
+        },
+    );
+
+    // 1c. Enqueue route health and a protocol block.
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteHealth(upstream_key_id.to_string(), model_pk.to_string()),
+        DurableOp::RouteHealthUpdate {
+            upstream_key_id: upstream_key_id.to_string(),
+            model_pk: model_pk.to_string(),
+            route_health: "cooling_down".to_string(),
+            route_health_until: Some(5_000),
+            health_version: 7,
+            last_error: Some("upstream_5xx".to_string()),
+        },
+    );
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteProtocolBlock(
+            upstream_key_id.to_string(),
+            model_pk.to_string(),
+            "chat".to_string(),
+        ),
+        DurableOp::RouteProtocolBlockUpsert {
+            upstream_key_id: upstream_key_id.to_string(),
+            model_pk: model_pk.to_string(),
+            protocol: "chat".to_string(),
+            reason: "plan_restricted".to_string(),
+            until_ms: 9_000,
+        },
     );
 
     // 2. Enqueue UsageEventRecord and Rollup via usage_writer
@@ -260,4 +317,47 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
             .await
             .expect("count usage_events");
     assert_eq!(event_count, 1, "usage_events must be persisted in SQLite");
+
+    // 4. Pins, route health, and protocol blocks use the same durable queue.
+    let repin_count: i64 =
+        sqlx::query_scalar("SELECT repin_count FROM pins WHERE session_hash = 'sess-hash-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("persisted pin");
+    assert_eq!(repin_count, 2, "PinUpsert must persist repin_count");
+
+    let (route_health, until, version): (String, Option<i64>, i64) = sqlx::query_as(
+        "SELECT route_health, route_health_until, health_version
+           FROM model_routes WHERE upstream_key_id = ? AND model_pk = ?",
+    )
+    .bind(upstream_key_id.to_string())
+    .bind(model_pk.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("route health");
+    assert_eq!(route_health, "cooling_down");
+    assert_eq!(until, Some(5_000));
+    assert_eq!(version, 7);
+
+    let block_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_protocol_blocks")
+        .fetch_one(&pool)
+        .await
+        .expect("protocol block count");
+    assert_eq!(block_count, 1);
+
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteProtocolClear(upstream_key_id.to_string()),
+        DurableOp::RouteProtocolBlockClear {
+            upstream_key_id: upstream_key_id.to_string(),
+        },
+    );
+    flush_data_queues(&pool, &writer.queues).await;
+    let block_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_protocol_blocks")
+        .fetch_one(&pool)
+        .await
+        .expect("protocol block count after clear");
+    assert_eq!(
+        block_count, 0,
+        "a discovery refresh must clear persisted blocks"
+    );
 }

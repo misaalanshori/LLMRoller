@@ -34,7 +34,7 @@ use llmroller_core::health::StrikeResult;
 use llmroller_core::ids::{
     ClientKeyId, ModelPk, ProviderId, RequestId, ShareId, UpstreamKeyId, UserId,
 };
-use llmroller_core::pins::{PinKey, PinOutcome, PinTicket};
+use llmroller_core::pins::{PinEntry, PinKey, PinOutcome, PinTicket};
 use llmroller_core::pricing::{
     CostSource, PriceEntry, Rates, compute_request_cost, estimate_input_tokens,
 };
@@ -61,7 +61,7 @@ use llmroller_store::crypto::{SecretSealer as _, XChaCha20Poly1305Sealer};
 use llmroller_store::pins::ResponseLinkRow;
 use llmroller_store::traces::{SealJob, StoredTurnTraceV2};
 use llmroller_store::usage_writer::{UsageAttemptRecord, UsageEventRecord};
-use llmroller_store::writer::{DurableKey, DurableOp};
+use llmroller_store::writer::{DurableKey, DurableOp, WriterHandle};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -590,6 +590,91 @@ fn enqueue_response_link(
     );
 }
 
+/// Coalesced durable confirmation of a live session pin (RTE-10, REL-1).
+fn enqueue_pin_upsert(
+    state: &ProxyAuthState,
+    pin_key: &PinKey,
+    model_pk: ModelPk,
+    entry: &PinEntry,
+) {
+    let Some(writer) = &state.writer else {
+        return;
+    };
+    writer.queues.durable_state.lock().insert(
+        DurableKey::Pin(
+            pin_key.client_key_id.to_string(),
+            pin_key.session_hash.clone(),
+            model_pk.to_string(),
+        ),
+        DurableOp::PinUpsert {
+            client_key_id: pin_key.client_key_id.to_string(),
+            session_hash: pin_key.session_hash.clone(),
+            model_pk: model_pk.to_string(),
+            upstream_key_id: entry.upstream_key_id.to_string(),
+            pool_tier: entry.pool_tier as u8,
+            created_at: entry.created_ms,
+            last_used_at: entry.last_used_ms,
+            expires_at: entry.expires_ms,
+            repin_count: i64::from(entry.repin_count),
+        },
+    );
+}
+
+/// Coalesced durable key-health projection (REL-1).
+///
+/// The latest in-memory projection wins because the queue is keyed per upstream
+/// key; SQLite therefore never observes an out-of-order transition.
+fn enqueue_key_health(
+    writer: Option<&WriterHandle>,
+    runtime: &RuntimeState,
+    key_id: UpstreamKeyId,
+    now_ms: i64,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let entry = runtime.key_health_entry(key_id);
+    let (health, health_until) = llmroller_store::health::project_health(&entry, now_ms);
+    writer.queues.durable_state.lock().insert(
+        DurableKey::HealthVersion(key_id.to_string()),
+        DurableOp::HealthVersionUpdate {
+            upstream_key_id: key_id.to_string(),
+            health: health.to_string(),
+            health_until,
+            health_version: i64::try_from(runtime.health.current_version()).unwrap_or(i64::MAX),
+            last_error: entry.quarantine_reason.clone(),
+        },
+    );
+}
+
+/// Coalesced durable `PlanRestricted` protocol block (API-8, REL-1).
+fn enqueue_route_protocol_block(
+    state: &ProxyAuthState,
+    key_id: UpstreamKeyId,
+    model_pk: ModelPk,
+    protocol: &str,
+    reason: &str,
+    until_ms: i64,
+) {
+    let Some(writer) = &state.writer else {
+        return;
+    };
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteProtocolBlock(
+            key_id.to_string(),
+            model_pk.to_string(),
+            protocol.to_string(),
+        ),
+        DurableOp::RouteProtocolBlockUpsert {
+            upstream_key_id: key_id.to_string(),
+            model_pk: model_pk.to_string(),
+            protocol: protocol.to_string(),
+            reason: reason.to_string(),
+            until_ms,
+        },
+    );
+}
+
 /// Extract the upstream response id from a non-streaming `responses` payload.
 fn json_response_id(value: &serde_json::Value) -> Option<&str> {
     value.get("id").and_then(|id| id.as_str())
@@ -1095,6 +1180,7 @@ fn spawn_credential_probe(
     }
     let client = state.select_http_client(allow_private_network).clone();
     let runtime = Arc::clone(&state.runtime_state);
+    let writer = state.writer.clone();
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let authorization = format!("Bearer {secret}");
     tokio::spawn(async move {
@@ -1107,6 +1193,12 @@ fn spawn_credential_probe(
             .and_then(|response| credential_probe_verdict(response.status()));
         if let Some(probe_success) = verdict {
             runtime.record_credential_probe_result(key_id, probe_success);
+            enqueue_key_health(
+                writer.as_ref(),
+                &runtime,
+                key_id,
+                SystemClock::new().now_ms(),
+            );
         }
         runtime.finish_credential_probe(key_id);
     });
@@ -1744,10 +1836,12 @@ fn unseal_upstream_key(
     snapshot: &ConfigSnapshot,
     key: &UpstreamKeyRecord,
 ) -> Result<String, ()> {
+    let now_ms = SystemClock::new().now_ms();
     let Some(master_key) = state.master_key.clone() else {
         state
             .runtime_state
             .quarantine_key(key.id, "master_key_unavailable");
+        enqueue_key_health(state.writer.as_ref(), &state.runtime_state, key.id, now_ms);
         return Err(());
     };
     let sealer =
@@ -1764,11 +1858,13 @@ fn unseal_upstream_key(
             state
                 .runtime_state
                 .quarantine_key(key.id, "invalid_utf8_secret");
+            enqueue_key_health(state.writer.as_ref(), &state.runtime_state, key.id, now_ms);
         }),
         Err(_) => {
             state
                 .runtime_state
                 .quarantine_key(key.id, "aead_unseal_failed");
+            enqueue_key_health(state.writer.as_ref(), &state.runtime_state, key.id, now_ms);
             Err(())
         }
     }
@@ -3260,6 +3356,12 @@ pub async fn handle_inference_request(
                     None,
                     now,
                 );
+                enqueue_key_health(
+                    state.writer.as_ref(),
+                    &state.runtime_state,
+                    candidate.upstream_key_id,
+                    now,
+                );
                 attempts.push(attempt_record(
                     request_id,
                     attempt_no as i64,
@@ -3370,11 +3472,20 @@ pub async fn handle_inference_request(
                     );
                 }
                 ErrorClass::PlanRestricted => {
+                    let until = now.saturating_add(PROTOCOL_BLOCK_MS);
                     state.runtime_state.block_route_protocol(
                         candidate.upstream_key_id,
                         candidate.model_pk,
                         protocol,
-                        now.saturating_add(PROTOCOL_BLOCK_MS),
+                        until,
+                    );
+                    enqueue_route_protocol_block(
+                        &state,
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        "plan_restricted",
+                        until,
                     );
                     try_outcomes.push(TryOutcome::PlanRestricted);
                     attempts.push(attempt_record(
@@ -3393,6 +3504,12 @@ pub async fn handle_inference_request(
                     state.runtime_state.record_quota_exhausted(
                         candidate.upstream_key_id,
                         last_retry_after_ms,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
                         now,
                     );
                     try_outcomes.push(TryOutcome::QuotaExhausted { retry_after_secs });
@@ -3420,6 +3537,12 @@ pub async fn handle_inference_request(
                         caller.id,
                         outcome,
                         last_retry_after_ms,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
                         now,
                     );
                     if strike == Some(StrikeResult::ProbeRequired) {
@@ -3454,6 +3577,12 @@ pub async fn handle_inference_request(
                         last_retry_after_ms,
                         now,
                     );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
                     try_outcomes.push(TryOutcome::RateLimited { retry_after_secs });
                     attempts.push(attempt_record(
                         request_id,
@@ -3475,6 +3604,12 @@ pub async fn handle_inference_request(
                         caller.id,
                         outcome,
                         last_retry_after_ms,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
                         now,
                     );
                     try_outcomes.push(TryOutcome::HostFailure);
@@ -3577,6 +3712,12 @@ pub async fn handle_inference_request(
                         None,
                         now,
                     );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
                     let (charged_micro_usd, charge_basis) = failure_charge(
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
                         attempt_estimate,
@@ -3618,10 +3759,18 @@ pub async fn handle_inference_request(
                     Some(ttfb_ms as u64),
                     now,
                 );
-                if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket) {
-                    let _ = state
+                enqueue_key_health(
+                    state.writer.as_ref(),
+                    &state.runtime_state,
+                    candidate.upstream_key_id,
+                    now,
+                );
+                if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket)
+                    && let Some(entry) = state
                         .pin_store
-                        .first_valid_frame(pin_key, ticket, now, pin_ttl_ms);
+                        .first_valid_frame(pin_key, ticket, now, pin_ttl_ms)
+                {
+                    enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
                 }
                 drop(permit.take());
 
@@ -3934,10 +4083,18 @@ pub async fn handle_inference_request(
             None,
             now,
         );
-        if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket) {
-            let _ = state
+        enqueue_key_health(
+            state.writer.as_ref(),
+            &state.runtime_state,
+            candidate.upstream_key_id,
+            now,
+        );
+        if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket)
+            && let Some(entry) = state
                 .pin_store
-                .first_valid_frame(pin_key, ticket, now, pin_ttl_ms);
+                .first_valid_frame(pin_key, ticket, now, pin_ttl_ms)
+        {
+            enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
         }
         drop(permit.take());
 

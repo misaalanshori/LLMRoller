@@ -35,7 +35,7 @@ use llmroller_store::providers::{
     NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
 };
 use llmroller_store::settings::seed_defaults;
-use llmroller_store::writer::start_writer;
+use llmroller_store::writer::{WriterHandle, flush_data_queues, start_writer};
 
 #[derive(Clone, Debug)]
 struct RecordedRequest {
@@ -706,6 +706,18 @@ async fn build_wire_app_with_max_body(
     master_key: &MasterKey,
     max_body_mb: usize,
 ) -> Router {
+    build_wire_app_and_writer(pool, master_key, max_body_mb)
+        .await
+        .0
+}
+
+/// Builds the data-plane router and returns the writer handle so a test can
+/// drain the write-behind queues deterministically.
+async fn build_wire_app_and_writer(
+    pool: &sqlx::SqlitePool,
+    master_key: &MasterKey,
+    max_body_mb: usize,
+) -> (Router, WriterHandle) {
     let (reloader_tx, _reloader_rx) = tokio::sync::mpsc::channel(100);
     let (writer, _writer_task) = start_writer(pool.clone(), reloader_tx);
     let snapshot = load_initial_snapshot(pool).await.expect("load snapshot");
@@ -713,10 +725,10 @@ async fn build_wire_app_with_max_body(
     let mut proxy_auth_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![])
         .with_master_key(master_key.clone());
     proxy_auth_state.is_ready.store(true, Ordering::SeqCst);
-    proxy_auth_state.writer = Some(writer);
+    proxy_auth_state.writer = Some(writer.clone());
     proxy_auth_state.session_hmac_secret = Some(secret_bytes(vec![0x5A; 32]));
     proxy_auth_state.budget_semaphore = Arc::new(PreflightBudgetSemaphore::new(819, max_body_mb));
-    data_plane_router(proxy_auth_state)
+    (data_plane_router(proxy_auth_state), writer)
 }
 
 #[tokio::test]
@@ -1512,7 +1524,7 @@ async fn test_plan_restricted_blocks_route_until_next_discovery() {
         "{}",
     )
     .await;
-    let app = build_wire_app(&pool, &master_key).await;
+    let (app, writer) = build_wire_app_and_writer(&pool, &master_key, 32).await;
 
     let first = app
         .clone()
@@ -1525,6 +1537,18 @@ async fn test_plan_restricted_blocks_route_until_next_discovery() {
         2,
         "PlanRestricted must fail over to the next candidate"
     );
+    flush_data_queues(&pool, &writer.queues).await;
+    let (protocol, reason): (String, String) = sqlx::query_as(
+        "SELECT b.protocol, b.reason
+         FROM route_protocol_blocks b
+         JOIN upstream_keys k ON b.upstream_key_id = k.id
+         WHERE k.label = 'Mock Error Key sk-plan'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("PlanRestricted must persist a durable protocol block");
+    assert_eq!(protocol, "chat");
+    assert!(!reason.is_empty());
 
     let second = app.oneshot(chat_request(&token)).await.expect("response");
     assert_eq!(second.status(), StatusCode::OK);
@@ -1649,6 +1673,150 @@ async fn test_body_session_fields_pin_across_distinct_openings() {
     assert_eq!(
         authorizations[2], authorizations[3],
         "metadata.session_id must pin distinct openings to one upstream key"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: RTE-10, REL-1 - a confirmed session pin is written behind the durable queue"]
+async fn test_confirmed_pin_is_persisted_without_manual_sql() {
+    let (mock_addr, _mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_pin_persist.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF4; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-pin-persist", 100)],
+        "{}",
+    )
+    .await;
+    let (app, writer) = build_wire_app_and_writer(&pool, &master_key, 32).await;
+
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-session-id", "durable-session-1")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .expect("request")
+    };
+
+    let response = app.clone().oneshot(request()).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush_data_queues(&pool, &writer.queues).await;
+
+    let (session_hash, repin_count, canonical_id, key_label): (String, i64, String, String) =
+        sqlx::query_as(
+            "SELECT p.session_hash, p.repin_count, m.canonical_id, k.label
+             FROM pins p
+             JOIN models m ON p.model_pk = m.model_pk
+             JOIN upstream_keys k ON p.upstream_key_id = k.id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the confirmed pin must be persisted by the writer");
+    assert!(
+        !session_hash.is_empty(),
+        "the persisted pin must carry the tenant-salted session hash"
+    );
+    assert_eq!(repin_count, 0);
+    assert_eq!(canonical_id, "gpt-4o");
+    assert_eq!(key_label, "Mock Error Key sk-pin-persist");
+
+    let first_last_used: i64 =
+        sqlx::query_scalar("SELECT last_used_at FROM pins WHERE session_hash = ?")
+            .bind(&session_hash)
+            .fetch_one(&pool)
+            .await
+            .expect("last_used_at");
+
+    let response = app.oneshot(request()).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush_data_queues(&pool, &writer.queues).await;
+
+    let pin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pins")
+        .fetch_one(&pool)
+        .await
+        .expect("pin count");
+    assert_eq!(
+        pin_count, 1,
+        "the follow-up turn must upsert, not duplicate"
+    );
+    let second_last_used: i64 =
+        sqlx::query_scalar("SELECT last_used_at FROM pins WHERE session_hash = ?")
+            .bind(&session_hash)
+            .fetch_one(&pool)
+            .await
+            .expect("last_used_at");
+    assert!(
+        second_last_used >= first_last_used,
+        "a followed pin must refresh last_used_at"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: REL-1 - key health transitions are written behind the durable queue"]
+async fn test_key_health_transition_is_persisted() {
+    let (mock_addr, _mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_health_persist.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xF5; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-health-persist", 100)],
+        "{}",
+    )
+    .await;
+    let (app, writer) = build_wire_app_and_writer(&pool, &master_key, 32).await;
+
+    let response = app
+        .clone()
+        .oneshot(chat_request(&token))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush_data_queues(&pool, &writer.queues).await;
+    let health: String = sqlx::query_scalar(
+        "SELECT health FROM upstream_keys WHERE label = 'Mock Error Key sk-health-persist'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("health row");
+    assert_eq!(health, "healthy");
+
+    let response = app
+        .oneshot(chat_request_with_header(&token, "x-fail-429", "1"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    flush_data_queues(&pool, &writer.queues).await;
+
+    let (health, health_until): (String, Option<i64>) = sqlx::query_as(
+        "SELECT health, health_until FROM upstream_keys WHERE label = 'Mock Error Key sk-health-persist'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("health row");
+    assert_eq!(
+        health, "cooling_down",
+        "a 429 cooldown must be persisted before shutdown"
+    );
+    assert!(
+        health_until.is_some(),
+        "a persisted cooldown must carry its retry deadline"
     );
 }
 

@@ -5,9 +5,18 @@
 //! Spec: ./docs/srdd/5. SRDD - System Architecture.md#553-ordered-graceful-shutdown-sigterm--sigint-and-job-supervision
 //! Requirements: REL-1, RTE-7.
 
-use llmroller_core::ids::UpstreamKeyId;
+use llmroller_core::ids::{ModelPk, UpstreamKeyId};
 use llmroller_core::runtime_state::KeyHealthEntry;
 use sqlx::SqlitePool;
+
+/// One unexpired `PlanRestricted` protocol block loaded at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRouteProtocolBlock {
+    pub upstream_key_id: UpstreamKeyId,
+    pub model_pk: ModelPk,
+    pub protocol: String,
+    pub until_ms: i64,
+}
 
 /// Persist the in-memory health projection for the supplied keys.
 ///
@@ -39,6 +48,37 @@ pub async fn persist_key_health(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Load unexpired `PlanRestricted` protocol blocks for startup preload.
+pub async fn load_active_route_protocol_blocks(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> Result<Vec<ActiveRouteProtocolBlock>, sqlx::Error> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT upstream_key_id, model_pk, protocol, until_ms
+           FROM route_protocol_blocks
+          WHERE until_ms > ?",
+    )
+    .bind(now_ms)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (key, model, protocol, until_ms) in rows {
+        let (Ok(upstream_key_id), Ok(model_pk)) =
+            (UpstreamKeyId::parse(&key), ModelPk::parse(&model))
+        else {
+            continue;
+        };
+        out.push(ActiveRouteProtocolBlock {
+            upstream_key_id,
+            model_pk,
+            protocol,
+            until_ms,
+        });
+    }
+    Ok(out)
 }
 
 /// Project a live health entry onto the schema's four-state health column.

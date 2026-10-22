@@ -106,7 +106,10 @@ fn test_pin_store_concurrency_loser_adoption_and_recovery_repin() {
                 )
                 .expect("ticket");
 
-            if st.first_valid_frame(&pk, &ticket, clk.now_ms(), 86_400_000) {
+            if st
+                .first_valid_frame(&pk, &ticket, clk.now_ms(), 86_400_000)
+                .is_some()
+            {
                 cc.fetch_add(1, Ordering::SeqCst);
             }
         }));
@@ -199,7 +202,7 @@ fn test_pin_store_concurrency_loser_adoption_and_recovery_repin() {
     // Stale confirm from ticket_move (k1)
     let stale_confirmed =
         store.first_valid_frame(&pin_key, &ticket_move, clock.now_ms(), 86_400_000);
-    assert!(!stale_confirmed);
+    assert!(stale_confirmed.is_none());
 
     // Add a pin on k1 to verify that invalidating k2 purges only k2 pins
     let pin_key_k1 = PinKey {
