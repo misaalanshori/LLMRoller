@@ -7,6 +7,7 @@
 
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
+use llmroller_core::provider::StripHeaderTokens;
 use llmroller_core::rbac::PoolTier;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -122,7 +123,7 @@ pub fn apply_request_header_pipeline(
     tier: PoolTier,
     auth_header: Option<(&str, &str)>,
     strip_headers: &[String],
-    strip_header_tokens: &[String],
+    strip_header_tokens: &StripHeaderTokens,
 ) -> Result<HeaderMap, HeaderPipelineError> {
     validate_request_smuggling(inbound)?;
 
@@ -173,14 +174,16 @@ pub fn apply_request_header_pipeline(
             continue;
         }
 
-        // Strip individual comma-separated tokens from matching headers
+        // Strip individual comma-separated tokens configured for this header
         if !strip_header_tokens.is_empty()
+            && let Some(configured_tokens) = strip_header_tokens.for_header(&name_lower)
+            && !configured_tokens.is_empty()
             && let Ok(val_str) = val.to_str()
         {
             let mut remaining_tokens = Vec::new();
             for token in val_str.split(',') {
                 let token_trimmed = token.trim();
-                if !strip_header_tokens
+                if !configured_tokens
                     .iter()
                     .any(|t| t.eq_ignore_ascii_case(token_trimmed))
                 {

@@ -131,6 +131,7 @@ mod tests {
         let profile = SessionProfile {
             headers: vec!["x-opencode-session".to_string()],
             body_field: None,
+            max_len: 256,
         };
 
         // 1. Own tier: client session header preserved, profile written only if absent

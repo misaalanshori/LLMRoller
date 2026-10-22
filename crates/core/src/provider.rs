@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Supported provider kinds matching the SQLite schema CHECK constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,26 +107,88 @@ impl ProviderPaths {
     }
 }
 
+/// Auxiliary endpoint support mode from SRDD Section 9.3.1.
+///
+/// Legacy configuration files used booleans; `true` maps to [`Self::Supported`]
+/// and `false` maps to [`Self::Unsupported`] during deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuxEndpointMode {
+    #[default]
+    Probe,
+    Supported,
+    Unsupported,
+}
+
+impl<'de> Deserialize<'de> for AuxEndpointMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Name(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(Self::Supported),
+            Repr::Bool(false) => Ok(Self::Unsupported),
+            Repr::Name(name) => match name.as_str() {
+                "probe" => Ok(Self::Probe),
+                "supported" => Ok(Self::Supported),
+                "unsupported" => Ok(Self::Unsupported),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["probe", "supported", "unsupported"],
+                )),
+            },
+        }
+    }
+}
+
 /// Optional auxiliary capability overrides (`PRV-3`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderAuxEndpoints {
     #[serde(default)]
-    pub count_tokens: Option<bool>,
+    pub count_tokens: Option<AuxEndpointMode>,
     #[serde(default)]
-    pub responses_compact: Option<bool>,
+    pub responses_compact: Option<AuxEndpointMode>,
+}
+
+/// Default maximum byte length of an outbound session affinity value.
+pub const DEFAULT_SESSION_MAX_LEN: usize = 256;
+
+const fn default_session_max_len() -> usize {
+    DEFAULT_SESSION_MAX_LEN
 }
 
 /// Outbound provider session hint profile (SRDD Section 11.2).
 ///
 /// `headers` are written with the resolved affinity token, and `body_field` is
 /// inserted into the surgical JSON body when the endpoint supports it. Missing
-/// configuration falls back to the adapter preset default.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// configuration falls back to the adapter preset default. The canonical
+/// Section 9.3.1 names (`headers_if_absent` / `body_field_if_absent`) are
+/// accepted as aliases for the legacy names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProfile {
-    #[serde(default)]
+    #[serde(default, alias = "headers_if_absent")]
     pub headers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "body_field_if_absent")]
     pub body_field: Option<String>,
+    #[serde(default = "default_session_max_len")]
+    pub max_len: usize,
+}
+
+impl Default for SessionProfile {
+    fn default() -> Self {
+        Self {
+            headers: Vec::new(),
+            body_field: None,
+            max_len: DEFAULT_SESSION_MAX_LEN,
+        }
+    }
 }
 
 /// Header name and value prefix used to inject an upstream credential.
@@ -137,27 +199,79 @@ pub struct ProviderAuthScheme {
     pub prefix: String,
 }
 
+/// Shorthand credential schemes accepted by SRDD Section 9.3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthShorthand {
+    Bearer,
+    XApiKey,
+    XApiKeyOrBearer,
+}
+
+/// Per-protocol credential configuration: either a canonical shorthand string
+/// or an explicit `{header, prefix}` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProtocolAuthConfig {
+    Shorthand(AuthShorthand),
+    Explicit(ProviderAuthScheme),
+}
+
+impl ProtocolAuthConfig {
+    /// Resolve this configuration to a concrete header and value prefix.
+    ///
+    /// `x_api_key_or_bearer` prefers the native Anthropic `x-api-key` header for
+    /// Messages endpoints and OpenAI-compatible Bearer auth elsewhere.
+    #[must_use]
+    pub fn resolve(&self, endpoint: ProviderEndpoint) -> ProviderAuthScheme {
+        match self {
+            Self::Explicit(scheme) => scheme.clone(),
+            Self::Shorthand(AuthShorthand::Bearer) => ProviderAuthScheme {
+                header: "authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            },
+            Self::Shorthand(AuthShorthand::XApiKey) => ProviderAuthScheme {
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
+            },
+            Self::Shorthand(AuthShorthand::XApiKeyOrBearer) => {
+                if endpoint == ProviderEndpoint::Messages {
+                    ProviderAuthScheme {
+                        header: "x-api-key".to_string(),
+                        prefix: String::new(),
+                    }
+                } else {
+                    ProviderAuthScheme {
+                        header: "authorization".to_string(),
+                        prefix: "Bearer ".to_string(),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Per-protocol credential injection schemes (`PRV-3`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderAuth {
     #[serde(default)]
-    pub default: Option<ProviderAuthScheme>,
+    pub default: Option<ProtocolAuthConfig>,
     #[serde(default)]
-    pub chat: Option<ProviderAuthScheme>,
+    pub chat: Option<ProtocolAuthConfig>,
     #[serde(default)]
-    pub responses: Option<ProviderAuthScheme>,
+    pub responses: Option<ProtocolAuthConfig>,
     #[serde(default)]
-    pub messages: Option<ProviderAuthScheme>,
+    pub messages: Option<ProtocolAuthConfig>,
     #[serde(default)]
-    pub models: Option<ProviderAuthScheme>,
+    pub models: Option<ProtocolAuthConfig>,
     #[serde(default)]
-    pub usage: Option<ProviderAuthScheme>,
+    pub usage: Option<ProtocolAuthConfig>,
 }
 
 impl ProviderAuth {
     /// Resolve the configured scheme for an endpoint, falling back to `auth.default`.
     #[must_use]
-    pub fn for_endpoint(&self, endpoint: ProviderEndpoint) -> Option<&ProviderAuthScheme> {
+    pub fn for_endpoint(&self, endpoint: ProviderEndpoint) -> Option<ProviderAuthScheme> {
         let specific = match endpoint {
             ProviderEndpoint::Chat => self.chat.as_ref(),
             ProviderEndpoint::Responses => self.responses.as_ref(),
@@ -165,7 +279,66 @@ impl ProviderAuth {
             ProviderEndpoint::Models => self.models.as_ref(),
             ProviderEndpoint::Usage => self.usage.as_ref(),
         };
-        specific.or(self.default.as_ref())
+        specific
+            .or(self.default.as_ref())
+            .map(|config| config.resolve(endpoint))
+    }
+}
+
+/// Per-header comma-separated token stripping rules (`API-3`, `TRN-1`).
+///
+/// The canonical SRDD Section 9.3.1 shape is a map from lowercase header name
+/// to the tokens removed from that header. Legacy configuration stored a flat
+/// list, which continues to apply to the beta headers (`anthropic-beta` and
+/// `openai-beta`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct StripHeaderTokens(BTreeMap<String, Vec<String>>);
+
+impl StripHeaderTokens {
+    /// Tokens configured for a header name, matched case-insensitively.
+    #[must_use]
+    pub fn for_header(&self, header_name: &str) -> Option<&[String]> {
+        self.0
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(header_name))
+            .map(|(_, tokens)| tokens.as_slice())
+    }
+
+    /// Whether any header has token-stripping rules.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<String>> for StripHeaderTokens {
+    fn from(tokens: Vec<String>) -> Self {
+        let mut map = BTreeMap::new();
+        if !tokens.is_empty() {
+            map.insert("anthropic-beta".to_string(), tokens.clone());
+            map.insert("openai-beta".to_string(), tokens);
+        }
+        Self(map)
+    }
+}
+
+impl<'de> Deserialize<'de> for StripHeaderTokens {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            PerHeader(BTreeMap<String, Vec<String>>),
+            Legacy(Vec<String>),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::PerHeader(map) => Self(map),
+            Repr::Legacy(tokens) => Self::from(tokens),
+        })
     }
 }
 
@@ -183,6 +356,17 @@ pub enum ChatStreamSetting {
 pub struct UsageReporting {
     #[serde(default)]
     pub chat_stream: Option<ChatStreamSetting>,
+}
+
+/// Provider `/usage` profile from SRDD Section 9.3.1 (`PRV-3`, `USG-4`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UsageProfile {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub parser_kind: Option<String>,
 }
 
 /// User-Agent policy configured per provider (`API-3`).
@@ -209,6 +393,8 @@ pub struct ErrorClassifiers {
     pub plan_restricted_substrings: Vec<String>,
     #[serde(default)]
     pub credential_invalid_substrings: Vec<String>,
+    #[serde(default)]
+    pub model_not_found_substrings: Vec<String>,
 }
 
 impl ErrorClassifiers {
@@ -231,25 +417,50 @@ impl ErrorClassifiers {
     }
 }
 
-/// Per-provider timeout overrides (SRDD Section 10, `stream_idle_timeout_ms`).
+/// Per-provider timeout overrides (SRDD Section 9.3.1 and Section 10).
 ///
-/// A missing or non-positive value falls back to the 300,000 ms default.
+/// A missing or non-positive `stream_idle_timeout_ms` falls back to the
+/// 300,000 ms default. The remaining fields mirror the canonical schema and
+/// are consumed by the failover and pre-first-frame timeout paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderTimeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_idle_timeout_ms: Option<i64>,
+    #[serde(default)]
+    pub timeout_failover: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_activity_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_valid_frame_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonstream_response_timeout_ms: Option<i64>,
 }
 
 /// Default gap allowed between bytes after the first valid streaming frame.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: i64 = 300_000;
+
+/// Current canonical `providers.config_json` schema version.
+pub const PROVIDER_CONFIG_SCHEMA_VERSION: u32 = 1;
+
+const fn default_schema_version() -> u32 {
+    PROVIDER_CONFIG_SCHEMA_VERSION
+}
+
+const fn default_inherit_preset_defaults() -> bool {
+    true
+}
 
 /// Parsed `providers.config_json` projection used by the data plane (`PRV-3`).
 ///
 /// Unknown keys are preserved by the database but ignored here so older or newer
 /// control-plane versions can coexist. Missing values fall back to the adapter
 /// preset default at the call site.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default = "default_inherit_preset_defaults")]
+    pub inherit_preset_defaults: bool,
     #[serde(default)]
     pub paths: ProviderPaths,
     #[serde(default)]
@@ -261,7 +472,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub strip_headers: Vec<String>,
     #[serde(default)]
-    pub strip_header_tokens: Vec<String>,
+    pub strip_header_tokens: StripHeaderTokens,
     #[serde(default)]
     pub add_headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -271,16 +482,49 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub session_profile: Option<SessionProfile>,
     #[serde(default)]
+    pub usage_profile: Option<UsageProfile>,
+    #[serde(default)]
     pub error_classifiers: ErrorClassifiers,
     #[serde(default)]
     pub timeouts: ProviderTimeouts,
 }
 
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: PROVIDER_CONFIG_SCHEMA_VERSION,
+            inherit_preset_defaults: true,
+            paths: ProviderPaths::default(),
+            aux_endpoints: ProviderAuxEndpoints::default(),
+            auth: ProviderAuth::default(),
+            usage_reporting: UsageReporting::default(),
+            strip_headers: Vec::new(),
+            strip_header_tokens: StripHeaderTokens::default(),
+            add_headers: BTreeMap::new(),
+            response_header_allow: Vec::new(),
+            ua_policy: None,
+            session_profile: None,
+            usage_profile: None,
+            error_classifiers: ErrorClassifiers::default(),
+            timeouts: ProviderTimeouts::default(),
+        }
+    }
+}
+
 impl ProviderConfig {
     /// Parse a provider configuration document, defaulting to an empty profile.
+    ///
+    /// Database rows written by older versions or by hand may be corrupt or
+    /// schema-incompatible. Snapshot loading must stay fail-open; control-plane
+    /// write boundaries use [`Self::try_from_json`] to reject bad documents.
     #[must_use]
     pub fn from_json(config_json: &str) -> Self {
-        serde_json::from_str(config_json).unwrap_or_default()
+        Self::try_from_json(config_json).unwrap_or_default()
+    }
+
+    /// Parse a provider configuration document, reporting deserialization errors.
+    pub fn try_from_json(config_json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(config_json)
     }
 
     /// Effective post-first-frame SSE idle timeout in milliseconds.
@@ -308,6 +552,7 @@ mod tests {
             Some(SessionProfile {
                 headers: vec!["x-session-id".to_string()],
                 body_field: Some("session_id".to_string()),
+                max_len: DEFAULT_SESSION_MAX_LEN,
             })
         );
 
@@ -343,6 +588,208 @@ mod tests {
                 .stream_idle_timeout_ms(),
             300_000,
             "non-positive overrides must not disable the timeout"
+        );
+    }
+
+    /// Verbatim `providers.config_json` document from SRDD Section 9.3.1.
+    const SRDD_9_3_1_CONFIG: &str = r#"{
+      "schema_version": 1,
+      "inherit_preset_defaults": true,
+      "paths": {
+        "chat": "/chat/completions",
+        "responses": "/responses",
+        "messages": "/messages",
+        "models": "/models"
+      },
+      "aux_endpoints": {
+        "count_tokens": "probe",
+        "responses_compact": "probe"
+      },
+      "auth": {
+        "chat": "bearer",
+        "responses": "bearer",
+        "messages": "x_api_key_or_bearer"
+      },
+      "usage_reporting": {
+        "chat_stream": "inject"
+      },
+      "strip_headers": ["x-experimental-*"],
+      "strip_header_tokens": {
+        "anthropic-beta": []
+      },
+      "add_headers": {},
+      "response_header_allow": [],
+      "ua_policy": "label",
+      "session_profile": {
+        "headers_if_absent": ["x-opencode-session"],
+        "body_field_if_absent": null,
+        "max_len": 256
+      },
+      "usage_profile": {
+        "enabled": true,
+        "endpoints": ["https://opencode.ai/zen/go/v1/usage"],
+        "parser_kind": "opencode_go"
+      },
+      "timeouts": {
+        "timeout_failover": false,
+        "first_activity_timeout_ms": 60000,
+        "first_valid_frame_timeout_ms": 180000,
+        "nonstream_response_timeout_ms": 600000
+      },
+      "error_classifiers": {
+        "quota_exhausted_substrings": ["quota_exceeded", "window_limit_reached", "insufficient_credits"],
+        "request_rejected_substrings": ["flagged", "moderation"],
+        "plan_restricted_substrings": ["upgrade_required", "not available on your plan"],
+        "credential_invalid_substrings": ["invalid_api_key", "invalid x-api-key", "unauthorized"],
+        "model_not_found_substrings": ["model_not_found", "does not exist", "unknown model"]
+      }
+    }"#;
+
+    #[doc = "Spec: PRV-3, API-2, API-3, RTE-1, RTE-9, TRN-1 - canonical SRDD Section 9.3.1 JSON parses without silent wipeout"]
+    #[test]
+    fn provider_config_parses_srdd_9_3_1_canonical_document() {
+        let config = ProviderConfig::try_from_json(SRDD_9_3_1_CONFIG)
+            .expect("canonical SRDD provider config must deserialize");
+
+        assert_eq!(config.schema_version, 1);
+        assert!(config.inherit_preset_defaults);
+        assert_eq!(config.paths.chat.as_deref(), Some("/chat/completions"));
+        assert_eq!(config.paths.responses.as_deref(), Some("/responses"));
+        assert_eq!(config.paths.messages.as_deref(), Some("/messages"));
+        assert_eq!(config.paths.models.as_deref(), Some("/models"));
+        assert_eq!(
+            config.aux_endpoints.count_tokens,
+            Some(AuxEndpointMode::Probe)
+        );
+        assert_eq!(
+            config.aux_endpoints.responses_compact,
+            Some(AuxEndpointMode::Probe)
+        );
+
+        let chat_auth = config
+            .auth
+            .for_endpoint(ProviderEndpoint::Chat)
+            .expect("chat auth");
+        assert_eq!(chat_auth.header, "authorization");
+        assert_eq!(chat_auth.prefix, "Bearer ");
+        let messages_auth = config
+            .auth
+            .for_endpoint(ProviderEndpoint::Messages)
+            .expect("messages auth");
+        assert_eq!(messages_auth.header, "x-api-key");
+        assert_eq!(messages_auth.prefix, "");
+
+        assert_eq!(
+            config.usage_reporting.chat_stream,
+            Some(ChatStreamSetting::Inject)
+        );
+        assert_eq!(config.strip_headers, vec!["x-experimental-*".to_string()]);
+        assert_eq!(
+            config
+                .strip_header_tokens
+                .for_header("anthropic-beta")
+                .map(<[String]>::len),
+            Some(0)
+        );
+        assert_eq!(config.ua_policy, Some(UaPolicySetting::Label));
+
+        let session = config.session_profile.as_ref().expect("session profile");
+        assert_eq!(session.headers, vec!["x-opencode-session".to_string()]);
+        assert_eq!(session.body_field, None);
+        assert_eq!(session.max_len, 256);
+
+        let usage = config.usage_profile.as_ref().expect("usage profile");
+        assert!(usage.enabled);
+        assert_eq!(
+            usage.endpoints,
+            vec!["https://opencode.ai/zen/go/v1/usage".to_string()]
+        );
+        assert_eq!(usage.parser_kind.as_deref(), Some("opencode_go"));
+
+        assert!(!config.timeouts.timeout_failover);
+        assert_eq!(config.timeouts.first_activity_timeout_ms, Some(60_000));
+        assert_eq!(config.timeouts.first_valid_frame_timeout_ms, Some(180_000));
+        assert_eq!(config.timeouts.nonstream_response_timeout_ms, Some(600_000));
+        assert_eq!(config.stream_idle_timeout_ms(), 300_000);
+
+        let classifiers = &config.error_classifiers;
+        assert_eq!(
+            classifiers.quota_exhausted_substrings,
+            vec![
+                "quota_exceeded",
+                "window_limit_reached",
+                "insufficient_credits"
+            ]
+        );
+        assert_eq!(
+            classifiers.request_rejected_substrings,
+            vec!["flagged", "moderation"]
+        );
+        assert_eq!(
+            classifiers.plan_restricted_substrings,
+            vec!["upgrade_required", "not available on your plan"]
+        );
+        assert_eq!(
+            classifiers.credential_invalid_substrings,
+            vec!["invalid_api_key", "invalid x-api-key", "unauthorized"]
+        );
+        assert_eq!(
+            classifiers.model_not_found_substrings,
+            vec!["model_not_found", "does not exist", "unknown model"]
+        );
+    }
+
+    #[doc = "Spec: PRV-3, API-3 - legacy boolean aux modes, explicit auth objects, flat token list, and session aliases remain accepted"]
+    #[test]
+    fn provider_config_accepts_legacy_shapes() {
+        let config = ProviderConfig::try_from_json(
+            r#"{
+                "aux_endpoints": {"count_tokens": true, "responses_compact": false},
+                "auth": {"chat": {"header": "x-goog-api-key", "prefix": ""}},
+                "strip_header_tokens": ["legacy-beta"],
+                "session_profile": {"headers": ["x-session-id"], "body_field": "session_id"}
+            }"#,
+        )
+        .expect("legacy config must deserialize");
+
+        assert_eq!(
+            config.aux_endpoints.count_tokens,
+            Some(AuxEndpointMode::Supported)
+        );
+        assert_eq!(
+            config.aux_endpoints.responses_compact,
+            Some(AuxEndpointMode::Unsupported)
+        );
+        let chat_auth = config
+            .auth
+            .for_endpoint(ProviderEndpoint::Chat)
+            .expect("chat auth");
+        assert_eq!(chat_auth.header, "x-goog-api-key");
+        assert_eq!(chat_auth.prefix, "");
+        assert_eq!(
+            config.strip_header_tokens.for_header("anthropic-beta"),
+            Some(["legacy-beta".to_string()].as_slice())
+        );
+        assert_eq!(
+            config.strip_header_tokens.for_header("openai-beta"),
+            Some(["legacy-beta".to_string()].as_slice())
+        );
+        let session = config.session_profile.as_ref().expect("session profile");
+        assert_eq!(session.max_len, DEFAULT_SESSION_MAX_LEN);
+    }
+
+    #[doc = "Spec: PRV-3, API-2 - invalid config_json is reported at write boundaries but tolerated on read"]
+    #[test]
+    fn provider_config_try_from_json_reports_errors() {
+        let invalid = r#"{"auth":{"chat":"carrier_pigeon"}}"#;
+        assert!(
+            ProviderConfig::try_from_json(invalid).is_err(),
+            "unknown auth shorthand must be rejected"
+        );
+        assert_eq!(
+            ProviderConfig::from_json(invalid),
+            ProviderConfig::default(),
+            "read-side parsing stays fail-open"
         );
     }
 }

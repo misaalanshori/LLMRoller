@@ -651,6 +651,79 @@ async fn test_json_crud_endpoints_via_control_plane_router() {
         .expect("str")
         .to_string();
 
+    // 2b. POST /api/user/providers with malformed config_json -> 422 at the
+    // write boundary instead of persisting a document that silently wipes the
+    // provider configuration (PRV-3, API-2).
+    let bad_config_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/providers")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "json_bad_config_prov",
+                "kind": "custom",
+                "base_url": "https://custom.api/v1",
+                "config_json": "{\"auth\":{\"chat\":\"carrier_pigeon\"}}",
+            })
+            .to_string(),
+        ))
+        .expect("bad config req");
+    let bad_config_res = app.clone().oneshot(bad_config_req).await.expect("res");
+    assert_eq!(bad_config_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 2c. Canonical SRDD Section 9.3.1 string enums and per-header token maps
+    // are accepted at the same boundary.
+    let canonical_config = serde_json::json!({
+        "schema_version": 1,
+        "inherit_preset_defaults": true,
+        "aux_endpoints": {"count_tokens": "probe", "responses_compact": "unsupported"},
+        "auth": {"chat": "bearer", "messages": "x_api_key_or_bearer"},
+        "strip_header_tokens": {"anthropic-beta": ["unsupported-beta"]},
+        "usage_profile": {
+            "enabled": true,
+            "endpoints": ["https://custom.api/v1/usage"],
+            "parser_kind": "opencode_go"
+        },
+        "error_classifiers": {"model_not_found_substrings": ["does not exist"]}
+    });
+    let canonical_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/providers")
+        .header(header::COOKIE, &session_cookie)
+        .header("x-csrf-token", &session_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "json_canonical_config_prov",
+                "kind": "custom",
+                "base_url": "https://custom.api/v1",
+                "config_json": canonical_config.to_string(),
+            })
+            .to_string(),
+        ))
+        .expect("canonical config req");
+    let canonical_res = app.clone().oneshot(canonical_req).await.expect("res");
+    assert_eq!(canonical_res.status(), StatusCode::CREATED);
+    let canonical_bytes = canonical_res
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    let canonical_json: serde_json::Value =
+        serde_json::from_slice(&canonical_bytes).expect("parse canonical json");
+    let stored: serde_json::Value =
+        serde_json::from_str(canonical_json["config_json"].as_str().expect("config_json"))
+            .expect("stored config_json");
+    assert_eq!(stored["auth"]["chat"], "bearer");
+    assert_eq!(
+        stored["strip_header_tokens"]["anthropic-beta"][0],
+        "unsupported-beta"
+    );
+    assert_eq!(stored["aux_endpoints"]["count_tokens"], "probe");
+
     // 3. POST /api/user/providers -> create personal provider via JSON API
     let create_prov_req = Request::builder()
         .method("POST")

@@ -105,9 +105,11 @@ pub fn discovery_endpoint(kind: ProviderKind, base_url: &str, config: &ProviderC
 #[must_use]
 pub fn discovery_headers(config: &ProviderConfig, secret: &str) -> http::HeaderMap {
     let scheme = config.auth.for_endpoint(ProviderEndpoint::Models);
-    let (auth_header, auth_prefix) = scheme.map_or(("authorization", "Bearer "), |scheme| {
-        (scheme.header.as_str(), scheme.prefix.as_str())
-    });
+    let (auth_header, auth_prefix) = scheme
+        .as_ref()
+        .map_or(("authorization", "Bearer "), |scheme| {
+            (scheme.header.as_str(), scheme.prefix.as_str())
+        });
 
     let mut headers = http::HeaderMap::new();
     headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));

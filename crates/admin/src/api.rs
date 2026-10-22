@@ -15,7 +15,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use llmroller_core::chat_preview::escape_html;
 use llmroller_core::ids::{ClientKeyId, ProviderId, UpstreamKeyId, UserId};
-use llmroller_core::provider::ProviderKind;
+use llmroller_core::provider::{ProviderConfig, ProviderKind};
 use llmroller_core::rbac::{ActorScope, OwnershipScope};
 use llmroller_core::seams::secret_string;
 use llmroller_core::snapshot::ConfigDomain;
@@ -478,6 +478,28 @@ fn default_config_json() -> String {
     "{}".to_owned()
 }
 
+/// Reject provider configuration documents that cannot be deserialized.
+///
+/// Snapshot loading stays fail-open for legacy or hand-edited rows, but the
+/// control plane must not persist a document that would silently wipe the
+/// provider's routing configuration (`PRV-3`, `API-2`).
+fn validate_provider_config_json(
+    config_json: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    ProviderConfig::try_from_json(config_json)
+        .map(|_| ())
+        .map_err(|error| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("invalid provider config_json: {error}"),
+                    }
+                })),
+            )
+        })
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -548,6 +570,7 @@ async fn post_user_provider(
     Json(payload): Json<CreateProviderRequest>,
 ) -> Result<(StatusCode, Json<Provider>), (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, true).await?;
+    validate_provider_config_json(&payload.config_json)?;
     let owner_user_id = actor.user_id();
 
     let new_provider = NewProvider {
@@ -588,6 +611,9 @@ async fn patch_user_provider_handler(
     Json(payload): Json<PatchProviderRequest>,
 ) -> Result<Json<Provider>, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, true).await?;
+    if let Some(config_json) = &payload.config_json {
+        validate_provider_config_json(config_json)?;
+    }
     let patch = ProviderPatch {
         name: payload.name,
         base_url: payload.base_url,
@@ -824,6 +850,7 @@ async fn post_admin_provider(
     Json(payload): Json<CreateProviderRequest>,
 ) -> Result<(StatusCode, Json<Provider>), (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_admin(&state, &headers, true).await?;
+    validate_provider_config_json(&payload.config_json)?;
     let new_provider = NewProvider {
         name: payload.name,
         kind: payload.kind,

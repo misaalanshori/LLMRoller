@@ -336,6 +336,29 @@ pub fn edit_body(
     chat_stream_mode: ChatStreamMode,
     session_field: Option<(&str, &str)>,
 ) -> Result<(Bytes, bool), BodyEditError> {
+    edit_body_with_session_limit(
+        original,
+        tier,
+        target_model,
+        chat_stream_mode,
+        session_field,
+        256,
+    )
+}
+
+/// Surgical JSON body edits with an explicit session affinity value limit.
+///
+/// `session_max_len` is the provider's `session_profile.max_len` (SRDD Section
+/// 12.3): the inserted value is truncated to the largest UTF-8 boundary at or
+/// below this byte count without re-serializing the rest of the payload.
+pub fn edit_body_with_session_limit(
+    original: Bytes,
+    tier: PoolTier,
+    target_model: Option<&str>,
+    chat_stream_mode: ChatStreamMode,
+    session_field: Option<(&str, &str)>,
+    session_max_len: usize,
+) -> Result<(Bytes, bool), BodyEditError> {
     let scan = scan_top_level(&original)?;
 
     // Check if any edits are needed
@@ -438,7 +461,7 @@ pub fn edit_body(
             if inserted_something {
                 buf.push(b',');
             }
-            let truncated_token = truncate_utf8(token, 256);
+            let truncated_token = truncate_utf8(token, session_max_len);
             let val_json = serde_json::to_string(truncated_token)
                 .map_err(|e| BodyEditError::Json(e.to_string()))?;
             buf.extend_from_slice(format!("\"{field_name}\":{val_json}").as_bytes());

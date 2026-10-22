@@ -51,7 +51,9 @@ use llmroller_proto::adapters::{
     EndpointKind, ErrorClass, classify_error_with_classifiers, get_adapter,
 };
 use llmroller_proto::affinity::{apply_outbound_session_affinity, compute_salted_affinity_token};
-use llmroller_proto::body_edit::{ChatStreamMode, edit_body, scan_top_level};
+use llmroller_proto::body_edit::{
+    ChatStreamMode, edit_body, edit_body_with_session_limit, scan_top_level,
+};
 use llmroller_proto::json_usage::extract_json_usage;
 use llmroller_proto::sse_tap::SseUsageTap;
 use llmroller_proto::trace_tap::{
@@ -1409,7 +1411,7 @@ fn endpoint_url(candidate: &RouteCandidate, endpoint: EndpointKind) -> String {
 fn auth_scheme_for(
     candidate: &RouteCandidate,
     endpoint: EndpointKind,
-) -> Option<&ProviderAuthScheme> {
+) -> Option<ProviderAuthScheme> {
     candidate
         .config
         .auth
@@ -1439,10 +1441,10 @@ fn build_upstream_headers(
     } else {
         ("authorization", "Bearer ")
     };
-    let (auth_header, auth_prefix) = auth_scheme_for(candidate, endpoint)
-        .map_or(default_scheme, |scheme| {
-            (scheme.header.as_str(), scheme.prefix.as_str())
-        });
+    let resolved_scheme = auth_scheme_for(candidate, endpoint);
+    let (auth_header, auth_prefix) = resolved_scheme.as_ref().map_or(default_scheme, |scheme| {
+        (scheme.header.as_str(), scheme.prefix.as_str())
+    });
     let auth_value = format!("{auth_prefix}{secret}");
     let mut outbound = apply_request_header_pipeline(
         inbound,
@@ -3369,12 +3371,13 @@ pub async fn handle_inference_request(
             .as_deref()
             .zip(session_token)
             .filter(|_| matches!(endpoint, EndpointKind::Chat | EndpointKind::Responses));
-        let (edited_body, strip_injected_usage) = match edit_body(
+        let (edited_body, strip_injected_usage) = match edit_body_with_session_limit(
             body.clone(),
             candidate.pool_tier(),
             Some(&candidate.upstream_model_id),
             chat_stream_mode,
             session_field,
+            session_profile.max_len,
         ) {
             Ok(edited) => edited,
             Err(_) => (body.clone(), false),

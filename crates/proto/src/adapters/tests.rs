@@ -159,6 +159,7 @@ fn test_per_provider_error_classifiers_override_builtin_patterns() {
         request_rejected_substrings: vec!["custom_content_block".to_string()],
         plan_restricted_substrings: vec!["tier_too_low".to_string()],
         credential_invalid_substrings: vec!["revoked_by_tenant".to_string()],
+        ..ErrorClassifiers::default()
     };
 
     assert_eq!(

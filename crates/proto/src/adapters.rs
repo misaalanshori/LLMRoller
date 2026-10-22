@@ -207,6 +207,7 @@ impl ProviderAdapter for OpencodeGoAdapter {
         SessionProfile {
             headers: vec!["x-opencode-session".to_string()],
             body_field: None,
+            ..SessionProfile::default()
         }
     }
 }
@@ -252,6 +253,7 @@ impl ProviderAdapter for CommandCodeAdapter {
         SessionProfile {
             headers: vec!["x-session-affinity".to_string(), "x-session-id".to_string()],
             body_field: Some("prompt_cache_key".to_string()),
+            ..SessionProfile::default()
         }
     }
 }
@@ -297,6 +299,7 @@ impl ProviderAdapter for OpenDesignAmrAdapter {
         SessionProfile {
             headers: vec!["x-session-affinity".to_string(), "x-session-id".to_string()],
             body_field: Some("prompt_cache_key".to_string()),
+            ..SessionProfile::default()
         }
     }
 }
@@ -342,6 +345,7 @@ impl ProviderAdapter for OpenrouterAdapter {
         SessionProfile {
             headers: vec!["x-session-id".to_string()],
             body_field: Some("session_id".to_string()),
+            ..SessionProfile::default()
         }
     }
 }
@@ -387,6 +391,7 @@ impl ProviderAdapter for CustomAdapter {
         SessionProfile {
             headers: vec!["x-session-id".to_string(), "x-session-affinity".to_string()],
             body_field: None,
+            ..SessionProfile::default()
         }
     }
 }

@@ -5,6 +5,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
 
 use http::{HeaderMap, HeaderValue, header};
+use llmroller_core::provider::StripHeaderTokens;
 use llmroller_core::rbac::PoolTier;
 
 use crate::headers::{
@@ -89,7 +90,7 @@ fn test_request_header_pipeline() {
         HeaderValue::from_static("unsupported-beta, computer-use-2024-10-22"),
     );
 
-    let strip_tokens = vec!["unsupported-beta".to_string()];
+    let strip_tokens = StripHeaderTokens::from(vec!["unsupported-beta".to_string()]);
     let strip_headers = vec![];
     let auth_header = Some(("authorization", "Bearer sk-upstream-secret-real"));
 
@@ -153,6 +154,56 @@ fn test_request_header_pipeline() {
     .expect("apply pipeline global");
 
     assert!(out_global.get("x-claude-code-session-id").is_none());
+}
+
+/// Spec: API-3, TRN-1
+/// Verify `strip_header_tokens` is scoped to the configured header: a token
+/// listed for `anthropic-beta` must not be removed from `openai-beta`.
+#[doc = "Spec: API-3, TRN-1"]
+#[test]
+fn test_strip_header_tokens_are_scoped_per_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static("keep-alpha, drop-anthropic"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("openai-beta"),
+        HeaderValue::from_static("keep-beta, drop-openai, drop-anthropic"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-other"),
+        HeaderValue::from_static("drop-anthropic"),
+    );
+
+    let per_header: StripHeaderTokens = serde_json::from_str(
+        r#"{"anthropic-beta":["drop-anthropic"],"openai-beta":["drop-openai"]}"#,
+    )
+    .expect("canonical per-header token map");
+
+    let out = apply_request_header_pipeline(
+        &headers,
+        PoolTier::Own,
+        Some(("authorization", "Bearer secret")),
+        &[],
+        &per_header,
+    )
+    .expect("apply pipeline");
+
+    assert_eq!(
+        out.get("anthropic-beta").expect("anthropic-beta"),
+        "keep-alpha"
+    );
+    assert_eq!(
+        out.get("openai-beta").expect("openai-beta"),
+        "keep-beta, drop-anthropic",
+        "tokens configured for another header must not be stripped"
+    );
+    assert_eq!(
+        out.get("x-other").expect("unlisted header"),
+        "drop-anthropic",
+        "headers without configured tokens pass through unchanged"
+    );
 }
 
 /// Spec: API-2, API-3, SEC-8, SEC-15
