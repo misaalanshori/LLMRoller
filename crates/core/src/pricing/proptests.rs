@@ -272,3 +272,25 @@ proptest! {
         prop_assert!(cost >= 0);
     }
 }
+
+#[doc = "Spec: USG-10 — subscription plan multiplier scaling and dual-cost calculation"]
+#[test]
+fn test_subscription_plan_multiplier_dual_cost_math() {
+    // 1. subscription_plan applies plan_multiplier_bps scaling:
+    // 10_000 bps = 1.0x (unadjusted)
+    assert_eq!(apply_plan_multiplier(100_000, 10_000, "subscription_plan"), 100_000);
+    // 5_000 bps = 50%
+    assert_eq!(apply_plan_multiplier(100_000, 5_000, "subscription_plan"), 50_000);
+    // 2_500 bps = 25%
+    assert_eq!(apply_plan_multiplier(100_000, 2_500, "subscription_plan"), 25_000);
+    // 0 bps = 0
+    assert_eq!(apply_plan_multiplier(100_000, 0, "subscription_plan"), 0);
+    // 20_000 bps = 2.0x
+    assert_eq!(apply_plan_multiplier(100_000, 20_000, "subscription_plan"), 200_000);
+
+    // 2. Other billing coverage modes always charge unadjusted list price:
+    assert_eq!(apply_plan_multiplier(100_000, 5_000, "pay_as_you_go"), 100_000);
+    assert_eq!(apply_plan_multiplier(100_000, 5_000, "shared_grant"), 100_000);
+    assert_eq!(apply_plan_multiplier(100_000, 5_000, "free_tier"), 100_000);
+    assert_eq!(apply_plan_multiplier(100_000, 0, "pay_as_you_go"), 100_000);
+}

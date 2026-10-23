@@ -46,6 +46,13 @@ pub struct UsageEventRecord {
     pub pin_outcome: Option<String>,
     pub failovers: i64,
     pub error_code: Option<String>,
+    pub list_cost_micro_usd: i64,
+    pub plan_multiplier_bps: i64,
+    pub billing_coverage_mode: String,
+    pub service_account_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub request_headers_json: Option<String>,
+    pub metadata_json: Option<String>,
 }
 
 /// Upstream attempt data recorded during the failover loop.
@@ -99,6 +106,7 @@ pub struct RollupDelta {
     pub output_tokens: i64,
     pub reasoning_tokens: i64,
     pub cost_micro_usd: i64,
+    pub list_cost_micro_usd: i64,
 }
 
 /// Three-queue in-memory usage batcher:
@@ -182,6 +190,7 @@ impl ThreeQueueUsageWriter {
             d.output_tokens += event.output_tokens;
             d.reasoning_tokens += event.reasoning_tokens;
             d.cost_micro_usd += event.cost_micro_usd;
+            d.list_cost_micro_usd += event.list_cost_micro_usd;
         }
 
         // 3. Enqueue into bounded raw_events, evicting oldest if capacity exceeded (REL-3)
@@ -248,9 +257,10 @@ impl ThreeQueueUsageWriter {
                        hour_ms, owner_user_id, client_key_id, upstream_key_id,
                        provider_id, provider_scope, share_id, canonical_id,
                        requests, errors, input_uncached_tokens, cache_read_tokens,
-                       cache_write_tokens, output_tokens, reasoning_tokens, cost_micro_usd
+                       cache_write_tokens, output_tokens, reasoning_tokens, cost_micro_usd,
+                       list_cost_micro_usd
                    )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (hour_ms, client_key_id, upstream_key_id, canonical_id, share_id) DO UPDATE SET
                        requests = usage_rollups_hourly.requests + excluded.requests,
                        errors = usage_rollups_hourly.errors + excluded.errors,
@@ -259,7 +269,8 @@ impl ThreeQueueUsageWriter {
                        cache_write_tokens = usage_rollups_hourly.cache_write_tokens + excluded.cache_write_tokens,
                        output_tokens = usage_rollups_hourly.output_tokens + excluded.output_tokens,
                        reasoning_tokens = usage_rollups_hourly.reasoning_tokens + excluded.reasoning_tokens,
-                       cost_micro_usd = usage_rollups_hourly.cost_micro_usd + excluded.cost_micro_usd"#,
+                       cost_micro_usd = usage_rollups_hourly.cost_micro_usd + excluded.cost_micro_usd,
+                       list_cost_micro_usd = usage_rollups_hourly.list_cost_micro_usd + excluded.list_cost_micro_usd"#,
             )
             .bind(k.hour_ms)
             .bind(&k.owner_user_id)
@@ -277,6 +288,7 @@ impl ThreeQueueUsageWriter {
             .bind(d.output_tokens)
             .bind(d.reasoning_tokens)
             .bind(d.cost_micro_usd)
+            .bind(d.list_cost_micro_usd)
             .execute(&mut **tx)
             .await?;
         }
@@ -349,51 +361,60 @@ async fn insert_usage_event(
     e: &UsageEventRecord,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-                r#"INSERT INTO usage_events (
-                       id, ts, request_id, client_key_id, owner_user_id,
-                       upstream_key_id, provider_id, provider_scope, share_id,
-                       canonical_id, upstream_model_id, endpoint, protocol,
-                       session_hash, status, stream, incomplete, termination,
-                       trace_dropped, input_uncached_tokens, cache_read_tokens,
-                       cache_write_tokens, output_tokens, reasoning_tokens,
-                       cost_micro_usd, cost_source, latency_ms, ttfb_ms,
-                       pin_outcome, failovers, error_code
-                   )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(&e.id)
-            .bind(e.ts)
-            .bind(e.request_id.to_string())
-            .bind(e.client_key_id.to_string())
-            .bind(e.owner_user_id.to_string())
-            .bind(&e.upstream_key_id)
-            .bind(&e.provider_id)
-            .bind(&e.provider_scope)
-            .bind(&e.share_id)
-            .bind(&e.canonical_id)
-            .bind(&e.upstream_model_id)
-            .bind(&e.endpoint)
-            .bind(&e.protocol)
-            .bind(&e.session_hash)
-            .bind(e.status)
-            .bind(if e.stream { 1 } else { 0 })
-            .bind(if e.incomplete { 1 } else { 0 })
-            .bind(&e.termination)
-            .bind(if e.trace_dropped { 1 } else { 0 })
-            .bind(e.input_uncached_tokens)
-            .bind(e.cache_read_tokens)
-            .bind(e.cache_write_tokens)
-            .bind(e.output_tokens)
-            .bind(e.reasoning_tokens)
-            .bind(e.cost_micro_usd)
-            .bind(e.cost_source.as_str())
-            .bind(e.latency_ms)
-            .bind(e.ttfb_ms)
-            .bind(&e.pin_outcome)
-            .bind(e.failovers)
-            .bind(&e.error_code)
-            .execute(&mut **tx)
-            .await?;
+        r#"INSERT INTO usage_events (
+               id, ts, request_id, client_key_id, owner_user_id,
+               upstream_key_id, provider_id, provider_scope, share_id,
+               canonical_id, upstream_model_id, endpoint, protocol,
+               session_hash, status, stream, incomplete, termination,
+               trace_dropped, input_uncached_tokens, cache_read_tokens,
+               cache_write_tokens, output_tokens, reasoning_tokens,
+               cost_micro_usd, cost_source, latency_ms, ttfb_ms,
+               pin_outcome, failovers, error_code,
+               list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode,
+               service_account_id, stop_reason, request_headers_json, metadata_json
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(&e.id)
+    .bind(e.ts)
+    .bind(e.request_id.to_string())
+    .bind(e.client_key_id.to_string())
+    .bind(e.owner_user_id.to_string())
+    .bind(&e.upstream_key_id)
+    .bind(&e.provider_id)
+    .bind(&e.provider_scope)
+    .bind(&e.share_id)
+    .bind(&e.canonical_id)
+    .bind(&e.upstream_model_id)
+    .bind(&e.endpoint)
+    .bind(&e.protocol)
+    .bind(&e.session_hash)
+    .bind(e.status)
+    .bind(if e.stream { 1 } else { 0 })
+    .bind(if e.incomplete { 1 } else { 0 })
+    .bind(&e.termination)
+    .bind(if e.trace_dropped { 1 } else { 0 })
+    .bind(e.input_uncached_tokens)
+    .bind(e.cache_read_tokens)
+    .bind(e.cache_write_tokens)
+    .bind(e.output_tokens)
+    .bind(e.reasoning_tokens)
+    .bind(e.cost_micro_usd)
+    .bind(e.cost_source.as_str())
+    .bind(e.latency_ms)
+    .bind(e.ttfb_ms)
+    .bind(&e.pin_outcome)
+    .bind(e.failovers)
+    .bind(&e.error_code)
+    .bind(e.list_cost_micro_usd)
+    .bind(e.plan_multiplier_bps)
+    .bind(&e.billing_coverage_mode)
+    .bind(&e.service_account_id)
+    .bind(&e.stop_reason)
+    .bind(&e.request_headers_json)
+    .bind(&e.metadata_json)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

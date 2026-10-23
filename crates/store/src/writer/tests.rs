@@ -287,6 +287,13 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
             pin_outcome: None,
             failovers: 0,
             error_code: None,
+            list_cost_micro_usd: 150,
+            plan_multiplier_bps: 10_000,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            service_account_id: None,
+            stop_reason: None,
+            request_headers_json: None,
+            metadata_json: None,
         },
         vec![],
     );

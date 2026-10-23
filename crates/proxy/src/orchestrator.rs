@@ -2373,6 +2373,9 @@ struct UsageContext {
     pin_outcome: Option<String>,
     failovers: i64,
     error_code: Option<String>,
+    billing_coverage_mode: String,
+    plan_multiplier_bps: i64,
+    service_account_id: Option<String>,
 }
 
 impl UsageContext {
@@ -2390,6 +2393,12 @@ impl UsageContext {
         ttfb_ms: Option<i64>,
         latency_ms: Option<i64>,
     ) -> UsageEventRecord {
+        let list_cost_micro_usd = cost_micro_usd;
+        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+            list_cost_micro_usd,
+            self.plan_multiplier_bps,
+            &self.billing_coverage_mode,
+        );
         UsageEventRecord {
             id: llmroller_core::ids::UsageEventId::generate().to_string(),
             ts,
@@ -2415,13 +2424,20 @@ impl UsageContext {
             cache_write_tokens: usage.cache_write_tokens,
             output_tokens: usage.output_tokens,
             reasoning_tokens: usage.reasoning_tokens,
-            cost_micro_usd,
+            cost_micro_usd: effective_cost,
             cost_source,
             latency_ms,
             ttfb_ms,
             pin_outcome: self.pin_outcome.clone(),
             failovers: self.failovers,
             error_code: self.error_code.clone(),
+            list_cost_micro_usd,
+            plan_multiplier_bps: self.plan_multiplier_bps,
+            billing_coverage_mode: self.billing_coverage_mode.clone(),
+            service_account_id: self.service_account_id.clone(),
+            stop_reason: None,
+            request_headers_json: None,
+            metadata_json: None,
         }
     }
 }
@@ -3925,6 +3941,11 @@ pub async fn handle_inference_request(
                     None
                 };
 
+                let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                    .providers
+                    .get(&candidate.provider_id)
+                    .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                    .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
                 let usage = UsageContext {
                     request_id,
                     client_key_id: caller.id,
@@ -3942,6 +3963,9 @@ pub async fn handle_inference_request(
                         .map(|ticket| ticket.outcome.as_str().to_string()),
                     failovers,
                     error_code: None,
+                    billing_coverage_mode,
+                    plan_multiplier_bps,
+                    service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
                 };
                 let trace = trace_request.clone().map(|request_body| {
                     TraceCapture::new(request_body, trace_retention_days, first_chunk.as_ref())
@@ -4277,6 +4301,11 @@ pub async fn handle_inference_request(
         });
 
         if let Some(writer) = &state.writer {
+            let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                .providers
+                .get(&candidate.provider_id)
+                .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
             let usage = UsageContext {
                 request_id,
                 client_key_id: caller.id,
@@ -4294,6 +4323,9 @@ pub async fn handle_inference_request(
                     .map(|ticket| ticket.outcome.as_str().to_string()),
                 failovers,
                 error_code: None,
+                billing_coverage_mode,
+                plan_multiplier_bps,
+                service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
             };
             let mut event = usage.event(
                 now,
@@ -4393,6 +4425,9 @@ pub async fn handle_inference_request(
             pin_outcome: None,
             failovers,
             error_code: Some(terminal_code.to_string()),
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            plan_multiplier_bps: 10_000,
+            service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
         };
         let event = usage.event(
             now,

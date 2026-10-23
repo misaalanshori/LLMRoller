@@ -108,6 +108,13 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
             pin_outcome: Some("new_pin".to_string()),
             failovers: 0,
             error_code: None,
+            list_cost_micro_usd: 10_000,
+            plan_multiplier_bps: 10_000,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            service_account_id: None,
+            stop_reason: None,
+            request_headers_json: None,
+            metadata_json: None,
         };
 
         writer.enqueue(event, vec![]);
@@ -191,6 +198,13 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         pin_outcome: None,
         failovers: 0,
         error_code: Some("no_eligible_route".to_string()),
+        list_cost_micro_usd: 0,
+        plan_multiplier_bps: 10_000,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        service_account_id: None,
+        stop_reason: None,
+        request_headers_json: None,
+        metadata_json: None,
     };
 
     writer.enqueue(pre_route_event, vec![]);
@@ -238,6 +252,13 @@ async fn test_three_queue_writer_batching_drop_oldest_and_rollups() {
         pin_outcome: Some("repin".to_string()),
         failovers: 1,
         error_code: None,
+        list_cost_micro_usd: 20_000,
+        plan_multiplier_bps: 10_000,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        service_account_id: None,
+        stop_reason: None,
+        request_headers_json: None,
+        metadata_json: None,
     };
 
     let attempt1 = UsageAttemptRecord {
@@ -439,6 +460,13 @@ async fn test_live_usage_emission_and_attempt_charging() {
         pin_outcome: Some("repin".to_string()),
         failovers: 1,
         error_code: None,
+        list_cost_micro_usd: 15_000,
+        plan_multiplier_bps: 10_000,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        service_account_id: None,
+        stop_reason: None,
+        request_headers_json: None,
+        metadata_json: None,
     };
 
     writer.enqueue(event, vec![attempt_fail, attempt_success]);
@@ -503,6 +531,13 @@ async fn test_live_usage_emission_and_attempt_charging() {
         pin_outcome: Some("followed".to_string()),
         failovers: 0,
         error_code: Some("client_gone".to_string()),
+        list_cost_micro_usd: 5_000,
+        plan_multiplier_bps: 10_000,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        service_account_id: None,
+        stop_reason: None,
+        request_headers_json: None,
+        metadata_json: None,
     };
 
     writer.enqueue(aborted_event, vec![]);
@@ -758,6 +793,13 @@ async fn test_invalid_usage_row_is_isolated_by_savepoint_without_rolling_back_ba
         pin_outcome: None,
         failovers: 0,
         error_code: None,
+        list_cost_micro_usd: 10,
+        plan_multiplier_bps: 10_000,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        service_account_id: None,
+        stop_reason: None,
+        request_headers_json: None,
+        metadata_json: None,
     };
     let mut valid = base.clone();
     valid.id = "event-valid".to_string();

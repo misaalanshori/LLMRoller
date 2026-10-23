@@ -7,6 +7,8 @@
 //! Spec: ./docs/srdd/9. SRDD - Data Model.md#933-closed-runtime-settings-registry
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#20-sub-phase-20-minimal-control-plane-json-crud-for-providers-keys-client-keys-and-settings
 
+use std::net::SocketAddr;
+
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -3240,14 +3242,26 @@ async fn get_admin_overview_telemetry_handler(
         .await
         .unwrap_or(0);
 
-    Ok(Json(serde_json::json!({
-        "projected_disk_mb": projected_disk_mb,
-        "unpriced_models_count": unpriced_count,
-        "usage_events_count": usage_events_count,
-        "max_usage_events_rows": 50_000_000i64,
-        "retention_days": retention_days,
-        "daily_requests": daily_requests
-    })))
+    let overview = get_overview_internal(
+        &state,
+        None,
+        OverviewQuery {
+            range: Some("7d".to_string()),
+            since: None,
+            until: None,
+        },
+    )
+    .await?;
+
+    let mut map = overview.as_object().cloned().unwrap_or_default();
+    map.insert("projected_disk_mb".to_string(), serde_json::json!(projected_disk_mb));
+    map.insert("unpriced_models_count".to_string(), serde_json::json!(unpriced_count));
+    map.insert("usage_events_count".to_string(), serde_json::json!(usage_events_count));
+    map.insert("max_usage_events_rows".to_string(), serde_json::json!(50_000_000i64));
+    map.insert("retention_days".to_string(), serde_json::json!(retention_days));
+    map.insert("daily_requests".to_string(), serde_json::json!(daily_requests));
+
+    Ok(Json(serde_json::Value::Object(map)))
 }
 
 // ---------------------------------------------------------------------------
@@ -5007,6 +5021,1008 @@ async fn export_csv_internal(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers, Logs Explorer, Cost Ledger, and Overview Analytics (USG-9, USG-10, AUD-2, UI-6)
+// ---------------------------------------------------------------------------
+
+fn format_cost_usd(micro_usd: i64) -> String {
+    let dollars = micro_usd as f64 / 1_000_000.0;
+    if dollars >= 10.0 {
+        format!("${dollars:.2}")
+    } else if dollars >= 0.01 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.5}")
+    }
+}
+
+fn format_tokens_compact(tokens: i64) -> String {
+    if tokens >= 1_000_000_000 {
+        format!("{:.2}B", tokens as f64 / 1_000_000_000.0)
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LogsQuery {
+    pub stream: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub model: Option<String>,
+    pub client_key_id: Option<String>,
+    pub service_account_id: Option<String>,
+    pub status: Option<i64>,
+    pub method: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+async fn get_user_logs_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    get_logs_internal(&state, Some(uid.to_string()), query).await
+}
+
+async fn get_admin_logs_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_logs_internal(&state, None, query).await
+}
+
+async fn get_logs_internal(
+    state: &ApiAppState,
+    actor_user_id: Option<String>,
+    query: LogsQuery,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let is_api = query.stream.as_deref() == Some("api");
+    let limit = query.limit.unwrap_or(50).clamp(1, 1000);
+
+    if is_api {
+        let sql = if actor_user_id.is_some() {
+            "SELECT id, ts, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent
+             FROM control_plane_logs
+             WHERE actor_user_id = ?
+               AND (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)
+               AND (? IS NULL OR status = ?)
+               AND (? IS NULL OR method = ?)
+               AND (? IS NULL OR ts < ?)
+             ORDER BY ts DESC LIMIT ?"
+        } else {
+            "SELECT id, ts, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent
+             FROM control_plane_logs
+             WHERE (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)
+               AND (? IS NULL OR status = ?)
+               AND (? IS NULL OR method = ?)
+               AND (? IS NULL OR ts < ?)
+             ORDER BY ts DESC LIMIT ?"
+        };
+        let cursor_ts = query.cursor.as_deref().and_then(|c| c.parse::<i64>().ok());
+
+        let rows = if let Some(ref uid) = actor_user_id {
+            sqlx::query(sql)
+                .bind(uid)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to)
+                .bind(query.status)
+                .bind(query.status)
+                .bind(query.method.as_deref())
+                .bind(query.method.as_deref())
+                .bind(cursor_ts)
+                .bind(cursor_ts)
+                .bind(limit)
+                .fetch_all(&state.auth.reader_pool)
+                .await
+        } else {
+            sqlx::query(sql)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to)
+                .bind(query.status)
+                .bind(query.status)
+                .bind(query.method.as_deref())
+                .bind(query.method.as_deref())
+                .bind(cursor_ts)
+                .bind(cursor_ts)
+                .bind(limit)
+                .fetch_all(&state.auth.reader_pool)
+                .await
+        }
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let logs = rows
+            .into_iter()
+            .map(|r| {
+                let status: i64 = r.try_get("status").unwrap_or(200);
+                let latency_ms: i64 = r.try_get("latency_ms").unwrap_or(0);
+                serde_json::json!({
+                    "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                    "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
+                    "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
+                    "actor_user_id": r.try_get::<Option<String>, _>("actor_user_id").unwrap_or_default(),
+                    "workspace_scope": r.try_get::<String, _>("workspace_scope").unwrap_or_default(),
+                    "method": r.try_get::<String, _>("method").unwrap_or_default(),
+                    "path": r.try_get::<String, _>("path").unwrap_or_default(),
+                    "endpoint": r.try_get::<String, _>("path").unwrap_or_default(),
+                    "status": status,
+                    "latency_ms": latency_ms,
+                    "duration_formatted": format!("{latency_ms} ms"),
+                    "ip_addr": r.try_get::<Option<String>, _>("ip_addr").unwrap_or_default(),
+                    "user_agent": r.try_get::<Option<String>, _>("user_agent").unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        return Ok(Json(serde_json::json!({
+            "stream": "api",
+            "retention_days": 30,
+            "rows": logs,
+        })));
+    }
+
+    // Default stream: inference
+    let sql = if actor_user_id.is_some() {
+        "SELECT id, ts, request_id, client_key_id, owner_user_id, canonical_id, endpoint, protocol,
+                session_hash, status, stream, incomplete, termination, input_uncached_tokens,
+                cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+                cost_micro_usd, latency_ms, ttfb_ms, stop_reason, service_account_id,
+                error_code, pin_outcome, failovers
+         FROM usage_events
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR status = ?)
+           AND (? IS NULL OR client_key_id = ?)
+           AND (? IS NULL OR service_account_id = ?)
+           AND (? IS NULL OR id < ?)
+         ORDER BY id DESC LIMIT ?"
+    } else {
+        "SELECT id, ts, request_id, client_key_id, owner_user_id, canonical_id, endpoint, protocol,
+                session_hash, status, stream, incomplete, termination, input_uncached_tokens,
+                cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+                cost_micro_usd, latency_ms, ttfb_ms, stop_reason, service_account_id,
+                error_code, pin_outcome, failovers
+         FROM usage_events
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR status = ?)
+           AND (? IS NULL OR client_key_id = ?)
+           AND (? IS NULL OR service_account_id = ?)
+           AND (? IS NULL OR id < ?)
+         ORDER BY id DESC LIMIT ?"
+    };
+
+    let rows = if let Some(ref uid) = actor_user_id {
+        sqlx::query(sql)
+            .bind(uid)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .bind(query.status)
+            .bind(query.status)
+            .bind(query.client_key_id.as_deref())
+            .bind(query.client_key_id.as_deref())
+            .bind(query.service_account_id.as_deref())
+            .bind(query.service_account_id.as_deref())
+            .bind(query.cursor.as_deref())
+            .bind(query.cursor.as_deref())
+            .bind(limit)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(sql)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .bind(query.status)
+            .bind(query.status)
+            .bind(query.client_key_id.as_deref())
+            .bind(query.client_key_id.as_deref())
+            .bind(query.service_account_id.as_deref())
+            .bind(query.service_account_id.as_deref())
+            .bind(query.cursor.as_deref())
+            .bind(query.cursor.as_deref())
+            .bind(limit)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let logs = rows
+        .into_iter()
+        .map(|r| {
+            let status: i64 = r.try_get("status").unwrap_or(200);
+            let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+            let latency_ms: Option<i64> = r.try_get("latency_ms").unwrap_or(None);
+            let input: i64 = r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0);
+            let output: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
+            let total_tokens = input + output;
+
+            serde_json::json!({
+                "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
+                "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
+                "status": status,
+                "status_badge": if status == 200 { "200".to_string() } else { format!("{status} Rejected") },
+                "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+                "model": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+                "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
+                "service_account_id": r.try_get::<Option<String>, _>("service_account_id").unwrap_or_default(),
+                "session_hash": r.try_get::<Option<String>, _>("session_hash").unwrap_or_default(),
+                "endpoint": r.try_get::<String, _>("endpoint").unwrap_or_default(),
+                "protocol": r.try_get::<Option<String>, _>("protocol").unwrap_or_default(),
+                "stream": r.try_get::<i64, _>("stream").unwrap_or(0) == 1,
+                "latency_ms": latency_ms,
+                "duration_formatted": latency_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "—".to_string()),
+                "total_tokens": total_tokens,
+                "tokens_formatted": if status == 200 { format_tokens_compact(total_tokens) } else { "—".to_string() },
+                "cost_micro_usd": cost,
+                "cost_formatted": if status == 200 { format_cost_usd(cost) } else { "—".to_string() },
+                "error_code": r.try_get::<Option<String>, _>("error_code").unwrap_or_default(),
+                "stop_reason": r.try_get::<Option<String>, _>("stop_reason").unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "stream": "inference",
+        "retention_days": 30,
+        "rows": logs,
+    })))
+}
+
+async fn get_user_log_detail_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    get_log_detail_internal(&state, &actor, &request_id).await
+}
+
+async fn get_admin_log_detail_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    get_log_detail_internal(&state, &actor, &request_id).await
+}
+
+async fn get_log_detail_internal(
+    state: &ApiAppState,
+    actor: &ActorScope,
+    request_id: &str,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let is_admin = actor.is_admin() || actor.is_system();
+    let uid = actor.user_id().map(|u| u.to_string());
+
+    let sql = if !is_admin {
+        "SELECT * FROM usage_events WHERE request_id = ? AND owner_user_id = ?"
+    } else {
+        "SELECT * FROM usage_events WHERE request_id = ?"
+    };
+
+    let row = if !is_admin {
+        sqlx::query(sql)
+            .bind(request_id)
+            .bind(uid.as_deref().unwrap_or_default())
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(sql)
+            .bind(request_id)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "log record not found"))?;
+
+    let attempt_rows = sqlx::query(
+        "SELECT attempt_no, ts, upstream_key_id, share_id, outcome, http_status, bytes_sent, charged_micro_usd, charge_basis
+         FROM usage_attempts WHERE request_id = ? ORDER BY attempt_no ASC",
+    )
+    .bind(request_id)
+    .fetch_all(&state.auth.reader_pool)
+    .await
+    .unwrap_or_default();
+
+    let attempts = attempt_rows
+        .into_iter()
+        .map(|ar| {
+            let kid: String = ar.try_get("upstream_key_id").unwrap_or_default();
+            serde_json::json!({
+                "attempt_no": ar.try_get::<i64, _>("attempt_no").unwrap_or(1),
+                "ts": ar.try_get::<i64, _>("ts").unwrap_or(0),
+                "upstream_key_id": kid,
+                "share_id": ar.try_get::<Option<String>, _>("share_id").unwrap_or_default(),
+                "outcome": ar.try_get::<String, _>("outcome").unwrap_or_default(),
+                "http_status": ar.try_get::<Option<i64>, _>("http_status").unwrap_or_default(),
+                "bytes_sent": ar.try_get::<i64, _>("bytes_sent").unwrap_or(0),
+                "charged_micro_usd": ar.try_get::<i64, _>("charged_micro_usd").unwrap_or(0),
+                "charge_basis": ar.try_get::<String, _>("charge_basis").unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let has_trace: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM trace_records WHERE request_id = ? LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .unwrap_or_default()
+    .is_some();
+
+    let status: i64 = row.try_get("status").unwrap_or(200);
+    let cost: i64 = row.try_get("cost_micro_usd").unwrap_or(0);
+    let list_cost: i64 = row.try_get("list_cost_micro_usd").unwrap_or(cost);
+    let latency_ms: Option<i64> = row.try_get("latency_ms").unwrap_or(None);
+    let ttfb_ms: Option<i64> = row.try_get("ttfb_ms").unwrap_or(None);
+
+    Ok(Json(serde_json::json!({
+        "id": row.try_get::<String, _>("id").unwrap_or_default(),
+        "request_id": request_id,
+        "ts": row.try_get::<i64, _>("ts").unwrap_or(0),
+        "status": status,
+        "stop_reason": row.try_get::<Option<String>, _>("stop_reason").unwrap_or_default(),
+        "endpoint": row.try_get::<String, _>("endpoint").unwrap_or_default(),
+        "protocol": row.try_get::<Option<String>, _>("protocol").unwrap_or_default(),
+        "stream": row.try_get::<i64, _>("stream").unwrap_or(0) == 1,
+        "latency_ms": latency_ms,
+        "ttfb_ms": ttfb_ms,
+        "model": row.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+        "tokens": {
+            "input": row.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0),
+            "output": row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
+            "reasoning": row.try_get::<Option<i64>, _>("reasoning_tokens").unwrap_or(None).unwrap_or(0),
+            "cache_read": row.try_get::<Option<i64>, _>("cache_read_tokens").unwrap_or(None).unwrap_or(0),
+            "cache_write": row.try_get::<Option<i64>, _>("cache_write_tokens").unwrap_or(None).unwrap_or(0),
+        },
+        "cost": {
+            "cost_micro_usd": cost,
+            "list_cost_micro_usd": list_cost,
+            "plan_multiplier_bps": row.try_get::<i64, _>("plan_multiplier_bps").unwrap_or(10_000),
+            "billing_coverage_mode": row.try_get::<String, _>("billing_coverage_mode").unwrap_or_else(|_| "pay_as_you_go".to_string()),
+        },
+        "identity": {
+            "client_key_id": row.try_get::<String, _>("client_key_id").unwrap_or_default(),
+            "service_account_id": row.try_get::<Option<String>, _>("service_account_id").unwrap_or_default(),
+            "owner_user_id": row.try_get::<String, _>("owner_user_id").unwrap_or_default(),
+        },
+        "session_hash": row.try_get::<Option<String>, _>("session_hash").unwrap_or_default(),
+        "client_user_agent": row.try_get::<Option<String>, _>("client_user_agent").unwrap_or_default(),
+        "request_headers_json": row.try_get::<Option<String>, _>("request_headers_json").unwrap_or_default(),
+        "metadata_json": row.try_get::<Option<String>, _>("metadata_json").unwrap_or_default(),
+        "attempts": attempts,
+        "has_trace": has_trace,
+    })))
+}
+
+async fn get_user_logs_export_csv_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    export_logs_csv_internal(&state, Some(uid.to_string()), query).await
+}
+
+async fn get_admin_logs_export_csv_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    export_logs_csv_internal(&state, None, query).await
+}
+
+async fn export_logs_csv_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    query: LogsQuery,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use llmroller_proto::headers::sanitize_csv_cell;
+    use sqlx::Row as _;
+
+    let is_api = query.stream.as_deref() == Some("api");
+    if is_api {
+        let sql = if owner_user_id.is_some() {
+            "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
+             FROM control_plane_logs WHERE actor_user_id = ? ORDER BY ts DESC LIMIT 5000"
+        } else {
+            "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
+             FROM control_plane_logs ORDER BY ts DESC LIMIT 5000"
+        };
+        let rows = if let Some(ref uid) = owner_user_id {
+            sqlx::query(sql).bind(uid).fetch_all(&state.auth.reader_pool).await
+        } else {
+            sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
+        }
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let mut csv = String::from("id,ts,request_id,method,path,status,duration_ms,ip_addr\r\n");
+        for r in rows {
+            let id: String = r.try_get("id").unwrap_or_default();
+            let ts: i64 = r.try_get("ts").unwrap_or(0);
+            let req_id: String = r.try_get("request_id").unwrap_or_default();
+            let method: String = r.try_get("method").unwrap_or_default();
+            let path: String = r.try_get("path").unwrap_or_default();
+            let status: i64 = r.try_get("status").unwrap_or(0);
+            let latency: i64 = r.try_get("latency_ms").unwrap_or(0);
+            let ip: String = r.try_get::<Option<String>, _>("ip_addr").unwrap_or_default().unwrap_or_default();
+            let line = format!(
+                "{},{},{},{},{},{},{},{}\r\n",
+                sanitize_csv_cell(&id),
+                ts,
+                sanitize_csv_cell(&req_id),
+                sanitize_csv_cell(&method),
+                sanitize_csv_cell(&path),
+                status,
+                latency,
+                sanitize_csv_cell(&ip),
+            );
+            csv.push_str(&line);
+        }
+
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+            .header(
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"api_logs.csv\"",
+            )
+            .body(axum::body::Body::from(csv))
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
+
+    let sql = if owner_user_id.is_some() {
+        "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, output_tokens, error_code
+         FROM usage_events WHERE owner_user_id = ? ORDER BY id DESC LIMIT 5000"
+    } else {
+        "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, output_tokens, error_code
+         FROM usage_events ORDER BY id DESC LIMIT 5000"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(sql).bind(uid).fetch_all(&state.auth.reader_pool).await
+    } else {
+        sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut csv = String::from(
+        "id,ts,request_id,canonical_id,status,cost_micro_usd,input_tokens,output_tokens,error_code\r\n",
+    );
+    for r in rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let ts: i64 = r.try_get("ts").unwrap_or(0);
+        let req_id: String = r.try_get("request_id").unwrap_or_default();
+        let model: String = r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default().unwrap_or_default();
+        let status: i64 = r.try_get("status").unwrap_or(0);
+        let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+        let input: i64 = r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0);
+        let output: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
+        let err: String = r.try_get::<Option<String>, _>("error_code").unwrap_or_default().unwrap_or_default();
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{}\r\n",
+            sanitize_csv_cell(&id),
+            ts,
+            sanitize_csv_cell(&req_id),
+            sanitize_csv_cell(&model),
+            status,
+            cost,
+            input,
+            output,
+            sanitize_csv_cell(&err),
+        );
+        csv.push_str(&line);
+    }
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"inference_logs.csv\"",
+        )
+        .body(axum::body::Body::from(csv))
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LedgerQuery {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub model: Option<String>,
+    pub initiator: Option<String>,
+    pub limit: Option<i64>,
+}
+
+async fn get_user_usage_ledger_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    get_usage_ledger_internal(&state, Some(uid.to_string()), query).await
+}
+
+async fn get_admin_usage_ledger_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_ledger_internal(&state, None, query).await
+}
+
+async fn get_usage_ledger_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    query: LedgerQuery,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+
+    let agg_sql = if owner_user_id.is_some() {
+        "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
+                COALESCE(SUM(cache_read_tokens), 0) as cache_read,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write,
+                COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(list_cost_micro_usd), 0) as list_cost_micro_usd
+         FROM usage_events
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)"
+    } else {
+        "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
+                COALESCE(SUM(cache_read_tokens), 0) as cache_read,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write,
+                COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(list_cost_micro_usd), 0) as list_cost_micro_usd
+         FROM usage_events
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)"
+    };
+
+    let agg_row = if let Some(ref uid) = owner_user_id {
+        sqlx::query(agg_sql)
+            .bind(uid)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .fetch_one(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(agg_sql)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .fetch_one(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let input: i64 = agg_row.try_get("input_uncached").unwrap_or(0);
+    let cache_read: i64 = agg_row.try_get("cache_read").unwrap_or(0);
+    let cache_write: i64 = agg_row.try_get("cache_write").unwrap_or(0);
+    let output: i64 = agg_row.try_get("output").unwrap_or(0);
+    let total_tokens = input + cache_read + cache_write + output;
+    let billed_cost: i64 = agg_row.try_get("cost_micro_usd").unwrap_or(0);
+    let list_cost: i64 = agg_row.try_get("list_cost_micro_usd").unwrap_or(0);
+    let plan_covered_savings = list_cost.saturating_sub(billed_cost);
+
+    let row_sql = if owner_user_id.is_some() {
+        "SELECT id, ts, request_id, client_key_id, canonical_id,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
+         FROM usage_events
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)
+         ORDER BY id DESC LIMIT ?"
+    } else {
+        "SELECT id, ts, request_id, client_key_id, canonical_id,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
+         FROM usage_events
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR canonical_id = ?)
+         ORDER BY id DESC LIMIT ?"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(row_sql)
+            .bind(uid)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .bind(limit)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(row_sql)
+            .bind(query.from)
+            .bind(query.from)
+            .bind(query.to)
+            .bind(query.to)
+            .bind(query.model.as_deref())
+            .bind(query.model.as_deref())
+            .bind(limit)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let u_cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+            let l_cost: i64 = r.try_get("list_cost_micro_usd").unwrap_or(u_cost);
+            let u_in: i64 = r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0);
+            let u_cr: i64 = r.try_get::<Option<i64>, _>("cache_read_tokens").unwrap_or(None).unwrap_or(0);
+            let u_cw: i64 = r.try_get::<Option<i64>, _>("cache_write_tokens").unwrap_or(None).unwrap_or(0);
+            let u_out: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
+
+            serde_json::json!({
+                "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
+                "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
+                "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
+                "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
+                "input_tokens": u_in,
+                "cache_read_tokens": u_cr,
+                "cache_write_tokens": u_cw,
+                "output_tokens": u_out,
+                "cost_micro_usd": u_cost,
+                "list_cost_micro_usd": l_cost,
+                "plan_multiplier_bps": r.try_get::<i64, _>("plan_multiplier_bps").unwrap_or(10_000),
+                "billing_coverage_mode": r.try_get::<String, _>("billing_coverage_mode").unwrap_or_else(|_| "pay_as_you_go".to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "summary": {
+            "total_tokens": total_tokens,
+            "total_tokens_formatted": format_tokens_compact(total_tokens),
+            "input_tokens": input,
+            "input_tokens_formatted": format_tokens_compact(input),
+            "output_tokens": output,
+            "output_tokens_formatted": format_tokens_compact(output),
+            "cache_read_tokens": cache_read,
+            "cache_read_tokens_formatted": format_tokens_compact(cache_read),
+            "cache_write_tokens": cache_write,
+            "cache_write_tokens_formatted": format_tokens_compact(cache_write),
+            "billed_cost_micro_usd": billed_cost,
+            "billed_cost_formatted": format_cost_usd(billed_cost),
+            "list_cost_micro_usd": list_cost,
+            "list_cost_formatted": format_cost_usd(list_cost),
+            "plan_covered_savings_micro_usd": plan_covered_savings,
+            "plan_covered_savings_formatted": format_cost_usd(plan_covered_savings),
+        },
+        "rows": items,
+    })))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct OverviewQuery {
+    pub range: Option<String>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+}
+
+async fn get_user_overview_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<OverviewQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let body = get_overview_internal(&state, Some(uid.to_string()), query).await?;
+    Ok(Json(body))
+}
+
+async fn get_overview_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    query: OverviewQuery,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let now_ms = state.auth.clock.now_ms();
+    let since_ms = if let Some(s) = query.since {
+        s
+    } else {
+        match query.range.as_deref() {
+            Some("24h") => now_ms - 86_400_000,
+            Some("30d") => now_ms - 30 * 86_400_000,
+            Some("all") => 0,
+            _ => now_ms - 7 * 86_400_000,
+        }
+    };
+    let until_ms = query.until.unwrap_or(now_ms);
+
+    let kpi_sql = if owner_user_id.is_some() {
+        "SELECT COALESCE(SUM(requests), 0) as total_requests,
+                COALESCE(SUM(cost_micro_usd), 0) as total_cost,
+                COALESCE(SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens), 0) as total_tokens
+         FROM usage_rollups_hourly
+         WHERE owner_user_id = ? AND hour_ms >= ? AND hour_ms <= ?"
+    } else {
+        "SELECT COALESCE(SUM(requests), 0) as total_requests,
+                COALESCE(SUM(cost_micro_usd), 0) as total_cost,
+                COALESCE(SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens), 0) as total_tokens
+         FROM usage_rollups_hourly
+         WHERE hour_ms >= ? AND hour_ms <= ?"
+    };
+
+    let kpi_row = if let Some(ref uid) = owner_user_id {
+        sqlx::query(kpi_sql)
+            .bind(uid)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_one(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(kpi_sql)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_one(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let total_requests: i64 = kpi_row.try_get("total_requests").unwrap_or(0);
+    let total_cost: i64 = kpi_row.try_get("total_cost").unwrap_or(0);
+    let total_tokens: i64 = kpi_row.try_get("total_tokens").unwrap_or(0);
+
+    let ts_sql = if owner_user_id.is_some() {
+        "SELECT hour_ms as bucket_ms,
+                COALESCE(SUM(requests), 0) as requests,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens), 0) as tokens
+         FROM usage_rollups_hourly
+         WHERE owner_user_id = ? AND hour_ms >= ? AND hour_ms <= ?
+         GROUP BY hour_ms ORDER BY hour_ms ASC"
+    } else {
+        "SELECT hour_ms as bucket_ms,
+                COALESCE(SUM(requests), 0) as requests,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens + cache_read_tokens + cache_write_tokens + output_tokens), 0) as tokens
+         FROM usage_rollups_hourly
+         WHERE hour_ms >= ? AND hour_ms <= ?
+         GROUP BY hour_ms ORDER BY hour_ms ASC"
+    };
+
+    let ts_rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(ts_sql)
+            .bind(uid)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(ts_sql)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let series = ts_rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "bucket_ms": r.try_get::<i64, _>("bucket_ms").unwrap_or(0),
+                "requests": r.try_get::<i64, _>("requests").unwrap_or(0),
+                "cost_micro_usd": r.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
+                "tokens": r.try_get::<i64, _>("tokens").unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let models_sql = if owner_user_id.is_some() {
+        "SELECT canonical_id,
+                COALESCE(SUM(requests), 0) as requests,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens
+         FROM usage_rollups_hourly
+         WHERE owner_user_id = ? AND hour_ms >= ? AND hour_ms <= ?
+         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+    } else {
+        "SELECT canonical_id,
+                COALESCE(SUM(requests), 0) as requests,
+                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens
+         FROM usage_rollups_hourly
+         WHERE hour_ms >= ? AND hour_ms <= ?
+         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+    };
+
+    let model_rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(models_sql)
+            .bind(uid)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(models_sql)
+            .bind(since_ms)
+            .bind(until_ms)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let models = model_rows
+        .into_iter()
+        .map(|r| {
+            let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+            serde_json::json!({
+                "canonical_id": r.try_get::<String, _>("canonical_id").unwrap_or_default(),
+                "requests": r.try_get::<i64, _>("requests").unwrap_or(0),
+                "cost_micro_usd": cost,
+                "cost_formatted": format_cost_usd(cost),
+                "input_tokens": r.try_get::<i64, _>("input_tokens").unwrap_or(0),
+                "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens").unwrap_or(0),
+                "cache_write_tokens": r.try_get::<i64, _>("cache_write_tokens").unwrap_or(0),
+                "output_tokens": r.try_get::<i64, _>("output_tokens").unwrap_or(0),
+                "badge": "[LLR]",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "kpi": {
+            "cost_micro_usd": total_cost,
+            "cost_formatted": format_cost_usd(total_cost),
+            "requests": total_requests,
+            "requests_formatted": format_tokens_compact(total_requests),
+            "tokens_total": total_tokens,
+            "tokens_formatted": format_tokens_compact(total_tokens),
+        },
+        "series": series,
+        "models": models,
+    }))
+}
+
+async fn control_plane_logging_middleware(
+    State(state): State<ApiAppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+    let is_cp = path.starts_with("/api/user/") || path.starts_with("/admin/api/");
+    if !is_cp || path.contains("/logs") {
+        return next.run(req).await;
+    }
+
+    let t0 = std::time::Instant::now();
+    let headers = req.headers().clone();
+    let peer_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0)
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let ip_addr = Some(
+        crate::auth::extract_client_ip(
+            peer_addr,
+            &headers,
+            state.auth.config.trusted_proxies.as_slice(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let actor_user_id = crate::auth::authenticate_session(&state.auth, &headers)
+        .await
+        .ok()
+        .map(|s| s.user.id);
+    let workspace_scope = if path.starts_with("/admin/") {
+        "global".to_string()
+    } else {
+        "personal".to_string()
+    };
+
+    let response = next.run(req).await;
+
+    if let Some(uid) = actor_user_id {
+        let latency_ms = t0.elapsed().as_millis() as i64;
+        let status = response.status().as_u16() as i64;
+        let pool = state.auth.pool.clone();
+        let log_id = llmroller_core::ids::RequestId::generate().to_string();
+        let req_id = llmroller_core::ids::RequestId::generate().to_string();
+        let now_ms = state.auth.clock.now_ms();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO control_plane_logs
+                 (id, ts, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&log_id)
+            .bind(now_ms)
+            .bind(&req_id)
+            .bind(uid.to_string())
+            .bind(&workspace_scope)
+            .bind(&method)
+            .bind(&path)
+            .bind(status)
+            .bind(latency_ms)
+            .bind(ip_addr)
+            .bind(user_agent)
+            .execute(&pool)
+            .await;
+        });
+    }
+
+    response
+}
+
+// ---------------------------------------------------------------------------
 // HTMX Partial Endpoints (SRDD Section 14.3)
 // ---------------------------------------------------------------------------
 
@@ -6030,6 +7046,20 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/usage/export.csv",
             get(get_user_usage_export_csv_handler),
         )
+        .route("/api/user/overview", get(get_user_overview_handler))
+        .route("/api/user/logs", get(get_user_logs_handler))
+        .route(
+            "/api/user/logs/{request_id}",
+            get(get_user_log_detail_handler),
+        )
+        .route(
+            "/api/user/logs/export.csv",
+            get(get_user_logs_export_csv_handler),
+        )
+        .route(
+            "/api/user/usage/ledger",
+            get(get_user_usage_ledger_handler),
+        )
         // Admin endpoints
         .route(
             "/admin/api/providers",
@@ -6142,6 +7172,19 @@ pub fn router(state: ApiAppState) -> Router {
             "/admin/api/usage/export.csv",
             get(get_admin_usage_export_csv_handler),
         )
+        .route("/admin/api/logs", get(get_admin_logs_handler))
+        .route(
+            "/admin/api/logs/{request_id}",
+            get(get_admin_log_detail_handler),
+        )
+        .route(
+            "/admin/api/logs/export.csv",
+            get(get_admin_logs_export_csv_handler),
+        )
+        .route(
+            "/admin/api/usage/ledger",
+            get(get_admin_usage_ledger_handler),
+        )
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))
         .route("/admin/api/sessions/{hash}/pin", delete(delete_pin_handler))
@@ -6153,6 +7196,10 @@ pub fn router(state: ApiAppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             control_mutation_barrier,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            control_plane_logging_middleware,
         ))
         .with_state(state)
 }
