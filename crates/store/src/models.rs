@@ -766,7 +766,10 @@ mod tests {
 
         let model_c = catalog.models.get(&pk_c).expect("model c present");
         assert_eq!(model_c.origin, ModelOrigin::Preset);
-        assert_eq!(model_c.merge_state, llmroller_core::catalog::MergeState::Confirmed);
+        assert_eq!(
+            model_c.merge_state,
+            llmroller_core::catalog::MergeState::Confirmed
+        );
 
         let snap = ConfigSnapshot {
             models: Arc::new(catalog.models),
@@ -776,8 +779,17 @@ mod tests {
             ..ConfigSnapshot::default()
         };
 
-        assert_eq!(snap.resolve_model("model-a").expect("resolve model-a").id, pk_c);
-        assert_eq!(snap.resolve_model("model-b").expect("resolve model-b").id, pk_c);
-        assert_eq!(snap.resolve_model("model-c").expect("resolve model-c").id, pk_c);
+        assert_eq!(
+            snap.resolve_model("model-a").expect("resolve model-a").id,
+            pk_c
+        );
+        assert_eq!(
+            snap.resolve_model("model-b").expect("resolve model-b").id,
+            pk_c
+        );
+        assert_eq!(
+            snap.resolve_model("model-c").expect("resolve model-c").id,
+            pk_c
+        );
     }
 }

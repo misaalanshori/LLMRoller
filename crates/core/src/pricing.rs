@@ -21,6 +21,8 @@ pub struct TokenUsage {
     pub cache_read: i64,
     pub cache_write: i64,
     pub output: i64,
+    /// Diagnostic subset of `output` that the provider attributed to reasoning/thinking.
+    pub reasoning: i64,
 }
 
 impl TokenUsage {
@@ -443,7 +445,6 @@ pub fn estimate_input_tokens(body: &[u8]) -> i64 {
 
     div_ceil_i64(text_bytes, 4) + binary_blocks * 1600
 }
-
 
 fn is_mostly_base64(raw_str: &[u8]) -> bool {
     let payload = if let Some(idx) = raw_str.windows(7).position(|w| w == b"base64,") {

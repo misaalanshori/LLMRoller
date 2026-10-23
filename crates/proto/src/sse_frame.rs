@@ -52,10 +52,7 @@ pub fn is_comment_frame(frame: &[u8]) -> bool {
 }
 
 fn is_non_null_error_value(err: &serde_json::Value) -> bool {
-    err.is_object()
-        || err
-            .as_str()
-            .is_some_and(|text| !text.trim().is_empty())
+    err.is_object() || err.as_str().is_some_and(|text| !text.trim().is_empty())
 }
 
 /// Checks if an SSE frame represents an upstream error event (`event: error`, `response.failed`,
@@ -147,9 +144,7 @@ pub fn is_injected_usage_frame(frame: &[u8]) -> bool {
         .get("choices")
         .and_then(serde_json::Value::as_array)
         .is_some_and(Vec::is_empty);
-    let has_usage_object = val
-        .get("usage")
-        .is_some_and(serde_json::Value::is_object);
+    let has_usage_object = val.get("usage").is_some_and(serde_json::Value::is_object);
     empty_choices && has_usage_object
 }
 

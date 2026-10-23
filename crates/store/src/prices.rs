@@ -264,7 +264,13 @@ pub const BUNDLED_PRICES: &[(&str, i64, i64, i64, i64)] = &[
     ("deepseek-chat", 270_000, 1_100_000, 70_000, 0),
     ("deepseek-reasoner", 550_000, 2_190_000, 140_000, 0),
     ("gpt-5.4", 2_500_000, 10_000_000, 1_250_000, 0),
-    ("claude-opus-4.6", 15_000_000, 75_000_000, 1_500_000, 18_750_000),
+    (
+        "claude-opus-4.6",
+        15_000_000,
+        75_000_000,
+        1_500_000,
+        18_750_000,
+    ),
     ("deepseek-v4.1", 270_000, 1_100_000, 70_000, 0),
     ("qwen-3.6-plus", 400_000, 1_200_000, 100_000, 0),
 ];
@@ -324,7 +330,9 @@ mod tests {
             .expect("bundled price must resolve");
         assert_eq!(rates.input_per_mtok_micro_usd, 3_000_000);
 
-        let entries = load_price_entries_tx(&mut tx).await.expect("load_price_entries_tx");
+        let entries = load_price_entries_tx(&mut tx)
+            .await
+            .expect("load_price_entries_tx");
         tx.commit().await.expect("commit");
 
         let snap = ConfigSnapshot {

@@ -183,11 +183,15 @@ async fn hash_chain_verification() {
 #[doc = "Spec: AUD-1, REL-2"]
 async fn concurrent_control_plane_mutations_preserve_intact_audit_hash_chain() {
     let (_dir, pool) = migrated_database().await;
-    let key = hmac_key();
+    let key = [0x42_u8; 32];
     for i in 0..25 {
         let mut conn = pool.acquire().await.expect("acquire");
-        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.expect("begin immediate");
-        let mut ent = entry(&format!("serialized_action_{i}"));
+        let mut tx = conn
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+        let action = format!("serialized_action_{i}");
+        let mut ent = entry(&action);
         ent.ts = 1_700_000_000_000 + i * 10;
         append(&mut tx, &key, ent).await.expect("append");
         tx.commit().await.expect("commit");
@@ -195,5 +199,5 @@ async fn concurrent_control_plane_mutations_preserve_intact_audit_hash_chain() {
     let count = verify_audit_log(&pool, &key, None, None)
         .await
         .expect("serialized chain must verify cleanly");
-    assert_eq!(count, 25);
+    assert_eq!(count.rows_verified, 25);
 }

@@ -707,9 +707,10 @@ mod tests {
         .await
         .expect("create client key");
 
-        let neg_err = rotate_client_key(&pool, &actor, created.client_key.id, -1, &OsEntropy, 2_000)
-            .await
-            .expect_err("negative grace period must fail");
+        let neg_err =
+            rotate_client_key(&pool, &actor, created.client_key.id, -1, &OsEntropy, 2_000)
+                .await
+                .expect_err("negative grace period must fail");
         assert!(matches!(neg_err, ClientKeyError::Validation(_)));
 
         let huge_err = rotate_client_key(

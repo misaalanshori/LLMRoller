@@ -1117,7 +1117,8 @@ mod tests {
 
     #[tokio::test]
     #[doc = "Spec: USR-3, USR-4, PRV-1, USG-10"]
-    async fn standard_user_cannot_read_global_provider_internal_config_json_and_can_update_billing_plan() {
+    async fn standard_user_cannot_read_global_provider_internal_config_json_and_can_update_billing_plan()
+     {
         let dir = tempfile::tempdir().expect("tempdir");
         let pool = open_pool(&dir.path().join("prov.db"), Role::Writer)
             .await
@@ -1199,7 +1200,10 @@ mod tests {
         .expect("create personal provider");
 
         let user_list = list_providers(&pool, &user_actor).await.expect("list");
-        let seen_global = user_list.iter().find(|p| p.id == global_p.id).expect("global in list");
+        let seen_global = user_list
+            .iter()
+            .find(|p| p.id == global_p.id)
+            .expect("global in list");
         assert_eq!(seen_global.config_json, "{}");
 
         let updated = set_provider_billing_plan(

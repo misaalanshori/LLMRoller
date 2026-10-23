@@ -1174,8 +1174,15 @@ pub async fn post_response_cancel(
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::POST, "/cancel", uri.query())
-        .await
+    forward_state_bound_response_op(
+        &state,
+        &client_key,
+        &id,
+        Method::POST,
+        "/cancel",
+        uri.query(),
+    )
+    .await
 }
 
 /// One fully-resolved routing candidate built exclusively from the immutable snapshot.
@@ -1640,9 +1647,9 @@ const fn failure_charge(
 ) -> (i64, &'static str) {
     use llmroller_core::usage::AttemptOutcome;
     match outcome {
-        AttemptOutcome::Http5xx
-        | AttemptOutcome::WaitTimeout
-        | AttemptOutcome::ErrorFrame => (estimate, "estimated_input"),
+        AttemptOutcome::Http5xx | AttemptOutcome::WaitTimeout | AttemptOutcome::ErrorFrame => {
+            (estimate, "estimated_input")
+        }
         _ => (0, "none"),
     }
 }
@@ -3181,7 +3188,7 @@ pub async fn handle_inference_request(
                 return rate_limit_error(retry_after_secs);
             }
             HardRouteDecision::Forbidden403KeyUnavailable => {
-                state.pin_store.invalidate_key(link.upstream_key_id);
+                state.pin_store.invalidate_key(&link.upstream_key_id);
                 return permission_error(
                     "the upstream key that holds previous_response_id is no longer available to this client key",
                 );
@@ -3826,7 +3833,10 @@ pub async fn handle_inference_request(
             let is_model_not_found_404 = status == StatusCode::NOT_FOUND && {
                 let body_lower = String::from_utf8_lossy(classify_prefix).to_ascii_lowercase();
                 llmroller_core::provider::ErrorClassifiers::matches(
-                    &candidate.config.error_classifiers.model_not_found_substrings,
+                    &candidate
+                        .config
+                        .error_classifiers
+                        .model_not_found_substrings,
                     &body_lower,
                 ) || body_lower.contains("model_not_found")
                     || body_lower.contains("does not exist")
@@ -4801,12 +4811,7 @@ pub async fn handle_inference_request(
 
     let (terminal_status, terminal_code, terminal_retry_after, terminal_body) =
         if aux_unsupported_seen {
-            (
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                None,
-                None,
-            )
+            (StatusCode::NOT_FOUND, "not_found_error", None, None)
         } else {
             select_terminal_error(&try_outcomes)
         };
@@ -5300,7 +5305,12 @@ mod tests {
         );
         assert_eq!(oai_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            oai_resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            oai_resp
+                .headers()
+                .get("retry-after")
+                .expect("retry-after header")
+                .to_str()
+                .expect("ASCII retry-after value"),
             "5"
         );
 
@@ -5318,13 +5328,11 @@ mod tests {
         assert_eq!(origin.port, 18080);
 
         let mut tap = SseUsageTap::new(EndpointKind::Chat);
-        tap.feed_chunk(b"data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}
-
-");
+        tap.feed_chunk(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        );
         assert!(!tap.is_complete_at_eof());
-        tap.feed_chunk(b"data: [DONE]
-
-");
+        tap.feed_chunk(b"data: [DONE]\n\n");
         assert!(tap.is_complete_at_eof());
     }
 }

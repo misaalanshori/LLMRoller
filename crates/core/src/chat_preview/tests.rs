@@ -143,9 +143,15 @@ fn test_xss_escaping_and_sanitization() {
         !sanitized_img.contains("<img"),
         "img tag should be stripped"
     );
+    // Raw HTML is neutralized as escaped text, never emitted as a live tag or
+    // event-handler attribute (`SEC-19`).
     assert!(
-        !sanitized_img.contains("onerror"),
-        "onerror with whitespace should be stripped"
+        sanitized_img.contains("&lt;img"),
+        "raw img tag must be escaped as inert text: {sanitized_img}"
+    );
+    assert!(
+        !sanitized_img.contains("<img src=x onerror"),
+        "onerror must not survive as a live attribute"
     );
 
     let sanitized_link = sanitize_assistant_text(js_link);
@@ -156,8 +162,12 @@ fn test_xss_escaping_and_sanitization() {
 
     let sanitized_a = sanitize_assistant_text(js_a_tag);
     assert!(
-        !sanitized_a.contains("javascript:"),
-        "javascript: scheme in a tag should be stripped"
+        !sanitized_a.contains("<a href=\"javascript:"),
+        "javascript: scheme in a live anchor must be stripped"
+    );
+    assert!(
+        sanitized_a.contains("&lt;a"),
+        "raw anchor tag must be escaped as inert text: {sanitized_a}"
     );
 
     // Safe Markdown is preserved and converted to safe HTML tags
@@ -173,7 +183,10 @@ fn test_xss_escaping_and_sanitization() {
 #[test]
 fn test_raw_html_disabled_mailto_rejected_and_lcp_compaction_detected() {
     let out = sanitize_assistant_markdown("[mail](mailto:test@example.com) <b>raw_tag</b>");
-    assert!(!out.contains("mailto:"), "mailto: scheme must be stripped: {out}");
+    assert!(
+        !out.contains("mailto:"),
+        "mailto: scheme must be stripped: {out}"
+    );
     assert!(
         !out.contains("<b>raw_tag</b>"),
         "raw HTML tags in markdown must be escaped as text: {out}"

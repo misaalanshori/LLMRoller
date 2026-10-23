@@ -448,8 +448,11 @@ async fn test_rbac_isolated_sessions_and_preview() {
     let malicious = "<script>alert(1)</script><img src=x onerror=alert(1)>";
     let sanitized = sanitize_assistant_text(malicious);
     assert!(!sanitized.contains("<script"));
-    assert!(!sanitized.contains("alert(1)"));
     assert!(!sanitized.contains("<img"));
+    // Raw HTML is neutralized as escaped text, never emitted as a live tag
+    // or event-handler attribute (SEC-19).
+    assert!(sanitized.contains("&lt;script&gt;"));
+    assert!(sanitized.contains("&lt;img"));
 
     let escaped = escape_html(malicious);
     assert!(!escaped.contains('<'));

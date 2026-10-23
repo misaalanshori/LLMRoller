@@ -346,8 +346,7 @@ fn test_stream_options_sibling_fields_and_session_override_edge_cases() {
         Some(("custom_session", "llr_salted123")),
     )
     .expect("custom session field edit");
-    let parsed_custom: serde_json::Value =
-        serde_json::from_slice(&out_custom).expect("valid json");
+    let parsed_custom: serde_json::Value = serde_json::from_slice(&out_custom).expect("valid json");
     assert_eq!(parsed_custom["custom_session"], "llr_salted123");
     assert!(scan_top_level(&out_custom).is_ok());
 

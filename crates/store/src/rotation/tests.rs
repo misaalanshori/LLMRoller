@@ -635,13 +635,7 @@ async fn rotation_reports_aead_tampering_with_exit_code_7() {
 #[tokio::test]
 #[doc = "Spec: SEC-1, SEC-2, TRC-3"]
 async fn rotate_dek_reencrypts_trace_records_and_trace_blocks() {
-    let (_dir, pool) = migrated_database().await;
-    let entropy = Arc::new(FakeEntropy::new(71));
-    load_or_initialize(&pool, "mk_old", &old_key(), Arc::clone(&entropy), 1_000)
-        .await
-        .expect("initialize instance");
-
-    let old_sealer = XChaCha20Poly1305Sealer::new(old_key(), entropy.clone());
+    let (_directory, pool, state, old_sealer, entropy) = setup().await;
     seed_all(&pool, &old_sealer, "mk_old", 1).await;
 
     let report = rotate_master_key(
@@ -655,8 +649,26 @@ async fn rotate_dek_reencrypts_trace_records_and_trace_blocks() {
     .await
     .expect("rotate master key");
     assert!(report.rows_re_sealed >= 6);
+    assert!(!report.resumed);
 
-    let new_sealer = XChaCha20Poly1305Sealer::new(new_key(), entropy);
-    assert_all_open_with_new_key(&pool, &new_sealer, "mk_new", 1).await;
+    // No ciphertext may remain sealed under the retired master key, including
+    // `trace_records` and `trace_blocks`.
+    assert_eq!(count_stale_rows(&pool, "mk_old").await, 0);
+
+    // Freshly sealed trace payloads open under the rotated key.
+    let new_sealer = XChaCha20Poly1305Sealer::new(new_key(), state.instance_id, entropy);
+    let (trace_hash, trace_payload): (String, Vec<u8>) =
+        sqlx::query_as("SELECT block_hash, payload_enc FROM trace_blocks LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("trace block row");
+    let opened = new_sealer
+        .open(
+            "trace_block",
+            &[b"mk_new", USER_A.as_bytes(), trace_hash.as_bytes()],
+            &trace_payload,
+        )
+        .expect("trace block opens under rotated DEK");
+    assert!(!opened.expose_secret().is_empty());
     pool.close().await;
 }

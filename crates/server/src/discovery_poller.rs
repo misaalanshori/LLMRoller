@@ -378,18 +378,20 @@ pub fn recover_invalid_key_after_models_probe(
     if !was_unhealthy {
         return false;
     }
-    runtime_state
-        .key_health
-        .insert(key_id, llmroller_core::runtime_state::KeyHealthEntry::default());
+    runtime_state.key_health.insert(
+        key_id,
+        llmroller_core::runtime_state::KeyHealthEntry::default(),
+    );
     let version = i64::try_from(runtime_state.health.bump_version()).unwrap_or(i64::MAX);
     if let Some(writer) = writer {
         writer.queues.durable_state.lock().insert(
-            DurableKey::KeyHealth(key_id.to_string()),
-            DurableOp::KeyHealthUpdate {
-                key_id: key_id.to_string(),
+            DurableKey::HealthVersion(key_id.to_string()),
+            DurableOp::HealthVersionUpdate {
+                upstream_key_id: key_id.to_string(),
                 health: "healthy".to_string(),
                 health_until: None,
                 health_version: version,
+                last_error: None,
             },
         );
     }
@@ -399,17 +401,17 @@ pub fn recover_invalid_key_after_models_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmroller_core::provider::{ProviderAuthConfig, ProviderAuthScheme};
+    use llmroller_core::provider::{ProtocolAuthConfig, ProviderAuthScheme};
 
     #[test]
     #[doc = "Spec: MDL-1, PRV-1, PRV-3"]
     fn discovery_poller_uses_configured_models_path_and_auth_header_mode() {
         let mut cfg = ProviderConfig::default();
         cfg.paths.models = Some("/custom/v2/models".to_string());
-        cfg.auth.models = Some(ProviderAuthScheme {
+        cfg.auth.models = Some(ProtocolAuthConfig::Explicit(ProviderAuthScheme {
             header: "x-api-key".to_string(),
             prefix: String::new(),
-        });
+        }));
         let url = discovery_endpoint(ProviderKind::Custom, "https://api.example.com/", &cfg);
         assert_eq!(url, "https://api.example.com/custom/v2/models");
         let headers = discovery_headers(&cfg, "secret-token");
@@ -426,7 +428,9 @@ mod tests {
         let key_id = UpstreamKeyId::generate();
         runtime.quarantine_key(key_id, "credential_rejected");
         assert!(!runtime.is_key_routable(key_id, 1_000));
-        assert!(recover_invalid_key_after_models_probe(&runtime, None, key_id));
+        assert!(recover_invalid_key_after_models_probe(
+            &runtime, None, key_id
+        ));
         assert!(runtime.is_key_routable(key_id, 1_000));
     }
 }

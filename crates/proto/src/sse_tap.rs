@@ -62,7 +62,8 @@ impl SseUsageTap {
     #[must_use]
     pub fn is_complete_at_eof(&self) -> bool {
         let pending_clean = self.pending.iter().all(|b| b.is_ascii_whitespace());
-        pending_clean && (self.saw_done || self.saw_terminal_event || self.has_terminal_output_usage)
+        pending_clean
+            && (self.saw_done || self.saw_terminal_event || self.has_terminal_output_usage)
     }
 
     fn process_frame(&mut self, frame: &[u8]) {
@@ -80,7 +81,10 @@ impl SseUsageTap {
                 let ev_name = ev.trim();
                 if matches!(
                     ev_name,
-                    "message_stop" | "response.completed" | "response.incomplete" | "response.failed"
+                    "message_stop"
+                        | "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
                 ) {
                     self.saw_terminal_event = true;
                 }

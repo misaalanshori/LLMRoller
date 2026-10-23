@@ -730,13 +730,6 @@ impl RuntimeState {
         decision
     }
 
-    /// Whether every configured hard budget window that applies to this key and
-    /// model has headroom (C8 quick gate).
-    ///
-    /// Windows are resolved through the published snapshot because window ids are
-    /// opaque UUIDs: `scope_kind = 'upstream_key'` windows always apply, while
-    /// `scope_kind = 'route'` windows apply only to their configured model.
-    #[must_use]
     /// Computes the minimum remaining headroom in basis points (`0..=10_000`) across all
     /// key-scoped (`scope_kind = 'upstream_key'`) and route-scoped (`scope_kind = 'route'`)
     /// budget windows that apply to `(key_id, model_pk)` (`RTE-13`, `LIM-1`).
@@ -762,7 +755,8 @@ impl RuntimeState {
                     min_bps = 0;
                     continue;
                 }
-                let used = crate::windows::BudgetCounter::effective_used(counter.as_ref(), now_ms).max(0);
+                let used =
+                    crate::windows::BudgetCounter::effective_used(counter.as_ref(), now_ms).max(0);
                 let rem = (max_spend - used).max(0);
                 let bps = (rem.saturating_mul(10_000) / max_spend).clamp(0, 10_000);
                 min_bps = min_bps.min(bps);

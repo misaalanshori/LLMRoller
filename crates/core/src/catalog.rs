@@ -137,6 +137,7 @@ pub fn normalize_keep_vendor(raw: &str) -> Result<String, NormalizeError> {
 #[serde(rename_all = "snake_case")]
 pub enum ModelOrigin {
     Global,
+    Preset,
     Personal,
 }
 

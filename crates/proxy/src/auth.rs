@@ -369,7 +369,10 @@ pub async fn client_key_auth_middleware(
             next.run(request).await
         }
         Err(failure) => {
-            let matched_key = snapshot.client_keys_by_hash.get(&hash);
+            let matched_key = snapshot
+                .client_keys_by_hash
+                .get(&hash)
+                .map(|(record, _role)| record);
             let record_gate_usage_event = |status_u16: u16, err_code: &str| {
                 if let (Some(ck), Some(writer)) = (matched_key, &state.writer) {
                     let ep = if is_messages_path {
@@ -415,7 +418,10 @@ pub async fn client_key_auth_middleware(
                             list_cost_micro_usd: 0,
                             plan_multiplier_bps: 10_000,
                             billing_coverage_mode: "pay_as_you_go".to_string(),
-                            service_account_id: ck.service_account_id.map(|sa| sa.to_string()),
+                            service_account_id: ck
+                                .service_account_id
+                                .clone()
+                                .map(|sa| sa.to_string()),
                             stop_reason: None,
                             request_headers_json: None,
                             metadata_json: None,

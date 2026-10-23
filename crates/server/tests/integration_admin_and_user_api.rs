@@ -588,7 +588,7 @@ async fn test_client_key_sessions_report_live_session_pins() {
     .await
     .expect("insert global pin");
 
-    // Standard user queries sessions: global key ID must be null and label must be "pooled" (USR-4, SEC-17)
+    // Standard user queries sessions: global key ID must be null and label must be "global pool" (USR-4, SEC-17)
     let user_req = Request::builder()
         .method("GET")
         .uri(format!(
@@ -619,8 +619,8 @@ async fn test_client_key_sessions_report_live_session_pins() {
         "global key id must be redacted to null for standard users"
     );
     assert_eq!(
-        global_pins[0]["key_label"], "pooled",
-        "global key label must be masked to pooled"
+        global_pins[0]["key_label"], "global pool",
+        "global key label must be masked to \"global pool\""
     );
 
     // Admin queries sessions: receives full unredacted key details

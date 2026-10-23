@@ -3,7 +3,7 @@
 //! Spec: Section 6.10, Section 7.1, Section 8.2, Section 9.1, Section 9.2,
 //! Requirements: TRC-4, TRC-7, PERF-5, SEC-19.
 
-use sqlx::{Sqlite, Transaction};
+use sqlx::{Row, Sqlite, Transaction};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -44,7 +44,7 @@ pub struct SealJob {
 }
 
 /// Output of a completed seal job.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SealedTurnResult {
     pub master_key_id: String,
     pub protocol: String,

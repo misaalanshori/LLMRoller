@@ -209,7 +209,7 @@ impl ThreeQueueUsageWriter {
 
         // 2b. Fold non-final failed attempt charges into 5-minute and hourly rollups (USG-1, USG-3, SHR-6)
         for att in &attempts {
-            if att.outcome != AttemptOutcome::Success
+            if att.outcome != AttemptOutcome::Served
                 && att.charged_micro_usd > 0
                 && !att.upstream_key_id.is_empty()
                 && att.upstream_key_id.as_str() != event.upstream_key_id.as_deref().unwrap_or("")
@@ -330,7 +330,9 @@ impl ThreeQueueUsageWriter {
         let rh_backup = rh_items.clone();
         let raw_backup = raw_items.clone();
 
-        let res = self.flush_to_db_inner(tx, r5_items, rh_items, raw_items).await;
+        let res = self
+            .flush_to_db_inner(tx, r5_items, rh_items, raw_items)
+            .await;
         if res.is_err() {
             self.restore_batch(r5_backup, rh_backup, raw_backup);
         }
@@ -344,7 +346,6 @@ impl ThreeQueueUsageWriter {
         rh_items: HashMap<RollupHourlyKey, RollupDelta>,
         raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)>,
     ) -> Result<usize, sqlx::Error> {
-
         // 1. Commit 5-minute rollups
         for (k, d) in r5_items {
             sqlx::query(
@@ -476,7 +477,11 @@ impl ThreeQueueUsageWriter {
     }
 }
 
-fn extract_json_string_field(json_opt: Option<&str>, keys: &[&str], max_len: usize) -> Option<String> {
+fn extract_json_string_field(
+    json_opt: Option<&str>,
+    keys: &[&str],
+    max_len: usize,
+) -> Option<String> {
     let raw = json_opt?;
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = val.as_object()?;
@@ -507,18 +512,16 @@ async fn insert_usage_event(
         .filter(|s| !s.trim().is_empty());
     let provider = e.provider_id.as_deref().filter(|s| !s.trim().is_empty());
     let share = e.share_id.as_deref().filter(|s| !s.trim().is_empty());
-    let client_user_agent = extract_json_string_field(
-        e.request_headers_json.as_deref(),
-        &["user-agent"],
-        256,
-    )
-    .or_else(|| {
-        extract_json_string_field(
-            e.metadata_json.as_deref(),
-            &["client_user_agent", "user_agent"],
-            256,
-        )
-    });
+    let client_user_agent =
+        extract_json_string_field(e.request_headers_json.as_deref(), &["user-agent"], 256).or_else(
+            || {
+                extract_json_string_field(
+                    e.metadata_json.as_deref(),
+                    &["client_user_agent", "user_agent"],
+                    256,
+                )
+            },
+        );
     let client_location = extract_json_string_field(
         e.metadata_json.as_deref(),
         &["client_location", "location"],
@@ -642,7 +645,7 @@ mod tests {
         let uid = UserId::generate();
 
         let event = UsageEventRecord {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             ts: 600_000,
             request_id: req_id,
             client_key_id: ck_id,
@@ -678,7 +681,9 @@ mod tests {
             billing_coverage_mode: "pay_as_you_go".to_string(),
             service_account_id: None,
             stop_reason: Some("stop".to_string()),
-            request_headers_json: Some(r#"{"user-agent":"ClaudeCode/1.2.3","cf-ipcountry":"US"}"#.to_string()),
+            request_headers_json: Some(
+                r#"{"user-agent":"ClaudeCode/1.2.3","cf-ipcountry":"US"}"#.to_string(),
+            ),
             metadata_json: None,
         };
         let attempts = vec![
@@ -700,7 +705,7 @@ mod tests {
                 ts: 600_000,
                 upstream_key_id: "uk_final".to_string(),
                 share_id: None,
-                outcome: AttemptOutcome::Success,
+                outcome: AttemptOutcome::Served,
                 http_status: Some(200),
                 bytes_sent: 512,
                 charged_micro_usd: 1_500,
@@ -730,11 +735,15 @@ mod tests {
         .await
         .expect("usage_event row");
         assert_eq!(
-            row.try_get::<Option<String>, _>("client_user_agent").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("client_user_agent")
+                .expect("client_user_agent column")
+                .as_deref(),
             Some("ClaudeCode/1.2.3")
         );
         assert_eq!(
-            row.try_get::<Option<String>, _>("client_location").unwrap().as_deref(),
+            row.try_get::<Option<String>, _>("client_location")
+                .expect("client_location column")
+                .as_deref(),
             Some("US")
         );
     }

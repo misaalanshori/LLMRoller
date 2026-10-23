@@ -323,7 +323,7 @@ async fn test_sealer_pool_flush_drains_accepted_jobs_and_closes_submissions() {
 #[tokio::test]
 #[doc = "Spec: TRC-5"]
 async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
-    let (_dir, pool, sealer) = setup_trace_test_db().await;
+    let (_dir, pool, sealer, _user) = setup_traces_test_db().await;
     let owner = UserId::generate();
     let ck = ClientKeyId::generate();
     let req1 = RequestId::generate();
@@ -356,7 +356,7 @@ async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
         .expect("ue");
     }
 
-    let job1 = UnsealedTurnJob {
+    let job1 = SealJob {
         usage_event_id: "ue_1".to_string(),
         request_id: req1,
         ts: 1_000,
@@ -364,11 +364,11 @@ async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
         client_key_id: ck,
         session_hash: "sess_page".to_string(),
         thread_id: "main".to_string(),
-        canonical_id: Some("gpt-4o".to_string()),
+        canonical_id: "gpt-4o".to_string(),
         protocol: "chat".to_string(),
         truncated_content: false,
         master_key_id: "mk-test".to_string(),
-        trace_payload: StoredTurnTraceV2 {
+        turn_trace: StoredTurnTraceV2 {
             v: 2,
             request_skeleton: serde_json::json!({}),
             block_refs: vec!["b1".to_string()],
@@ -376,10 +376,13 @@ async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
             response_raw: None,
             truncation: None,
         },
-        blocks: vec![("b1".to_string(), br#"{"role":"user","content":"hi"}"#.to_vec())],
+        blocks: vec![(
+            "b1".to_string(),
+            br#"{"role":"user","content":"hi"}"#.to_vec(),
+        )],
         expires_at: 99_000,
     };
-    let job2 = UnsealedTurnJob {
+    let job2 = SealJob {
         usage_event_id: "ue_2".to_string(),
         request_id: req2,
         ts: 2_000,
@@ -387,11 +390,11 @@ async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
         client_key_id: ck,
         session_hash: "sess_page".to_string(),
         thread_id: "main".to_string(),
-        canonical_id: Some("gpt-4o".to_string()),
+        canonical_id: "gpt-4o".to_string(),
         protocol: "chat".to_string(),
         truncated_content: false,
         master_key_id: "mk-test".to_string(),
-        trace_payload: StoredTurnTraceV2 {
+        turn_trace: StoredTurnTraceV2 {
             v: 2,
             request_skeleton: serde_json::json!({}),
             block_refs: vec!["b1".to_string(), "b2".to_string()],
@@ -399,16 +402,23 @@ async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
             response_raw: None,
             truncation: None,
         },
-        blocks: vec![("b2".to_string(), br#"{"role":"user","content":"next"}"#.to_vec())],
+        blocks: vec![(
+            "b2".to_string(),
+            br#"{"role":"user","content":"next"}"#.to_vec(),
+        )],
         expires_at: 99_000,
     };
 
-    let sealed1 = seal_turn_job(&job1, &sealer, "mk-test").expect("seal 1");
-    let sealed2 = seal_turn_job(&job2, &sealer, "mk-test").expect("seal 2");
+    let sealed1 = seal_turn_sync(&job1, &sealer).expect("seal 1");
+    let sealed2 = seal_turn_sync(&job2, &sealer).expect("seal 2");
 
     let mut tx = pool.begin().await.expect("begin");
-    insert_sealed_trace_tx(&mut tx, &sealed1, "mk-test").await.expect("insert 1");
-    insert_sealed_trace_tx(&mut tx, &sealed2, "mk-test").await.expect("insert 2");
+    insert_sealed_trace_tx(&mut tx, &sealed1, "mk-test")
+        .await
+        .expect("insert 1");
+    insert_sealed_trace_tx(&mut tx, &sealed2, "mk-test")
+        .await
+        .expect("insert 2");
 
     let req1_str = req1.to_string();
     let (pred, page2) = load_session_trace_page_tx(

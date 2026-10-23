@@ -349,7 +349,8 @@ pub fn parse_raw_usage_to_sanitized(
 
             if let Some(limit) = limit_usd {
                 let used_pct = ((usage_monthly_usd / limit) * 100.0).clamp(0.0, 100.0);
-                let balance = limit_remaining.unwrap_or_else(|| (limit - usage_monthly_usd).max(0.0));
+                let balance =
+                    limit_remaining.unwrap_or_else(|| (limit - usage_monthly_usd).max(0.0));
                 let mut windows = vec![parse_window_obj(
                     "1mo",
                     &serde_json::json!({ "used_percent": used_pct }),
@@ -585,8 +586,7 @@ mod tests {
             },
             "balance_usd": 42.5
         });
-        let amr =
-            parse_raw_usage_to_sanitized(ProviderKind::OpenDesignAmr, &amr_raw).expect("amr");
+        let amr = parse_raw_usage_to_sanitized(ProviderKind::OpenDesignAmr, &amr_raw).expect("amr");
         assert_eq!(amr.plan_name.as_deref(), Some("Design Plan"));
         assert_eq!(amr.windows.len(), 2);
         assert_eq!(amr.balance_micro_usd, Some(42_500_000));

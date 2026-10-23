@@ -91,12 +91,9 @@ impl MonthlyAccumulator {
         let ym = i64::from(ym_struct.year) * 100 + i64::from(ym_struct.month);
         let prev = self.current_yyyymm.load(Ordering::Acquire);
         if prev == 0 {
-            let _ = self.current_yyyymm.compare_exchange(
-                0,
-                ym,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let _ =
+                self.current_yyyymm
+                    .compare_exchange(0, ym, Ordering::AcqRel, Ordering::Acquire);
         } else if ym > prev
             && self
                 .current_yyyymm

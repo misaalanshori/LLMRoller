@@ -9,6 +9,7 @@ pub mod body_edit;
 pub mod discovery;
 pub mod headers;
 pub mod json_usage;
+pub mod scrub;
 pub mod sse_frame;
 pub mod sse_tap;
 pub mod trace_tap;

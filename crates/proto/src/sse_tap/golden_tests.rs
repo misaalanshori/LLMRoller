@@ -302,7 +302,11 @@ fn test_aborted_messages_and_responses_streams_preserve_input_and_estimate_outpu
     );
     let delta_400 = "x".repeat(400);
     let delta_frame = format!(
-        "event: content_block_delta\ndata: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{delta_400}"}}}}\n\n"
+        "event: content_block_delta\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": delta_400}
+        })
     );
     msg_tap.feed_chunk(delta_frame.as_bytes());
     let u = msg_tap.finalize_usage();

@@ -56,9 +56,9 @@ impl Scan {
         };
         recorded_paths.iter().any(|recorded| {
             let norm = recorded.to_string_lossy().replace('\\', "/");
-            allowed_rel_paths.iter().any(|allowed| {
-                norm == *allowed || norm.ends_with(&format!("/{allowed}"))
-            })
+            allowed_rel_paths
+                .iter()
+                .any(|allowed| norm == *allowed || norm.ends_with(&format!("/{allowed}")))
         })
     }
 
@@ -146,15 +146,17 @@ impl Scan {
                         continue;
                     }
                     if candidate.starts_with("fn ") || candidate.starts_with("async fn ") {
-                        let empty_inline =
-                            candidate.ends_with("{}") || candidate.ends_with("{ }");
+                        let empty_inline = candidate.ends_with("{}") || candidate.ends_with("{ }");
                         let empty_two_line = candidate.ends_with('{')
                             && lines
                                 .get(candidate_idx + 1)
                                 .is_some_and(|next| next.trim() == "}");
                         if empty_inline || empty_two_line {
-                            self.empty_test_stubs
-                                .push(format!("{}:{}", path.display(), candidate_idx + 1));
+                            self.empty_test_stubs.push(format!(
+                                "{}:{}",
+                                path.display(),
+                                candidate_idx + 1
+                            ));
                         }
                     }
                     break;

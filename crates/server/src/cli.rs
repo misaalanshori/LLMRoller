@@ -1369,7 +1369,9 @@ pub(crate) async fn auto_disable_expired_traceability(
                     llmroller_core::snapshot::ConfigDomain::Settings,
                     llmroller_core::snapshot::ConfigDomain::Traceability,
                 ],
-                invalidations: vec![llmroller_core::snapshot::CacheInvalidationEvent::SettingsChanged],
+                invalidations: vec![
+                    llmroller_core::snapshot::CacheInvalidationEvent::SettingsChanged,
+                ],
             })
             .await;
     }
@@ -1437,7 +1439,17 @@ mod phase7_tests {
         let db = dir.path().join("llmroller.db");
         let pool = open_pool(&db, Role::Writer).await.expect("open pool");
         migrate(&pool).await.expect("migrate");
-        seed_defaults(&pool, "smooth_weighted_rr", 1_000).await.expect("seed");
+        let master_key = MasterKey::from_bytes([0x11; 32]);
+        load_or_initialize(&pool, "mk_test", &master_key, Arc::new(OsEntropy), 1_000)
+            .await
+            .expect("init instance");
+        seed_defaults(
+            &pool,
+            Some(llmroller_core::strategy::RoutingStrategy::SmoothWeightedRr),
+            1_000,
+        )
+        .await
+        .expect("seed");
 
         let cfg = llmroller_core::settings::TraceabilityConfig {
             enabled: true,
@@ -1462,6 +1474,10 @@ mod phase7_tests {
             .expect("load settings");
         assert!(!loaded.traceability_config.enabled);
         let notif = reloader_rx.try_recv().expect("reloader notified");
-        assert!(notif.changed_domains.contains(&llmroller_core::snapshot::ConfigDomain::Settings));
+        assert!(
+            notif
+                .changed_domains
+                .contains(&llmroller_core::snapshot::ConfigDomain::Settings)
+        );
     }
 }

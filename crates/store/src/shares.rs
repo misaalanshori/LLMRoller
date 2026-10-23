@@ -44,13 +44,11 @@ pub async fn create_provider_share_tx(
     let key_str = new_share.upstream_key_id.as_ref().map(|k| k.to_string());
 
     // 0. Verify grantor actually owns the personal provider and optional upstream key (SHR-1, USR-3, F-115)
-    let prov_row = sqlx::query(
-        "SELECT owner_user_id, ownership_scope FROM providers WHERE id = ?",
-    )
-    .bind(&provider_str)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(ShareError::NotFound)?;
+    let prov_row = sqlx::query("SELECT owner_user_id, ownership_scope FROM providers WHERE id = ?")
+        .bind(&provider_str)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ShareError::NotFound)?;
     let prov_owner: Option<String> = prov_row.try_get("owner_user_id").unwrap_or(None);
     let prov_scope: String = prov_row.try_get("ownership_scope").unwrap_or_default();
     if prov_scope != "personal" || prov_owner.as_deref() != Some(owner_str.as_str()) {
@@ -58,13 +56,12 @@ pub async fn create_provider_share_tx(
     }
 
     if let Some(ref k_str) = key_str {
-        let key_row = sqlx::query(
-            "SELECT provider_id, owner_user_id FROM upstream_keys WHERE id = ?",
-        )
-        .bind(k_str)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(ShareError::NotFound)?;
+        let key_row =
+            sqlx::query("SELECT provider_id, owner_user_id FROM upstream_keys WHERE id = ?")
+                .bind(k_str)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(ShareError::NotFound)?;
         let key_prov: String = key_row.try_get("provider_id").unwrap_or_default();
         let key_owner: Option<String> = key_row.try_get("owner_user_id").unwrap_or(None);
         if key_prov != provider_str

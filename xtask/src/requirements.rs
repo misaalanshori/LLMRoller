@@ -185,8 +185,7 @@ impl Registry {
             }
         }
 
-        let traced =
-            selected.len() - missing.len() - partial_only.len() - unlinked_targets.len();
+        let traced = selected.len() - missing.len() - partial_only.len() - unlinked_targets.len();
         writeln!(
             out,
             "{milestone}: {traced}/{} requirements have full Spec links ({} partial-only, {} missing, {} unlinked-targets)",
@@ -220,9 +219,7 @@ impl Registry {
             writeln!(
                 out,
                 "UNLINKED_TARGET [{}] {}: Spec link not found in any registered test file {:?}",
-                requirement.priority,
-                requirement.id,
-                requirement.tests
+                requirement.priority, requirement.id, requirement.tests
             )
             .map_err(|error| format!("cannot write traceability report: {error}"))?;
         }
@@ -431,11 +428,7 @@ tests = ["crates/core/src/wrr/proptests.rs"]
     fn milestone_gate_rejects_partial_only_and_missing_links() {
         let registry = Registry::parse(REGISTRY).expect("registry must parse");
         let mut scan = Scan::default();
-        scan.record(
-            "AUTH-1",
-            true,
-            PathBuf::from("tests/e2e_setup_and_auth.rs"),
-        );
+        scan.record("AUTH-1", true, PathBuf::from("tests/e2e_setup_and_auth.rs"));
         scan.record(
             "SEC-1",
             false,
@@ -480,11 +473,7 @@ tests = ["crates/core/src/wrr/proptests.rs"]
     fn milestone_gate_passes_when_every_requirement_has_a_spec_link() {
         let registry = Registry::parse(REGISTRY).expect("registry must parse");
         let mut scan = Scan::default();
-        scan.record(
-            "AUTH-1",
-            true,
-            PathBuf::from("tests/e2e_setup_and_auth.rs"),
-        );
+        scan.record("AUTH-1", true, PathBuf::from("tests/e2e_setup_and_auth.rs"));
         scan.record(
             "SEC-1",
             true,

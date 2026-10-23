@@ -110,7 +110,11 @@ pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsag
     let cache_read_tokens = details
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_i64()))
+        .or_else(|| {
+            usage
+                .get("prompt_cache_hit_tokens")
+                .and_then(|v| v.as_i64())
+        })
         .unwrap_or(0)
         .max(0);
 
@@ -128,15 +132,17 @@ pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsag
         .unwrap_or(0)
         .max(0);
 
-    let input_uncached_tokens =
-        if let Some(miss) = usage.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64()) {
-            miss.max(0)
-        } else {
-            prompt_tokens
-                .saturating_sub(cache_read_tokens)
-                .saturating_sub(cache_write_tokens)
-                .max(0)
-        };
+    let input_uncached_tokens = if let Some(miss) = usage
+        .get("prompt_cache_miss_tokens")
+        .and_then(|v| v.as_i64())
+    {
+        miss.max(0)
+    } else {
+        prompt_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_write_tokens)
+            .max(0)
+    };
 
     let reasoning_tokens = usage
         .get("completion_tokens_details")

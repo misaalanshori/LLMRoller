@@ -384,7 +384,10 @@ fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
         vec![ConfigDomain::Settings]
     } else if path.contains("/users") {
         vec![ConfigDomain::Users]
-    } else if path.contains("/windows") || path.contains("/budget-windows") || path.contains("/budgets") {
+    } else if path.contains("/windows")
+        || path.contains("/budget-windows")
+        || path.contains("/budgets")
+    {
         vec![ConfigDomain::BudgetWindows]
     } else if path.contains("/service-accounts") {
         vec![ConfigDomain::ServiceAccounts, ConfigDomain::ClientKeys]
@@ -2234,8 +2237,8 @@ fn parse_catalog_prices(
             let Some(pricing) = item.get("pricing") else {
                 continue;
             };
-            let Some(in_micro) = parse_or_price(pricing, "prompt")
-                .or_else(|| parse_or_price(pricing, "input"))
+            let Some(in_micro) =
+                parse_or_price(pricing, "prompt").or_else(|| parse_or_price(pricing, "input"))
             else {
                 continue;
             };
@@ -2986,13 +2989,12 @@ async fn get_admin_trace_record_handler(
         .map(str::trim)
         .map(str::to_string);
 
-    let session_hash_opt: Option<String> = sqlx::query_scalar(
-        "SELECT session_hash FROM trace_records WHERE request_id = ? LIMIT 1",
-    )
-    .bind(&request_id)
-    .fetch_optional(&state.auth.reader_pool)
-    .await
-    .unwrap_or_default();
+    let session_hash_opt: Option<String> =
+        sqlx::query_scalar("SELECT session_hash FROM trace_records WHERE request_id = ? LIMIT 1")
+            .bind(&request_id)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+            .unwrap_or_default();
     let dedup_target = session_hash_opt.as_deref().unwrap_or(&request_id);
 
     let recent_audit: bool = sqlx::query_scalar::<_, i64>(
@@ -4743,7 +4745,9 @@ async fn post_user_totp_verify_handler(
     let now_ms = state.auth.clock.now_ms();
 
     if let Some(uid) = actor.user_id()
-        && !state.auth.check_and_record_totp_replay(uid, &payload.code, now_ms)
+        && !state
+            .auth
+            .check_and_record_totp_replay(uid, &payload.code, now_ms)
     {
         return Err(map_price_error(
             StatusCode::UNAUTHORIZED,
@@ -5849,9 +5853,7 @@ async fn get_usage_event_breakdown_internal(
         .unwrap_or(None)
         .unwrap_or(0);
     let cost_micro_usd: i64 = row.try_get("cost_micro_usd").unwrap_or(0);
-    let list_cost_micro_usd: i64 = row
-        .try_get("list_cost_micro_usd")
-        .unwrap_or(cost_micro_usd);
+    let list_cost_micro_usd: i64 = row.try_get("list_cost_micro_usd").unwrap_or(cost_micro_usd);
     let plan_multiplier_bps: i64 = row.try_get("plan_multiplier_bps").unwrap_or(10_000);
     let billing_coverage_mode: String = row
         .try_get("billing_coverage_mode")
@@ -5900,9 +5902,15 @@ async fn get_usage_event_breakdown_internal(
     if let Some(pr) = price_row {
         base_rates = Rates {
             input_per_mtok_micro_usd: pr.try_get("input_per_mtok_micro_usd").unwrap_or(3_000_000),
-            output_per_mtok_micro_usd: pr.try_get("output_per_mtok_micro_usd").unwrap_or(15_000_000),
-            cache_read_per_mtok_micro_usd: pr.try_get("cache_read_per_mtok_micro_usd").unwrap_or(300_000),
-            cache_write_per_mtok_micro_usd: pr.try_get("cache_write_per_mtok_micro_usd").unwrap_or(3_750_000),
+            output_per_mtok_micro_usd: pr
+                .try_get("output_per_mtok_micro_usd")
+                .unwrap_or(15_000_000),
+            cache_read_per_mtok_micro_usd: pr
+                .try_get("cache_read_per_mtok_micro_usd")
+                .unwrap_or(300_000),
+            cache_write_per_mtok_micro_usd: pr
+                .try_get("cache_write_per_mtok_micro_usd")
+                .unwrap_or(3_750_000),
         };
         if let Ok(Some(tj)) = pr.try_get::<Option<String>, _>("tiers_json") {
             tiers = serde_json::from_str(&tj).unwrap_or_default();
@@ -5917,13 +5925,15 @@ async fn get_usage_event_breakdown_internal(
         cache_read,
         cache_write,
         output,
+        reasoning: 0,
     };
     let total_input = tokens.total_input();
     let active_tier = tiers.iter().find(|t| t.matches(total_input));
     let effective_rates = active_tier.map_or(base_rates, ContextTier::rates);
     let active_schedule = schedules.iter().find(|s| s.matches(ts));
-    let (mult_num, mult_den) = active_schedule
-        .map_or((1_i64, 1_i64), |s| (s.multiplier_num.max(1), s.multiplier_den.max(1)));
+    let (mult_num, mult_den) = active_schedule.map_or((1_i64, 1_i64), |s| {
+        (s.multiplier_num.max(1), s.multiplier_den.max(1))
+    });
 
     let line_cost = |tok: i64, rate: i64| -> i64 {
         let num = (tok as i128) * (rate as i128) * (mult_num as i128);
@@ -7140,10 +7150,10 @@ async fn control_plane_logging_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let raw_path = req
-        .uri()
-        .path_and_query()
-        .map_or_else(|| req.uri().path().to_string(), |pq| pq.as_str().to_string());
+    let raw_path = req.uri().path_and_query().map_or_else(
+        || req.uri().path().to_string(),
+        |pq| pq.as_str().to_string(),
+    );
     let path = llmroller_proto::scrub::scrub_text(&raw_path);
     let method = req.method().as_str().to_string();
     let is_cp = path.starts_with("/api/user/") || path.starts_with("/admin/api/");
@@ -8843,10 +8853,7 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route("/api/user/shares/{id}", delete(delete_user_share_handler))
         .route("/api/user/pins", get(get_active_pins_handler))
-        .route(
-            "/api/user/pins/move",
-            post(post_user_move_pin_body_handler),
-        )
+        .route("/api/user/pins/move", post(post_user_move_pin_body_handler))
         .route(
             "/api/user/pins/{client_key_id}/{session_hash}/{canonical_id}",
             delete(delete_user_pin_handler),
@@ -9147,7 +9154,7 @@ mod catalog_sync_tests {
         let catalog = serde_json::json!({
             "data": [
                 {
-                    "id": "anthropic/claude-sonnet-4-6",
+                    "id": "anthropic/claude-sonnet-4.6",
                     "pricing": {
                         "prompt": "0.000003",
                         "completion": "0.000015",
@@ -9170,7 +9177,7 @@ mod catalog_sync_tests {
     #[test]
     #[doc = "Spec: SEC-19, UI-1, UI-3"]
     fn templates_have_zero_inline_handlers_and_correct_data_plane_port() {
-        let app_html = include_str!("../../templates/app.html");
+        let app_html = include_str!("../templates/app.html");
         assert!(!app_html.contains("onchange="));
         assert!(!app_html.contains("onclick="));
         assert!(app_html.contains("http://127.0.0.1:8080"));

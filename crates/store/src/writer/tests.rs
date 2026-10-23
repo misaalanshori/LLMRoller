@@ -372,8 +372,9 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
 #[tokio::test]
 #[doc = "Spec: REL-5, REL-2, REL-1"]
 async fn stale_health_version_update_does_not_overwrite_newer_version() {
-    let (_dir, pool) = setup_writer_test_db().await;
-    let writer = start_single_writer(pool.clone());
+    let (_dir, pool) = setup_writer_db().await;
+    let (reloader_tx, _reloader_rx) = mpsc::channel(10);
+    let (writer, _handle) = start_writer(pool.clone(), reloader_tx);
 
     let admin_id = llmroller_core::ids::UserId::generate();
     let provider_id = llmroller_core::ids::ProviderId::generate();
@@ -405,14 +406,16 @@ async fn stale_health_version_update_does_not_overwrite_newer_version() {
     .execute(&pool)
     .await
     .expect("upstream key");
-    sqlx::query("INSERT INTO models (model_pk, canonical_id, origin) VALUES (?, 'gpt-4o', 'global')")
-        .bind(model_pk.to_string())
-        .execute(&pool)
-        .await
-        .expect("model");
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, origin) VALUES (?, 'gpt-4o', 'global')",
+    )
+    .bind(model_pk.to_string())
+    .execute(&pool)
+    .await
+    .expect("model");
     sqlx::query(
         "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, route_health, health_version, discovered_at)
-         VALUES (?, ?, 'openai/gpt-4o', '["chat"]', 'active', 'healthy', 10, 100)",
+         VALUES (?, ?, 'openai/gpt-4o', '[\"chat\"]', 'active', 'healthy', 10, 100)",
     )
     .bind(upstream_key_id.to_string())
     .bind(model_pk.to_string())
@@ -432,10 +435,7 @@ async fn stale_health_version_update_does_not_overwrite_newer_version() {
         },
     );
     writer.queues.durable_state.lock().insert(
-        DurableKey::RouteHealth {
-            upstream_key_id: upstream_key_id.to_string(),
-            model_pk: model_pk.to_string(),
-        },
+        DurableKey::RouteHealth(upstream_key_id.to_string(), model_pk.to_string()),
         DurableOp::RouteHealthUpdate {
             upstream_key_id: upstream_key_id.to_string(),
             model_pk: model_pk.to_string(),

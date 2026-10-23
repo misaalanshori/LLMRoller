@@ -270,16 +270,14 @@ pub fn resolve_provider_usage_url(
     config_json: &str,
 ) -> Option<String> {
     let base = base_url.trim_end_matches('/');
-    let raw_ep = usage_endpoint(config_json).or_else(|| {
-        match kind {
-            llmroller_core::provider::ProviderKind::Openrouter => Some("/key".to_string()),
-            llmroller_core::provider::ProviderKind::OpencodeGo
-            | llmroller_core::provider::ProviderKind::OpenDesignAmr => Some("/usage".to_string()),
-            llmroller_core::provider::ProviderKind::CommandCode => {
-                Some("/alpha/billing/credits".to_string())
-            }
-            llmroller_core::provider::ProviderKind::Custom => None,
+    let raw_ep = usage_endpoint(config_json).or_else(|| match kind {
+        llmroller_core::provider::ProviderKind::Openrouter => Some("/key".to_string()),
+        llmroller_core::provider::ProviderKind::OpencodeGo
+        | llmroller_core::provider::ProviderKind::OpenDesignAmr => Some("/usage".to_string()),
+        llmroller_core::provider::ProviderKind::CommandCode => {
+            Some("/alpha/billing/credits".to_string())
         }
+        llmroller_core::provider::ProviderKind::Custom => None,
     })?;
     if raw_ep.starts_with("http://") || raw_ep.starts_with("https://") {
         return Some(raw_ep);
@@ -470,8 +468,9 @@ async fn fresh_poll_usage(
         .providers
         .get(&key.provider_id)
         .ok_or_else(|| "upstream provider is missing".to_string())?;
-    let target = resolve_provider_usage_url(&provider.base_url, provider.kind, &provider.config_json)
-        .ok_or_else(|| "provider has no usage endpoint".to_string())?;
+    let target =
+        resolve_provider_usage_url(&provider.base_url, provider.kind, &provider.config_json)
+            .ok_or_else(|| "provider has no usage endpoint".to_string())?;
     let master_key = state
         .master_key
         .clone()

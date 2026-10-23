@@ -83,7 +83,9 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                                 .runtime_state
                                 .last_key_used_ms
                                 .get(&key.id)
-                                .is_some_and(|last_used| now_ms.saturating_sub(*last_used) <= 3_600_000);
+                                .is_some_and(|last_used| {
+                                    now_ms.saturating_sub(*last_used) <= 3_600_000
+                                });
                             let jitter_bps = 8_000
                                 + (llmroller_core::seams::EntropySource::next_u64_bounded(
                                     &llmroller_core::seams::OsEntropy,

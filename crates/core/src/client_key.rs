@@ -274,7 +274,6 @@ pub fn evaluate_request_gates(
     Ok((key_record.clone(), *hash_role))
 }
 
-
 /// Parse an `allowed_cidrs` entry as either a CIDR prefix (`192.0.2.0/24`) or a bare IPv4/IPv6 address (`203.0.113.5`, `2001:db8::1`; `F-050`, `CLK-6`).
 #[must_use]
 pub fn parse_ip_or_cidr(s: &str) -> Option<IpNet> {

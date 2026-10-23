@@ -42,9 +42,7 @@ pub const MAX_SESSION_ID_LEN: usize = 256;
 
 /// Validates that a raw session ID is non-empty, <= 256 bytes, and printable non-space ASCII (`0x21..=0x7E`).
 pub fn is_valid_session_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_SESSION_ID_LEN
-        && s.bytes().all(|b| (0x21..=0x7E).contains(&b))
+    !s.is_empty() && s.len() <= MAX_SESSION_ID_LEN && s.bytes().all(|b| (0x21..=0x7E).contains(&b))
 }
 
 /// Resolves the raw session ID from headers and body fields across Steps 1 through 7.

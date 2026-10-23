@@ -647,7 +647,9 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
     }
 
     if let Err(err) = transaction.commit().await {
-        tracing::error!("SQLite batch commit failed ({err}); restoring rollups and traces to memory");
+        tracing::error!(
+            "SQLite batch commit failed ({err}); restoring rollups and traces to memory"
+        );
         if usage_res.is_ok() {
             queues
                 .usage_writer

@@ -413,7 +413,10 @@ fn test_scrub_secret_prefixes_oc_sk_and_safe_diagnostic_headers() {
     // F-011: extract_safe_diagnostic_headers retains allow-listed headers and omits Authorization
     let mut headers = HeaderMap::new();
     headers.insert(header::USER_AGENT, HeaderValue::from_static("opencode/1.2"));
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     headers.insert(
         header::AUTHORIZATION,
         HeaderValue::from_static("Bearer llr_secret12345678"),

@@ -27,6 +27,7 @@ fn test_provider_cost_parsing_and_fallback_sources() {
         cache_read: 0,
         cache_write: 0,
         output: 100,
+        reasoning: 0,
     };
     let fallback = Rates::default();
 
@@ -55,6 +56,7 @@ fn test_missing_price_rows_charge_unpriced_fallback_rates() {
         cache_read: 1_000_000,
         cache_write: 1_000_000,
         output: 1_000_000,
+        reasoning: 0,
     };
 
     let res = compute_request_cost(None, tokens, None, fallback, 0);
@@ -132,6 +134,7 @@ fn test_context_tiers_and_schedules_deterministic_evaluation() {
         cache_read: 0,
         cache_write: 0,
         output: 0,
+        reasoning: 0,
     };
     // In tier 1: rate_in = 1_000_000 micro-USD per MTok ($1.00/MTok)
     // Off-peak: 50_000 * 1_000_000 / 1_000_000 = 50_000 micro-USD ($0.05)
@@ -161,6 +164,7 @@ fn test_context_tiers_and_schedules_deterministic_evaluation() {
         cache_read: 0,
         cache_write: 0,
         output: 0,
+        reasoning: 0,
     };
     let res_high_off = compute_request_cost(
         None,
@@ -260,6 +264,7 @@ proptest! {
             cache_read,
             cache_write,
             output,
+            reasoning: 0,
         };
         let rates = Rates {
             input_per_mtok_micro_usd: rate_in,
