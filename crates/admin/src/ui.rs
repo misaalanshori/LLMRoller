@@ -24,6 +24,7 @@ pub struct BaseTemplate {
     pub ui_theme: String,
     pub ui_nav_layout: String,
     pub ui_locale: String,
+    pub t: crate::i18n::I18nCatalog,
     pub content: String,
 }
 
@@ -86,6 +87,7 @@ pub async fn get_app_ui(
         prefs.unwrap_or_else(|| ("dark".to_string(), "top_tabs".to_string(), "en".to_string()));
 
     let app_content = AppTemplate {}.render().unwrap_or_default();
+    let t = crate::i18n::get_catalog(&ui_locale);
     let base = BaseTemplate {
         title: "Personal Workspace".to_string(),
         csrf_token,
@@ -94,6 +96,7 @@ pub async fn get_app_ui(
         ui_theme,
         ui_nav_layout,
         ui_locale,
+        t,
         content: app_content,
     };
 
@@ -166,6 +169,7 @@ pub async fn get_admin_ui(
         prefs.unwrap_or_else(|| ("dark".to_string(), "top_tabs".to_string(), "en".to_string()));
 
     let admin_content = AdminTemplate {}.render().unwrap_or_default();
+    let t = crate::i18n::get_catalog(&ui_locale);
     let base = BaseTemplate {
         title: "Admin Console".to_string(),
         csrf_token,
@@ -174,6 +178,7 @@ pub async fn get_admin_ui(
         ui_theme,
         ui_nav_layout,
         ui_locale,
+        t,
         content: admin_content,
     };
 

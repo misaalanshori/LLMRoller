@@ -380,6 +380,65 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         ("light".to_string(), "sidebar".to_string(), "en".to_string())
     );
 
+    // Verify server-side rendered base template reflects updated preferences (UI-5, UI-6)
+    let app_page = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/app", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("app page response");
+    assert_eq!(app_page.status(), StatusCode::OK);
+    let app_bytes = http_body_util::BodyExt::collect(app_page.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    let app_html = std::str::from_utf8(&app_bytes).expect("html");
+    assert!(app_html.contains("data-theme=\"light\""));
+    assert!(app_html.contains("data-nav-layout=\"sidebar\""));
+    assert!(app_html.contains("lang=\"en\""));
+
+    // Verify Indonesian locale rendering (UI-5)
+    let id_prefs = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("PATCH", "/api/user/preferences", ADMIN_SESSION, ADMIN_CSRF)
+                .body(Body::from(
+                    serde_json::json!({
+                        "ui_locale": "id"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("id prefs response");
+    assert_eq!(id_prefs.status(), StatusCode::OK);
+
+    let id_page = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/app", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("id page response");
+    assert_eq!(id_page.status(), StatusCode::OK);
+    let id_bytes = http_body_util::BodyExt::collect(id_page.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    let id_html = std::str::from_utf8(&id_bytes).expect("html");
+    assert!(id_html.contains("lang=\"id\""));
+    assert!(id_html.contains("Ruang Kerja Pribadi"));
+    assert!(id_html.contains("Keluar"));
+
     // 8. Disabling TOTP requires the current password (`AUTH-9`, `SEC-4`).
     let wrong_password = ctx
         .app
@@ -451,7 +510,7 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
     let prefs_body = json_body(get_prefs).await;
     assert_eq!(prefs_body["ui_theme"], "light");
     assert_eq!(prefs_body["ui_nav_layout"], "sidebar");
-    assert_eq!(prefs_body["ui_locale"], "en");
+    assert_eq!(prefs_body["ui_locale"], "id");
 
     // 11. Child key creation via POST /api/user/service-accounts/{id}/keys (CLK-6).
     let sa_key_response = ctx

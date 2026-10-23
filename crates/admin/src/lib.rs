@@ -7,6 +7,7 @@
 pub mod api;
 pub mod assets;
 pub mod auth;
+pub mod i18n;
 pub mod projection;
 pub mod setup;
 pub mod ui;

@@ -176,3 +176,47 @@ h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.25rem; }
 .key-val-row { display: flex; justify-content: space-between; align-items: center; }
 .key-val-label { color: var(--muted); }
 .segmented-pill { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+
+/* Dual-Theme Light Tokens (SRDD 14.a.2, UI-5) */
+[data-theme="light"] {
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --card-hover: #f1f5f9;
+    --border: #e2e8f0;
+    --border-light: #cbd5e1;
+    --text: #0f172a;
+    --muted: #64748b;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --success: #059669;
+    --warning: #d97706;
+    --danger: #dc2626;
+    --info: #0891b2;
+}
+[data-theme="light"] .app-header { background: #ffffff; border-bottom: 1px solid var(--border); }
+[data-theme="light"] .brand-link { color: var(--text); }
+[data-theme="light"] .provider-box,
+[data-theme="light"] .setting-item { background: #f8fafc; }
+[data-theme="light"] .chat-turn-card { background: #ffffff; }
+[data-theme="light"] .inspection-drawer { background: #ffffff; }
+
+/* Sidebar Navigation Mode (SRDD 14.b, UI-5) */
+[data-nav-layout="sidebar"] body { display: flex; min-height: 100vh; }
+[data-nav-layout="sidebar"] .app-header {
+    width: 240px;
+    height: 100vh;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    position: fixed;
+    top: 0;
+    left: 0;
+    border-bottom: none;
+    border-right: 1px solid var(--border);
+    padding: 1.5rem 1rem;
+    gap: 1.5rem;
+}
+[data-nav-layout="sidebar"] .header-left { flex-direction: column; align-items: stretch; gap: 1.5rem; }
+[data-nav-layout="sidebar"] .nav-links { flex-direction: column; gap: 0.5rem; }
+[data-nav-layout="sidebar"] .header-right { margin-top: auto; flex-direction: column; align-items: stretch; gap: 1rem; }
+[data-nav-layout="sidebar"] .main-container { margin-left: 240px; width: calc(100% - 240px); max-width: none; }

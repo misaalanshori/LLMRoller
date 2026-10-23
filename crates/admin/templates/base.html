@@ -25,18 +25,18 @@
                 <span class="brand-name">LLMRoller</span>
             </a>
             <nav class="nav-links">
-                <a href="/app" class="nav-link {% if !is_admin %}active{% endif %}">Personal Workspace</a>
+                <a href="/app" class="nav-link {% if !is_admin %}active{% endif %}">{{ t.personal_workspace }}</a>
                 {% if is_admin %}
-                <a href="/admin" class="nav-link {% if is_admin %}active{% endif %}">Admin Console</a>
+                <a href="/admin" class="nav-link {% if is_admin %}active{% endif %}">{{ t.admin_console }}</a>
                 {% endif %}
             </nav>
         </div>
         <div class="header-right">
             <span class="status-indicator" title="Service Ready">
-                <span class="status-dot"></span> Ready
+                <span class="status-dot"></span> {{ t.ready }}
             </span>
             <form method="POST" action="/api/auth/logout" class="logout-form">
-                <button type="submit" class="btn btn-sm btn-ghost">Sign Out</button>
+                <button type="submit" class="btn btn-sm btn-ghost">{{ t.sign_out }}</button>
             </form>
         </div>
     </header>
