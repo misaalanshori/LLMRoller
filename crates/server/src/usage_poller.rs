@@ -17,10 +17,14 @@ use llmroller_proto::usage_poller::{KeyPollerState, UsagePoller, parse_raw_usage
 use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sealer};
 use llmroller_store::usage_snapshots::{NewUsageSnapshot, seal_usage_snapshot};
 use llmroller_store::writer::{DurableKey, DurableOp, WriterHandle};
+use tokio::sync::watch;
+
+use crate::shutdown::JobSupervisor;
 
 const TICK: Duration = Duration::from_secs(15);
 
 /// Startup dependencies for the usage poller supervisor.
+#[derive(Clone)]
 pub struct UsagePollerDeps {
     pub snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     pub runtime_state: Arc<RuntimeState>,
@@ -45,72 +49,85 @@ impl std::fmt::Debug for UsagePollerDeps {
 
 /// Spawn the supervised usage polling loop. Returns the join handle.
 pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> {
+    let supervisor = JobSupervisor::new("usage_poller");
+    let (_stop_tx, stop_rx) = watch::channel(false);
+
     tokio::spawn(async move {
-        let key_states: Arc<DashMap<UpstreamKeyId, KeyPollerState>> = Arc::new(DashMap::new());
-        let poller = UsagePoller::default();
-        loop {
-            tokio::time::sleep(TICK).await;
-            let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
-            let snapshot = deps.snapshot.load_full();
-            for key in snapshot.upstream_keys.values() {
-                let Some(provider) = snapshot.providers.get(&key.provider_id) else {
-                    continue;
-                };
-                if !key.enabled || !provider.enabled {
-                    continue;
-                }
-                let Some(endpoint) = usage_endpoint(&provider.config_json, provider.kind) else {
-                    continue;
-                };
-                let state = key_states.entry(key.id).or_default();
-                if !state.try_start_poll(now_ms, false) {
-                    continue;
-                }
-                let Ok(permit) = poller.semaphore.clone().acquire_owned().await else {
-                    state.finish_poll();
-                    continue;
-                };
-                let key = key.clone();
-                let provider = provider.clone();
-                let budget_windows = snapshot
-                    .budget_windows
-                    .get(&key.id)
-                    .cloned()
-                    .unwrap_or_default();
-                let writer = deps.writer.clone();
-                let runtime_state = deps.runtime_state.clone();
-                let sealer = XChaCha20Poly1305Sealer::new(
-                    deps.master_key.clone(),
-                    deps.instance_id,
-                    Arc::new(llmroller_core::seams::OsEntropy),
-                );
-                let master_key_id = deps.master_key_id.clone();
-                let key_states = key_states.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = poll_key(
-                        &writer,
-                        &runtime_state,
-                        &sealer,
-                        &master_key_id,
-                        &key,
-                        provider.kind,
-                        &budget_windows,
-                        &provider.base_url,
-                        &provider.config_json,
-                        &endpoint,
-                        provider.allow_private_network,
-                    )
-                    .await
-                    {
-                        tracing::warn!(key = %key.id, "usage poll failed: {error}");
+        supervisor
+            .run_supervised(stop_rx, move |mut job_stop| {
+                let deps = deps.clone();
+                async move {
+                    let key_states: Arc<DashMap<UpstreamKeyId, KeyPollerState>> = Arc::new(DashMap::new());
+                    let poller = UsagePoller::default();
+                    while !*job_stop.borrow_and_update() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(TICK) => {},
+                            _ = job_stop.changed() => break,
+                        }
+                        let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+                        let snapshot = deps.snapshot.load_full();
+                        for key in snapshot.upstream_keys.values() {
+                            let Some(provider) = snapshot.providers.get(&key.provider_id) else {
+                                continue;
+                            };
+                            if !key.enabled || !provider.enabled {
+                                continue;
+                            }
+                            let Some(endpoint) = usage_endpoint(&provider.config_json, provider.kind) else {
+                                continue;
+                            };
+                            let state = key_states.entry(key.id).or_default();
+                            if !state.try_start_poll(now_ms, false) {
+                                continue;
+                            }
+                            let Ok(permit) = poller.semaphore.clone().acquire_owned().await else {
+                                state.finish_poll();
+                                continue;
+                            };
+                            let key = key.clone();
+                            let provider = provider.clone();
+                            let budget_windows = snapshot
+                                .budget_windows
+                                .get(&key.id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let writer = deps.writer.clone();
+                            let runtime_state = deps.runtime_state.clone();
+                            let sealer = XChaCha20Poly1305Sealer::new(
+                                deps.master_key.clone(),
+                                deps.instance_id,
+                                Arc::new(llmroller_core::seams::OsEntropy),
+                            );
+                            let master_key_id = deps.master_key_id.clone();
+                            let key_states = key_states.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(error) = poll_key(
+                                    &writer,
+                                    &runtime_state,
+                                    &sealer,
+                                    &master_key_id,
+                                    &key,
+                                    provider.kind,
+                                    &budget_windows,
+                                    &provider.base_url,
+                                    &provider.config_json,
+                                    &endpoint,
+                                    provider.allow_private_network,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(key = %key.id, "usage poll failed: {error}");
+                                }
+                                if let Some(state) = key_states.get(&key.id) {
+                                    state.finish_poll();
+                                }
+                            });
+                        }
                     }
-                    if let Some(state) = key_states.get(&key.id) {
-                        state.finish_poll();
-                    }
-                });
-            }
-        }
+                }
+            })
+            .await;
     })
 }
 

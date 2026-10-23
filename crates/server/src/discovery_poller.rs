@@ -21,8 +21,10 @@ use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sea
 use llmroller_store::models::{is_valid_upstream_model_id, upsert_discovered_models_tx};
 use llmroller_store::writer::{ControlOp, DurableKey, DurableOp, WriterError, WriterHandle};
 use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
+
+use crate::shutdown::JobSupervisor;
 
 /// Scheduled full-catalog refresh cadence required by `MDL-1`.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -34,6 +36,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_DISCOVERIES: usize = 4;
 
 /// Startup dependencies for the `/models` discovery supervisor.
+#[derive(Clone)]
 pub struct DiscoveryPollerDeps {
     pub pool: SqlitePool,
     pub writer: WriterHandle,
@@ -76,66 +79,79 @@ pub fn start_discovery_poller(
     mpsc::UnboundedSender<DiscoveryTarget>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     let initial_tx = tx.clone();
+    let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+    let supervisor = JobSupervisor::new("discovery");
+    let (_stop_tx, stop_rx) = watch::channel(false);
+
     let handle = tokio::spawn(async move {
-        let sealer = Arc::new(XChaCha20Poly1305Sealer::new(
-            deps.master_key.clone(),
-            deps.instance_id,
-            Arc::new(llmroller_core::seams::OsEntropy),
-        ));
-        let in_flight: Arc<DashMap<UpstreamKeyId, ()>> = Arc::new(DashMap::new());
-
-        // The first tick completes immediately; consume it so startup does not
-        // hammer every upstream before the server is ready.
-        let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-
         // Trigger initial discovery pass for unpopulated keys shortly after boot (MDL-1)
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let _ = initial_tx.send(DiscoveryTarget::AllEnabled);
         });
 
-        loop {
-            let target = tokio::select! {
-                _ = ticker.tick() => DiscoveryTarget::AllEnabled,
-                Some(target) = rx.recv() => target,
-                else => break,
-            };
+        supervisor
+            .run_supervised(stop_rx, move |_stop_rx| {
+                let rx_arc = rx_arc.clone();
+                let deps = deps.clone();
+                async move {
+                    let sealer = Arc::new(XChaCha20Poly1305Sealer::new(
+                        deps.master_key.clone(),
+                        deps.instance_id,
+                        Arc::new(llmroller_core::seams::OsEntropy),
+                    ));
+                    let in_flight: Arc<DashMap<UpstreamKeyId, ()>> = Arc::new(DashMap::new());
 
-            let keys = match load_discovery_keys(&deps.pool, target).await {
-                Ok(keys) => keys,
-                Err(error) => {
-                    tracing::warn!(?target, "cannot load upstream keys for discovery: {error}");
-                    continue;
-                }
-            };
+                    // The first tick completes immediately; consume it so startup does not
+                    // hammer every upstream before the server is ready.
+                    let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ticker.tick().await;
 
-            let mut tasks = JoinSet::new();
-            for key in keys {
-                if in_flight.insert(key.id, ()).is_some() {
-                    continue;
-                }
-                if tasks.len() >= MAX_CONCURRENT_DISCOVERIES {
-                    let _ = tasks.join_next().await;
-                }
-                let writer = deps.writer.clone();
-                let runtime_state = deps.runtime_state.clone();
-                let sealer = sealer.clone();
-                let in_flight = in_flight.clone();
-                let key_id = key.id;
-                tasks.spawn(async move {
-                    if let Err(error) = discover_key(&writer, &runtime_state, &sealer, &key).await {
-                        tracing::warn!(key = %key.id, "model discovery failed: {error}");
+                    let mut rx_guard = rx_arc.lock().await;
+                    loop {
+                        let target = tokio::select! {
+                            _ = ticker.tick() => DiscoveryTarget::AllEnabled,
+                            Some(target) = rx_guard.recv() => target,
+                            else => break,
+                        };
+
+                        let keys = match load_discovery_keys(&deps.pool, target).await {
+                            Ok(keys) => keys,
+                            Err(error) => {
+                                tracing::warn!(?target, "cannot load upstream keys for discovery: {error}");
+                                continue;
+                            }
+                        };
+
+                        let mut tasks = JoinSet::new();
+                        for key in keys {
+                            if in_flight.insert(key.id, ()).is_some() {
+                                continue;
+                            }
+                            if tasks.len() >= MAX_CONCURRENT_DISCOVERIES {
+                                let _ = tasks.join_next().await;
+                            }
+                            let writer = deps.writer.clone();
+                            let runtime_state = deps.runtime_state.clone();
+                            let sealer = sealer.clone();
+                            let in_flight = in_flight.clone();
+                            let key_id = key.id;
+                            tasks.spawn(async move {
+                                if let Err(error) = discover_key(&writer, &runtime_state, &sealer, &key).await {
+                                    tracing::warn!(key = %key.id, "model discovery failed: {error}");
+                                }
+                                in_flight.remove(&key_id);
+                            });
+                        }
+
+                        while tasks.join_next().await.is_some() {}
                     }
-                    in_flight.remove(&key_id);
-                });
-            }
-
-            while tasks.join_next().await.is_some() {}
-        }
+                }
+            })
+            .await;
     });
 
     (tx, handle)

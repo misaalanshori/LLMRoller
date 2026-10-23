@@ -428,7 +428,7 @@ fn start_reloader_inner(
     shared_snapshot: Arc<ArcSwap<ConfigSnapshot>>,
     runtime_state: Arc<RuntimeState>,
     pin_store: Option<Arc<PinStore>>,
-    mut reloader_rx: mpsc::Receiver<ReloadNotification>,
+    reloader_rx: mpsc::Receiver<ReloadNotification>,
     reloader_tx: mpsc::Sender<ReloadNotification>,
 ) -> (ReloaderHandle, tokio::task::JoinHandle<()>) {
     let initial_version = shared_snapshot.load().config_version;
@@ -440,22 +440,36 @@ fn start_reloader_inner(
         published_version_rx,
     };
 
-    let join_handle = tokio::spawn(async move {
-        while let Some(first_notif) = reloader_rx.recv().await {
-            // 1. Drain and coalesce all pending ReloadNotification messages
-            let mut _min_version = first_notif.min_version;
-            let mut changed_domains = first_notif.changed_domains;
-            let mut invalidations = first_notif.invalidations;
+    let rx_arc = Arc::new(tokio::sync::Mutex::new(reloader_rx));
+    let supervisor = crate::shutdown::JobSupervisor::new("reloader");
+    let (_stop_tx, stop_rx) = watch::channel(false);
 
-            while let Ok(next) = reloader_rx.try_recv() {
-                _min_version = _min_version.max(next.min_version);
-                for domain in next.changed_domains {
-                    if !changed_domains.contains(&domain) {
-                        changed_domains.push(domain);
-                    }
-                }
-                invalidations.extend(next.invalidations);
-            }
+    let join_handle = tokio::spawn(async move {
+        supervisor
+            .run_supervised(stop_rx, move |_stop_rx| {
+                let rx_arc = rx_arc.clone();
+                let pool = pool.clone();
+                let shared_snapshot = shared_snapshot.clone();
+                let runtime_state = runtime_state.clone();
+                let pin_store = pin_store.clone();
+                let published_version_tx = published_version_tx.clone();
+                async move {
+                    let mut rx_guard = rx_arc.lock().await;
+                    while let Some(first_notif) = rx_guard.recv().await {
+                        // 1. Drain and coalesce all pending ReloadNotification messages
+                        let mut _min_version = first_notif.min_version;
+                        let mut changed_domains = first_notif.changed_domains;
+                        let mut invalidations = first_notif.invalidations;
+
+                        while let Ok(next) = rx_guard.try_recv() {
+                            _min_version = _min_version.max(next.min_version);
+                            for domain in next.changed_domains {
+                                if !changed_domains.contains(&domain) {
+                                    changed_domains.push(domain);
+                                }
+                            }
+                            invalidations.extend(next.invalidations);
+                        }
 
             // 2. Open ONE read transaction
             let mut tx = match pool.begin().await {
@@ -639,6 +653,9 @@ fn start_reloader_inner(
                 }
             }
         }
+                }
+            })
+            .await;
     });
 
     (handle, join_handle)

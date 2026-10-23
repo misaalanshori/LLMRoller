@@ -371,4 +371,30 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     let _ = stop_tx.send(true);
 
     assert!(panic_count.load(Ordering::SeqCst) >= 3);
+
+    // Verify discovery and usage supervisor recovery after transient panic (REL-1)
+    let recovery_count = Arc::new(AtomicUsize::new(0));
+    let recovery_clone = recovery_count.clone();
+    let discovery_supervisor = JobSupervisor::new("discovery");
+    let (disc_stop_tx, disc_stop_rx) = tokio::sync::watch::channel(false);
+
+    let disc_task = tokio::spawn(async move {
+        discovery_supervisor
+            .run_supervised(disc_stop_rx, move |_stop| {
+                let n = recovery_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        panic!("simulated transient discovery failure");
+                    }
+                }
+            })
+            .await;
+    });
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), disc_task).await;
+    let _ = disc_stop_tx.send(true);
+    assert!(
+        recovery_count.load(Ordering::SeqCst) >= 2,
+        "supervisor must restart after transient panic"
+    );
 }
