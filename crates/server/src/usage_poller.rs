@@ -149,7 +149,11 @@ async fn poll_key(
         .map_err(|_| "cannot unseal upstream key".to_string())?;
     let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
-    let target = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+    let target = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("{}{}", base_url.trim_end_matches('/'), endpoint)
+    };
     llmroller_core::ssrf::validate_url(&target, allow_private_network)
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private_network)

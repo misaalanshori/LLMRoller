@@ -183,6 +183,40 @@ pub fn compute_share_config_fingerprint(
     sha256_hex(canonical.as_bytes())
 }
 
+fn validate_provider_usage_cross_origin(
+    base_url: &str,
+    config_json: &str,
+    allow_private_network: bool,
+    usage_url_cross_origin_ack: bool,
+) -> Result<(), ProviderError> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) {
+        let usage_path = v
+            .get("paths")
+            .and_then(|p| p.get("usage"))
+            .and_then(|u| u.as_str())
+            .or_else(|| v.get("usage_endpoint").and_then(|u| u.as_str()));
+        if let Some(usage) = usage_path
+            && (usage.starts_with("http://") || usage.starts_with("https://"))
+        {
+            llmroller_core::ssrf::validate_url(usage, allow_private_network)
+                .map_err(|e| ProviderError::Validation(e.to_string()))?;
+            let base_host = url::Url::parse(base_url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+            let usage_host = url::Url::parse(usage)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+            if base_host != usage_host && !usage_url_cross_origin_ack {
+                return Err(ProviderError::Validation(
+                    "cross-origin usage endpoint requires usage_url_cross_origin_ack = 1"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a new provider record in SQLite within an active transaction.
 pub async fn create_provider_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
@@ -234,6 +268,12 @@ pub async fn create_provider_tx(
     }
 
     let provider_id = ProviderId::generate();
+    validate_provider_usage_cross_origin(
+        &new_provider.base_url,
+        &new_provider.config_json,
+        new_provider.allow_private_network,
+        new_provider.usage_url_cross_origin_ack,
+    )?;
     let fingerprint = compute_share_config_fingerprint(
         new_provider.kind.as_str(),
         &new_provider.base_url,
@@ -389,6 +429,12 @@ pub async fn patch_provider_tx(
         .unwrap_or(existing.allow_private_network);
     let new_enabled = patch.enabled.unwrap_or(existing.enabled);
 
+    validate_provider_usage_cross_origin(
+        &new_base_url,
+        &new_config_json,
+        new_private_net,
+        new_usage_ack,
+    )?;
     let new_fingerprint = compute_share_config_fingerprint(
         existing.kind.as_str(),
         &new_base_url,

@@ -4260,11 +4260,12 @@ pub async fn handle_inference_request(
         }
         cap_guards.commit(cost.cost_micro_usd);
 
+        let attempt_latency = (now - attempt_started).max(0) as u64;
         state.runtime_state.record_upstream_success(
             &origin,
             candidate.upstream_key_id,
             Some(candidate.route_id()),
-            None,
+            Some(attempt_latency),
             now,
         );
         enqueue_key_health(

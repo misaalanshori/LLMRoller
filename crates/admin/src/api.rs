@@ -597,14 +597,27 @@ async fn control_mutation_barrier(
 }
 
 /// Helper to validate session and CSRF for JSON endpoints.
-async fn authenticate_actor(
+async fn authenticate_actor_internal(
     state: &ApiAppState,
     headers: &HeaderMap,
     is_mutation: bool,
+    allow_must_change_password: bool,
 ) -> Result<ActorScope, (StatusCode, Json<serde_json::Value>)> {
     let session = authenticate_session(&state.auth, headers)
         .await
         .map_err(map_auth_error)?;
+
+    if !allow_must_change_password && session.user.must_change_password {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "must_change_password",
+                    "message": "password change required before accessing other resources"
+                }
+            })),
+        ));
+    }
 
     if is_mutation {
         crate::auth::validate_session_csrf(&session, headers)
@@ -613,6 +626,14 @@ async fn authenticate_actor(
     }
 
     Ok(ActorScope::user(session.user.id, session.user.role))
+}
+
+async fn authenticate_actor(
+    state: &ApiAppState,
+    headers: &HeaderMap,
+    is_mutation: bool,
+) -> Result<ActorScope, (StatusCode, Json<serde_json::Value>)> {
+    authenticate_actor_internal(state, headers, is_mutation, false).await
 }
 
 async fn authenticate_admin(
@@ -2958,39 +2979,28 @@ async fn patch_admin_user_handler(
     let actor = authenticate_admin(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
 
-    if let Some(ref role_str) = payload.role {
-        let role = match role_str.as_str() {
-            "admin" => llmroller_core::rbac::Role::Admin,
-            _ => llmroller_core::rbac::Role::User,
-        };
-        llmroller_store::users::set_role(&state.auth.pool, &actor, id, role, now_ms)
-            .await
-            .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
-    }
+    let role = payload.role.as_deref().map(|role_str| match role_str {
+        "admin" => llmroller_core::rbac::Role::Admin,
+        _ => llmroller_core::rbac::Role::User,
+    });
+    let patch = llmroller_store::users::UserPatch {
+        role,
+        disabled: payload.disabled,
+        can_use_global_providers: payload.can_use_global_providers,
+        global_budget_micro_usd_month: payload.global_budget_micro_usd_month,
+    };
 
-    if let Some(disabled) = payload.disabled {
-        llmroller_store::users::set_disabled(&state.auth.pool, &actor, id, disabled, now_ms)
-            .await
-            .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
-    }
+    let user_res = execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
+        Box::pin(async move {
+            llmroller_store::users::patch_user_tx(tx, &actor, id, patch, now_ms)
+                .await
+                .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+            Ok(())
+        })
+    })
+    .await;
 
-    if let Some(can_use) = payload.can_use_global_providers {
-        let _ = sqlx::query("UPDATE users SET can_use_global_providers = ? WHERE id = ?")
-            .bind(if can_use { 1i64 } else { 0i64 })
-            .bind(id.to_string())
-            .execute(&state.auth.pool)
-            .await;
-    }
-
-    if let Some(budget_opt) = payload.global_budget_micro_usd_month {
-        let _ = sqlx::query("UPDATE users SET global_budget_micro_usd_month = ? WHERE id = ?")
-            .bind(budget_opt)
-            .bind(id.to_string())
-            .execute(&state.auth.pool)
-            .await;
-    }
-
-    Ok(StatusCode::OK)
+    user_res.map(|_| StatusCode::OK)
 }
 
 async fn delete_admin_user_handler(
@@ -3776,7 +3786,7 @@ async fn post_user_password_handler(
     headers: HeaderMap,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let actor = authenticate_actor(&state, &headers, true).await?;
+    let actor = authenticate_actor_internal(&state, &headers, true, true).await?;
 
     let cookie_header = headers
         .get(axum::http::header::COOKIE)

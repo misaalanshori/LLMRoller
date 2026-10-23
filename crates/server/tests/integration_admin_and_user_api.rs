@@ -37,6 +37,7 @@ struct Harness {
 }
 
 struct FixtureKey {
+    owner: UserId,
     client_key_id: ClientKeyId,
     upstream_key_id: UpstreamKeyId,
     cookie: String,
@@ -141,6 +142,7 @@ async fn insert_personal_key(
     let (cookie, csrf) =
         insert_session(pool, owner, &format!("{label}-session-token-0123456789")).await;
     FixtureKey {
+        owner,
         client_key_id,
         upstream_key_id,
         cookie,
@@ -684,4 +686,97 @@ async fn test_usage_timeseries_and_breakdown_rollups() {
         .expect("bd req");
     let resp = app.clone().oneshot(bd_req).await.expect("bd resp");
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[doc = "Spec: AUTH-4, AUTH-5 — must_change_password flag restricts session to password change"]
+#[tokio::test]
+async fn test_must_change_password_blocks_resources_until_password_changed() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+
+    // 1. Mark Alice as must_change_password = 1
+    sqlx::query("UPDATE users SET must_change_password = 1 WHERE id = ?")
+        .bind(harness.alice_key.owner.to_string())
+        .execute(&harness.pool)
+        .await
+        .expect("update must_change_password");
+
+    // 2. Querying resources returns 403 must_change_password
+    let get_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/client-keys")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("get req");
+    let resp = app.clone().oneshot(get_req).await.expect("get resp");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("b");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["error"]["code"], "must_change_password");
+
+    // 3. Changing password clears must_change_password
+    sqlx::query("UPDATE users SET must_change_password = 0 WHERE id = ?")
+        .bind(harness.alice_key.owner.to_string())
+        .execute(&harness.pool)
+        .await
+        .expect("clear must_change_password");
+
+    // 4. Resource access succeeds now
+    let retry_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/client-keys")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("retry req");
+    let retry_resp = app.oneshot(retry_req).await.expect("retry resp");
+    assert_eq!(retry_resp.status(), StatusCode::OK);
+}
+
+#[doc = "Spec: PRV-6, SEC-7 — cross-origin usage endpoints require explicit acknowledgement"]
+#[tokio::test]
+async fn test_provider_usage_endpoint_cross_origin_validation() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+
+    // 1. Cross-origin usage endpoint without ACK returns 422
+    let cross_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/providers")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{
+                "name": "cross-test",
+                "kind": "custom",
+                "base_url": "https://api.openai.com/v1",
+                "config_json": "{\"paths\":{\"usage\":\"https://billing.otherdomain.com/v1/usage\"}}",
+                "ownership_scope": "personal",
+                "usage_url_cross_origin_ack": false
+            }"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(cross_req).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 2. Cross-origin usage endpoint WITH ACK succeeds (201 Created)
+    let ack_req = Request::builder()
+        .method("POST")
+        .uri("/api/user/providers")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{
+                "name": "cross-test-acked",
+                "kind": "custom",
+                "base_url": "https://api.openai.com/v1",
+                "config_json": "{\"paths\":{\"usage\":\"https://billing.otherdomain.com/v1/usage\"}}",
+                "ownership_scope": "personal",
+                "usage_url_cross_origin_ack": true
+            }"#,
+        ))
+        .expect("req");
+    let resp = app.oneshot(ack_req).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }

@@ -755,6 +755,12 @@ pub async fn patch_user_tx(
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);
     }
+    if new_disabled {
+        sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+            .bind(user_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+    }
     get_user_by_id_tx(tx, user_id).await
 }
 
