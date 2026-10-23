@@ -167,10 +167,15 @@ jobs:
           test "$size" -lt $((50 * 1024 * 1024))
 
           master_key="$(head -c 32 /dev/urandom | base64)"
+          # The data plane stays on 0.0.0.0:8080 (the published port under test).
+          # Admin/metrics stay on container loopback: SRDD 5.5.1 step 2 (SEC-5)
+          # fail-closes non-loopback admin binds without TLS/trusted proxies.
           docker run --detach --name llmroller-smoke \
             --publish 127.0.0.1:18080:8080 \
             --env LLMROLLER_MASTER_KEY="$master_key" \
             --env LLMROLLER_MASTER_KEY_ID=ci-smoke \
+            --env LLMROLLER_ADMIN_LISTEN=127.0.0.1:8081 \
+            --env LLMROLLER_METRICS_LISTEN=127.0.0.1:9090 \
             "$image"
 
           cleanup() { docker rm --force llmroller-smoke >/dev/null 2>&1 || true; }
