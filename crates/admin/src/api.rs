@@ -7664,6 +7664,120 @@ async fn get_partial_admin_log_detail_handler(
     Ok(Html(html))
 }
 
+fn render_usage_ledger_html(json: &serde_json::Value) -> String {
+    let summary = json.get("summary");
+    let total_tokens = escape_html(summary.and_then(|s| s.get("total_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+    let input_tokens = escape_html(summary.and_then(|s| s.get("input_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+    let output_tokens = escape_html(summary.and_then(|s| s.get("output_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+    let cache_read = escape_html(summary.and_then(|s| s.get("cache_read_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+    let cache_write = escape_html(summary.and_then(|s| s.get("cache_write_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+
+    let billed_usd = summary.and_then(|s| s.get("billed_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+    let list_usd = summary.and_then(|s| s.get("list_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+    let savings_usd = summary.and_then(|s| s.get("plan_covered_savings_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+
+    let mut out = format!(
+        "<div class=\"card\" style=\"margin-bottom: 1.5rem;\">\
+            <div style=\"display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; text-align: center;\">\
+                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Total tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{total_tokens}</div></div>\
+                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Input tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{input_tokens}</div></div>\
+                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Output tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{output_tokens}</div></div>\
+                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Cache read tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{cache_read}</div></div>\
+                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Cache write tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{cache_write}</div></div>\
+            </div>\
+            <div style=\"margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; font-size: 0.875rem;\">\
+                <div>Billed Cost: <strong>${billed_usd:.4}</strong> (List: <span style=\"text-decoration: line-through;\">${list_usd:.4}</span>)</div>\
+                <div class=\"text-success\">Plan Covered Savings: <strong>${savings_usd:.4}</strong></div>\
+            </div>\
+        </div>\
+        <div class=\"table-container\">\
+            <table class=\"data-table\">\
+                <thead>\
+                    <tr>\
+                        <th>Time</th>\
+                        <th>Initiator</th>\
+                        <th>Model</th>\
+                        <th>Input tokens</th>\
+                        <th>Output tokens</th>\
+                        <th>Cache read</th>\
+                        <th>Cache write</th>\
+                        <th>Credits used</th>\
+                    </tr>\
+                </thead>\
+                <tbody>"
+    );
+
+    let Some(rows) = json.get("rows").or_else(|| json.get("items")).and_then(|i| i.as_array()) else {
+        out.push_str("<tr><td colspan=\"8\" class=\"text-center text-muted\">No usage records found.</td></tr></tbody></table></div>");
+        return out;
+    };
+
+    if rows.is_empty() {
+        out.push_str("<tr><td colspan=\"8\" class=\"text-center text-muted\">No usage records found.</td></tr></tbody></table></div>");
+        return out;
+    }
+
+    for it in rows {
+        let ts = it.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        let initiator = escape_html(it.get("client_key_id").and_then(|v| v.as_str()).unwrap_or("-"));
+        let model = escape_html(it.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("-"));
+        let in_tok = it.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let out_tok = it.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cr_tok = it.get("cache_read_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cw_tok = it.get("cache_write_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cost_usd = it.get("cost_micro_usd").and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+        let list_usd = it.get("list_cost_micro_usd").and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+        let coverage = it.get("billing_coverage_mode").and_then(|v| v.as_str()).unwrap_or("pay_as_you_go");
+
+        let credits_used = if coverage == "subscription_plan" {
+            format!("<span style=\"text-decoration: line-through;\">${list_usd:.4}</span> <span class=\"badge badge-success\">Covered by plan credits</span>")
+        } else {
+            format!("<span>${cost_usd:.4}</span>")
+        };
+
+        out.push_str(&format!(
+            "<tr>\
+                <td>{ts}</td>\
+                <td><code>{initiator}</code></td>\
+                <td><strong>{model}</strong></td>\
+                <td>{in_tok}</td>\
+                <td>{out_tok}</td>\
+                <td>{cr_tok}</td>\
+                <td>{cw_tok}</td>\
+                <td>{credits_used}</td>\
+            </tr>"
+        ));
+    }
+
+    out.push_str("</tbody></table></div>");
+    out
+}
+
+async fn get_partial_user_ledger_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let json_res = get_usage_ledger_internal(&state, Some(uid.to_string()), query).await?;
+    let html = render_usage_ledger_html(&json_res.0);
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_ledger_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LedgerQuery>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    let json_res = get_usage_ledger_internal(&state, None, query).await?;
+    let html = render_usage_ledger_html(&json_res.0);
+    Ok(Html(html))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // Web UI screens & HTMX Partials
@@ -7695,6 +7809,10 @@ pub fn router(state: ApiAppState) -> Router {
             "/app/partials/logs/{request_id}",
             get(get_partial_user_log_detail_handler),
         )
+        .route(
+            "/app/partials/ledger",
+            get(get_partial_user_ledger_handler),
+        )
         .route("/admin", get(crate::ui::get_admin_ui))
         .route(
             "/admin/partials/overview",
@@ -7720,6 +7838,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/partials/logs/{request_id}",
             get(get_partial_admin_log_detail_handler),
+        )
+        .route(
+            "/admin/partials/ledger",
+            get(get_partial_admin_ledger_handler),
         )
         // User endpoints
         .route(

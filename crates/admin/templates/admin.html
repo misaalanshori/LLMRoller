@@ -19,6 +19,7 @@
         <button class="tab-btn" data-tab="tab-adm-settings">Runtime Settings</button>
         <button class="tab-btn" data-tab="tab-adm-audit">Audit Log</button>
         <button class="tab-btn" data-tab="tab-adm-logs">Logs</button>
+        <button class="tab-btn" data-tab="tab-adm-ledger">Usage Ledger</button>
     </div>
 
     <!-- Tab: Overview -->
@@ -214,6 +215,21 @@
             </div>
             <div id="adm-logs-table-container" hx-get="/admin/partials/logs?stream=inference" hx-trigger="load">
                 <p class="text-muted text-center" style="padding: 1.5rem;">Loading logs...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Usage Ledger (USG-10, SRDD 14.n) -->
+    <div id="tab-adm-ledger" class="tab-pane">
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h3>Usage Ledger</h3>
+                    <p class="card-desc">Review cross-tenant token composition, plan coverage multipliers, and credit charges.</p>
+                </div>
+            </div>
+            <div id="adm-ledger-content" hx-get="/admin/partials/ledger" hx-trigger="load">
+                <p class="text-muted text-center" style="padding: 1.5rem;">Loading usage ledger...</p>
             </div>
         </div>
     </div>

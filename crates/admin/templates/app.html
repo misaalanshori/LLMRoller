@@ -19,6 +19,7 @@
         <button class="tab-btn" data-tab="tab-matrix">Routing Matrix</button>
         <button class="tab-btn" data-tab="tab-sessions">Active Sessions</button>
         <button class="tab-btn" data-tab="tab-logs">Logs</button>
+        <button class="tab-btn" data-tab="tab-ledger">Usage Ledger</button>
     </div>
 
     <!-- Tab: Overview -->
@@ -251,6 +252,21 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             </div>
             <div id="logs-table-container" hx-get="/app/partials/logs?stream=inference" hx-trigger="load">
                 <p class="text-muted text-center" style="padding: 1.5rem;">Loading logs...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Usage Ledger (USG-10, SRDD 14.n) -->
+    <div id="tab-ledger" class="tab-pane">
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h3>Usage Ledger</h3>
+                    <p class="card-desc">Review token composition, plan coverage multipliers, and credit charges.</p>
+                </div>
+            </div>
+            <div id="ledger-content" hx-get="/app/partials/ledger" hx-trigger="load">
+                <p class="text-muted text-center" style="padding: 1.5rem;">Loading usage ledger...</p>
             </div>
         </div>
     </div>

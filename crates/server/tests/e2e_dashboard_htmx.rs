@@ -1339,7 +1339,7 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
         .expect("ledger req");
-    let ledger_res = app.oneshot(ledger_req).await.expect("res");
+    let ledger_res = app.clone().oneshot(ledger_req).await.expect("res");
     assert_eq!(ledger_res.status(), StatusCode::OK);
     let bytes = ledger_res
         .into_body()
@@ -1360,6 +1360,81 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
 
     let rows = json["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 2);
+
+    // 2. GET /app/partials/ledger (USG-10, SRDD 14.n)
+    let p_ledger_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/ledger")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let p_ledger_res = app.clone().oneshot(p_ledger_req).await.expect("res");
+    assert_eq!(p_ledger_res.status(), StatusCode::OK);
+    let p_ledger_bytes = p_ledger_res.into_body().collect().await.expect("b").to_bytes();
+    let p_ledger_html = std::str::from_utf8(&p_ledger_bytes).expect("utf8");
+    assert!(p_ledger_html.contains("Total tokens"));
+    assert!(p_ledger_html.contains("Plan Covered Savings"));
+    assert!(p_ledger_html.contains("Covered by plan credits"));
+    assert!(p_ledger_html.contains("deepseek-v4.1-flash"));
+
+    // 3. GET /app and GET /admin contain the Usage Ledger tab and pane container
+    let app_req = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let app_res = app.clone().oneshot(app_req).await.expect("res");
+    assert_eq!(app_res.status(), StatusCode::OK);
+    let app_bytes = app_res.into_body().collect().await.expect("b").to_bytes();
+    let app_html = std::str::from_utf8(&app_bytes).expect("utf8");
+    assert!(app_html.contains("data-tab=\"tab-ledger\""));
+    assert!(app_html.contains("id=\"tab-ledger\""));
+
+    let admin_session = "usg10_admin_session_token_12345678";
+    let admin_id_hash = llmroller_store::crypto::sha256_hex(admin_session.as_bytes());
+    let admin_csrf = llmroller_admin::auth::derive_session_csrf(admin_session);
+    let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &admin_id_hash,
+            user_id: _admin_id,
+            csrf_hash: &admin_csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("admin session");
+    let admin_cookie = format!("llmroller_session={admin_session}");
+
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri("/admin")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let admin_res = app.clone().oneshot(admin_req).await.expect("res");
+    assert_eq!(admin_res.status(), StatusCode::OK);
+    let admin_bytes = admin_res.into_body().collect().await.expect("b").to_bytes();
+    let admin_html = std::str::from_utf8(&admin_bytes).expect("utf8");
+    assert!(admin_html.contains("data-tab=\"tab-adm-ledger\""));
+    assert!(admin_html.contains("id=\"tab-adm-ledger\""));
+
+    let p_adm_ledger_req = Request::builder()
+        .method("GET")
+        .uri("/admin/partials/ledger")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let p_adm_ledger_res = app.oneshot(p_adm_ledger_req).await.expect("res");
+    assert_eq!(p_adm_ledger_res.status(), StatusCode::OK);
+    let p_adm_ledger_bytes = p_adm_ledger_res.into_body().collect().await.expect("b").to_bytes();
+    let p_adm_ledger_html = std::str::from_utf8(&p_adm_ledger_bytes).expect("utf8");
+    assert!(p_adm_ledger_html.contains("Total tokens"));
 }
 
 #[doc = "Spec: UI-6 — Overview Analytics Dashboard KPI summary cards, time series, and model breakdown"]
