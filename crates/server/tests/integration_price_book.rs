@@ -343,3 +343,35 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
     assert_eq!(resolved_none, None);
     tx.commit().await.expect("commit");
 }
+
+#[doc = "Spec: USG-3"]
+#[tokio::test]
+async fn test_seed_bundled_prices_seeds_standard_models_idempotently() {
+    let (_dir, pool, _master_key, _admin_id, _user_id, _admin_sess, _user_sess) =
+        setup_price_book_test_db().await;
+
+    let seeded = llmroller_store::prices::seed_bundled_prices(&pool, 1000)
+        .await
+        .expect("seed bundled prices");
+    assert!(seeded >= 10, "must seed at least 10 baseline models");
+
+    // Second seed is idempotent and inserts 0 rows
+    let seeded_again = llmroller_store::prices::seed_bundled_prices(&pool, 2000)
+        .await
+        .expect("idempotent seed");
+    assert_eq!(seeded_again, 0);
+
+    // Verify claude-sonnet-4.6 is present
+    let mut tx = pool.begin().await.expect("begin");
+    let price = get_price_tx(&mut tx, "bundled", "global", "claude-sonnet-4.6")
+        .await
+        .expect("get")
+        .expect("price must exist");
+    assert_eq!(price.input_per_mtok_micro_usd, 3_000_000);
+    assert_eq!(price.output_per_mtok_micro_usd, 15_000_000);
+    let source: String = sqlx::query_scalar("SELECT source FROM prices WHERE upstream_model_id = 'claude-sonnet-4.6'")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("fetch source");
+    assert_eq!(source, "bundled");
+}

@@ -316,11 +316,32 @@ pub async fn merge_models_tx(
     .await?;
 
     // Repoint dependent tables to target_pk (RESTRICT foreign keys)
+    // Clean duplicate conflicting rows from source_pk first to prevent UNIQUE constraint violations (F080, MDL-4).
+    sqlx::query(
+        r#"DELETE FROM model_aliases WHERE model_pk = ? AND alias IN (
+               SELECT alias FROM model_aliases WHERE model_pk = ?
+           )"#,
+    )
+    .bind(&source_str)
+    .bind(&target_str)
+    .execute(&mut **tx)
+    .await?;
+
     sqlx::query("UPDATE model_aliases SET model_pk = ? WHERE model_pk = ?")
         .bind(&target_str)
         .bind(&source_str)
         .execute(&mut **tx)
         .await?;
+
+    sqlx::query(
+        r#"DELETE FROM user_route_preferences WHERE model_pk = ? AND (user_id, upstream_key_id) IN (
+               SELECT user_id, upstream_key_id FROM user_route_preferences WHERE model_pk = ?
+           )"#,
+    )
+    .bind(&source_str)
+    .bind(&target_str)
+    .execute(&mut **tx)
+    .await?;
 
     sqlx::query("UPDATE user_route_preferences SET model_pk = ? WHERE model_pk = ?")
         .bind(&target_str)
@@ -328,11 +349,31 @@ pub async fn merge_models_tx(
         .execute(&mut **tx)
         .await?;
 
+    sqlx::query(
+        r#"DELETE FROM budget_windows WHERE model_pk = ? AND (scope_kind, COALESCE(upstream_key_id, '')) IN (
+               SELECT scope_kind, COALESCE(upstream_key_id, '') FROM budget_windows WHERE model_pk = ?
+           )"#,
+    )
+    .bind(&source_str)
+    .bind(&target_str)
+    .execute(&mut **tx)
+    .await?;
+
     sqlx::query("UPDATE budget_windows SET model_pk = ? WHERE model_pk = ?")
         .bind(&target_str)
         .bind(&source_str)
         .execute(&mut **tx)
         .await?;
+
+    sqlx::query(
+        r#"DELETE FROM pins WHERE model_pk = ? AND (client_key_id, session_hash) IN (
+               SELECT client_key_id, session_hash FROM pins WHERE model_pk = ?
+           )"#,
+    )
+    .bind(&source_str)
+    .bind(&target_str)
+    .execute(&mut **tx)
+    .await?;
 
     sqlx::query("UPDATE pins SET model_pk = ? WHERE model_pk = ?")
         .bind(&target_str)
@@ -345,6 +386,16 @@ pub async fn merge_models_tx(
         .bind(&source_str)
         .execute(&mut **tx)
         .await?;
+
+    sqlx::query(
+        r#"DELETE FROM route_protocol_blocks WHERE model_pk = ? AND (upstream_key_id, protocol) IN (
+               SELECT upstream_key_id, protocol FROM route_protocol_blocks WHERE model_pk = ?
+           )"#,
+    )
+    .bind(&source_str)
+    .bind(&target_str)
+    .execute(&mut **tx)
+    .await?;
 
     sqlx::query("UPDATE route_protocol_blocks SET model_pk = ? WHERE model_pk = ?")
         .bind(&target_str)

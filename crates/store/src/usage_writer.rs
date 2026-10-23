@@ -360,6 +360,10 @@ async fn insert_usage_event(
     tx: &mut Transaction<'_, Sqlite>,
     e: &UsageEventRecord,
 ) -> Result<(), sqlx::Error> {
+    let upstream_key = e.upstream_key_id.as_deref().filter(|s| !s.trim().is_empty());
+    let provider = e.provider_id.as_deref().filter(|s| !s.trim().is_empty());
+    let share = e.share_id.as_deref().filter(|s| !s.trim().is_empty());
+
     sqlx::query(
         r#"INSERT INTO usage_events (
                id, ts, request_id, client_key_id, owner_user_id,
@@ -380,10 +384,10 @@ async fn insert_usage_event(
     .bind(e.request_id.to_string())
     .bind(e.client_key_id.to_string())
     .bind(e.owner_user_id.to_string())
-    .bind(&e.upstream_key_id)
-    .bind(&e.provider_id)
+    .bind(upstream_key)
+    .bind(provider)
     .bind(&e.provider_scope)
-    .bind(&e.share_id)
+    .bind(share)
     .bind(&e.canonical_id)
     .bind(&e.upstream_model_id)
     .bind(&e.endpoint)

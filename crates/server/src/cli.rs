@@ -264,6 +264,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     seed_defaults(&pool, default_routing_strategy, clock.now_ms())
         .await
         .map_err(|e| CliFailure::new(13, e.to_string()))?;
+    llmroller_store::prices::seed_bundled_prices(&pool, clock.now_ms())
+        .await
+        .map_err(|e| CliFailure::new(13, e.to_string()))?;
 
     // 5. Initialize setup-token if users table is empty
     let setup_token_required = env::var("LLMROLLER_SETUP_TOKEN_REQUIRED")
@@ -982,11 +985,26 @@ async fn verify_audit_log_command(args: VerifyAuditLogArgs) -> Result<(), CliFai
     })?;
 
     let database = data_dir.join("llmroller.db");
+    if !database.is_file() {
+        return Err(CliFailure::new(
+            10,
+            format!("database {} does not exist", database.display()),
+        ));
+    }
+
     let pool = open_pool(&database, Role::cli_read_only())
         .await
         .map_err(|error| {
             CliFailure::new(13, format!("cannot open {}: {error}", database.display()))
         })?;
+
+    let has_meta: Option<i64> = sqlx::query_scalar("SELECT 1 FROM instance_meta WHERE singleton = 1")
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| CliFailure::new(13, e.to_string()))?;
+    if has_meta.is_none() {
+        return Err(CliFailure::new(10, "instance is uninitialized".to_string()));
+    }
 
     let clock = SystemClock::new();
     let entropy = Arc::new(OsEntropy::new());
