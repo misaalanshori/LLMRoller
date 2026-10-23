@@ -2213,7 +2213,7 @@ async fn get_user_client_key_sessions_handler(
         ));
     }
 
-    list_client_key_sessions_internal(&state, &id).await
+    list_client_key_sessions_internal(&state, &actor, &id).await
 }
 
 async fn get_admin_client_key_sessions_handler(
@@ -2221,15 +2221,17 @@ async fn get_admin_client_key_sessions_handler(
     headers: HeaderMap,
     Path(id): Path<ClientKeyId>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let _actor = authenticate_admin(&state, &headers, false).await?;
-    list_client_key_sessions_internal(&state, &id).await
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    list_client_key_sessions_internal(&state, &actor, &id).await
 }
 
 async fn list_client_key_sessions_internal(
     state: &ApiAppState,
+    actor: &ActorScope,
     client_key_id: &ClientKeyId,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use sqlx::Row as _;
+    let is_admin = actor.is_admin() || actor.is_system();
     let rows = sqlx::query(
         r#"SELECT session_hash, MAX(ts) as last_active_at, COUNT(*) as traced_turn_count
            FROM trace_records
@@ -2249,10 +2251,11 @@ async fn list_client_key_sessions_internal(
     let now_ms = state.auth.clock.now_ms();
     let pin_rows = sqlx::query(
         r#"SELECT p.session_hash, p.upstream_key_id, m.canonical_id, p.pool_tier,
-                  p.last_used_at, k.label AS key_label
+                  p.last_used_at, k.label AS key_label, pr.ownership_scope
            FROM pins p
            JOIN models m ON m.model_pk = p.model_pk
            JOIN upstream_keys k ON k.id = p.upstream_key_id
+           JOIN providers pr ON pr.id = k.provider_id
            WHERE p.client_key_id = ? AND p.expires_at > ?
            ORDER BY p.last_used_at DESC"#,
     )
@@ -2270,17 +2273,25 @@ async fn list_client_key_sessions_internal(
         let upstream_key_id: String = pin.try_get("upstream_key_id").unwrap_or_default();
         let canonical_id: String = pin.try_get("canonical_id").unwrap_or_default();
         let key_label: String = pin.try_get("key_label").unwrap_or_default();
+        let ownership_scope: String = pin.try_get("ownership_scope").unwrap_or_default();
         let pool_tier: i64 = pin.try_get("pool_tier").unwrap_or(0);
         let last_used_at: i64 = pin.try_get("last_used_at").unwrap_or(0);
+
+        let (redacted_key_id, redacted_label) = if is_admin || ownership_scope == "personal" {
+            (Some(upstream_key_id), key_label)
+        } else {
+            (None, "pooled".to_string())
+        };
+
         pin_last_used.insert(session_hash.clone(), last_used_at);
         pins_by_session
             .entry(session_hash)
             .or_default()
             .push(serde_json::json!({
-                "upstream_key_id": upstream_key_id,
+                "upstream_key_id": redacted_key_id,
                 "canonical_id": canonical_id,
                 "pool_tier": pool_tier,
-                "key_label": key_label,
+                "key_label": redacted_label,
             }));
     }
 

@@ -513,7 +513,7 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .header(header::COOKIE, &harness.alice_key.cookie)
         .body(Body::empty())
         .expect("sessions request");
-    let response = app.oneshot(request).await.expect("sessions response");
+    let response = app.clone().oneshot(request).await.expect("sessions response");
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
@@ -537,6 +537,102 @@ async fn test_client_key_sessions_report_live_session_pins() {
     assert_eq!(pins[0]["canonical_id"], "gpt-4o");
     assert_eq!(pins[0]["key_label"], "alice-upstream");
     assert_eq!(pins[0]["pool_tier"], 1);
+
+    // Create a global provider and upstream key (USR-4, SEC-17)
+    let global_prov_id = ProviderId::generate();
+    let global_key_id = UpstreamKeyId::generate();
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let model_pk: String = sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = 'gpt-4o'")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("model_pk");
+
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, created_at)
+         VALUES (?, 'global-provider', 'custom', 'https://global.test', '{}', 'global', ?)",
+    )
+    .bind(global_prov_id.to_string())
+    .bind(now_ms)
+    .execute(&harness.pool)
+    .await
+    .expect("insert global provider");
+
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, label, secret_enc, master_key_id, secret_last4, created_at)
+         VALUES (?, ?, 'global-secret-key', X'00', 'key-0', '1234', ?)",
+    )
+    .bind(global_key_id.to_string())
+    .bind(global_prov_id.to_string())
+    .bind(now_ms)
+    .execute(&harness.pool)
+    .await
+    .expect("insert global upstream key");
+
+    // Pin a session to the global key
+    sqlx::query(
+        "INSERT INTO pins (client_key_id, session_hash, model_pk, upstream_key_id, pool_tier, expires_at, created_at, last_used_at)
+         VALUES (?, 'global-session-hash', ?, ?, 3, ?, ?, ?)",
+    )
+    .bind(harness.alice_key.client_key_id.to_string())
+    .bind(&model_pk)
+    .bind(global_key_id.to_string())
+    .bind(now_ms + 3_600_000)
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(&harness.pool)
+    .await
+    .expect("insert global pin");
+
+    // Standard user queries sessions: global key ID must be null and label must be "pooled" (USR-4, SEC-17)
+    let user_req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/user/client-keys/{}/sessions",
+            harness.alice_key.client_key_id
+        ))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("user sessions request");
+    let user_res = app.clone().oneshot(user_req).await.expect("user sessions response");
+    assert_eq!(user_res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(user_res.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let user_body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    let user_sessions = user_body["data"].as_array().expect("user sessions array");
+    let global_sess = user_sessions
+        .iter()
+        .find(|s| s["session_hash"] == "global-session-hash")
+        .expect("global session present");
+    let global_pins = global_sess["current_pins"].as_array().expect("global pins");
+    assert!(global_pins[0]["upstream_key_id"].is_null(), "global key id must be redacted to null for standard users");
+    assert_eq!(global_pins[0]["key_label"], "pooled", "global key label must be masked to pooled");
+
+    // Admin queries sessions: receives full unredacted key details
+    let (admin_cookie, _admin_csrf) = insert_session(&harness.pool, harness.admin, "admin_sessions_token_12345").await;
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/admin/api/client-keys/{}/sessions",
+            harness.alice_key.client_key_id
+        ))
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("admin sessions request");
+    let admin_res = app.oneshot(admin_req).await.expect("admin sessions response");
+    assert_eq!(admin_res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(admin_res.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let admin_body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    let admin_sessions = admin_body["data"].as_array().expect("admin sessions array");
+    let admin_global_sess = admin_sessions
+        .iter()
+        .find(|s| s["session_hash"] == "global-session-hash")
+        .expect("global session present");
+    let admin_global_pins = admin_global_sess["current_pins"].as_array().expect("admin global pins");
+    assert_eq!(admin_global_pins[0]["upstream_key_id"], global_key_id.to_string());
+    assert_eq!(admin_global_pins[0]["key_label"], "global-secret-key");
 }
 
 #[doc = "Spec: LIM-1 — budget window CRUD endpoints with validation and RBAC scoping"]
