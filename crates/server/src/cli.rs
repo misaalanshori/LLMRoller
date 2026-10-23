@@ -678,13 +678,18 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     wait_for_shutdown_signal().await;
     eprintln!("Shutdown signal received; initiating graceful drain...");
 
+    let (drain_grace, drain_timeout) = {
+        let snap = shared_snapshot.load();
+        let timeout_secs = snap.settings.drain_timeout_secs.clamp(5, 300) as u64;
+        (Duration::from_secs(5), Duration::from_secs(timeout_secs))
+    };
     let shutdown_sup = ShutdownSupervisor::new(
         is_ready.clone(),
         open_streams.clone(),
         shutdown_notify.clone(),
         pool.clone(),
-        Duration::from_millis(500),
-        Duration::from_secs(5),
+        drain_grace,
+        drain_timeout,
     )
     .with_writer(writer_handle.clone())
     .with_shutdown_cut(shutdown_cut.clone())

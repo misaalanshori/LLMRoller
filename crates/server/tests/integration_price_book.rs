@@ -300,4 +300,46 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
     );
 
     tx.commit().await.expect("commit");
+
+    // Delete price override (F059)
+    let mut tx = pool.begin().await.expect("begin");
+    let deleted = llmroller_store::prices::delete_price_tx(
+        &mut tx,
+        &provider.id.to_string(),
+        "deepseek/deepseek-v4.1-flash",
+    )
+    .await
+    .expect("delete price");
+    assert!(deleted);
+    let resolved_after_delete = get_price_tx(
+        &mut tx,
+        &provider.id.to_string(),
+        "openrouter",
+        "deepseek/deepseek-v4.1-flash",
+    )
+    .await
+    .expect("resolve");
+    assert_eq!(
+        resolved_after_delete
+            .expect("resolved global")
+            .input_per_mtok_micro_usd,
+        1_000_000
+    );
+
+    // Delete global default price: now returns None
+    let deleted_global =
+        llmroller_store::prices::delete_price_tx(&mut tx, "", "deepseek/deepseek-v4.1-flash")
+            .await
+            .expect("delete global");
+    assert!(deleted_global);
+    let resolved_none = get_price_tx(
+        &mut tx,
+        &provider.id.to_string(),
+        "openrouter",
+        "deepseek/deepseek-v4.1-flash",
+    )
+    .await
+    .expect("resolve");
+    assert_eq!(resolved_none, None);
+    tx.commit().await.expect("commit");
 }

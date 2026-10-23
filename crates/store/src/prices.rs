@@ -79,6 +79,20 @@ pub async fn upsert_price_tx(
     Ok(())
 }
 
+/// Delete a model price entry by provider ID and upstream model ID.
+pub async fn delete_price_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    provider_id: &str,
+    upstream_model_id: &str,
+) -> Result<bool, PriceError> {
+    let res = sqlx::query("DELETE FROM prices WHERE provider_id = ? AND upstream_model_id = ?")
+        .bind(provider_id)
+        .bind(upstream_model_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 pub async fn get_price_tx(
     tx: &mut Transaction<'_, Sqlite>,
     provider_id: &str,

@@ -1632,6 +1632,59 @@ pub struct UpsertPricePayload {
     pub schedules: Vec<llmroller_core::pricing::Schedule>,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeletePriceParams {
+    pub provider_id: Option<String>,
+    pub upstream_model_id: String,
+}
+
+async fn delete_user_provider_price_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<ProviderId>,
+    axum::extract::Query(params): axum::extract::Query<DeletePriceParams>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let p = llmroller_store::providers::get_provider(&state.auth.pool, &actor, id)
+        .await
+        .map_err(map_provider_error)?;
+    if p.owner_user_id != actor.user_id() {
+        return Err(map_price_error(StatusCode::FORBIDDEN, "not provider owner"));
+    }
+    let provider_id = id.to_string();
+    let upstream_model_id = params.upstream_model_id;
+    execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
+        Box::pin(async move {
+            llmroller_store::prices::delete_price_tx(tx, &provider_id, &upstream_model_id)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_admin_price_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<DeletePriceParams>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let provider_id = params.provider_id.unwrap_or_default();
+    let upstream_model_id = params.upstream_model_id;
+    execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
+        Box::pin(async move {
+            llmroller_store::prices::delete_price_tx(tx, &provider_id, &upstream_model_id)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn put_admin_price_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -1639,7 +1692,7 @@ async fn put_admin_price_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
     let provider_id = payload.provider_id.clone().unwrap_or_default();
-    upsert_price_internal(&state, provider_id, payload).await
+    upsert_price_internal(&state, provider_id, payload, "admin").await
 }
 
 async fn put_user_provider_price_handler(
@@ -1655,13 +1708,14 @@ async fn put_user_provider_price_handler(
     if p.owner_user_id != actor.user_id() {
         return Err(map_price_error(StatusCode::FORBIDDEN, "not provider owner"));
     }
-    upsert_price_internal(&state, id.to_string(), payload).await
+    upsert_price_internal(&state, id.to_string(), payload, "user").await
 }
 
 async fn upsert_price_internal(
     state: &ApiAppState,
     provider_id: String,
     payload: UpsertPricePayload,
+    source: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mut tx = state
         .auth
@@ -1684,7 +1738,7 @@ async fn upsert_price_internal(
         rates,
         tiers: payload.tiers,
         schedules: payload.schedules,
-        source: "admin".to_string(),
+        source: source.to_string(),
         now_ms: state.auth.clock.now_ms(),
     };
 
@@ -7075,7 +7129,7 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route(
             "/api/user/providers/{id}/prices",
-            put(put_user_provider_price_handler),
+            put(put_user_provider_price_handler).delete(delete_user_provider_price_handler),
         )
         .route(
             "/api/user/usage/summary",
@@ -7233,7 +7287,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))
         .route("/admin/api/sessions/{hash}/pin", delete(delete_pin_handler))
-        .route("/admin/api/prices", put(put_admin_price_handler))
+        .route(
+            "/admin/api/prices",
+            put(put_admin_price_handler).delete(delete_admin_price_handler),
+        )
         .route(
             "/admin/api/prices/sync",
             post(post_admin_prices_sync_handler),
