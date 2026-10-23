@@ -566,7 +566,9 @@ async fn test_budget_window_crud_endpoints_and_validation() {
         .expect("create req");
     let resp = app.clone().oneshot(create_req).await.expect("create resp");
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("bytes");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("bytes");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     let window_id = body["id"].as_str().expect("window id").to_string();
 
@@ -582,7 +584,9 @@ async fn test_budget_window_crud_endpoints_and_validation() {
         .expect("list req");
     let resp = app.clone().oneshot(list_req).await.expect("list resp");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("bytes");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("bytes");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     let windows = body["data"].as_array().expect("data array");
     assert_eq!(windows.len(), 1);
@@ -634,7 +638,11 @@ async fn test_budget_window_crud_endpoints_and_validation() {
             }"#,
         ))
         .expect("invalid req");
-    let resp = app.clone().oneshot(invalid_req).await.expect("invalid resp");
+    let resp = app
+        .clone()
+        .oneshot(invalid_req)
+        .await
+        .expect("invalid resp");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     // 6. Alice deletes the window -> 204
@@ -710,7 +718,9 @@ async fn test_must_change_password_blocks_resources_until_password_changed() {
         .expect("get req");
     let resp = app.clone().oneshot(get_req).await.expect("get resp");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("b");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("b");
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(json["error"]["code"], "must_change_password");
 

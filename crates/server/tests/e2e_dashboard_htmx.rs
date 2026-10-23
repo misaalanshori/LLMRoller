@@ -949,7 +949,12 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
         .expect("logs req");
     let logs_res = app.clone().oneshot(logs_req).await.expect("logs res");
     assert_eq!(logs_res.status(), StatusCode::OK);
-    let body_bytes = logs_res.into_body().collect().await.expect("body").to_bytes();
+    let body_bytes = logs_res
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
     let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
     assert_eq!(body_json["stream"], "api");
     let rows = body_json["rows"].as_array().expect("rows");
@@ -1093,7 +1098,12 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
         .expect("req");
     let detail_res = app.clone().oneshot(detail_req).await.expect("res");
     assert_eq!(detail_res.status(), StatusCode::OK);
-    let d_bytes = detail_res.into_body().collect().await.expect("b").to_bytes();
+    let d_bytes = detail_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
     let d_json: serde_json::Value = serde_json::from_slice(&d_bytes).expect("json");
     assert_eq!(d_json["request_id"], req_id.to_string());
     assert_eq!(d_json["status"], 200);
@@ -1230,7 +1240,12 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
         .expect("ledger req");
     let ledger_res = app.oneshot(ledger_req).await.expect("res");
     assert_eq!(ledger_res.status(), StatusCode::OK);
-    let bytes = ledger_res.into_body().collect().await.expect("b").to_bytes();
+    let bytes = ledger_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
 
     let summary = &json["summary"];

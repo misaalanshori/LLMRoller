@@ -400,10 +400,11 @@ async fn post_setup(
     .map_err(|err| SetupError::User(UserError::from(err)))?;
 
     // Bump config_version so Reloader picks up the newly created administrator (AUTH-1, REL-4)
-    let _ = sqlx::query("UPDATE instance_meta SET config_version = config_version + 1, updated_at = ?")
-        .bind(now_ms)
-        .execute(&mut *transaction)
-        .await;
+    let _ =
+        sqlx::query("UPDATE instance_meta SET config_version = config_version + 1, updated_at = ?")
+            .bind(now_ms)
+            .execute(&mut *transaction)
+            .await;
 
     transaction.commit().await?;
     drop(connection);

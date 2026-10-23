@@ -686,9 +686,10 @@ async fn test_retention_sweeper_and_wal_checkpoint_supervisor() {
     .execute(&pool)
     .await
     .expect("insert hourly rollups");
-    let swept_hourly = llmroller_store::retention::sweep_expired_usage_rollups_hourly(&pool, 3000, 100)
-        .await
-        .expect("sweep hourly");
+    let swept_hourly =
+        llmroller_store::retention::sweep_expired_usage_rollups_hourly(&pool, 3000, 100)
+            .await
+            .expect("sweep hourly");
     assert_eq!(swept_hourly, 1);
 
     sqlx::query(

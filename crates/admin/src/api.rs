@@ -3264,12 +3264,30 @@ async fn get_admin_overview_telemetry_handler(
     .await?;
 
     let mut map = overview.as_object().cloned().unwrap_or_default();
-    map.insert("projected_disk_mb".to_string(), serde_json::json!(projected_disk_mb));
-    map.insert("unpriced_models_count".to_string(), serde_json::json!(unpriced_count));
-    map.insert("usage_events_count".to_string(), serde_json::json!(usage_events_count));
-    map.insert("max_usage_events_rows".to_string(), serde_json::json!(50_000_000i64));
-    map.insert("retention_days".to_string(), serde_json::json!(retention_days));
-    map.insert("daily_requests".to_string(), serde_json::json!(daily_requests));
+    map.insert(
+        "projected_disk_mb".to_string(),
+        serde_json::json!(projected_disk_mb),
+    );
+    map.insert(
+        "unpriced_models_count".to_string(),
+        serde_json::json!(unpriced_count),
+    );
+    map.insert(
+        "usage_events_count".to_string(),
+        serde_json::json!(usage_events_count),
+    );
+    map.insert(
+        "max_usage_events_rows".to_string(),
+        serde_json::json!(50_000_000i64),
+    );
+    map.insert(
+        "retention_days".to_string(),
+        serde_json::json!(retention_days),
+    );
+    map.insert(
+        "daily_requests".to_string(),
+        serde_json::json!(daily_requests),
+    );
 
     Ok(Json(serde_json::Value::Object(map)))
 }
@@ -5382,14 +5400,13 @@ async fn get_log_detail_internal(
         })
         .collect::<Vec<_>>();
 
-    let has_trace: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM trace_records WHERE request_id = ? LIMIT 1",
-    )
-    .bind(request_id)
-    .fetch_optional(&state.auth.reader_pool)
-    .await
-    .unwrap_or_default()
-    .is_some();
+    let has_trace: bool =
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM trace_records WHERE request_id = ? LIMIT 1")
+            .bind(request_id)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+            .unwrap_or_default()
+            .is_some();
 
     let status: i64 = row.try_get("status").unwrap_or(200);
     let cost: i64 = row.try_get("cost_micro_usd").unwrap_or(0);
@@ -5475,7 +5492,10 @@ async fn export_logs_csv_internal(
              FROM control_plane_logs ORDER BY ts DESC LIMIT 5000"
         };
         let rows = if let Some(ref uid) = owner_user_id {
-            sqlx::query(sql).bind(uid).fetch_all(&state.auth.reader_pool).await
+            sqlx::query(sql)
+                .bind(uid)
+                .fetch_all(&state.auth.reader_pool)
+                .await
         } else {
             sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
         }
@@ -5490,7 +5510,10 @@ async fn export_logs_csv_internal(
             let path: String = r.try_get("path").unwrap_or_default();
             let status: i64 = r.try_get("status").unwrap_or(0);
             let latency: i64 = r.try_get("latency_ms").unwrap_or(0);
-            let ip: String = r.try_get::<Option<String>, _>("ip_addr").unwrap_or_default().unwrap_or_default();
+            let ip: String = r
+                .try_get::<Option<String>, _>("ip_addr")
+                .unwrap_or_default()
+                .unwrap_or_default();
             let line = format!(
                 "{},{},{},{},{},{},{},{}\r\n",
                 sanitize_csv_cell(&id),
@@ -5527,7 +5550,10 @@ async fn export_logs_csv_internal(
     };
 
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(sql).bind(uid).fetch_all(&state.auth.reader_pool).await
+        sqlx::query(sql)
+            .bind(uid)
+            .fetch_all(&state.auth.reader_pool)
+            .await
     } else {
         sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
     }
@@ -5540,12 +5566,24 @@ async fn export_logs_csv_internal(
         let id: String = r.try_get("id").unwrap_or_default();
         let ts: i64 = r.try_get("ts").unwrap_or(0);
         let req_id: String = r.try_get("request_id").unwrap_or_default();
-        let model: String = r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default().unwrap_or_default();
+        let model: String = r
+            .try_get::<Option<String>, _>("canonical_id")
+            .unwrap_or_default()
+            .unwrap_or_default();
         let status: i64 = r.try_get("status").unwrap_or(0);
         let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
-        let input: i64 = r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0);
-        let output: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
-        let err: String = r.try_get::<Option<String>, _>("error_code").unwrap_or_default().unwrap_or_default();
+        let input: i64 = r
+            .try_get::<Option<i64>, _>("input_uncached_tokens")
+            .unwrap_or(None)
+            .unwrap_or(0);
+        let output: i64 = r
+            .try_get::<Option<i64>, _>("output_tokens")
+            .unwrap_or(None)
+            .unwrap_or(0);
+        let err: String = r
+            .try_get::<Option<String>, _>("error_code")
+            .unwrap_or_default()
+            .unwrap_or_default();
         let line = format!(
             "{},{},{},{},{},{},{},{},{}\r\n",
             sanitize_csv_cell(&id),
@@ -7066,10 +7104,7 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/logs/export.csv",
             get(get_user_logs_export_csv_handler),
         )
-        .route(
-            "/api/user/usage/ledger",
-            get(get_user_usage_ledger_handler),
-        )
+        .route("/api/user/usage/ledger", get(get_user_usage_ledger_handler))
         // Admin endpoints
         .route(
             "/admin/api/providers",
