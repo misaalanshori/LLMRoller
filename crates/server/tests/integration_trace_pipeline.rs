@@ -34,9 +34,7 @@ use llmroller_store::providers::{
     NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
 };
 use llmroller_store::settings::seed_defaults;
-use llmroller_store::traces::{
-    SealedTurnResult, SealerPool, StoredTurnTraceV2, insert_sealed_trace_tx,
-};
+use llmroller_store::traces::{SealerPool, StoredTurnTraceV2};
 use llmroller_store::writer::start_writer;
 
 #[derive(Clone, Default)]
@@ -95,37 +93,18 @@ async fn spawn_mock_upstream() -> (SocketAddr, MockState) {
     (addr, state)
 }
 
-async fn wait_for_sealed(
-    receiver: &std::sync::mpsc::Receiver<SealedTurnResult>,
-) -> SealedTurnResult {
-    for _ in 0..500 {
-        match receiver.try_recv() {
-            Ok(sealed) => return sealed,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                panic!("sealer pool closed before producing a trace")
-            }
-        }
-    }
-    panic!("timed out waiting for a sealed trace");
-}
-
-async fn persist_sealed(pool: &sqlx::SqlitePool, sealed: &SealedTurnResult) {
-    for _ in 0..300 {
-        let attempt = async {
-            let mut tx = pool.begin().await?;
-            insert_sealed_trace_tx(&mut tx, sealed, "key-0").await?;
-            tx.commit().await
-        }
-        .await;
-        if attempt.is_ok() {
+async fn wait_for_trace_record(pool: &sqlx::SqlitePool, expected_count: usize) {
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_records")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        if count as usize >= expected_count {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("usage event never committed; trace insert kept failing its foreign key");
+    panic!("timed out waiting for {expected_count} trace records to persist via writer actor");
 }
 
 fn decrypt_trace(
@@ -276,6 +255,17 @@ async fn test_trace_pipeline_persists_streaming_and_non_streaming_turns() {
     let (sealer_pool, sealed_rx) = SealerPool::new(sealer.clone());
     let sealer_pool = Arc::new(sealer_pool);
 
+    // Spawn production bridge moving sealed traces into the SQLite writer queue
+    let trace_writer = writer.clone();
+    std::thread::Builder::new()
+        .name("llmroller-trace-enqueue".to_string())
+        .spawn(move || {
+            while let Ok(sealed) = sealed_rx.recv() {
+                trace_writer.queues.push_sealed_trace(sealed);
+            }
+        })
+        .expect("spawn trace enqueue thread");
+
     let mut proxy_state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![])
         .with_master_key(master_key.clone());
     proxy_state.is_ready.store(true, Ordering::SeqCst);
@@ -313,8 +303,7 @@ async fn test_trace_pipeline_persists_streaming_and_non_streaming_turns() {
         "trace pipeline answer"
     );
 
-    let sealed_non_stream = wait_for_sealed(&sealed_rx).await;
-    persist_sealed(&pool, &sealed_non_stream).await;
+    wait_for_trace_record(&pool, 1).await;
 
     let (payload, request_id, owner_user_id, session_hash) =
         sqlx::query_as::<_, (Vec<u8>, String, String, String)>(
@@ -371,8 +360,7 @@ async fn test_trace_pipeline_persists_streaming_and_non_streaming_turns() {
     assert!(stream_text.contains("Hello from "));
     assert!(stream_text.contains("the trace stream!"));
 
-    let sealed_stream = wait_for_sealed(&sealed_rx).await;
-    persist_sealed(&pool, &sealed_stream).await;
+    wait_for_trace_record(&pool, 2).await;
 
     let records: Vec<(Vec<u8>, String, String, String)> = sqlx::query_as(
         "SELECT payload_enc, request_id, owner_user_id, session_hash FROM trace_records ORDER BY ts",
