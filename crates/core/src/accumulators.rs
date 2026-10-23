@@ -73,11 +73,46 @@ impl UtcYearMonth {
 pub struct MonthlyAccumulator {
     pub used_micro_usd: AtomicI64,
     pub reserved_in_flight: AtomicI64,
+    pub current_yyyymm: AtomicI64,
 }
 
 impl MonthlyAccumulator {
+    pub fn new(initial_used_micro_usd: i64) -> Self {
+        Self {
+            used_micro_usd: AtomicI64::new(initial_used_micro_usd),
+            reserved_in_flight: AtomicI64::new(0),
+            current_yyyymm: AtomicI64::new(0),
+        }
+    }
+
+    /// Atomically resets `used_micro_usd` when the UTC calendar month (`YYYYMM`) rolls over (`F-076`, `LIM-1`).
+    pub fn ensure_month(&self, now_ms: i64) {
+        let ym_struct = UtcYearMonth::from_epoch_millis(now_ms);
+        let ym = i64::from(ym_struct.year) * 100 + i64::from(ym_struct.month);
+        let prev = self.current_yyyymm.load(Ordering::Acquire);
+        if prev == 0 {
+            let _ = self.current_yyyymm.compare_exchange(
+                0,
+                ym,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else if ym > prev
+            && self
+                .current_yyyymm
+                .compare_exchange(prev, ym, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.used_micro_usd.store(0, Ordering::Release);
+        }
+    }
+
     pub fn used(&self) -> i64 {
         self.used_micro_usd.load(Ordering::Acquire)
+    }
+
+    pub fn committed(&self) -> i64 {
+        self.used()
     }
 
     pub fn reserved(&self) -> i64 {

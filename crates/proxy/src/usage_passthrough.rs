@@ -236,12 +236,59 @@ fn usage_windows(
 
 fn usage_endpoint(config_json: &str) -> Option<String> {
     let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
-    config
+    if let Some(ep) = config
         .get("usage_endpoint")
         .or_else(|| config.get("usage_path"))
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
+    {
+        return Some(ep.to_string());
+    }
+    if let Some(ep) = config
+        .get("usage_profile")
+        .and_then(|up| up.get("endpoints"))
+        .and_then(|arr| arr.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(ep.to_string());
+    }
+    config
+        .get("paths")
+        .and_then(|p| p.get("usage"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
+}
+
+/// Resolves the full upstream `/usage` URL for a provider without duplicating `/api/v1` prefixes (`USG-6`, `USG-7`, `PRV-1`).
+#[must_use]
+pub fn resolve_provider_usage_url(
+    base_url: &str,
+    kind: llmroller_core::provider::ProviderKind,
+    config_json: &str,
+) -> Option<String> {
+    let base = base_url.trim_end_matches('/');
+    let raw_ep = usage_endpoint(config_json).or_else(|| {
+        match kind {
+            llmroller_core::provider::ProviderKind::Openrouter => Some("/key".to_string()),
+            llmroller_core::provider::ProviderKind::OpencodeGo
+            | llmroller_core::provider::ProviderKind::OpenDesignAmr => Some("/usage".to_string()),
+            llmroller_core::provider::ProviderKind::CommandCode => {
+                Some("/alpha/billing/credits".to_string())
+            }
+            llmroller_core::provider::ProviderKind::Custom => None,
+        }
+    })?;
+    if raw_ep.starts_with("http://") || raw_ep.starts_with("https://") {
+        return Some(raw_ep);
+    }
+    let rel = raw_ep.trim_start_matches('/');
+    if base.ends_with("/api/v1") && rel.starts_with("api/v1/") {
+        return Some(format!("{}/{}", base.trim_end_matches("/api/v1"), rel));
+    }
+    Some(format!("{base}/{rel}"))
 }
 
 async fn load_instance_id(state: &ProxyAuthState) -> Result<[u8; 16], String> {
@@ -423,7 +470,7 @@ async fn fresh_poll_usage(
         .providers
         .get(&key.provider_id)
         .ok_or_else(|| "upstream provider is missing".to_string())?;
-    let endpoint = usage_endpoint(&provider.config_json)
+    let target = resolve_provider_usage_url(&provider.base_url, provider.kind, &provider.config_json)
         .ok_or_else(|| "provider has no usage endpoint".to_string())?;
     let master_key = state
         .master_key
@@ -445,8 +492,7 @@ async fn fresh_poll_usage(
         .map_err(|_| "cannot unseal upstream key for usage polling".to_string())?;
     let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
-    let target = format!("{}{}", provider.base_url.trim_end_matches('/'), endpoint);
-    llmroller_core::ssrf::validate_url(&target, provider.allow_private_network)
+    crate::ssrf::validate_url(&target, provider.allow_private_network)
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
 
     let response = state
@@ -590,25 +636,40 @@ pub async fn get_v1_usage_handler(
         Err(UsageKeyNotFound(message)) => return not_found(&message),
     };
 
-    // `fresh=1` is honored only for an Own personal key or an admin. For Shared and
-    // Global keys the request silently uses the cached snapshot (Sections 13.4, 4).
+    let mut stored = match load_usage_snapshot(&state, &snapshot, &client_key, target_key).await {
+        Ok(row) => row,
+        Err(error) => return internal_error(&error),
+    };
+
+    // `fresh=1` is honored only for an Own personal key or an admin, and only when
+    // the stored snapshot is at least 10 s old (`FRESH_POLL_MIN_INTERVAL_MS`). For Shared
+    // and Global keys the request silently uses the cached snapshot (Sections 13.4, 4).
     let want_fresh = matches!(params.fresh.as_deref(), Some("1" | "true"));
+    let stored_is_recent = stored
+        .as_ref()
+        .is_some_and(|row| now.saturating_sub(row.fetched_at) < FRESH_POLL_MIN_INTERVAL_MS);
     if want_fresh
+        && !stored_is_recent
         && let Some(key_id) = target_key
         && let Some(key) = snapshot.upstream_keys.get(&key_id)
         && fresh_poll_allowed(&snapshot, &client_key, key)
         && state
             .runtime_state
             .try_begin_fresh_poll(key_id, now, FRESH_POLL_MIN_INTERVAL_MS)
-        && let Err(error) = fresh_poll_usage(&state, &snapshot, key, now).await
     {
-        tracing::warn!(upstream_key = %key_id, "on-demand usage poll failed: {error}");
+        match fresh_poll_usage(&state, &snapshot, key, now).await {
+            Ok(_) => {
+                if let Ok(reloaded) =
+                    load_usage_snapshot(&state, &snapshot, &client_key, target_key).await
+                {
+                    stored = reloaded;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(upstream_key = %key_id, "on-demand usage poll failed: {error}");
+            }
+        }
     }
-
-    let stored = match load_usage_snapshot(&state, &snapshot, &client_key, target_key).await {
-        Ok(row) => row,
-        Err(error) => return internal_error(&error),
-    };
     let response_windows = usage_windows(&state, &snapshot, target_key, now);
 
     let (source, fetched_at, upstream_value) = if let Some(row) = &stored {
@@ -657,6 +718,31 @@ pub async fn get_v1_usage_handler(
         .accumulators
         .usage_for(&BudgetScopeId::ClientKey(client_key.id), now);
 
+    let is_global_non_admin = target_key
+        .and_then(|kid| snapshot.upstream_keys.get(&kid))
+        .and_then(|uk| snapshot.providers.get(&uk.provider_id))
+        .is_some_and(|prov| prov.ownership_scope == OwnershipScope::Global)
+        && !is_admin(&snapshot, &client_key);
+    let projected_upstream_key_id = if is_global_non_admin {
+        None
+    } else {
+        target_key.map(|key| key.to_string())
+    };
+    let projected_pinned_route = target_key.map(|key| {
+        if is_global_non_admin {
+            serde_json::json!({
+                "upstream_key_id": serde_json::Value::Null,
+                "upstream_key_label": "global pool",
+                "source": source
+            })
+        } else {
+            serde_json::json!({
+                "upstream_key_id": key.to_string(),
+                "source": source
+            })
+        }
+    });
+
     let mut response = (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -666,11 +752,8 @@ pub async fn get_v1_usage_handler(
             "stale": stale,
             "client_key_prefix": client_key.prefix,
             "session_id": sess_id,
-            "upstream_key_id": target_key.map(|key| key.to_string()),
-            "pinned_route": target_key.map(|key| serde_json::json!({
-                "upstream_key_id": key.to_string(),
-                "source": source
-            })),
+            "upstream_key_id": projected_upstream_key_id,
+            "pinned_route": projected_pinned_route,
             "windows": response_windows,
             "usage": {
                 "windows": usage_windows(&state, &snapshot, target_key, now),
@@ -728,12 +811,16 @@ pub async fn get_v1_key_handler(
             "data": {
                 "label": client_key.prefix,
                 "usage": usage_usd,
-                "usage_daily": serde_json::Value::Null,
-                "usage_weekly": serde_json::Value::Null,
+                "usage_daily": usage_usd,
+                "usage_weekly": usage_usd,
                 "usage_monthly": usage_usd,
                 "limit": limit_usd,
                 "limit_remaining": limit_remaining_usd,
-                "limit_reset": serde_json::Value::Null,
+                "limit_reset": if client_key.budget_micro_usd_month.is_some() {
+                    serde_json::json!("monthly")
+                } else {
+                    serde_json::Value::Null
+                },
                 "is_free_tier": false,
                 "rate_limit": {
                     "requests": client_key.rate_limit_rpm.unwrap_or(0),
@@ -757,6 +844,7 @@ pub async fn get_v1_key_handler(
 /// the allow-list sanitized document.
 pub async fn get_v1_usage_raw_handler(
     State(state): State<ProxyAuthState>,
+    headers: HeaderMap,
     Query(params): Query<UsageQueryParams>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
@@ -766,11 +854,41 @@ pub async fn get_v1_usage_raw_handler(
         );
     }
 
+    let header_vec: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let (sess_id, _step) =
+        llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
+    let fallback = [0u8; 32];
+    let secret = state
+        .session_hmac_secret
+        .as_ref()
+        .map(|s| s.expose_secret())
+        .unwrap_or(&fallback);
+    let session_hash = if !sess_id.is_empty() {
+        Some(llmroller_core::session::compute_session_hash(
+            secret,
+            &client_key.owner_user_id,
+            &sess_id,
+        ))
+    } else {
+        None
+    };
+
     let now = SystemClock::new().now_ms();
     let snapshot = state.snapshot.load();
-    let has_explicit_target = params.upstream_key_id.is_some() || params.model.is_some();
+    let has_explicit_target =
+        params.upstream_key_id.is_some() || params.model.is_some() || session_hash.is_some();
     let target_key = if has_explicit_target {
-        match resolve_usage_key(&snapshot, &client_key, &params, None, None, now) {
+        match resolve_usage_key(
+            &snapshot,
+            &client_key,
+            &params,
+            session_hash.as_deref(),
+            Some(&state.pin_store),
+            now,
+        ) {
             Ok(key) => key,
             Err(UsageKeyNotFound(message)) => return not_found(&message),
         }
@@ -802,4 +920,30 @@ pub async fn get_v1_usage_raw_handler(
             .insert("x-llmroller-upstream-http-status", status);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmroller_core::provider::ProviderKind;
+
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1, USR-4, SEC-7, SEC-9, API-1"]
+    fn openrouter_usage_url_does_not_duplicate_api_v1_prefix() {
+        let url = resolve_provider_usage_url(
+            "https://openrouter.ai/api/v1",
+            ProviderKind::Openrouter,
+            r#"{"paths":{"usage":"/api/v1/key"}}"#,
+        )
+        .expect("url");
+        assert_eq!(url, "https://openrouter.ai/api/v1/key");
+
+        let default_or = resolve_provider_usage_url(
+            "https://openrouter.ai/api/v1",
+            ProviderKind::Openrouter,
+            "{}",
+        )
+        .expect("default openrouter url");
+        assert_eq!(default_or, "https://openrouter.ai/api/v1/key");
+    }
 }

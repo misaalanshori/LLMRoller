@@ -368,3 +368,103 @@ async fn test_writer_flushes_durable_ops_rollups_and_raw_events() {
         "a discovery refresh must clear persisted blocks"
     );
 }
+
+#[tokio::test]
+#[doc = "Spec: REL-5, REL-2, REL-1"]
+async fn stale_health_version_update_does_not_overwrite_newer_version() {
+    let (_dir, pool) = setup_writer_test_db().await;
+    let writer = start_single_writer(pool.clone());
+
+    let admin_id = llmroller_core::ids::UserId::generate();
+    let provider_id = llmroller_core::ids::ProviderId::generate();
+    let upstream_key_id = llmroller_core::ids::UpstreamKeyId::generate();
+    let model_pk = llmroller_core::ids::ModelPk::generate();
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, created_at)
+         VALUES (?, 'stale_health_admin', 'hash', 'admin', 100)",
+    )
+    .bind(admin_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("user");
+    sqlx::query(
+        "INSERT INTO providers (id, ownership_scope, owner_user_id, kind, name, base_url, config_json, created_at)
+         VALUES (?, 'global', NULL, 'openrouter', 'StaleHealthProvider', 'https://openrouter.ai/api/v1', '{}', 100)",
+    )
+    .bind(provider_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("provider");
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, owner_user_id, label, secret_enc, master_key_id, secret_last4, health, health_version, created_at)
+         VALUES (?, ?, NULL, 'k1', X'00', 'mk1', '1234', 'healthy', 10, 100)",
+    )
+    .bind(upstream_key_id.to_string())
+    .bind(provider_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("upstream key");
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, origin) VALUES (?, 'gpt-4o', 'global')")
+        .bind(model_pk.to_string())
+        .execute(&pool)
+        .await
+        .expect("model");
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, route_health, health_version, discovered_at)
+         VALUES (?, ?, 'openai/gpt-4o', '["chat"]', 'active', 'healthy', 10, 100)",
+    )
+    .bind(upstream_key_id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&pool)
+    .await
+    .expect("route");
+
+    // Enqueue stale health_version = 4 (< 10)
+    writer.queues.durable_state.lock().insert(
+        DurableKey::HealthVersion(upstream_key_id.to_string()),
+        DurableOp::HealthVersionUpdate {
+            upstream_key_id: upstream_key_id.to_string(),
+            health: "quarantined".to_string(),
+            health_until: None,
+            health_version: 4,
+            last_error: Some("stale".to_string()),
+        },
+    );
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteHealth {
+            upstream_key_id: upstream_key_id.to_string(),
+            model_pk: model_pk.to_string(),
+        },
+        DurableOp::RouteHealthUpdate {
+            upstream_key_id: upstream_key_id.to_string(),
+            model_pk: model_pk.to_string(),
+            route_health: "cooling_down".to_string(),
+            route_health_until: Some(9_000),
+            health_version: 4,
+            last_error: Some("stale route".to_string()),
+        },
+    );
+
+    flush_data_queues(&pool, &writer.queues).await;
+
+    let (health, version): (String, i64) =
+        sqlx::query_as("SELECT health, health_version FROM upstream_keys WHERE id = ?")
+            .bind(upstream_key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("key health");
+    assert_eq!(health, "healthy");
+    assert_eq!(version, 10);
+
+    let (r_health, r_version): (String, i64) = sqlx::query_as(
+        "SELECT route_health, health_version FROM model_routes WHERE upstream_key_id = ? AND model_pk = ?",
+    )
+    .bind(upstream_key_id.to_string())
+    .bind(model_pk.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("route health");
+    assert_eq!(r_health, "healthy");
+    assert_eq!(r_version, 10);
+}

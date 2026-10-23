@@ -312,3 +312,17 @@ fn test_subscription_plan_multiplier_dual_cost_math() {
     assert_eq!(apply_plan_multiplier(100_000, 5_000, "free_tier"), 100_000);
     assert_eq!(apply_plan_multiplier(100_000, 0, "pay_as_you_go"), 100_000);
 }
+
+#[test]
+#[doc = "Spec: USG-3, LIM-2"]
+fn cjk_text_without_spaces_is_not_misclassified_as_base64_media() {
+    let cjk = "你好世界".repeat(2000); // 24,000 UTF-8 bytes, 0 ASCII spaces
+    let body = format!(
+        r#"{{"model":"gpt-5","messages":[{{"role":"user","content":"{cjk}"}}],"data":"{cjk}"}}"#
+    );
+    let est = estimate_input_tokens(body.as_bytes());
+    assert!(
+        est >= 12_000,
+        "expected >= 12000 tokens for 48KB CJK text across content and data, got {est}"
+    );
+}

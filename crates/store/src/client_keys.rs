@@ -399,6 +399,11 @@ pub async fn rotate_client_key_tx(
     entropy: &dyn EntropySource,
     now_ms: i64,
 ) -> Result<CreateClientKeyResult, ClientKeyError> {
+    if !(0..=86_400).contains(&grace_period_secs) {
+        return Err(ClientKeyError::Validation(
+            "grace_period_secs must be between 0 and 86400".to_string(),
+        ));
+    }
     let existing = get_client_key_tx(tx, actor, id).await?;
     let (raw_token, new_prefix, new_hash) = generate_client_key_token(entropy);
 
@@ -641,5 +646,82 @@ fn validate_constant_session_mode(mode: &str) -> Result<(), ClientKeyError> {
         other => Err(ClientKeyError::Validation(format!(
             "invalid constant_session_mode: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+    use crate::users::{NewUser, create_user};
+    use llmroller_core::rbac::Role as UserRole;
+    use llmroller_core::seams::OsEntropy;
+
+    #[tokio::test]
+    #[doc = "Spec: CLK-4, SEC-3"]
+    async fn rotate_client_key_rejects_out_of_bounds_grace_period() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("ck.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        let sys = ActorScope::system(
+            llmroller_core::rbac::SystemTask::Writer,
+            llmroller_core::rbac::SystemSeal::store(),
+        );
+        let user = create_user(
+            &pool,
+            &sys,
+            NewUser {
+                username: "ck_user",
+                password: "supersecretpassword123",
+                role: UserRole::User,
+                must_change_password: false,
+            },
+            &OsEntropy,
+            1_000,
+        )
+        .await
+        .expect("create user");
+        let actor = ActorScope::user(user.id, UserRole::User);
+        let created = create_client_key(
+            &pool,
+            &actor,
+            user.id,
+            NewClientKey {
+                label: "k1".to_string(),
+                service_account_id: None,
+                allowed_models: None,
+                routing_scope: None,
+                rate_limit_rpm: None,
+                budget_micro_usd_month: None,
+                allowed_cidrs: None,
+                expires_at: None,
+                constant_session_mode: None,
+            },
+            &OsEntropy,
+            1_000,
+        )
+        .await
+        .expect("create client key");
+
+        let neg_err = rotate_client_key(&pool, &actor, created.client_key.id, -1, &OsEntropy, 2_000)
+            .await
+            .expect_err("negative grace period must fail");
+        assert!(matches!(neg_err, ClientKeyError::Validation(_)));
+
+        let huge_err = rotate_client_key(
+            &pool,
+            &actor,
+            created.client_key.id,
+            86_401,
+            &OsEntropy,
+            2_000,
+        )
+        .await
+        .expect_err("grace period > 86400s must fail");
+        assert!(matches!(huge_err, ClientKeyError::Validation(_)));
     }
 }

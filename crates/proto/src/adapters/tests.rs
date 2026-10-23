@@ -193,3 +193,20 @@ fn test_per_provider_error_classifiers_override_builtin_patterns() {
         vec!["window_limit_reached"]
     );
 }
+
+#[doc = "Spec: PRV-2, API-1, RTE-12"]
+#[test]
+fn test_openrouter_adapter_stateless_responses_and_messages_session_support() {
+    let openrouter = get_adapter(ProviderKind::Openrouter);
+    assert!(
+        !openrouter.aux_endpoints().contains(&"responses_compact"),
+        "OpenRouter /responses is stateless and does not expose /responses/compact"
+    );
+    assert!(openrouter.supports_session_body_on_endpoint(EndpointKind::Chat));
+    assert!(openrouter.supports_session_body_on_endpoint(EndpointKind::Responses));
+    assert!(openrouter.supports_session_body_on_endpoint(EndpointKind::Messages));
+
+    let cc = get_adapter(ProviderKind::CommandCode);
+    assert!(cc.supports_session_body_on_endpoint(EndpointKind::Chat));
+    assert!(!cc.supports_session_body_on_endpoint(EndpointKind::Messages));
+}

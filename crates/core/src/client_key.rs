@@ -239,7 +239,7 @@ pub fn evaluate_request_gates(
             }
             let matches_any = allowed_cidrs
                 .iter()
-                .any(|cidr_str| IpNet::from_str(cidr_str).is_ok_and(|net| net.contains(&ip)));
+                .any(|cidr_str| parse_ip_or_cidr(cidr_str).is_some_and(|net| net.contains(&ip)));
             if !matches_any {
                 return Err(GateFailure::G4CidrForbidden);
             }
@@ -272,6 +272,16 @@ pub fn evaluate_request_gates(
     }
 
     Ok((key_record.clone(), *hash_role))
+}
+
+
+/// Parse an `allowed_cidrs` entry as either a CIDR prefix (`192.0.2.0/24`) or a bare IPv4/IPv6 address (`203.0.113.5`, `2001:db8::1`; `F-050`, `CLK-6`).
+#[must_use]
+pub fn parse_ip_or_cidr(s: &str) -> Option<IpNet> {
+    let trimmed = s.trim();
+    IpNet::from_str(trimmed)
+        .or_else(|_| trimmed.parse::<IpAddr>().map(IpNet::from))
+        .ok()
 }
 
 #[cfg(test)]

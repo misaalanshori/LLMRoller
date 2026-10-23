@@ -233,6 +233,9 @@ impl AnchoredFixed {
     }
 
     pub fn record(&mut self, now_ms: i64, amount_micro_usd: i64) {
+        if amount_micro_usd <= 0 {
+            return;
+        }
         self.advance(now_ms);
         if now_ms >= self.window_start_ms && now_ms < self.resets_at_ms {
             self.used_micro_usd += amount_micro_usd;
@@ -339,8 +342,13 @@ impl AnchoredCalendarMonth {
     }
 
     pub fn record(&mut self, now_ms: i64, amount_micro_usd: i64) {
+        if amount_micro_usd <= 0 {
+            return;
+        }
         self.advance(now_ms);
-        self.used_micro_usd += amount_micro_usd;
+        if now_ms >= self.window_start_ms && now_ms < self.resets_at_ms {
+            self.used_micro_usd += amount_micro_usd;
+        }
     }
 
     pub fn used_at(&mut self, now_ms: i64) -> i64 {
@@ -511,6 +519,7 @@ pub struct AtomicBudgetCounter {
     pub state: RwLock<WindowState>,
     pub reserved: AtomicI64,
     pub observation: RwLock<Option<UpstreamObservation>>,
+    pub manual_offset: RwLock<Option<ManualOffset>>,
 }
 
 impl AtomicBudgetCounter {
@@ -574,7 +583,23 @@ impl AtomicBudgetCounter {
             state: RwLock::new(state),
             reserved: AtomicI64::new(0),
             observation: RwLock::new(None),
+            manual_offset: RwLock::new(None),
         }
+    }
+
+    /// Sets or clears a manual calibration offset for this budget window (`F-064`, `LIM-1`).
+    pub fn set_manual_offset(&self, offset: Option<ManualOffset>) {
+        *self.manual_offset.write() = offset;
+    }
+
+    /// Returns local ring/window spend plus any active [`ManualOffset`] at `now_ms` (`F-063`, `F-064`).
+    pub fn local_used(&self, now_ms: i64) -> i64 {
+        let base = self.state.write().local_used(now_ms);
+        let offset = self
+            .manual_offset
+            .read()
+            .map_or(0, |manual| manual.value_at(now_ms));
+        (base + offset).max(0)
     }
 
     /// Whether this counter still reflects the configured window shape.
@@ -628,7 +653,7 @@ impl BudgetCounter for AtomicBudgetCounter {
     }
 
     fn effective_used(&self, now_ms: i64) -> i64 {
-        let local = self.state.write().local_used(now_ms);
+        let local = self.local_used(now_ms);
         let obs = *self.observation.read();
         match obs {
             None => local,

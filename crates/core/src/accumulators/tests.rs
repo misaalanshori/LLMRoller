@@ -171,3 +171,15 @@ fn test_is_exhausted_detects_tier_cap_and_zero_cap() {
 fn utc_to_epoch_millis(year: i32, month: u8, day: u8, minute_of_day: u16) -> i64 {
     crate::windows::utc_to_epoch_millis(year, month, day, minute_of_day)
 }
+
+#[test]
+#[doc = "Spec: LIM-1, CLK-5, SHR-2"]
+fn monthly_cap_accumulator_resets_committed_spend_at_utc_month_rollover() {
+    let acc = MonthlyAccumulator::new(50_000_000);
+    let oct_31 = 1_761_951_600_000_i64; // 2025-10-31T23:00:00Z
+    let nov_01 = 1_761_958_800_000_i64; // 2025-11-01T01:00:00Z
+    acc.ensure_month(oct_31);
+    assert_eq!(acc.committed(), 50_000_000);
+    acc.ensure_month(nov_01);
+    assert_eq!(acc.committed(), 0);
+}

@@ -37,12 +37,14 @@ impl SessionPrecedenceStep {
     }
 }
 
-/// Validates that a raw session ID is non-empty, <= 256 bytes, and printable ASCII.
+/// Maximum allowed session identifier length in bytes (SRDD Section 11.1 / OpenRouter OpenAPI).
+pub const MAX_SESSION_ID_LEN: usize = 256;
+
+/// Validates that a raw session ID is non-empty, <= 256 bytes, and printable non-space ASCII (`0x21..=0x7E`).
 pub fn is_valid_session_id(s: &str) -> bool {
-    if s.is_empty() || s.len() > 256 {
-        return false;
-    }
-    s.bytes().all(|b| (0x21..=0x7E).contains(&b) || b == b' ')
+    !s.is_empty()
+        && s.len() <= MAX_SESSION_ID_LEN
+        && s.bytes().all(|b| (0x21..=0x7E).contains(&b))
 }
 
 /// Resolves the raw session ID from headers and body fields across Steps 1 through 7.
@@ -175,6 +177,27 @@ pub fn compute_step8_fingerprint(
     format!("fp:{}", &hex_full[..32])
 }
 
+/// Recursively strips volatile cache/citation annotations (`cache_control`, `prompt_cache_breakpoint`, `citations`)
+/// from a JSON value before canonical hashing (`F-020`, SRDD Section 11.1.3).
+pub fn canonicalize_block_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            map.remove("prompt_cache_breakpoint");
+            map.remove("citations");
+            for v in map.values_mut() {
+                canonicalize_block_value(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                canonicalize_block_value(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn canonical_block(block: &serde_json::Value) -> Vec<u8> {
     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
     if block_type == "text" || block_type == "input_text" {
@@ -193,10 +216,7 @@ fn canonical_block(block: &serde_json::Value) -> Vec<u8> {
         out.extend_from_slice(block_type.as_bytes());
         out.push(0x1F);
         let mut cleaned_block = block.clone();
-        if let serde_json::Value::Object(ref mut map) = cleaned_block {
-            map.remove("cache_control");
-            map.remove("citations");
-        }
+        canonicalize_block_value(&mut cleaned_block);
         let cleaned_bytes = serde_json::to_vec(&cleaned_block).unwrap_or_default();
         let hash = Sha256::digest(&cleaned_bytes);
         out.extend_from_slice(&hash);
@@ -399,6 +419,21 @@ impl ConstantSessionDetector {
         lock.get(&(client_key_id, session_hash.to_string()))
             .and_then(|e| e.flagged_at_ms)
             .is_some()
+    }
+
+    /// Periodic sweep of expired opening slots and idle unflagged detector entries (`PERF-3`, `F-102`).
+    pub fn sweep_idle(&self, now_ms: i64) {
+        let now_minute = (now_ms / 60_000) as u32;
+        let mut lock = self.entries.write();
+        lock.retain(|_, entry| {
+            entry
+                .slots
+                .retain(|s| now_minute.saturating_sub(s.seen_minute) < 60);
+            !entry.slots.is_empty()
+                || entry
+                    .flagged_at_ms
+                    .is_some_and(|flagged| now_ms.saturating_sub(flagged) < 86_400_000)
+        });
     }
 }
 

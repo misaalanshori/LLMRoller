@@ -164,6 +164,7 @@ pub struct DataQueues {
     /// Sealed traces waiting for the writer to persist them after their
     /// referenced `usage_events` row in the same batch (F09).
     pub sealed_traces: Mutex<VecDeque<SealedTurnResult>>,
+    pub sqlite_full: std::sync::atomic::AtomicBool,
 }
 
 impl Default for DataQueues {
@@ -175,6 +176,7 @@ impl Default for DataQueues {
             raw_events: Mutex::new(VecDeque::new()),
             raw_bytes: Mutex::new(0),
             sealed_traces: Mutex::new(VecDeque::new()),
+            sqlite_full: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -230,6 +232,24 @@ impl std::fmt::Debug for WriterHandle {
 }
 
 impl WriterHandle {
+    #[must_use]
+    pub fn is_sqlite_full(&self) -> bool {
+        self.queues
+            .sqlite_full
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_sqlite_full(&self, full: bool) {
+        self.queues
+            .sqlite_full
+            .store(full, std::sync::atomic::Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_durable_queue_full(&self) -> bool {
+        self.queues.durable_state.lock().len() >= DURABLE_STATE_MAX_ITEMS
+    }
+
     /// Execute an atomic control-plane mutation with strict priority, incrementing
     /// `config_version` and notifying the Reloader.
     pub async fn execute_control<O: ControlOp + 'static>(
@@ -462,13 +482,14 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             } => sqlx::query(
                 r#"UPDATE upstream_keys SET
                            health = ?, health_until = ?, health_version = ?, last_error = ?
-                       WHERE id = ?"#,
+                       WHERE id = ? AND health_version < ?"#,
             )
             .bind(health)
             .bind(health_until)
             .bind(health_version)
             .bind(last_error)
             .bind(upstream_key_id)
+            .bind(health_version)
             .execute(&mut *transaction)
             .await
             .map(|_| ()),
@@ -482,7 +503,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             } => sqlx::query(
                 r#"UPDATE model_routes SET
                            route_health = ?, route_health_until = ?, health_version = ?, last_error = ?
-                       WHERE upstream_key_id = ? AND model_pk = ?"#,
+                       WHERE upstream_key_id = ? AND model_pk = ? AND health_version < ?"#,
             )
             .bind(route_health)
             .bind(route_health_until)
@@ -490,6 +511,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .bind(last_error)
             .bind(upstream_key_id)
             .bind(model_pk)
+            .bind(health_version)
             .execute(&mut *transaction)
             .await
             .map(|_| ()),
@@ -559,11 +581,18 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             )))
             .execute(&mut *transaction)
             .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                .execute(&mut *transaction)
+                .await;
         }
     }
 
+    let r5_backup = queues.usage_writer.rollups_5min.lock().clone();
+    let rh_backup = queues.usage_writer.rollups_hourly.lock().clone();
+    let raw_backup = queues.usage_writer.raw_events.lock().clone();
+
     // 2. Flush usage rollups, usage_events, and usage_attempts
-    let _ = queues.usage_writer.flush_to_db(&mut transaction).await;
+    let usage_res = queues.usage_writer.flush_to_db(&mut transaction).await;
 
     // 2b. Persist sealed traces immediately after their `usage_events` rows so
     // the foreign key is satisfied without a retry loop (F09). A trace whose
@@ -572,6 +601,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         let mut lock = queues.sealed_traces.lock();
         std::mem::take(&mut *lock).into_iter().collect()
     };
+    let trace_backup = trace_items.clone();
     for (idx, trace) in trace_items.into_iter().enumerate() {
         let sp_name = format!("trace_{idx}");
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
@@ -597,6 +627,9 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 )))
                 .execute(&mut *transaction)
                 .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                    .execute(&mut *transaction)
+                    .await;
             }
         }
     }
@@ -613,7 +646,18 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         }
     }
 
-    let _ = transaction.commit().await;
+    if let Err(err) = transaction.commit().await {
+        tracing::error!("SQLite batch commit failed ({err}); restoring rollups and traces to memory");
+        if usage_res.is_ok() {
+            queues
+                .usage_writer
+                .restore_batch(r5_backup, rh_backup, raw_backup);
+        }
+        let mut trace_lock = queues.sealed_traces.lock();
+        for item in trace_backup.into_iter().rev() {
+            trace_lock.push_front(item);
+        }
+    }
 }
 
 #[cfg(test)]

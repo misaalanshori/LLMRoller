@@ -79,8 +79,18 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                             else {
                                 continue;
                             };
+                            let is_active_key = deps
+                                .runtime_state
+                                .last_key_used_ms
+                                .get(&key.id)
+                                .is_some_and(|last_used| now_ms.saturating_sub(*last_used) <= 3_600_000);
+                            let jitter_bps = 8_000
+                                + (llmroller_core::seams::EntropySource::next_u64_bounded(
+                                    &llmroller_core::seams::OsEntropy,
+                                    4_001,
+                                ) as i64);
                             let state = key_states.entry(key.id).or_default();
-                            if !state.try_start_poll(now_ms, false) {
+                            if !state.try_start_scheduled_poll(now_ms, is_active_key, jitter_bps) {
                                 continue;
                             }
                             let Ok(permit) = poller.semaphore.clone().acquire_owned().await else {
@@ -201,6 +211,7 @@ async fn poll_key(
             prefix: "Bearer ".to_string(),
         });
     let auth_header_val = format!("{}{secret}", scheme.prefix);
+    let t0_ms = llmroller_core::seams::SystemClock::new().now_ms();
 
     let response = client
         .get(&target)
@@ -267,7 +278,7 @@ async fn poll_key(
             },
         )
         .collect();
-    runtime_state.reconcile_upstream_usage(key.id, budget_windows, &observations, now_ms);
+    runtime_state.reconcile_upstream_usage_at(key.id, budget_windows, &observations, t0_ms, now_ms);
     runtime_state.publish_upstream_snapshot(
         key.id,
         serde_json::json!({
@@ -376,5 +387,18 @@ mod tests {
             health.quarantine_reason.as_deref(),
             Some("credential_rejected")
         );
+    }
+
+    #[test]
+    #[doc = "Spec: USG-6"]
+    fn usage_poller_distinguishes_active_300s_and_idle_3600s_cadence() {
+        let state = KeyPollerState::default();
+        assert!(state.try_start_scheduled_poll(1_000, false, 10_000));
+        state.finish_poll();
+        // Idle key must wait 3600s (3,600,000 ms), so at t=301,000 ms it is skipped when still idle
+        assert!(!state.try_start_scheduled_poll(301_000, false, 10_000));
+        // If the key becomes active, it is eligible once 300s has elapsed
+        assert!(state.try_start_scheduled_poll(301_000, true, 10_000));
+        state.finish_poll();
     }
 }

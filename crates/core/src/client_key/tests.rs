@@ -447,3 +447,52 @@ fn paused_keys_and_disabled_service_accounts_fail_g2_with_distinct_codes() {
         .expect_err("paused key must fail G2 as paused");
     assert_eq!(err, GateFailure::G2ClientKeyPaused);
 }
+
+#[test]
+#[doc = "Spec: CLK-6, API-2"]
+fn check_ip_allowed_accepts_both_cidr_and_bare_ip_addresses() {
+    let user_id = UserId::generate();
+    let record = record_with_service_account(
+        user_id,
+        "sa-1",
+        Some(vec!["127.0.0.1".to_string(), "2001:db8::1".to_string()]),
+    );
+    let hash = record.key_hash;
+    let mut snapshot = setup_test_snapshot(user_id, false, record, HashRole::Current, hash);
+    let mut accounts = HashMap::new();
+    accounts.insert(
+        "sa-1".to_string(),
+        ServiceAccountRecord {
+            id: "sa-1".to_string(),
+            owner_user_id: user_id,
+            workspace_scope: "personal".to_string(),
+            name: "agents".to_string(),
+            description: None,
+            allowed_cidrs: Some(vec!["127.0.0.1".to_string(), "2001:db8::/32".to_string()]),
+            disabled: false,
+        },
+    );
+    snapshot.service_accounts = Arc::new(accounts);
+
+    evaluate_request_gates(
+        &hash,
+        Some("127.0.0.1".parse().expect("ipv4")),
+        None,
+        None,
+        &snapshot,
+        None,
+        1,
+    )
+    .expect("bare IPv4 address in allowed_cidrs must pass Gate G4");
+
+    evaluate_request_gates(
+        &hash,
+        Some("2001:db8::1".parse().expect("ipv6")),
+        None,
+        None,
+        &snapshot,
+        None,
+        1,
+    )
+    .expect("bare IPv6 address in allowed_cidrs must pass Gate G4");
+}

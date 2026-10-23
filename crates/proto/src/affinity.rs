@@ -9,6 +9,9 @@ use llmroller_core::rbac::PoolTier;
 use sha2::Sha256;
 
 pub use llmroller_core::provider::SessionProfile;
+pub use llmroller_core::session::{
+    MAX_SESSION_ID_LEN, canonical_content, canonicalize_block_value, is_valid_session_id,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -66,6 +69,25 @@ const SESSION_HEADERS_TO_STRIP: [&str; 11] = [
     "x-claude-code-session-id",
 ];
 
+fn truncate_session_value(s: &str, max_len: usize) -> &str {
+    let limit = if max_len == 0 {
+        MAX_SESSION_ID_LEN
+    } else {
+        max_len.min(MAX_SESSION_ID_LEN)
+    };
+    if s.len() <= limit {
+        return s;
+    }
+    let mut boundary = 0;
+    for (idx, _) in s.char_indices() {
+        if idx > limit {
+            break;
+        }
+        boundary = idx;
+    }
+    &s[..boundary]
+}
+
 /// Applies outbound session headers based on key tier and provider profile (SEC-16).
 pub fn apply_outbound_session_affinity(
     headers: &mut HeaderMap,
@@ -75,15 +97,17 @@ pub fn apply_outbound_session_affinity(
     raw_session_id: &str,
 ) {
     if tier == PoolTier::Own {
-        // Own tier: forward client session headers verbatim; write affinity headers only if absent
-        let token = if raw_session_id.is_empty() {
+        // Own tier: forward client session headers verbatim; synchronize profile headers
+        // with the resolved session ID (or salted_token when Step 8 was used).
+        let raw_token = if raw_session_id.is_empty() {
             salted_token
         } else {
             raw_session_id
         };
+        let token = truncate_session_value(raw_token, profile.max_len);
         for h_name in &profile.headers {
             if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes())
-                && !headers.contains_key(&name)
+                && (!headers.contains_key(&name) || !raw_session_id.is_empty())
                 && let Ok(val) = HeaderValue::from_str(token)
             {
                 headers.insert(name, val);
@@ -97,10 +121,11 @@ pub fn apply_outbound_session_affinity(
                 headers.remove(name);
             }
         }
+        let token = truncate_session_value(salted_token, profile.max_len);
         // Always write salted affinity token
         for h_name in &profile.headers {
             if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes())
-                && let Ok(val) = HeaderValue::from_str(salted_token)
+                && let Ok(val) = HeaderValue::from_str(token)
             {
                 headers.insert(name, val);
             }
@@ -134,7 +159,7 @@ mod tests {
             max_len: 256,
         };
 
-        // 1. Own tier: client session header preserved, profile written only if absent
+        // 1. Own tier: client session header preserved, profile header synchronized with resolved session ID
         let mut own_headers = HeaderMap::new();
         own_headers.insert(
             HeaderName::from_static("x-claude-code-session-id"),

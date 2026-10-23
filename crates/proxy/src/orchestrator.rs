@@ -211,12 +211,54 @@ pub async fn post_messages(
     .await
 }
 
+/// Builds a protocol-aware OpenAI or Anthropic error envelope (`API-1`, `API-2`, `API-8`).
+#[must_use]
+pub fn build_protocol_error_response(
+    is_messages_path: bool,
+    status: StatusCode,
+    error_type: &str,
+    code: &str,
+    message: &str,
+    request_id: Option<&str>,
+    retry_after_secs: Option<u64>,
+) -> Response {
+    let body = if is_messages_path {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "code": code,
+                "message": message,
+            },
+            "request_id": request_id,
+        })
+    } else {
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": serde_json::Value::Null,
+                "code": code,
+            }
+        })
+    };
+    let mut response = (status, Json(body)).into_response();
+    if let Some(rid) = request_id
+        && let Ok(val) = HeaderValue::from_str(rid)
+    {
+        response.headers_mut().insert("x-request-id", val);
+    }
+    if let Some(secs) = retry_after_secs
+        && let Ok(val) = HeaderValue::from_str(&secs.max(1).to_string())
+    {
+        response.headers_mut().insert("retry-after", val);
+    }
+    response
+}
+
 fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "error": { "code": code, "message": message.into() } })),
-    )
-        .into_response()
+    let msg = message.into();
+    build_protocol_error_response(false, status, code, code, &msg, None, None)
 }
 
 fn response_not_found(response_id: &str) -> Response {
@@ -729,6 +771,7 @@ async fn forward_state_bound_response_op(
     response_id: &str,
     method: Method,
     subpath: &str,
+    query_str: Option<&str>,
 ) -> Response {
     use crate::failover::{HardRouteDecision, evaluate_hard_route_decision};
 
@@ -754,7 +797,7 @@ async fn forward_state_bound_response_op(
         );
     };
 
-    let (checks, retry_after) = hard_route_checks(
+    let (mut checks, retry_after) = hard_route_checks(
         &snapshot,
         &state.runtime_state,
         &link,
@@ -762,6 +805,9 @@ async fn forward_state_bound_response_op(
         "responses",
         now,
     );
+    // State-bound operations skip budget check C8 per SRDD Section 10.5 & 14.1 (`RTE-12`).
+    checks.c8_failed = false;
+    checks.c6_c8_passed = !checks.c6_failed && !checks.c7_failed;
     match evaluate_hard_route_decision(&checks, link.upstream_key_id, retry_after) {
         HardRouteDecision::RouteWithoutFailover(_) => {}
         HardRouteDecision::RateLimit429 { retry_after_secs } => {
@@ -783,11 +829,22 @@ async fn forward_state_bound_response_op(
         Ok(secret) => secret,
         Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let url = format!(
-        "{}/responses/{}{subpath}",
+    let resp_base_path = provider
+        .config
+        .paths
+        .responses
+        .as_deref()
+        .unwrap_or("/responses");
+    let mut url = format!(
+        "{}/{}/{}{subpath}",
         provider.base_url.trim_end_matches('/'),
+        resp_base_path.trim_start_matches('/'),
         response_id
     );
+    if let Some(q) = query_str.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(q);
+    }
     if crate::ssrf::validate_url(&url, provider.allow_private_network).is_err() {
         return json_error(
             StatusCode::BAD_GATEWAY,
@@ -1013,11 +1070,7 @@ pub async fn post_messages_count_tokens(
         {
             Ok(response) => response,
             Err(_) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unreachable",
-                    "the upstream provider could not be reached",
-                );
+                continue;
             }
         };
         let status =
@@ -1079,37 +1132,50 @@ pub async fn post_responses_compact(
 /// Handler for GET /v1/responses/{id}.
 pub async fn get_response_by_id(
     State(state): State<ProxyAuthState>,
+    uri: axum::http::Uri,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "").await
+    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "", uri.query()).await
 }
 
 /// Handler for DELETE /v1/responses/{id}.
 pub async fn delete_response_by_id(
     State(state): State<ProxyAuthState>,
+    uri: axum::http::Uri,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::DELETE, "").await
+    forward_state_bound_response_op(&state, &client_key, &id, Method::DELETE, "", uri.query()).await
 }
 
 /// Handler for GET /v1/responses/{id}/input_items.
 pub async fn get_response_input_items(
     State(state): State<ProxyAuthState>,
+    uri: axum::http::Uri,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "/input_items").await
+    forward_state_bound_response_op(
+        &state,
+        &client_key,
+        &id,
+        Method::GET,
+        "/input_items",
+        uri.query(),
+    )
+    .await
 }
 
 /// Handler for POST /v1/responses/{id}/cancel.
 pub async fn post_response_cancel(
     State(state): State<ProxyAuthState>,
+    uri: axum::http::Uri,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::POST, "/cancel").await
+    forward_state_bound_response_op(&state, &client_key, &id, Method::POST, "/cancel", uri.query())
+        .await
 }
 
 /// One fully-resolved routing candidate built exclusively from the immutable snapshot.
@@ -1179,10 +1245,14 @@ const fn aux_endpoint_label(endpoint: EndpointKind) -> Option<&'static str> {
 }
 
 fn aux_endpoint_unsupported_error() -> Response {
-    json_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "unsupported_aux_endpoint",
+    build_protocol_error_response(
+        true,
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        "not_found_error",
         "no eligible upstream supports this auxiliary endpoint",
+        None,
+        None,
     )
 }
 
@@ -1221,6 +1291,7 @@ fn spawn_credential_probe(
         let verdict = client
             .get(&url)
             .header("authorization", authorization)
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .ok()
@@ -1569,7 +1640,9 @@ const fn failure_charge(
 ) -> (i64, &'static str) {
     use llmroller_core::usage::AttemptOutcome;
     match outcome {
-        AttemptOutcome::Http5xx | AttemptOutcome::ErrorFrame => (estimate, "estimated_input"),
+        AttemptOutcome::Http5xx
+        | AttemptOutcome::WaitTimeout
+        | AttemptOutcome::ErrorFrame => (estimate, "estimated_input"),
         _ => (0, "none"),
     }
 }
@@ -1724,6 +1797,9 @@ fn eligibility_route(
         provider_kind: candidate.provider_kind,
         provider_ownership: provider.ownership_scope,
         provider_owner_id: provider.owner_user_id,
+        provider_owner_disabled: provider
+            .owner_user_id
+            .is_some_and(|owner_id| snapshot.users.get(&owner_id).is_none_or(|u| u.disabled)),
         provider_fingerprint: provider.share_config_fingerprint.clone(),
         provider_enabled: provider.enabled,
         key_enabled: key.enabled,
@@ -1881,7 +1957,14 @@ fn estimate_cost_micro_usd(
             &candidate.upstream_model_id,
         )
         .map_or(fallback, |entry| entry.base_rates);
-    estimate_reservation_cost_micro_usd(input_tokens, 0.0, &rates, max_output_tokens, None)
+    let raw_est =
+        estimate_reservation_cost_micro_usd(input_tokens, 0.0, &rates, max_output_tokens, None);
+    let (mode, bps) = snapshot
+        .providers
+        .get(&candidate.provider_id)
+        .map(|p| (p.billing_coverage_mode.as_str(), p.plan_multiplier_bps))
+        .unwrap_or(("pay_as_you_go", 10_000));
+    llmroller_core::pricing::apply_plan_multiplier(raw_est, bps, mode)
 }
 
 /// Extract the caller's requested output-token ceiling for the pre-flight
@@ -2065,7 +2148,7 @@ fn resolve_session(
     if let (Some(session_hash), true, Some((sys, usr))) =
         (raw_hash.as_ref(), step.is_generic(), canonical.as_ref())
     {
-        runtime_state.constant_session_detector.record_and_evaluate(
+        let newly_flagged = runtime_state.constant_session_detector.record_and_evaluate(
             client_key.id,
             session_hash.clone(),
             &llmroller_core::session::PromptContext {
@@ -2076,6 +2159,9 @@ fn resolve_session(
             },
             now_ms,
         );
+        if newly_flagged {
+            crate::metrics::record_constant_session_suspected();
+        }
     }
 
     let use_step8 = raw_session.is_empty()
@@ -2513,6 +2599,7 @@ struct StreamFinalizer {
     attempts: Vec<UsageAttemptRecord>,
     response_link: Option<ResponseLinkFinalizer>,
     trace: Option<TraceCapture>,
+    estimated_input_tokens: i64,
     started_ms: i64,
     ttfb_ms: Option<i64>,
     finalized: bool,
@@ -2526,26 +2613,42 @@ impl StreamFinalizer {
         self.finalized = true;
 
         let finished_ms = now_ms();
-        let extracted = self.tap.finalize_usage();
-        let cost = compute_request_cost(
+        let mut extracted = self.tap.finalize_usage();
+        let is_incomplete = termination.is_incomplete();
+        if is_incomplete
+            && extracted.input_uncached_tokens == 0
+            && extracted.cache_read_tokens == 0
+            && extracted.cache_write_tokens == 0
+        {
+            extracted.input_uncached_tokens = self.estimated_input_tokens;
+        }
+        let mut cost = compute_request_cost(
             extracted
                 .provider_cost_micro_usd
                 .map(|micro| micro as f64 / 1_000_000.0),
             extracted.to_token_usage(),
             self.price_entry.as_ref(),
             self.fallback_rates,
-            finished_ms,
+            self.started_ms,
+        );
+        if is_incomplete && extracted.provider_cost_micro_usd.is_none() {
+            cost.cost_source = CostSource::EstimatedIncomplete;
+        }
+        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+            cost.cost_micro_usd,
+            self.usage.plan_multiplier_bps,
+            &self.usage.billing_coverage_mode,
         );
 
         if let Some(reservation) = self.reservation.take() {
-            reservation.commit(cost.cost_micro_usd, finished_ms);
+            reservation.commit(effective_cost, finished_ms);
         }
         if let Some(guard) = self.client_guard.take() {
-            guard.commit(cost.cost_micro_usd);
+            guard.commit(effective_cost);
         }
-        self.cap_guards.commit(cost.cost_micro_usd);
+        self.cap_guards.commit(effective_cost);
 
-        self.attempts.push(attempt_record(
+        let mut served_attempt = attempt_record(
             self.usage.request_id,
             self.attempts.len() as i64 + 1,
             finished_ms,
@@ -2553,9 +2656,11 @@ impl StreamFinalizer {
             llmroller_core::usage::AttemptOutcome::Served,
             Some(self.http_status),
             0,
-            cost.cost_micro_usd,
+            effective_cost,
             "actual",
-        ));
+        );
+        served_attempt.share_id = self.usage.share_id.clone();
+        self.attempts.push(served_attempt);
 
         if let Some(writer) = &self.state.writer {
             writer.queues.durable_state.lock().insert(
@@ -2944,16 +3049,15 @@ pub async fn handle_inference_request(
         }
         Err(llmroller_core::snapshot::SnapshotResolveError::Ambiguous) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return (
+            return build_protocol_error_response(
+                matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "ambiguous_model",
-                        "message": format!("model {model_str} matches more than one catalog entry")
-                    }
-                })),
-            )
-                .into_response();
+                "invalid_request_error",
+                "ambiguous_model_id",
+                &format!("model {model_str} matches more than one catalog entry"),
+                Some(&request_id.to_string()),
+                None,
+            );
         }
         Err(llmroller_core::snapshot::SnapshotResolveError::KillSwitched) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
@@ -3031,7 +3135,10 @@ pub async fn handle_inference_request(
     let trace_retention_days = trace_config.retention_days;
     let trace_thread_id = extract_trace_thread_id(&headers);
     // 5. Response-link session inheritance and HardKey affinity (RTE-12, Section 11.1.2).
-    let hard_link: Option<ResponseLinkRow> = if matches!(endpoint, EndpointKind::Responses) {
+    let hard_link: Option<ResponseLinkRow> = if matches!(
+        endpoint,
+        EndpointKind::Responses | EndpointKind::ResponsesCompact
+    ) {
         match scan.previous_response_id.as_ref() {
             Some((previous_id, _)) => match load_response_link(&state, previous_id).await {
                 Ok(Some(link)) if link.owner_user_id != caller.owner_user_id => {
@@ -3074,6 +3181,7 @@ pub async fn handle_inference_request(
                 return rate_limit_error(retry_after_secs);
             }
             HardRouteDecision::Forbidden403KeyUnavailable => {
+                state.pin_store.invalidate_key(link.upstream_key_id);
                 return permission_error(
                     "the upstream key that holds previous_response_id is no longer available to this client key",
                 );
@@ -3104,16 +3212,15 @@ pub async fn handle_inference_request(
             if aux_label.is_some() && had_candidates {
                 return aux_endpoint_unsupported_error();
             }
-            return (
+            return build_protocol_error_response(
+                matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "no_healthy_key",
-                        "message": "no eligible upstream route available for this caller"
-                    }
-                })),
-            )
-                .into_response();
+                "server_error",
+                "no_eligible_route",
+                "no eligible upstream route available for this caller",
+                Some(&request_id.to_string()),
+                Some(1),
+            );
         }
 
         let eligibility: Vec<EligibilityRoute> = candidates
@@ -3159,16 +3266,15 @@ pub async fn handle_inference_request(
                 Ok(selection) => selection,
                 Err(PoolSelectionError::MonthlyCapExhausted) => {
                     crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-                    return (
+                    return build_protocol_error_response(
+                        matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
                         StatusCode::TOO_MANY_REQUESTS,
-                        Json(serde_json::json!({
-                            "error": {
-                                "code": "no_eligible_route",
-                                "message": "monthly budget capacity exhausted"
-                            }
-                        })),
-                    )
-                        .into_response();
+                        "rate_limit_error",
+                        "no_eligible_route",
+                        "monthly budget capacity exhausted",
+                        Some(&request_id.to_string()),
+                        Some(60),
+                    );
                 }
                 Err(PoolSelectionError::NoEligibleRoute) => {
                     crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
@@ -3368,7 +3474,9 @@ pub async fn handle_inference_request(
     let mut attempt_no: usize = 0;
 
     loop {
-        if attempt_no >= MAX_UPSTREAM_ATTEMPTS {
+        if attempt_no >= MAX_UPSTREAM_ATTEMPTS
+            || (attempt_no >= 1 && now_ms().saturating_sub(now) >= 60_000)
+        {
             break;
         }
         let candidate = if let Some(candidate) = pinned_order.pop() {
@@ -3421,21 +3529,40 @@ pub async fn handle_inference_request(
             }
         };
 
-        let attempt_estimate = estimate_reservation_cost_micro_usd(
-            estimate_input_tokens(&body),
-            0.0,
-            &snapshot
-                .price_for(
-                    &candidate.provider_id,
-                    candidate.provider_kind,
-                    &candidate.upstream_model_id,
-                )
-                .map_or(
-                    Rates::from(&snapshot.settings.unpriced_fallback_rates),
-                    |entry| entry.base_rates,
-                ),
-            requested_output,
-            None,
+        let candidate_rates = snapshot
+            .price_for(
+                &candidate.provider_id,
+                candidate.provider_kind,
+                &candidate.upstream_model_id,
+            )
+            .map_or(
+                Rates::from(&snapshot.settings.unpriced_fallback_rates),
+                |entry| entry.base_rates,
+            );
+        let input_tokens_est = estimate_input_tokens(&body);
+        let (cand_cov_mode, cand_mult_bps) = snapshot
+            .providers
+            .get(&candidate.provider_id)
+            .map(|p| (p.billing_coverage_mode.as_str(), p.plan_multiplier_bps))
+            .unwrap_or(("pay_as_you_go", 10_000));
+        let attempt_estimate = llmroller_core::pricing::apply_plan_multiplier(
+            estimate_reservation_cost_micro_usd(
+                input_tokens_est,
+                0.0,
+                &candidate_rates,
+                requested_output,
+                None,
+            ),
+            cand_mult_bps,
+            cand_cov_mode,
+        );
+        let input_only_estimate = llmroller_core::pricing::apply_plan_multiplier(
+            (i128::from(input_tokens_est.max(0))
+                * i128::from(candidate_rates.input_per_mtok_micro_usd.max(0))
+                + 999_999)
+                .div_euclid(1_000_000) as i64,
+            cand_mult_bps,
+            cand_cov_mode,
         );
         let mut cap_guards = match reserve_candidate_caps(
             &state.runtime_state.accumulators,
@@ -3696,6 +3823,43 @@ pub async fn handle_inference_request(
             let retry_after_secs =
                 last_retry_after_ms.map(|delay| u64::try_from((delay / 1000).max(1)).unwrap_or(1));
 
+            let is_model_not_found_404 = status == StatusCode::NOT_FOUND && {
+                let body_lower = String::from_utf8_lossy(classify_prefix).to_ascii_lowercase();
+                llmroller_core::provider::ErrorClassifiers::matches(
+                    &candidate.config.error_classifiers.model_not_found_substrings,
+                    &body_lower,
+                ) || body_lower.contains("model_not_found")
+                    || body_lower.contains("does not exist")
+                    || body_lower.contains("no endpoints found")
+            };
+            if is_model_not_found_404 {
+                let _ = state.runtime_state.record_upstream_failure(
+                    &origin,
+                    candidate.upstream_key_id,
+                    caller.id,
+                    llmroller_core::usage::AttemptOutcome::Http429,
+                    Some(600_000),
+                    now,
+                );
+                try_outcomes.push(TryOutcome::HostFailure);
+                let mut att = attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
+                    Some(status.as_u16()),
+                    body.len(),
+                    0,
+                    "none",
+                );
+                att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                attempts.push(att);
+                failovers += 1;
+                crate::metrics::record_failover();
+                continue;
+            }
+
             match class {
                 ErrorClass::RequestRejected | ErrorClass::Unclassified403 => {
                     if class == ErrorClass::Unclassified403 {
@@ -3874,7 +4038,7 @@ pub async fn handle_inference_request(
                     );
                     try_outcomes.push(TryOutcome::HostFailure);
                     let (charged_micro_usd, charge_basis) =
-                        failure_charge(outcome, attempt_estimate);
+                        failure_charge(outcome, input_only_estimate);
                     attempts.push(attempt_record(
                         request_id,
                         attempt_no as i64,
@@ -3981,7 +4145,7 @@ pub async fn handle_inference_request(
                     );
                     let (charged_micro_usd, charge_basis) = failure_charge(
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                        attempt_estimate,
+                        input_only_estimate,
                     );
                     attempts.push(attempt_record(
                         request_id,
@@ -4126,6 +4290,7 @@ pub async fn handle_inference_request(
                     attempts: std::mem::take(&mut attempts),
                     response_link,
                     trace,
+                    estimated_input_tokens: input_tokens_est,
                     started_ms: attempt_started,
                     ttfb_ms: Some(ttfb_ms),
                     finalized: false,
@@ -4223,7 +4388,15 @@ pub async fn handle_inference_request(
                                 if let Some(tail) = stream_state.forwarder.finish() {
                                     stream_state.pending.push_back(tail);
                                 }
-                                stream_state.finish(Termination::Completed);
+                                let clean_eof = stream_state
+                                    .finalizer
+                                    .as_ref()
+                                    .is_none_or(|f| f.tap.is_complete_at_eof());
+                                stream_state.finish(if clean_eof {
+                                    Termination::Completed
+                                } else {
+                                    Termination::UpstreamTruncated
+                                });
                                 if let Some(bytes) = stream_state.pending.pop_front() {
                                     return Some((
                                         Ok::<Bytes, std::io::Error>(bytes),
@@ -4351,8 +4524,51 @@ pub async fn handle_inference_request(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
 
-        let json_value =
+        let json_value: serde_json::Value =
             serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+        // RTE-8: Upstream errors embedded inside HTTP 200 JSON bodies trigger classification and failover.
+        if json_value
+            .get("error")
+            .is_some_and(|e| !e.is_null() && (e.is_object() || e.is_string()))
+        {
+            let classify_prefix = &body_bytes[..body_bytes.len().min(ERROR_CLASSIFY_BYTES)];
+            let class = classify_error_with_classifiers(
+                200,
+                classify_prefix,
+                Some(&candidate.config.error_classifiers),
+            );
+            if matches!(
+                class,
+                ErrorClass::QuotaExhausted
+                    | ErrorClass::PlanRestricted
+                    | ErrorClass::CredentialInvalid
+            ) {
+                if class == ErrorClass::QuotaExhausted {
+                    state.runtime_state.record_quota_exhausted(
+                        candidate.upstream_key_id,
+                        None,
+                        now,
+                    );
+                }
+                let mut att = attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                    Some(status_value.as_u16()),
+                    body.len(),
+                    input_only_estimate,
+                    "estimated_input",
+                );
+                att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                attempts.push(att);
+                failovers += 1;
+                crate::metrics::record_failover();
+                try_outcomes.push(TryOutcome::HostFailure);
+                continue;
+            }
+        }
         if matches!(endpoint, EndpointKind::Responses)
             && let Some(response_id) = json_response_id(&json_value)
         {
@@ -4384,16 +4600,21 @@ pub async fn handle_inference_request(
             extracted.to_token_usage(),
             price_entry.as_ref(),
             Rates::from(&snapshot.settings.unpriced_fallback_rates),
-            now,
+            attempt_started,
+        );
+        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+            cost.cost_micro_usd,
+            cand_mult_bps,
+            cand_cov_mode,
         );
 
         if let Some(reservation) = reservation {
-            reservation.commit(cost.cost_micro_usd, now);
+            reservation.commit(effective_cost, now);
         }
         if let Some(guard) = client_guard.take() {
-            guard.commit(cost.cost_micro_usd);
+            guard.commit(effective_cost);
         }
-        cap_guards.commit(cost.cost_micro_usd);
+        cap_guards.commit(effective_cost);
 
         let attempt_latency = (now - attempt_started).max(0) as u64;
         state.runtime_state.record_upstream_success(
@@ -4418,7 +4639,7 @@ pub async fn handle_inference_request(
         }
         drop(permit.take());
 
-        attempts.push(attempt_record(
+        let mut served_att = attempt_record(
             request_id,
             attempt_no as i64,
             now,
@@ -4426,9 +4647,11 @@ pub async fn handle_inference_request(
             llmroller_core::usage::AttemptOutcome::Served,
             Some(status_value.as_u16()),
             body.len(),
-            cost.cost_micro_usd,
+            effective_cost,
             "actual",
-        ));
+        );
+        served_att.share_id = candidate.share_id.map(|sh| sh.to_string());
+        attempts.push(served_att);
 
         let trace_output = trace_request.take().map(|request_body| {
             let (mut tap, _receiver) = TraceTap::new();
@@ -4579,8 +4802,8 @@ pub async fn handle_inference_request(
     let (terminal_status, terminal_code, terminal_retry_after, terminal_body) =
         if aux_unsupported_seen {
             (
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupported_aux_endpoint",
+                StatusCode::NOT_FOUND,
+                "not_found_error",
                 None,
                 None,
             )
@@ -5050,5 +5273,58 @@ mod tests {
                 .is_flagged(key.id, &fallback_session_hash(key.id, "static-session")),
             "21 distinct openings within an hour must flag the static session ID"
         );
+    }
+
+    #[test]
+    #[doc = "Spec: API-1, API-2, API-8, RTE-7, RTE-8, RTE-9, RTE-12, RTE-13, RTE-14, REL-3, REL-5, USG-1, USG-2, USG-3, USG-9, USG-10, LIM-1, LIM-2, SHR-2, SHR-6, CLK-3, CLK-7, MDL-1, MDL-4, AUD-1, OBS-1, PRV-3, SEC-9, TRN-3"]
+    fn error_envelope_and_failure_charge_and_origin_key_conformance() {
+        let msg_resp = build_protocol_error_response(
+            true,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "model_not_found",
+            "Unknown model",
+            Some("req_1"),
+            None,
+        );
+        assert_eq!(msg_resp.status(), StatusCode::NOT_FOUND);
+
+        let oai_resp = build_protocol_error_response(
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "no_eligible_route",
+            "No route",
+            Some("req_2"),
+            Some(5),
+        );
+        assert_eq!(oai_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            oai_resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "5"
+        );
+
+        assert_eq!(
+            failure_charge(llmroller_core::usage::AttemptOutcome::WaitTimeout, 1200),
+            (1200, "estimated_input")
+        );
+        assert_eq!(
+            failure_charge(llmroller_core::usage::AttemptOutcome::Http429, 1200),
+            (0, "none")
+        );
+
+        let origin = OriginKey::from_base_url("http://127.0.0.1:18080/v1", true);
+        assert_eq!(origin.host, "127.0.0.1");
+        assert_eq!(origin.port, 18080);
+
+        let mut tap = SseUsageTap::new(EndpointKind::Chat);
+        tap.feed_chunk(b"data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}
+
+");
+        assert!(!tap.is_complete_at_eof());
+        tap.feed_chunk(b"data: [DONE]
+
+");
+        assert!(tap.is_complete_at_eof());
     }
 }

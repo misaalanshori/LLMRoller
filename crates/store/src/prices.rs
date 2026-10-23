@@ -140,6 +140,30 @@ pub async fn get_price_tx(
         }));
     }
 
+    let norm_model = llmroller_core::catalog::normalize_model_id(upstream_model_id).ok();
+    for candidate in std::iter::once(upstream_model_id).chain(norm_model.as_deref()) {
+        let row_bundled = sqlx::query(
+            r#"SELECT input_per_mtok_micro_usd, output_per_mtok_micro_usd,
+                      cache_read_per_mtok_micro_usd, cache_write_per_mtok_micro_usd
+               FROM prices
+               WHERE provider_id IN ('bundled', '') AND provider_kind = 'global' AND upstream_model_id = ?
+               ORDER BY CASE WHEN provider_id = 'bundled' THEN 0 ELSE 1 END
+               LIMIT 1"#,
+        )
+        .bind(candidate)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some(r) = row_bundled {
+            return Ok(Some(Rates {
+                input_per_mtok_micro_usd: r.try_get("input_per_mtok_micro_usd")?,
+                output_per_mtok_micro_usd: r.try_get("output_per_mtok_micro_usd")?,
+                cache_read_per_mtok_micro_usd: r.try_get("cache_read_per_mtok_micro_usd")?,
+                cache_write_per_mtok_micro_usd: r.try_get("cache_write_per_mtok_micro_usd")?,
+            }));
+        }
+    }
+
     Ok(None)
 }
 
@@ -239,6 +263,10 @@ pub const BUNDLED_PRICES: &[(&str, i64, i64, i64, i64)] = &[
     ("o3-mini", 1_100_000, 4_400_000, 550_000, 0),
     ("deepseek-chat", 270_000, 1_100_000, 70_000, 0),
     ("deepseek-reasoner", 550_000, 2_190_000, 140_000, 0),
+    ("gpt-5.4", 2_500_000, 10_000_000, 1_250_000, 0),
+    ("claude-opus-4.6", 15_000_000, 75_000_000, 1_500_000, 18_750_000),
+    ("deepseek-v4.1", 270_000, 1_100_000, 70_000, 0),
+    ("qwen-3.6-plus", 400_000, 1_200_000, 100_000, 0),
 ];
 
 pub async fn seed_bundled_prices(pool: &SqlitePool, now_ms: i64) -> Result<usize, sqlx::Error> {
@@ -265,4 +293,49 @@ pub async fn seed_bundled_prices(pool: &SqlitePool, now_ms: i64) -> Result<usize
         count += inserted as usize;
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+    use llmroller_core::ids::ProviderId;
+    use llmroller_core::provider::ProviderKind;
+    use llmroller_core::snapshot::ConfigSnapshot;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    #[doc = "Spec: USG-2, USG-3"]
+    async fn price_for_resolves_seeded_bundled_global_prices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("prices.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        let seeded = seed_bundled_prices(&pool, 1_000).await.expect("seed");
+        assert!(seeded >= 10);
+
+        let mut tx = pool.begin().await.expect("begin");
+        let rates = get_price_tx(&mut tx, "prv_1", "openrouter", "claude-sonnet-4.6")
+            .await
+            .expect("get_price_tx")
+            .expect("bundled price must resolve");
+        assert_eq!(rates.input_per_mtok_micro_usd, 3_000_000);
+
+        let entries = load_price_entries_tx(&mut tx).await.expect("load_price_entries_tx");
+        tx.commit().await.expect("commit");
+
+        let snap = ConfigSnapshot {
+            prices: Arc::new(entries),
+            ..ConfigSnapshot::default()
+        };
+        let p_id = ProviderId::generate();
+        let entry = snap
+            .price_for(&p_id, ProviderKind::Openrouter, "claude-sonnet-4.6")
+            .expect("snapshot price_for must resolve bundled global price");
+        assert_eq!(entry.base_rates.input_per_mtok_micro_usd, 3_000_000);
+        assert_eq!(entry.base_rates.output_per_mtok_micro_usd, 15_000_000);
+    }
 }

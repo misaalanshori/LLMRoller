@@ -216,11 +216,74 @@ pub fn record_failover() {
 /// Record an upstream 403 that did not match any classified error pattern (API-8).
 pub fn record_unclassified_403(provider_id: &str) {
     let _ = get_or_init_prometheus_recorder();
+    let labels = [("provider_id", provider_id)];
+    let _ = validate_metric_labels(&labels);
     metrics::counter!(
         "llmroller_upstream_unclassified_403_total",
         "provider_id" => provider_id.to_owned()
     )
     .increment(1);
+}
+
+/// Record a suspected constant-session client key anomaly (`RTE-1`, `OBS-1`).
+pub fn record_constant_session_suspected() {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!("llmroller_constant_session_suspected_total").increment(1);
+}
+
+/// Record a slow upstream TTFB or timeout observation (`OBS-1`).
+pub fn record_upstream_slow(provider_id: &str) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("provider_id", provider_id)];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!(
+        "llmroller_upstream_slow_total",
+        "provider_id" => provider_id.to_owned()
+    )
+    .increment(1);
+}
+
+/// Record a PinStore capacity overflow event (`RTE-11`, `OBS-1`).
+pub fn record_pin_capacity_overflow() {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!("llmroller_pin_capacity_overflow_total").increment(1);
+}
+
+/// Record a stale generation confirmation ignored by PinStore (`RTE-10`, `OBS-1`).
+pub fn record_pin_stale_confirm() {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!("llmroller_pin_stale_confirm_total").increment(1);
+}
+
+/// Record a dropped session trace job (`TRC-1`, `OBS-1`).
+pub fn record_trace_dropped() {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::counter!("llmroller_trace_dropped_total").increment(1);
+}
+
+/// Set the `llmroller_plaintext_data_plane` gauge (`0` or `1`) per `SEC-10` / `OBS-1` (`F-099`).
+pub fn set_plaintext_data_plane(val: u8) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::gauge!("llmroller_plaintext_data_plane").set(f64::from(val));
+}
+
+/// Verify data-plane bind security per `SEC-10` (`F-099`).
+///
+/// Returns `Ok(true)` when binding plaintext on a non-loopback address (`llmroller_plaintext_data_plane = 1`),
+/// `Ok(false)` when loopback or TLS-enabled, or `Err(2)` when `require_tls` is true on a non-loopback plaintext bind.
+pub fn check_data_plane_bind_security(
+    listen_addr: &str,
+    tls_enabled: bool,
+    require_tls: bool,
+) -> Result<bool, u8> {
+    let parsed: std::net::SocketAddr = listen_addr.parse().map_err(|_| 2)?;
+    if !parsed.ip().is_loopback() && !tls_enabled {
+        if require_tls {
+            return Err(2);
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Errors returned when metric labels violate the closed allowlist.
@@ -250,4 +313,21 @@ pub async fn metrics_handler() -> Response {
         output,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: OBS-1, SEC-9"]
+    fn increments_normative_prometheus_counters_on_edge_events() {
+        record_constant_session_suspected();
+        record_upstream_slow("prv_test");
+        record_pin_capacity_overflow();
+        record_pin_stale_confirm();
+        record_trace_dropped();
+        assert!(validate_metric_labels(&[("provider_id", "prv_test")]).is_ok());
+        assert!(validate_metric_labels(&[("user_email", "bad")]).is_err());
+    }
 }

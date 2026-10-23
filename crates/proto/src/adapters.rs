@@ -164,6 +164,11 @@ pub trait ProviderAdapter: Send + Sync {
     fn default_ua_policy(&self) -> UaPolicy;
     /// Default outbound session hint profile (SRDD Section 11.2).
     fn default_session_profile(&self) -> SessionProfile;
+    /// Whether this provider supports injecting `session_profile.body_field` on `endpoint` (`F-014`).
+    fn supports_session_body_on_endpoint(&self, endpoint: EndpointKind) -> bool {
+        matches!(endpoint, EndpointKind::Chat | EndpointKind::Responses)
+            || (self.kind() == ProviderKind::Openrouter && endpoint == EndpointKind::Messages)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

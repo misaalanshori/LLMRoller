@@ -76,9 +76,13 @@ pub struct PinTicket {
     pub pool_tier: CandidatePoolTier,
 }
 
+/// Minimum interval between coalesced SQLite persistence updates for a confirmed pin (`RTE-2`, Section 10.4).
+pub const PIN_PERSIST_COALESCE_MS: i64 = 60_000;
+
 /// In-memory session pin store backed by DashMap and per-entry Mutex.
 pub struct PinStore {
     entries: DashMap<PinKey, Arc<Mutex<PinEntry>>>,
+    last_persisted_ms: DashMap<PinKey, i64>,
     max_active_pins: usize,
 }
 
@@ -95,6 +99,7 @@ impl PinStore {
     pub fn new(max_active_pins: usize) -> Self {
         Self {
             entries: DashMap::new(),
+            last_persisted_ms: DashMap::new(),
             max_active_pins,
         }
     }
@@ -223,11 +228,16 @@ impl PinStore {
                         pool_tier: entry.pool_tier,
                     })
                 } else {
-                    let (k_new, tier_new) = select_fn(&[entry.upstream_key_id])?;
+                    let prev_key = entry.upstream_key_id;
+                    if !entry.tried_this_generation.contains(&prev_key) {
+                        entry.tried_this_generation.push(prev_key);
+                    }
+                    let (k_new, tier_new) = select_fn(&entry.tried_this_generation)
+                        .or_else(|| select_fn(&[prev_key]))
+                        .or_else(|| select_fn(&[]))?;
                     entry.upstream_key_id = k_new;
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
-                    entry.tried_this_generation.clear();
                     entry.expires_ms = now + 50_000;
                     Some(PinTicket {
                         upstream_key_id: k_new,
@@ -280,6 +290,9 @@ impl PinStore {
                     })
                 } else if is_candidate_eligible(entry.upstream_key_id) {
                     entry.last_used_ms = now;
+                    if _pin_ttl_ms > 0 {
+                        entry.expires_ms = now + _pin_ttl_ms;
+                    }
                     Some(PinTicket {
                         upstream_key_id: entry.upstream_key_id,
                         generation: entry.generation,
@@ -287,7 +300,8 @@ impl PinStore {
                         pool_tier: entry.pool_tier,
                     })
                 } else {
-                    let (k_new, tier_new) = select_fn(&[entry.upstream_key_id])?;
+                    let prev_key = entry.upstream_key_id;
+                    let (k_new, tier_new) = select_fn(&[prev_key]).or_else(|| select_fn(&[]))?;
                     entry.upstream_key_id = k_new;
                     entry.pool_tier = tier_new;
                     entry.generation += 1;
@@ -323,14 +337,59 @@ impl PinStore {
             if ticket.generation == entry.generation
                 && ticket.upstream_key_id == entry.upstream_key_id
             {
+                let was_provisional = entry.state == PinState::Provisional;
                 entry.state = PinState::Confirmed;
                 entry.last_used_ms = now_ms;
                 entry.expires_ms = now_ms + pin_ttl_ms;
                 entry.tried_this_generation.clear();
-                return Some(entry.clone());
+                let snapshot = entry.clone();
+                drop(entry);
+                let last = self
+                    .last_persisted_ms
+                    .get(pin_key)
+                    .map_or(0, |v| *v.value());
+                if was_provisional
+                    || last == 0
+                    || now_ms.saturating_sub(last) >= PIN_PERSIST_COALESCE_MS
+                {
+                    self.last_persisted_ms.insert(pin_key.clone(), now_ms);
+                    return Some(snapshot);
+                }
             }
         }
         None
+    }
+
+    /// Returns a confirmed [`PinEntry`] to persist to SQLite when at least [`PIN_PERSIST_COALESCE_MS`]
+    /// (`60 s`) have elapsed since the last durable write for `pin_key` (`F-051`, `RTE-2`).
+    pub fn take_coalesced_persist(
+        &self,
+        pin_key: &PinKey,
+        now_ms: i64,
+        pin_ttl_ms: i64,
+    ) -> Option<PinEntry> {
+        let entry_arc = self.entries.get(pin_key)?;
+        let mut entry = entry_arc.lock();
+        if entry.state != PinState::Confirmed {
+            return None;
+        }
+        entry.last_used_ms = now_ms;
+        if pin_ttl_ms > 0 {
+            entry.expires_ms = now_ms + pin_ttl_ms;
+        }
+        let snapshot = entry.clone();
+        drop(entry);
+
+        let last = self
+            .last_persisted_ms
+            .get(pin_key)
+            .map_or(0, |v| *v.value());
+        if last == 0 || now_ms.saturating_sub(last) >= PIN_PERSIST_COALESCE_MS {
+            self.last_persisted_ms.insert(pin_key.clone(), now_ms);
+            Some(snapshot)
+        } else {
+            None
+        }
     }
 
     /// Handles failover before first byte with race-free winner adoption (RTE-8).

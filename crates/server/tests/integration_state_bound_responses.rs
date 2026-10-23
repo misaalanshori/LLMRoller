@@ -762,10 +762,10 @@ async fn test_count_tokens_unsupported_upstream_returns_local_not_implemented_an
         ))
         .await
         .expect("count tokens");
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         response_json(response).await["error"]["code"],
-        "unsupported_aux_endpoint"
+        "not_found_error"
     );
 
     // The negative probe is cached: a second request must not reach upstream.
@@ -778,7 +778,7 @@ async fn test_count_tokens_unsupported_upstream_returns_local_not_implemented_an
         ))
         .await
         .expect("count tokens");
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         mock.calls
             .lock()

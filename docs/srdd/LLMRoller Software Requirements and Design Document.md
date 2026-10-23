@@ -136,6 +136,7 @@ Because LLMRoller's embedded control plane serves both human operators (`admin` 
 3. **IAM, Service Accounts & Client Key Lifecycle (`14.i`–`14.k`)**: The `My API keys` table with inline `Rename`, `Pause key` / `Resume key`, `Rotate`, and `Revoke` controls, the `Settings > Service Accounts` directory, and the `Service Accounts > <name>` drill-down view with 64-entry IPv4/IPv6 CIDR allow-lists and child key roll-ups.
 4. **Telemetry, Dual-Stream Logs & Cost Attribution (`14.l`–`14.o`)**: The `Logs` explorer with `Inference` (7-column) vs. `API` (5-column) segmented streams, the 460px right-docked Request Detail Inspection Drawer, the `Usage` ledger with 5-metric Token Summary Strip and pill filters, and the interactive `Credit usage breakdown` popover (`Plan contribution multiplier`).
 5. **Providers, Quotas, Sharing, Routing & Traceability (`14.p`–`14.z`)**: Provider & key cards, `Plan & balance` dual window gauges, consented personal sharing, the `Routing Matrix` with 6 pluggable strategies, `Active Sessions` & per-key `Recently Active Sessions` drawers, `Session Chat Preview`, `Model Catalog & Price Book`, `Settings`, `Audit Log`, WCAG 2.1 AA accessibility, and the master `ui-spec` component inventory.
+
 ## 1. Summary
 
 LLMRoller is a self-hosted LLM proxy and API key router written in Rust. It sits between coding agents and multiple paid upstream subscriptions or aggregator accounts. Each user authenticates to LLMRoller with a single client key, and LLMRoller distributes conversations across a pool of upstream keys.
@@ -178,6 +179,7 @@ LLMRoller unifies high-throughput Rust proxy engineering with a self-contained, 
 - **Zero-friction onboarding (`Connection setup` & `Connect CLI`)**: Developers select their coding agent's wire protocol (`OpenAI · Chat Completions`, `OpenAI · Responses`, or `Anthropic · Messages`), copy the protocol-matched base URL (`https://<host>/v1` or `https://<host>`), and launch pre-filled CLI setup snippets for Claude Code, Codex CLI, opencode, and Hermes Agent (`CLK-7`, `Section 14.h`).
 - **Machine principal isolation (`Service Accounts`)**: Automation keys for CI pipelines and bots are organized under named Service Accounts (`agents`, `testing`, `bots`, `ci`) with account-wide IPv4/IPv6 CIDR restrictions (up to 64 CIDRs), aggregated `Cost` / `Requests` / `Tokens` KPI cards, and instant per-key `Pause key` / `Resume key` controls (`CLK-6`, `CLK-7`, `Section 14.j`, `Section 14.k`).
 - **Wire-level observability without privacy compromise (`Logs` & `Usage`)**: Operators inspect every inference and console API call in the Dual-Stream `Logs` explorer, drill into a 460px slide-over Request Detail Drawer (TTFT, stop reason, tokens, identity, session, user-agent, and sanitized headers), and verify subscription credit multipliers (`× 0.25` contribution multiplier or `× 2.0` peak schedule) via the interactive `Credit usage breakdown` popover (`USG-9`, `USG-10`, `Section 14.l`–`14.o`).
+
 ## 2. Research findings
 
 This section records the empirical findings gathered on 19 October 2026 from vendor documentation, source repositories, issue trackers, and live endpoint checks. These facts ground every requirement in this specification.
@@ -281,6 +283,7 @@ Fifteen empirical findings shape the requirements and design in the remaining se
 | F13 | Reversible client key pause and protocol-aware base URLs | Developers frequently pause a key during debugging (`● Paused`) without wanting to revoke it and break configured scripts, and need protocol-specific base URLs (`OpenAI Chat Completions`, `OpenAI Responses`, `Anthropic Messages`) surfaced directly above their key list (`CLK-7`). |
 | F14 | Dual-stream inference vs. control-plane log inspection | Operators troubleshooting `429 Rejected` or `403 Rejected` errors need a slide-over request inspector showing TTFT, stop reason, token breakdown, session ID, user-agent, and sanitized HTTP headers alongside a separate `API` control-plane request log stream (`USG-9`, `AUD-2`). |
 | F15 | List-price vs. plan-covered cost attribution | Coding plans apply promotional or tier multipliers (such as OpenDesign's `× 0.25` contribution multiplier or Command Code's `× 2.0` weekday peak schedule). Recording both `list_cost_micro_usd` and `plan_multiplier_bps` lets the UI show struck-through list prices alongside actual plan credits consumed in an interactive breakdown popover (`USG-10`). |
+
 ## 3. Goals, non-goals, and assumptions
 
 This section establishes the operational goals, explicit version 1.0 boundaries, and sizing assumptions for LLMRoller.
@@ -343,6 +346,7 @@ The embedded control plane in `crates/admin` enforces five quantitative UX and r
 | `UX-3` | Cumulative Layout Shift (`CLS`) during HTMX partial swaps and `uPlot` bar rendering | `0.00` (fixed-height chart containers `240px`, skeleton table rows, and docked `460px` slide-over drawer overlay) |
 | `UX-4` | Contrast ratio across both Dark (`#0d0d0d`) and Light (`#ffffff`) themes | `>= 4.5:1` for all body and muted metadata text; `>= 7.0:1` for primary headings, KPI figures, and active status badges |
 | `UX-5` | Client key lifecycle and Service Account CIDR propagation latency | `<= 1,000 ms` from `Pause key`, `Resume key`, `Revoke`, or `Save IP restrictions` HTTP 200 response to active enforcement in `ConfigSnapshot` |
+
 ## 4. Users, roles, and provider ownership
 
 LLMRoller is a multi-user system in version 1.0. It defines two human user classes (`admin` and `user`), one internal system actor class (`SystemTask`), and one machine caller class (`client`). It also defines two provider ownership scopes (`global` and `personal`) with explicit, consented user-to-user sharing across three ordered routing tiers (`Own`, `Shared`, and `Global`).
@@ -473,6 +477,7 @@ Human developers and administrators often run headless coding agents, CI pipelin
 | Child API keys and derived `Permissions` status | A service account can hold zero or more child `client_keys` (`service_account_id = service_accounts.id`). In the Service Account Detail table and `My API keys` table, each key displays a derived `Permissions` badge: `All` when `allowed_models IS NULL AND rate_limit_rpm IS NULL AND budget_micro_usd_month IS NULL AND routing_scope == 'inherit'`, or `Restricted` when any model, rate, budget, or scope restriction is configured. |
 | Reversible `Paused` vs. `Active` lifecycle | Any client key (personal or service-account) can be toggled between `● Active` (`disabled = 0, paused_at IS NULL`) and `● Paused` (`disabled = 1, paused_at = now_ms`) via inline `Pause key` / `Resume key` actions (`POST /api/user/client-keys/{id}/pause` and `/resume`). Pausing a key updates `ConfigSnapshot` within 1 s via `Reloader` so Gate `G2` rejects new calls with HTTP 401 (`client_key_paused`), while preserving existing `PinStore` entries until their natural TTL expiry so resuming the key restores warm session cache locality. |
 | Aggregated Service Account KPIs | The Service Account Detail View (`Service Accounts > <name>`) aggregates `Cost` (`$`), `Requests`, and `Tokens` across all child keys belonging to `service_account_id` over the selected time range (`Last 24h`, `Last 7 days`, `Last 30 days`, `All time`) using `usage_rollups_hourly`. |
+
 ## 5. System architecture
 
 LLMRoller runs as one Rust process made of six internal subsystems. These subsystems share an atomic in-memory configuration snapshot (`ArcSwap<ConfigSnapshot>`), a mutex-guarded in-memory pin store (`PinStore`), and one SQLite database in Write-Ahead Logging (WAL) mode.
@@ -671,6 +676,7 @@ LLMRoller separates static bootstrap parameters from dynamic runtime policies. S
 Every authenticated HTTP request handled by the control plane (`127.0.0.1:8081`) passes through a lightweight telemetry and theme-context middleware stack in `crates/admin`:
 1. **Theme & Shell Context Resolution**: The middleware reads the authenticated user's `ui_theme` (`dark`, `light`, `system`), `ui_nav_layout` (`top_tabs`, `sidebar`), `ui_locale` (`en`), and active workspace (`personal` vs. `global`/`admin`) from `ConfigSnapshot.users[user_id]` (with cookie override `llmroller_ui_prefs`) and injects them into `BaseTemplate` so every full-page load renders with zero flash of unstyled content (FOUC).
 2. **Non-Blocking Control-Plane API Logger (`AUD-2`, `USG-9`)**: When any `/api/user/*` or `/admin/api/*` handler completes, the response middleware constructs a `ControlPlaneLogItem { id: Ulid::new(), ts: now_ms, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent }` and enqueues it via `try_send` to the writer's `raw_events` queue. These rows populate the `Logs > API` sub-tab (`Section 14.l`) without adding disk latency to control-plane responses.
+
 ## 6. Functional requirements
 
 This section specifies all functional requirements for LLMRoller version 1.0. Every requirement has a unique ID, a priority (`P0`, `P1`, or `P2`), and a clear pass or fail condition linked to Section 16 and `requirements.toml`.
@@ -843,6 +849,7 @@ The web UI and audit subsystem provide full self-service and administrative visi
 | UI-5 | P0 | The embedded web UI must implement a **Dual-Theme Design System** supporting both high-contrast OpenCode Dark Mode (`#0d0d0d` canvas, `#141414` elevated surfaces, `#262626` subtle borders) and OpenDesign Light Mode (`#ffffff` canvas, `#f9fafb` surfaces, `#e5e7eb` borders) with user-selectable theme (`dark`, `light`, `system`) and navigation layout (`top_tabs` horizontal module bar with split-pane `Settings` sidebar `General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`, or `sidebar` collapsible left navigation shell), workspace switcher (`Personal` vs `Default`/`Admin`), and `⌘K` command search (`Section 14.a`, `Section 14.b`, `Section 14.w`). |
 | UI-6 | P0 | The **Overview Analytics Dashboard** (`Overview` screen) must render a 3-card KPI summary row (`Cost`, `Requests`, `Tokens`), a `Daily Cost` time-series vertical bar chart (`uPlot`) with a segmented `Cost` \| `Tokens` metric toggle and dynamic Y-axis gridlines, and a sortable `Usage by Model` breakdown table displaying a `<N> models · <M> providers` summary badge, monochrome provider badges (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`), `Free` tier badges, and columns `Model`, `Requests`, `Input`, `Cache Read`, `Cache Write`, `Output`, and `Cost ↓` (`Section 14.e`, `Section 14.f`, `Section 14.g`). |
 | AUD-2 | P0 | Every authenticated HTTP request to the control plane (`/api/user/*` and `/admin/api/*`) must be recorded non-blockingly in `control_plane_logs` (`ts`, `status`, `method`, `path`, `actor_user_id`, `workspace_scope`, `latency_ms`, `ip_addr`, `user_agent`, retained for 30 days) and exposed in the `Logs > API` sub-tab (`Time`, `Status`, `Endpoint`, `User`, `Duration`) with status/method/path filtering, refresh (`↻`), and CSV/JSON export (`Section 14.l`). |
+
 ## 7. Non-functional requirements
 
 LLMRoller must add less than 5 ms of proxy overhead at p99 before the first upstream byte. It must forward every complete streamed frame within 1 ms and preserve pins, response links, and committed usage rollups across restarts.
@@ -900,6 +907,7 @@ Operational quality attributes keep the binary portable, auditable, observable, 
 All interactive components specified in `Section 14.a` through `14.z`—including the `Overview` `Daily Cost` / `Tokens` bar chart toggle, the `Logs` `Inference` / `API` stream switcher, the 460px Request Detail Inspection Drawer, the `Usage` 5-token summary strip and `Credit usage breakdown` popover, and the `Service Accounts` CIDR editor—execute without external runtime dependencies:
 1. **Zero external network calls (`PRIV-1`, `UI-3`)**: Every stylesheet, script, font stack (`system-ui`, `ui-monospace`), and provider badge icon (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`) is served from memory via `rust-embed` with immutable SHA-256 `ETag` caching.
 2. **Bounded read queries (`REL-3`)**: Every dashboard table (`Usage by Model`, `Logs > Inference`, `Logs > API`, `Usage` ledger, `Service Accounts`, and `My API keys`) uses indexed SQLite queries capped at `<= 50` rows per UI page (`<= 5,000` rows per CSV/JSON export batch) so control-plane browsing never delays data-plane WAL checkpoints.
+
 ## 8. Security and privacy
 
 Warning: Do not expose the control-plane listener (`LLMROLLER_ADMIN_LISTEN`) to an untrusted network without TLS. Bind it to `127.0.0.1` or place it behind an authenticated reverse proxy that handles TLS and is listed in `LLMROLLER_TRUSTED_PROXIES`.
@@ -970,6 +978,7 @@ To power the `Request headers` section of the `Logs` Request Detail Drawer (`Ope
 - **Unconditionally forbidden header keys**: `authorization`, `x-api-key`, `proxy-authorization`, `cookie`, `set-cookie`, `x-csrf-token`, and any header whose value matches `(sk-[A-Za-z0-9_-]{8,}|llr_[A-Za-z0-9_-]{8,}|oc_sk_[A-Za-z0-9_-]{8,})`.
 
 Similarly, when an operator or user saves `Allowed IP addresses` on a Service Account (`PUT /api/user/service-accounts/{id}/ip-restrictions` or `PUT /admin/api/service-accounts/{id}/ip-restrictions`, `CLK-6`), the handler parses comma- and newline-separated tokens, rejects any list exceeding `64` entries with HTTP 422 (`too_many_cidrs`), validates each entry as a canonical IPv4/IPv6 address or CIDR prefix via `ipnet::IpNet`, and logs `service_account.ip_restrictions_updated` in `audit_log`.
+
 ## 9. Data model
 
 LLMRoller stores all persistent state in a single SQLite database running in Write-Ahead Logging (`WAL`) mode with incremental auto-vacuum (`PRAGMA auto_vacuum = INCREMENTAL`) and foreign-key enforcement (`PRAGMA foreign_keys = ON`). All monetary amounts are stored as 64-bit signed integers representing micro-USD (`1 USD = 1,000,000 micro_usd`) to avoid floating-point rounding errors. All timestamps are 64-bit integers in UTC epoch milliseconds, and primary keys use 26-character ULIDs or composite keys.
@@ -1795,6 +1804,7 @@ WHERE ck.service_account_id = :service_account_id
 #### 9.4.2 Usage Ledger 5-token summary strip and per-model breakdown queries (`UI-6`, `USG-10`)
 
 The `Overview` `Usage by Model` table (`Section 14.g`) and the `Usage` Ledger 5-metric Token Summary Strip (`Section 14.n`) aggregate directly over `usage_rollups_hourly` for any selected window (`Last 7 days`, `Last 30 days`, `All time`), while individual row inspection in the `Credit usage breakdown` popover (`Section 14.o`) and Request Detail Drawer (`Section 14.m`) reads the indexed `usage_events` row by `id` or `request_id`.
+
 ## 10. Routing design
 
 The routing engine in `crates/core` is a pure, deterministic state machine with zero network or disk I/O on the critical path. It evaluates request gates (`G1` through `G7`), resolves the session and routing constraint, and checks candidate eligibility (`C1` through `C8`). It then selects routes through the pluggable `RouteSelector` strategy engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`) and manages single-flight pinning and pre-first-valid-frame failover.
@@ -2260,6 +2270,7 @@ pub fn check_g2_and_g4(
 ```
 
 Unlike permanent revocation (`DELETE /api/user/client-keys/{id}`), pausing a client key (`POST /api/user/client-keys/{id}/pause`) does **not** emit `CacheInvalidationEvent::ClientKeyRevoked`. Active session pins in `PinStore` for that key remain intact until their natural sliding TTL expires (`pin_ttl_secs`), so clicking `Resume key` (`POST /api/user/client-keys/{id}/resume`) immediately restores routing to the same warm upstream key.
+
 ## 11. Session identification and hints
 
 Coding agents and upstream providers use different session headers and body fields. LLMRoller therefore separates inbound session extraction and response-link inheritance from outbound affinity hint injection.
@@ -2368,6 +2379,7 @@ When an engineer inspects a request in the `Logs` slide-over Request Detail Draw
 | `Client > User agent` | Extracted verbatim from the inbound `user-agent` header (truncated to 256 printable ASCII bytes) and stored in `usage_events.client_user_agent`. | `lca/0.6.0 (linux; x86_64; abi-0.6)` |
 | `Client > Location` | Derived from trusted reverse-proxy geo headers (`cf-ipcountry`, `x-geo-city`, `x-geo-country`) when present from `LLMROLLER_TRUSTED_PROXIES`, or formatted client subnet (`203.0.113.0/24`). | `Singapore, SG` |
 | `Request headers` grid | 2-column key-value table of allow-listed inbound headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`, `x-claude-code-session-id`, `anthropic-version`, `openai-beta`) stored in `usage_events.request_headers_json` with all credentials (`authorization`, `x-api-key`, `cookie`) unconditionally stripped (`SEC-6`). | `content-length: 242031`, `content-type: application/json`, `user-agent: lca/0.6.0 (linux; x86_64; abi-0.6)`, `x-opencode-session: 1792266230924-65bbf89a` |
+
 ## 12. Protocol handling and transparent proxying
 
 LLMRoller acts as a transparent wire proxy for OpenAI Chat Completions (`POST /v1/chat/completions`), OpenAI Responses (`POST /v1/responses`), and Anthropic Messages (`POST /v1/messages`). It buffers the inbound request body once in a shared `Bytes` buffer to read `model` and support pre-first-byte failover. It edits only top-level routing and usage fields, and streams responses chunk-by-chunk after the first valid frame.
@@ -2661,6 +2673,7 @@ To populate the 7-section slide-over Request Detail Inspection Drawer (`Section 
 3. **Time to first token (`ttfb_ms`)**: Measured in milliseconds from completion of the outbound HTTP request write until the first valid non-comment response frame is verified (`1.82 s` rendered in the drawer when `ttfb_ms = 1820`).
 4. **Sanitized `request_headers_json`**: Built by `extract_safe_diagnostic_headers(req.headers())`, storing a sorted JSON object of safe diagnostic headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`, `anthropic-version`, `openai-beta`) capped at `4 KiB`.
 5. **Top-level `metadata_json`**: When the inbound JSON request contains a top-level `"metadata"` object, its string key-value pairs (up to `16` keys, `2 KiB` total, scrubbed of any secret patterns per `SEC-6`) are serialized into `usage_events.metadata_json`; otherwise the drawer renders `None recorded.`.
+
 ## 13. Pricing, limits, and source provider usage engine
 
 LLMRoller combines local micro-USD pricing and window budgets with single-flight `/usage` polling, time-bounded observation projections, and sanitized `/usage` pass-through.
@@ -2875,6 +2888,7 @@ When a user hovers or clicks the `(i)` info icon in the `Credits used` column of
   "footer_note": "This call uses Design Plan credits and does not deduct from your pay-as-you-go balance."
 }
 ```
+
 ## 14. API and web UI specification
 
 LLMRoller exposes three HTTP surfaces. The data plane (`/v1/*`) serves coding agents. The user control plane (`/app/*`, `/api/user/*`) serves personal resources, machine principal service accounts, and scoped telemetry. The admin control plane (`/admin/*`, `/admin/api/*`) serves instance administration, global provider pools, model catalog governance, and full-cluster observability.
@@ -3009,6 +3023,7 @@ The web interface is server-rendered with Askama templates and HTMX partial upda
 | `14.x` | Audit Log Explorer, Hash-Chain Verifier & Deleted Users | Tamper-evident `audit_log` explorer, `audit_anchor` integrity badge, event detail JSON drawer, and `deleted_users` historical attribution table (`AUD-1`, `AUTH-4`, `SEC-13`). |
 | `14.y` | Accessibility (WCAG 2.1 AA), Keyboard Nav, i18n & Responsive | Contrast verification across Dark/Light themes, keyboard shortcuts (`⌘K`, `<`/`>`, `Esc`), ARIA live regions, `[EN]` locale architecture, and desktop/tablet/mobile breakpoints (`UI-5`). |
 | `14.z` | Complete UI Component Inventory & Declarative `ui-spec` Map | Master traceability table from every screen/drawer/modal/popover to its Askama template, Rust handler, and complete `ui-spec` structural pseudocode (`UI-1`..`UI-6`). |
+
 ## 15. Technology choices and workspace layout
 
 LLMRoller is implemented in safe Rust (Rust 2024 edition) with a pinned stable toolchain and a small, audited dependency tree.
@@ -3147,6 +3162,7 @@ crates/admin/
     uPlot.iife.min.js         # Vendored uPlot canvas charting library
     uPlot.min.css             # Vendored uPlot styles
 ```
+
 ## 16. Testing plan and TDD governance
 
 Testing in LLMRoller is a primary architectural constraint, never an afterthought written after code lands. Every subsystem is built under strict Test-Driven Development (TDD) with bidirectional traceability between requirements (`docs/srdd/requirements.toml`), automated tests, and source modules verified by `cargo xtask traceability`. The test suite combines component mocking, property-based testing, integration tests, regression tests, end-to-end tests, and mutation testing with [cargo-mutants](https://mutants.rs/).
@@ -3307,6 +3323,7 @@ Every Web UI screen and interactive component defined in `Section 14.a` through 
 2. **Universal `project_key` Redaction (`USR-4`)**: Verifies that standard user responses across `Overview` (`Usage by Model`), `Logs` (`Inference` table and Request Detail Drawer), `Usage` (`Credit usage breakdown` popover), `Routing Matrix`, `Active Sessions`, and `Session Chat Preview` never contain global `upstream_key_id` ULIDs, administrative key labels, priorities, or `secret_last4` suffixes.
 3. **Interactive State Transitions (`CLK-6`, `CLK-7`, `USG-9`, `USG-10`, `UI-5`, `UI-6`, `AUD-2`)**: Verifies Service Account creation and 64-CIDR enforcement, inline Client Key `Pause key` -> `401 client_key_paused` -> `Resume key` -> `200 OK`, Connection Setup format switching (`Chat Completions` -> `/v1`, `Responses` -> `/v1`, `Messages` -> root URL), `Logs` `Inference` vs. `API` stream toggling and Request Detail Drawer rendering, and `Usage` ledger `Credit usage breakdown` math (`list_cost_micro_usd * plan_multiplier_bps / 10_000 == cost_micro_usd`).
 4. **Cross-Tenant IDOR 404 Isolation (`USR-3`, `SEC-17`)**: Verifies that User A requesting User B's Service Account ID, Client Key ID, Inference Log ID, or Cost Breakdown ID receives HTTP `404 not_found`.
+
 ## 17. Roadmap and milestones
 
 Implementation follows eight dependency-ordered milestones (`M0`, `M1`, `M2`, `M3`, `M4`, `M3b`, `M5`, `M6`) that map one-to-one to the Big-Bang epics. A milestone is complete when `cargo xtask traceability --milestone <M>` verifies 100% `Spec:` coverage and `cargo-mutants` reports zero unannotated survivors.
@@ -3345,6 +3362,7 @@ The table below maps each sub-phase of Epic 6 (`Milestone M5`) to its authoritat
 | `6.3` | Admin Console, Global Providers, Canonical Model Catalog & Cross-Vendor Merge UI, Tiered/Scheduled Price Book Editor, Split-Pane Settings (`General`, `Members`, `Service accounts`, `Billing`, `Security`, `Privacy`), Control-Plane API Logger (`control_plane_logs`), and Audit Log Explorer | `14.v`, `14.w`, `14.x` (`AUTH-4`, `USR-5`, `MDL-3`, `MDL-4`, `AUD-1`, `AUD-2`) |
 | `6.4` | Overview Analytics Dashboard (`Cost`/`Tokens` segmented `uPlot` bar chart & `Usage by Model` table), Dual-Stream Logs Explorer (`Inference` vs `API`) + 460px Request Detail Drawer, Usage Ledger + 5-Token Strip + `Credit usage breakdown` Popover, and Active Sessions Pin Manager | `14.e`, `14.f`, `14.g`, `14.l`, `14.m`, `14.n`, `14.o`, `14.t` (`UI-1`, `UI-2`, `UI-6`, `USG-9`, `USG-10`, `SEC-6`) |
 | `6.5` | Read-Only Session Chat Preview UI and Turn Trace Inspector Drawer | `14.u` (`TRC-5`, `TRC-6`, `TRC-8`, `TRC-9`, `UI-4`, `SEC-19`) |
+
 ## 18. Risks and mitigations
 
 Eighteen technical, vendor, security, and operational risks are tracked below alongside their concrete architectural mitigations.
@@ -3373,6 +3391,7 @@ Each risk lists its likelihood, impact, and the specific design mechanisms and r
 | R16 | An administrator or user enters an overly restrictive or malformed IPv4/IPv6 CIDR list in a Service Account's `Allowed IP addresses` form, locking out CI runners or agents using child API keys. | Medium | Medium | Validate all CIDR entries (up to 64 IPv4/IPv6 addresses or prefixes) via `ipnet` before saving (`422 invalid_cidr`), display a prominent warning in the Service Account UI (`"Applies to every key for this service account. IP changes can lock clients out."`), surface `● 403 Rejected / inference_failed` rows immediately in `Logs > Inference`, and allow instant clearing (`Blank allows any IP`) (`CLK-6`, `Section 14.k`). |
 | R17 | Storing inbound request headers for the `Logs` Request Detail Drawer accidentally captures `Authorization`, `x-api-key`, `Cookie`, or custom secret headers in SQLite. | Low | High | Enforce a strict lowercase header allow-list in `crates/proto::headers::extract_safe_diagnostic_headers` (`content-length`, `content-type`, `user-agent`, `accept`, `anthropic-version`, `anthropic-beta`, `openai-beta`, and tenant-salted session headers) and run automated canary tests asserting zero secret substrings in `usage_events.request_headers_json` and `control_plane_logs` (`SEC-6`, `USG-9`). |
 | R18 | Users confuse unadjusted model list prices with actual subscription plan credit deductions when a provider applies a contribution multiplier (e.g., `× 0.25`) or peak-hour schedule (`× 2.0`). | Medium | Low | Compute and persist both `list_cost_micro_usd` and `cost_micro_usd` with `plan_multiplier_bps` and `billing_coverage_mode`, render struck-through list prices (`~$0.0024~`) alongside `Covered by <Plan> credits` badges in the `Usage` table, and expose the line-item `Credit usage breakdown` popover on every usage row (`USG-10`, `Section 14.o`). |
+
 ## 19. Architectural decisions and open questions
 
 This section records the architectural decisions resolved during specification refinement and lists the remaining operational configuration choices for deployment.
@@ -3410,6 +3429,7 @@ Four empirical checks are scheduled during Milestone 1 implementation against li
 | 2. Upstream `/v1/usage` readiness | Open Design AMR | Monitor [nexu-io/open-design#8674](https://github.com/nexu-io/open-design/issues/8674) and enable the `open_design_amr` `/usage` poller URL in `presets/open_design_amr.toml` once the upstream service endpoint ships. |
 | 3. Alpha billing schema lock | Command Code (`GOAT` and `Pro`) | Capture live JSON responses from `/alpha/billing/credits` and `/alpha/usage/summary` across `GOAT` and `Pro` keys and lock them into `fixtures/usage/command_code_*.json`. |
 | 4. Responses transport check | Codex CLI | Verify that current Codex CLI builds use HTTP SSE when configured with a custom `base_url` on `/v1/responses` and inherit `session_hash` across `previous_response_id` turns. |
+
 ## 20. Sources
 
 All factual claims, endpoint paths, header names, quota windows, and tool capabilities in this specification were verified against primary sources on 19 October 2026.
@@ -3496,6 +3516,7 @@ The links below ground the Web UI design system, HTMX strict-CSP architecture, t
 | `uPlot` fast HTML5 Canvas time-series bar and line chart library | https://github.com/leeoniya/uPlot |
 | W3C Web Content Accessibility Guidelines (WCAG) 2.1 Level AA contrast and keyboard navigation | https://www.w3.org/TR/WCAG21/ |
 | WAI-ARIA Authoring Practices 1.2 (Modal Dialogs, Slide-Over Drawers, Tabs, Popovers, and Live Regions) | https://www.w3.org/WAI/ARIA/apg/ |
+
 ## 21. Concurrency, Lifecycle, and Failure-Recovery Model
 
 LLMRoller coordinates high-concurrency streaming inference (`2,000` open SSE streams and `500 req/s`) and lock-free configuration reads. It also coordinates in-memory state machines and asynchronous SQLite WAL persistence in one process. This section specifies the cross-cutting concurrency invariants, lock hierarchies, RAII lifecycle guards, state-machine synchronization rules, and failure-recovery protocols that govern every crate in the workspace.
@@ -3679,6 +3700,7 @@ Upon receiving `SIGTERM` or `SIGINT`, the server drains in eight time-bounded st
 Stateless background jobs (`Discovery`, `UsagePoller`, `RetentionSweeper`, `WalCheckpointer`) run inside tasks wrapped with `FutureExt::catch_unwind`. On panic, the supervisor logs the panic payload (redacted per `SEC-6`) and restarts the job with exponential backoff (`1 s, 2 s, 4 s, ...` capped at `300 s`). Three panics within 10 minutes mark the job `failed`, set `llmroller_job_failed{job} = 1`, and leave the job stopped until operator intervention.
 
 The **SQLite writer actor is never restarted** after a panic because an interrupted batch could desynchronize in-memory queues. Instead, a writer panic sets `/readyz` to HTTP `503` and triggers controlled shutdown with exit code `12`.
+
 ## 22. Deployment and containerization specification
 
 This section defines the containerization architecture, orchestration topologies, volume and network boundaries, and environment contracts for LLMRoller (`POR-1`, `SEC-9`, `SEC-11`, `REL-1`). Every port, path, timeout, and environment variable matches Sections 5, 7, 8, 9, 10, and 21 with zero drift.

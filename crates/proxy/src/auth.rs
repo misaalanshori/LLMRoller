@@ -339,9 +339,12 @@ pub async fn client_key_auth_middleware(
     // 3. Evaluate gates G1 through G6.
     // RPM rate limiting (G5) applies strictly to inference endpoints (CLK-1, API-2);
     // administrative/discovery routes like /v1/models, /v1/usage, /v1/key do not consume RPM.
-    let path = request.uri().path();
+    let path = request.uri().path().to_string();
+    let is_messages_path = path.starts_with("/v1/messages")
+        || path.starts_with("/v1/v1/messages")
+        || path.starts_with("/messages");
     let is_inference = path.starts_with("/v1/chat/completions")
-        || path.starts_with("/v1/messages")
+        || is_messages_path
         || path.starts_with("/v1/responses");
     let rpm_limiter = if is_inference {
         Some(&*state.rpm_limiter)
@@ -365,110 +368,186 @@ pub async fn client_key_auth_middleware(
             request.extensions_mut().insert(hash_role);
             next.run(request).await
         }
-        Err(failure) => match failure {
-            GateFailure::G1AuthenticationError => {
-                state.record_failure(client_ip, "unknown_key", now_ms).await;
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "authentication_error",
-                            "message": "invalid client key"
-                        }
-                    })),
-                )
-                    .into_response()
+        Err(failure) => {
+            let matched_key = snapshot.client_keys_by_hash.get(&hash);
+            let record_gate_usage_event = |status_u16: u16, err_code: &str| {
+                if let (Some(ck), Some(writer)) = (matched_key, &state.writer) {
+                    let ep = if is_messages_path {
+                        "messages"
+                    } else if path.starts_with("/v1/responses") {
+                        "responses"
+                    } else {
+                        "chat"
+                    };
+                    writer.queues.usage_writer.enqueue(
+                        llmroller_store::usage_writer::UsageEventRecord {
+                            id: llmroller_core::ids::UsageEventId::generate().to_string(),
+                            ts: now_ms,
+                            request_id: llmroller_core::ids::RequestId::generate(),
+                            client_key_id: ck.id,
+                            owner_user_id: ck.owner_user_id,
+                            upstream_key_id: None,
+                            provider_id: None,
+                            provider_scope: Some("none".to_string()),
+                            share_id: None,
+                            canonical_id: None,
+                            upstream_model_id: None,
+                            endpoint: ep.to_string(),
+                            protocol: Some(ep.to_string()),
+                            session_hash: None,
+                            status: i64::from(status_u16),
+                            stream: false,
+                            incomplete: false,
+                            termination: "completed".to_string(),
+                            trace_dropped: false,
+                            input_uncached_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                            output_tokens: 0,
+                            reasoning_tokens: 0,
+                            cost_micro_usd: 0,
+                            cost_source: llmroller_core::pricing::CostSource::PriceBook,
+                            latency_ms: Some(0),
+                            ttfb_ms: None,
+                            pin_outcome: None,
+                            failovers: 0,
+                            error_code: Some(err_code.to_string()),
+                            list_cost_micro_usd: 0,
+                            plan_multiplier_bps: 10_000,
+                            billing_coverage_mode: "pay_as_you_go".to_string(),
+                            service_account_id: ck.service_account_id.map(|sa| sa.to_string()),
+                            stop_reason: None,
+                            request_headers_json: None,
+                            metadata_json: None,
+                        },
+                        Vec::new(),
+                    );
+                }
+            };
+
+            match failure {
+                GateFailure::G1AuthenticationError => {
+                    state.record_failure(client_ip, "unknown_key", now_ms).await;
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        "authentication_error",
+                        "invalid client key",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G2KeyDisabledOrExpired => {
+                    let g2_reason = if matched_key.is_some_and(|ck| ck.revoked_at.is_some()) {
+                        "revoked"
+                    } else if matched_key
+                        .and_then(|ck| ck.expires_at)
+                        .is_some_and(|exp| now_ms >= exp)
+                    {
+                        "expired"
+                    } else {
+                        "disabled"
+                    };
+                    state.record_failure(client_ip, g2_reason, now_ms).await;
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        "authentication_error",
+                        "client key is disabled, revoked, or expired",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G2ClientKeyPaused => {
+                    state.record_failure(client_ip, "disabled", now_ms).await;
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        "client_key_paused",
+                        "client key is paused; resume it in the control plane",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G2ServiceAccountDisabled => {
+                    state.record_failure(client_ip, "disabled", now_ms).await;
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        "service_account_disabled",
+                        "parent service account is disabled",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G3OwnerDisabled => {
+                    state
+                        .record_failure(client_ip, "owner_disabled", now_ms)
+                        .await;
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        "authentication_error",
+                        "account is disabled",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G4CidrForbidden => {
+                    record_gate_usage_event(403, "permission_error");
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        "permission_error",
+                        "client IP not allowed by key CIDR policy",
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G5RateLimitExceeded { retry_after_secs } => {
+                    record_gate_usage_event(429, "rate_limit_error");
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "rate_limit_error",
+                        "client key rate limit exceeded",
+                        None,
+                        Some(retry_after_secs),
+                    )
+                }
+                GateFailure::G6ModelNotFound { model } => {
+                    record_gate_usage_event(404, "model_not_found");
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::NOT_FOUND,
+                        "not_found_error",
+                        "model_not_found",
+                        &format!("model {model} not found"),
+                        None,
+                        None,
+                    )
+                }
+                GateFailure::G6ModelForbidden { model } => {
+                    record_gate_usage_event(403, "permission_error");
+                    crate::orchestrator::build_protocol_error_response(
+                        is_messages_path,
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        "permission_error",
+                        &format!("model {model} not permitted on this key"),
+                        None,
+                        None,
+                    )
+                }
             }
-            GateFailure::G2KeyDisabledOrExpired => {
-                state.record_failure(client_ip, "disabled", now_ms).await;
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "authentication_error",
-                            "message": "client key is disabled, revoked, or expired"
-                        }
-                    })),
-                )
-                    .into_response()
-            }
-            GateFailure::G2ClientKeyPaused => (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "client_key_paused",
-                        "message": "client key is paused; resume it in the control plane"
-                    }
-                })),
-            )
-                .into_response(),
-            GateFailure::G2ServiceAccountDisabled => (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "service_account_disabled",
-                        "message": "parent service account is disabled"
-                    }
-                })),
-            )
-                .into_response(),
-            GateFailure::G3OwnerDisabled => {
-                state
-                    .record_failure(client_ip, "owner_disabled", now_ms)
-                    .await;
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "authentication_error",
-                            "message": "account is disabled"
-                        }
-                    })),
-                )
-                    .into_response()
-            }
-            GateFailure::G4CidrForbidden => (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "permission_error",
-                        "message": "client IP not allowed by key CIDR policy"
-                    }
-                })),
-            )
-                .into_response(),
-            GateFailure::G5RateLimitExceeded { retry_after_secs } => (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", retry_after_secs.to_string())],
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "rate_limit_error",
-                        "message": "client key rate limit exceeded"
-                    }
-                })),
-            )
-                .into_response(),
-            GateFailure::G6ModelNotFound { model } => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "model_not_found",
-                        "message": format!("model {model} not found")
-                    }
-                })),
-            )
-                .into_response(),
-            GateFailure::G6ModelForbidden { model } => (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "permission_error",
-                        "message": format!("model {model} not permitted on this key")
-                    }
-                })),
-            )
-                .into_response(),
-        },
+        }
     }
 }
 

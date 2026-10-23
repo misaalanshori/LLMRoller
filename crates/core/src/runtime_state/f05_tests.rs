@@ -254,3 +254,68 @@ fn reserve_key_windows_filters_route_windows_by_model() {
         "the model with headroom must acquire a reservation"
     );
 }
+
+#[test]
+#[doc = "Spec: USG-6, LIM-1, LIM-2"]
+fn reconcile_upstream_usage_honors_reserve_pct_and_preserves_local_delta() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let mut w = window("w-5h", key, "upstream_key", None, 10_000_000);
+    w.reserve_pct = 5; // 95% threshold
+    let snapshot = snapshot_with_windows(vec![w.clone()]);
+    runtime.rebuild_window_counters(&snapshot, now);
+    let counter = runtime.window_counter("w-5h").expect("counter");
+
+    // Record $1.00 local spend before poll
+    crate::windows::BudgetCounter::record_actual(counter.as_ref(), now, 1_000_000);
+
+    // Poll 1: Upstream reports 50% ($5.00), resets_at = None
+    runtime.reconcile_upstream_usage(
+        key,
+        &[w.clone()],
+        &[UpstreamWindowObservation {
+            kind: "5h".to_string(),
+            used_percent: 50.0,
+            resets_at: None,
+        }],
+        now,
+    );
+    assert!(runtime.is_key_routable(key, now));
+    assert_eq!(
+        crate::windows::BudgetCounter::effective_used(counter.as_ref(), now),
+        5_000_000
+    );
+
+    // Poll 2 (same local spend): must still use local_used ($1.00) as baseline, not $5.00!
+    runtime.reconcile_upstream_usage(
+        key,
+        &[w.clone()],
+        &[UpstreamWindowObservation {
+            kind: "5h".to_string(),
+            used_percent: 50.0,
+            resets_at: None,
+        }],
+        now + 1_000,
+    );
+    // Now local grows by $0.50 -> effective_used must be $5.50 (5_500_000), not $5.00!
+    crate::windows::BudgetCounter::record_actual(counter.as_ref(), now + 2_000, 500_000);
+    assert_eq!(
+        crate::windows::BudgetCounter::effective_used(counter.as_ref(), now + 2_000),
+        5_500_000
+    );
+
+    // Poll 3: Upstream reports 96% (>= 95% threshold with reserve_pct = 5) and resets_at = None -> exhausted for 300s fallback
+    runtime.reconcile_upstream_usage(
+        key,
+        &[w],
+        &[UpstreamWindowObservation {
+            kind: "5h".to_string(),
+            used_percent: 96.0,
+            resets_at: None,
+        }],
+        now + 3_000,
+    );
+    assert!(!runtime.is_key_routable(key, now + 4_000));
+    assert!(runtime.is_key_routable(key, now + 303_001));
+}

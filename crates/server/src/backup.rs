@@ -81,3 +81,89 @@ pub async fn run_backup(
         "bytes": metadata.len()
     }))
 }
+
+/// Restores a SQLite backup into `target_db_path` after verifying `PRAGMA integrity_check`,
+/// schema presence (`instance_meta` / `instance_secrets`), and optional DEK unwrap under `master_key` (`REL-6`, `SEC-1`, `F-104`).
+pub async fn restore_backup(
+    backup_path: &Path,
+    target_db_path: &Path,
+    master_key: Option<&llmroller_store::crypto::MasterKey>,
+    master_key_id: Option<&str>,
+) -> Result<(), BackupError> {
+    let verify_pool =
+        llmroller_store::pool::open_pool(backup_path, llmroller_store::pool::Role::Reader).await?;
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_one(&verify_pool)
+        .await?;
+    if integrity != "ok" {
+        verify_pool.close().await;
+        return Err(BackupError::IntegrityCheckFailed);
+    }
+
+    let has_meta: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'instance_meta' LIMIT 1",
+    )
+    .fetch_optional(&verify_pool)
+    .await?;
+    if has_meta.is_none() {
+        verify_pool.close().await;
+        return Err(BackupError::IntegrityCheckFailed);
+    }
+
+    if let (Some(mk), Some(mk_id)) = (master_key, master_key_id) {
+        let entropy = std::sync::Arc::new(llmroller_core::seams::OsEntropy::new());
+        if llmroller_store::instance::load_or_initialize(&verify_pool, mk_id, mk, entropy, 0)
+            .await
+            .is_err()
+        {
+            verify_pool.close().await;
+            return Err(BackupError::IntegrityCheckFailed);
+        }
+    }
+    verify_pool.close().await;
+
+    let parent = target_db_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_path = parent.join(format!(
+        "{}.restore.tmp",
+        target_db_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
+    fs::copy(backup_path, &staging_path)?;
+    if let Ok(file) = File::open(&staging_path) {
+        let _ = file.sync_all();
+    }
+    fs::rename(&staging_path, target_db_path)?;
+    if let Ok(parent_dir) = File::open(parent) {
+        let _ = parent_dir.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[doc = "Spec: REL-6, SEC-1"]
+    async fn restore_backup_verifies_sqlite_integrity_and_schema_before_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_db = dir.path().join("empty.db");
+        let target_db = dir.path().join("target.db");
+        std::fs::write(&target_db, b"original").expect("write target");
+        // Create an uninitialized SQLite file lacking instance_meta
+        let pool = llmroller_store::pool::open_pool(&empty_db, llmroller_store::pool::Role::Writer)
+            .await
+            .expect("open empty db");
+        sqlx::query("CREATE TABLE dummy (id INTEGER PRIMARY KEY);")
+            .execute(&pool)
+            .await
+            .expect("create dummy");
+        pool.close().await;
+
+        let res = restore_backup(&empty_db, &target_db, None, None).await;
+        assert!(matches!(res, Err(BackupError::IntegrityCheckFailed)));
+        assert_eq!(std::fs::read(&target_db).expect("read target"), b"original");
+    }
+}

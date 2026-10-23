@@ -103,6 +103,7 @@ pub fn connect_options(role: Role) -> SqliteConnectOptions {
         .foreign_keys(true)
         .busy_timeout(busy_timeout)
         .pragma("temp_store", "MEMORY")
+        .pragma("wal_autocheckpoint", "0")
         .create_if_missing(role.create_if_missing());
 
     options = match role {

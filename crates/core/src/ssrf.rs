@@ -215,7 +215,17 @@ pub fn validate_url(url_str: &str, allow_private_network: bool) -> Result<Url, S
         }
 
         let parts: Vec<&str> = raw_host.split('.').collect();
-        if parts.len() == 4 {
+        if (2..=4).contains(&parts.len())
+            && parts.iter().all(|part| {
+                !part.is_empty()
+                    && (part.chars().all(|c| c.is_ascii_digit())
+                        || part.starts_with("0x")
+                        || part.starts_with("0X"))
+            })
+        {
+            if parts.len() != 4 {
+                return Err(SsrfError::NonStandardIpEncoding(raw_host.to_owned()));
+            }
             for part in &parts {
                 if part.starts_with("0x") || part.starts_with("0X") {
                     return Err(SsrfError::NonStandardIpEncoding(raw_host.to_owned()));
@@ -274,4 +284,34 @@ pub fn extract_raw_host(url_str: &str) -> Option<&str> {
         return Some(&host[..=end_bracket]);
     }
     Some(host.split(':').next().unwrap_or(host))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: SEC-7, PRV-7"]
+    fn rejects_two_and_three_part_shorthand_and_octal_hex_ipv4_urls() {
+        assert!(matches!(
+            validate_url("https://127.1/v1", false),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+        assert!(matches!(
+            validate_url("https://127.0.1/v1", false),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+        assert!(matches!(
+            validate_url("https://169.254.1/v1", true),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+        assert!(matches!(
+            validate_url("https://0177.0.0.1/v1", false),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+        assert!(matches!(
+            validate_url("https://2130706433/v1", false),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+    }
 }

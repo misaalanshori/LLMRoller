@@ -260,6 +260,10 @@ impl ConfigSnapshot {
             pk
         } else if let Some(&pk) = self.models_by_canonical.get(trimmed) {
             pk
+        } else if let Some(&pk) = self.redirects.get(trimmed) {
+            pk
+        } else if let Some(&pk) = self.redirects.get(&normalized) {
+            pk
         } else {
             // Fallback: exact upstream model ID match when unambiguous.
             let mut found: Option<ModelPk> = None;
@@ -342,19 +346,55 @@ impl ConfigSnapshot {
         provider_kind: ProviderKind,
         upstream_model_id: &str,
     ) -> Option<&PriceEntry> {
-        let specific = PriceKey {
-            provider_id: provider_id.to_string(),
-            provider_kind: provider_kind.as_str().to_string(),
-            upstream_model_id: upstream_model_id.to_string(),
-        };
-        if let Some(entry) = self.prices.get(&specific) {
-            return Some(entry);
+        let pid = provider_id.to_string();
+        let pkind = provider_kind.as_str().to_string();
+        let raw_model = upstream_model_id.to_string();
+        let norm_model = crate::catalog::normalize_model_id(upstream_model_id).ok();
+
+        for model_candidate in std::iter::once(&raw_model).chain(norm_model.as_ref()) {
+            if let Some(entry) = self.prices.get(&PriceKey {
+                provider_id: pid.clone(),
+                provider_kind: pkind.clone(),
+                upstream_model_id: model_candidate.clone(),
+            }) {
+                return Some(entry);
+            }
+            if let Some(entry) = self.prices.get(&PriceKey {
+                provider_id: String::new(),
+                provider_kind: pkind.clone(),
+                upstream_model_id: model_candidate.clone(),
+            }) {
+                return Some(entry);
+            }
+            if let Some(entry) = self.prices.get(&PriceKey {
+                provider_id: "bundled".to_string(),
+                provider_kind: "global".to_string(),
+                upstream_model_id: model_candidate.clone(),
+            }) {
+                return Some(entry);
+            }
+            if let Some(entry) = self.prices.get(&PriceKey {
+                provider_id: String::new(),
+                provider_kind: "global".to_string(),
+                upstream_model_id: model_candidate.clone(),
+            }) {
+                return Some(entry);
+            }
         }
-        self.prices.get(&PriceKey {
-            provider_id: String::new(),
-            provider_kind: provider_kind.as_str().to_string(),
-            upstream_model_id: upstream_model_id.to_string(),
-        })
+
+        self.prices
+            .get(&PriceKey {
+                provider_id: pid,
+                provider_kind: pkind.clone(),
+                upstream_model_id: "*".to_string(),
+            })
+            .or_else(|| {
+                self.prices.get(&PriceKey {
+                    provider_id: String::new(),
+                    provider_kind: pkind,
+                    upstream_model_id: "*".to_string(),
+                })
+            })
     }
 }
 

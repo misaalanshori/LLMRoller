@@ -146,3 +146,19 @@ async fn opening_a_missing_reader_database_fails_instead_of_creating_it() {
         "unexpected reader error: {error}"
     );
 }
+
+#[tokio::test]
+#[doc = "Spec: REL-1, REL-2"]
+async fn pool_connections_disable_automatic_wal_autocheckpoint() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("autocheckpoint.db");
+    let writer = open_pool(&path, Role::Writer)
+        .await
+        .expect("writer pool must open");
+    let autocheckpoint: i64 = sqlx::query_scalar("PRAGMA wal_autocheckpoint")
+        .fetch_one(&writer)
+        .await
+        .expect("wal_autocheckpoint pragma");
+    assert_eq!(autocheckpoint, 0);
+    writer.close().await;
+}

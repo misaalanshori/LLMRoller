@@ -300,3 +300,68 @@ proptest! {
         prop_assert_eq!(parsed["model"].as_str(), Some(model_name.as_str()));
     }
 }
+
+#[doc = "Spec: API-4, API-5, TRN-2, SEC-16"]
+#[test]
+fn test_stream_options_sibling_fields_and_session_override_edge_cases() {
+    // F-007: numeric/boolean sibling fields before include_usage inside stream_options
+    let raw_sibling = Bytes::from_static(
+        br#"{"model":"gpt-4o","stream":true,"stream_options":{"extra":123,"include_obfuscation":true,"include_usage":false}}"#,
+    );
+    let (out_sib, strip_sib) = edit_body(
+        raw_sibling,
+        PoolTier::Own,
+        None,
+        ChatStreamMode::Inject,
+        None,
+    )
+    .expect("sibling stream_options must parse and replace false with true");
+    assert!(strip_sib);
+    let parsed_sib: serde_json::Value = serde_json::from_slice(&out_sib).expect("valid json");
+    assert_eq!(parsed_sib["stream_options"]["extra"], 123);
+    assert_eq!(parsed_sib["stream_options"]["include_obfuscation"], true);
+    assert_eq!(parsed_sib["stream_options"]["include_usage"], true);
+
+    // F-007: non-boolean include_usage and duplicate keys inside stream_options are rejected
+    let bad_usage_type =
+        br#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":"yes"}}"#;
+    assert!(matches!(
+        scan_top_level(bad_usage_type).expect_err("non-bool include_usage must fail"),
+        BodyEditError::InvalidType(_)
+    ));
+    let dup_stream_opt =
+        br#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false,"include_usage":true}}"#;
+    assert!(matches!(
+        scan_top_level(dup_stream_opt).expect_err("duplicate stream_options key must fail"),
+        BodyEditError::DuplicateKey(_)
+    ));
+
+    // F-008: custom session_field on Shared/Global strips any matching top-level key before inserting
+    let raw_custom = Bytes::from_static(br#"{"custom_session":"client-1","model":"gpt-4o"}"#);
+    let (out_custom, _) = edit_body(
+        raw_custom,
+        PoolTier::Shared,
+        None,
+        ChatStreamMode::Native,
+        Some(("custom_session", "llr_salted123")),
+    )
+    .expect("custom session field edit");
+    let parsed_custom: serde_json::Value =
+        serde_json::from_slice(&out_custom).expect("valid json");
+    assert_eq!(parsed_custom["custom_session"], "llr_salted123");
+    assert!(scan_top_level(&out_custom).is_ok());
+
+    // F-016: on Own tier, a higher-precedence header session ID overrides a conflicting body session_id
+    let raw_own = Bytes::from_static(br#"{"session_id":"stale-body","model":"gpt-4o"}"#);
+    let (out_own, _) = edit_body(
+        raw_own,
+        PoolTier::Own,
+        None,
+        ChatStreamMode::Native,
+        Some(("session_id", "header-override")),
+    )
+    .expect("own tier header override");
+    let parsed_own: serde_json::Value = serde_json::from_slice(&out_own).expect("valid json");
+    assert_eq!(parsed_own["session_id"], "header-override");
+    assert!(scan_top_level(&out_own).is_ok());
+}

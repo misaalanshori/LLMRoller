@@ -319,3 +319,110 @@ async fn test_sealer_pool_flush_drains_accepted_jobs_and_closes_submissions() {
     assert_eq!(pool.in_flight(), 0);
     assert!(pool.dropped_jobs_count.load(Ordering::SeqCst) >= 1);
 }
+
+#[tokio::test]
+#[doc = "Spec: TRC-5"]
+async fn page_2_cursor_pagination_seeds_lcp_from_last_turn_of_page_1() {
+    let (_dir, pool, sealer) = setup_trace_test_db().await;
+    let owner = UserId::generate();
+    let ck = ClientKeyId::generate();
+    let req1 = RequestId::generate();
+    let req2 = RequestId::generate();
+
+    // Seed parent user, client_key, and usage_events rows
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, 'trc5_u', 'h', 'user', 100)")
+        .bind(owner.to_string())
+        .execute(&pool)
+        .await
+        .expect("user");
+    sqlx::query("INSERT INTO client_keys (id, owner_user_id, label, prefix, key_hash, created_at) VALUES (?, ?, 'k', 'llr_1234', 'h1', 100)")
+        .bind(ck.to_string())
+        .bind(owner.to_string())
+        .execute(&pool)
+        .await
+        .expect("ck");
+    for (ue_id, req, ts) in [("ue_1", req1, 1_000_i64), ("ue_2", req2, 2_000_i64)] {
+        sqlx::query(
+            "INSERT INTO usage_events (id, ts, request_id, client_key_id, owner_user_id, endpoint, status, stream, cost_micro_usd, cost_source)
+             VALUES (?, ?, ?, ?, ?, 'chat', 200, 0, 0, 'provider')",
+        )
+        .bind(ue_id)
+        .bind(ts)
+        .bind(req.to_string())
+        .bind(ck.to_string())
+        .bind(owner.to_string())
+        .execute(&pool)
+        .await
+        .expect("ue");
+    }
+
+    let job1 = UnsealedTurnJob {
+        usage_event_id: "ue_1".to_string(),
+        request_id: req1,
+        ts: 1_000,
+        owner_user_id: owner,
+        client_key_id: ck,
+        session_hash: "sess_page".to_string(),
+        thread_id: "main".to_string(),
+        canonical_id: Some("gpt-4o".to_string()),
+        protocol: "chat".to_string(),
+        truncated_content: false,
+        master_key_id: "mk-test".to_string(),
+        trace_payload: StoredTurnTraceV2 {
+            v: 2,
+            request_skeleton: serde_json::json!({}),
+            block_refs: vec!["b1".to_string()],
+            response: serde_json::json!({"assistant_text": "hello"}),
+            response_raw: None,
+            truncation: None,
+        },
+        blocks: vec![("b1".to_string(), br#"{"role":"user","content":"hi"}"#.to_vec())],
+        expires_at: 99_000,
+    };
+    let job2 = UnsealedTurnJob {
+        usage_event_id: "ue_2".to_string(),
+        request_id: req2,
+        ts: 2_000,
+        owner_user_id: owner,
+        client_key_id: ck,
+        session_hash: "sess_page".to_string(),
+        thread_id: "main".to_string(),
+        canonical_id: Some("gpt-4o".to_string()),
+        protocol: "chat".to_string(),
+        truncated_content: false,
+        master_key_id: "mk-test".to_string(),
+        trace_payload: StoredTurnTraceV2 {
+            v: 2,
+            request_skeleton: serde_json::json!({}),
+            block_refs: vec!["b1".to_string(), "b2".to_string()],
+            response: serde_json::json!({"assistant_text": "world"}),
+            response_raw: None,
+            truncation: None,
+        },
+        blocks: vec![("b2".to_string(), br#"{"role":"user","content":"next"}"#.to_vec())],
+        expires_at: 99_000,
+    };
+
+    let sealed1 = seal_turn_job(&job1, &sealer, "mk-test").expect("seal 1");
+    let sealed2 = seal_turn_job(&job2, &sealer, "mk-test").expect("seal 2");
+
+    let mut tx = pool.begin().await.expect("begin");
+    insert_sealed_trace_tx(&mut tx, &sealed1, "mk-test").await.expect("insert 1");
+    insert_sealed_trace_tx(&mut tx, &sealed2, "mk-test").await.expect("insert 2");
+
+    let req1_str = req1.to_string();
+    let (pred, page2) = load_session_trace_page_tx(
+        &mut tx,
+        "sess_page",
+        Some(&owner),
+        Some((1_000, &req1_str)),
+        50,
+    )
+    .await
+    .expect("load page 2");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(pred.expect("predecessor turn").request_id, req1_str);
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].request_id, req2.to_string());
+}

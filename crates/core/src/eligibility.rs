@@ -40,6 +40,7 @@ pub struct CandidateRoute {
     pub provider_kind: crate::provider::ProviderKind,
     pub provider_ownership: OwnershipScope,
     pub provider_owner_id: Option<UserId>,
+    pub provider_owner_disabled: bool,
     pub provider_fingerprint: String,
     pub provider_enabled: bool,
     pub key_enabled: bool,
@@ -121,7 +122,7 @@ pub fn evaluate_candidate(
                     route.upstream_key_id,
                     route.provider_kind,
                     &route.provider_fingerprint,
-                    ctx.owner_disabled,
+                    false,
                 );
 
                 match matching_share {
@@ -130,7 +131,7 @@ pub fn evaluate_candidate(
                             s,
                             route.provider_kind,
                             &route.provider_fingerprint,
-                            ctx.owner_disabled,
+                            false,
                             Some(ctx.model_canonical_id),
                         )
                         .is_err()
@@ -151,8 +152,10 @@ pub fn evaluate_candidate(
         }
     };
 
-    // C3: Personal owner disabled check
-    if (tier == CandidatePoolTier::Own || tier == CandidatePoolTier::Shared) && ctx.owner_disabled {
+    // C3: Personal / grantor provider owner disabled check (F-049, RTE-3, USR-2, SHR-2)
+    if (tier == CandidatePoolTier::Own || tier == CandidatePoolTier::Shared)
+        && (route.provider_owner_disabled || ctx.owner_disabled)
+    {
         return Err(CheckFailure::C3GrantorDisabled);
     }
 

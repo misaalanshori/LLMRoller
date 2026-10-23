@@ -178,3 +178,22 @@ async fn hash_chain_verification() {
     ));
     assert_eq!(trunc_err.exit_code(), 9);
 }
+
+#[tokio::test]
+#[doc = "Spec: AUD-1, REL-2"]
+async fn concurrent_control_plane_mutations_preserve_intact_audit_hash_chain() {
+    let (_dir, pool) = migrated_database().await;
+    let key = hmac_key();
+    for i in 0..25 {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.expect("begin immediate");
+        let mut ent = entry(&format!("serialized_action_{i}"));
+        ent.ts = 1_700_000_000_000 + i * 10;
+        append(&mut tx, &key, ent).await.expect("append");
+        tx.commit().await.expect("commit");
+    }
+    let count = verify_audit_log(&pool, &key, None, None)
+        .await
+        .expect("serialized chain must verify cleanly");
+    assert_eq!(count, 25);
+}

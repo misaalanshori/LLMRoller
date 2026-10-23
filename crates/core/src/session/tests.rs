@@ -256,3 +256,45 @@ fn test_21_slot_exact_constant_session_detector() {
     }
     assert!(!detector.is_flagged(slow_key, &slow_hash));
 }
+
+#[doc = "Spec: RTE-1, SEC-16"]
+#[test]
+fn test_session_id_256_char_boundary_and_recursive_canonical_block_stripping() {
+    // F-009: 200-char and 256-char session IDs are valid; 257-char or space-containing IDs are rejected
+    let id_200 = "s".repeat(200);
+    let id_256 = "a".repeat(256);
+    let id_257 = "a".repeat(257);
+    assert!(is_valid_session_id(&id_200));
+    assert!(is_valid_session_id(&id_256));
+    assert!(!is_valid_session_id(&id_257));
+    assert!(!is_valid_session_id("has space"));
+
+    // F-020: nested cache_control, prompt_cache_breakpoint, and citations inside tool_result content blocks
+    let tool_res_with_nested_cache = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_01",
+        "content": [
+            {
+                "type": "text",
+                "text": "file contents",
+                "cache_control": {"type": "ephemeral"},
+                "prompt_cache_breakpoint": true,
+                "citations": [{"type": "char_location"}]
+            }
+        ]
+    });
+    let tool_res_clean = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": "toolu_01",
+        "content": [
+            {
+                "type": "text",
+                "text": "file contents"
+            }
+        ]
+    });
+    assert_eq!(
+        canonical_content(&tool_res_with_nested_cache),
+        canonical_content(&tool_res_clean)
+    );
+}

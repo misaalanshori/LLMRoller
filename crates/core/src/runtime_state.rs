@@ -303,6 +303,8 @@ pub struct RuntimeState {
     pub upstream_snapshots: DashMap<UpstreamKeyId, Arc<serde_json::Value>>,
     /// Last on-demand fresh poll start per key for the 10 s single-flight gate.
     pub last_fresh_poll_ts: DashMap<UpstreamKeyId, i64>,
+    /// Last data-plane traffic timestamp per upstream key for active (300s) vs idle (3600s) `/usage` polling (`USG-6`, `F-071`).
+    pub last_key_used_ms: DashMap<UpstreamKeyId, i64>,
     pub accumulators: Arc<MonthlyAccumulatorRegistry>,
     pub constant_session_detector: Arc<ConstantSessionDetector>,
 }
@@ -342,6 +344,7 @@ impl RuntimeState {
             window_counters: DashMap::new(),
             upstream_snapshots: DashMap::new(),
             last_fresh_poll_ts: DashMap::new(),
+            last_key_used_ms: DashMap::new(),
             accumulators: Arc::new(MonthlyAccumulatorRegistry::new()),
             constant_session_detector: Arc::new(ConstantSessionDetector::new()),
         }
@@ -427,6 +430,18 @@ impl RuntimeState {
         windows: &[UpstreamWindowObservation],
         now_ms: i64,
     ) {
+        self.reconcile_upstream_usage_at(key_id, budget_windows, windows, now_ms, now_ms);
+    }
+
+    /// Reconcile normalized upstream window observations capturing `local_at_observation` at poll start `t0_ms` (`USG-6`, `F-071`).
+    pub fn reconcile_upstream_usage_at(
+        &self,
+        key_id: UpstreamKeyId,
+        budget_windows: &[SnapshotBudgetWindow],
+        windows: &[UpstreamWindowObservation],
+        t0_ms: i64,
+        now_ms: i64,
+    ) {
         for configured in budget_windows {
             let local_kind: &str = configured
                 .upstream_window_kind
@@ -441,21 +456,26 @@ impl RuntimeState {
             let Some(counter) = self.window_counter(&configured.id) else {
                 continue;
             };
-            if remote.used_percent >= 100.0 {
+            let threshold_pct = (100 - counter.reserve_percent()).clamp(0, 100) as f64;
+            if remote.used_percent >= threshold_pct || remote.used_percent >= 100.0 {
                 // Mutate in place: overwriting the entry would silently clear a
-                // quarantine, cooldown, or credential strike counter (USG-5).
+                // quarantine, cooldown, or credential strike counter (USG-5, F-063).
+                let until = remote
+                    .resets_at
+                    .filter(|&incoming| incoming > now_ms)
+                    .unwrap_or(now_ms + 300_000);
                 let mut entry = self.key_health.entry(key_id).or_default();
-                if let Some(incoming) = remote.resets_at {
-                    entry.exhausted_until_ms = Some(
-                        entry
-                            .exhausted_until_ms
-                            .map_or(incoming, |existing| existing.max(incoming)),
-                    );
-                }
+                entry.exhausted_until_ms = Some(
+                    entry
+                        .exhausted_until_ms
+                        .map_or(until, |existing| existing.max(until)),
+                );
+                drop(entry);
+                self.health.bump_version();
             }
             let used_micro_usd =
                 (counter.limit_micro_usd() as f64 * remote.used_percent / 100.0).round() as i64;
-            let local_at_observation = counter.effective_used(now_ms);
+            let local_at_observation = counter.local_used(t0_ms);
             counter.observe(crate::windows::UpstreamObservation {
                 used_micro_usd,
                 observed_at_ms: now_ms,
@@ -596,6 +616,7 @@ impl RuntimeState {
         ttfb_ms: Option<u64>,
         now_ms: i64,
     ) {
+        self.last_key_used_ms.insert(key_id, now_ms);
         self.key_health.insert(key_id, KeyHealthEntry::default());
         // A success can clear a previous cooldown, so it is a health transition
         // that must be visible to the write-behind durable projection (REL-1).
@@ -716,6 +737,40 @@ impl RuntimeState {
     /// opaque UUIDs: `scope_kind = 'upstream_key'` windows always apply, while
     /// `scope_kind = 'route'` windows apply only to their configured model.
     #[must_use]
+    /// Computes the minimum remaining headroom in basis points (`0..=10_000`) across all
+    /// key-scoped (`scope_kind = 'upstream_key'`) and route-scoped (`scope_kind = 'route'`)
+    /// budget windows that apply to `(key_id, model_pk)` (`RTE-13`, `LIM-1`).
+    #[must_use]
+    pub fn headroom_bps_for_route(
+        &self,
+        snapshot: &ConfigSnapshot,
+        key_id: UpstreamKeyId,
+        model_pk: Option<ModelPk>,
+        now_ms: i64,
+    ) -> i64 {
+        let Some(windows) = snapshot.budget_windows.get(&key_id) else {
+            return 10_000;
+        };
+        let mut min_bps = 10_000_i64;
+        for window in windows
+            .iter()
+            .filter(|window| window_applies_to_model(window, model_pk))
+        {
+            if let Some(counter) = self.window_counters.get(&window.id) {
+                let max_spend = crate::windows::BudgetCounter::max_allowed_spend(counter.as_ref());
+                if max_spend <= 0 {
+                    min_bps = 0;
+                    continue;
+                }
+                let used = crate::windows::BudgetCounter::effective_used(counter.as_ref(), now_ms).max(0);
+                let rem = (max_spend - used).max(0);
+                let bps = (rem.saturating_mul(10_000) / max_spend).clamp(0, 10_000);
+                min_bps = min_bps.min(bps);
+            }
+        }
+        min_bps
+    }
+
     pub fn key_budget_admitted(
         &self,
         snapshot: &ConfigSnapshot,
@@ -834,9 +889,10 @@ impl RuntimeState {
                 | CacheInvalidationEvent::OwnerDisabled(_) => {}
             }
         }
-        if rebuild_windows {
-            self.rebuild_window_counters(snapshot, now_ms);
-        }
+        let _ = rebuild_windows;
+        // Always synchronize window_counters with the newly published snapshot so any
+        // newly created or updated budget_windows take effect immediately (F-095, LIM-1).
+        self.rebuild_window_counters(snapshot, now_ms);
     }
 
     /// Seeds a budget window counter from startup reconstruction.
@@ -858,6 +914,44 @@ impl RuntimeState {
         ));
         if ring_seed > 0 {
             crate::windows::BudgetCounter::record_actual(counter.as_ref(), now_ms, ring_seed);
+        }
+        self.window_counters.insert(window.id.clone(), counter);
+    }
+
+    /// Hydrates a budget window counter by replaying historical rollup buckets at their
+    /// original `bucket.start_ms` timestamps so rolling expiry remains exact across restarts (`REL-4`, `LIM-1`, `F-066`).
+    pub fn hydrate_window_counter_from_ring(
+        &self,
+        window: &SnapshotBudgetWindow,
+        ring: Option<&crate::windows::RollingRing>,
+        now_ms: i64,
+    ) {
+        let counter = Arc::new(AtomicBudgetCounter::for_window(
+            stable_counter_id(&window.id),
+            window.limit_micro_usd,
+            window.reserve_pct,
+            crate::windows::WindowKind::parse(&window.window_kind),
+            window.period_ms,
+            window.anchor_at,
+            window.upstream_window_kind.as_deref(),
+            now_ms,
+        ));
+        if let Some(ring) = ring {
+            let cutoff = window.period_ms.map_or(0, |period| now_ms - period);
+            let mut active_buckets: Vec<crate::windows::RingBucket> = ring
+                .buckets
+                .iter()
+                .copied()
+                .filter(|b| b.amount_micro_usd > 0 && b.start_ms >= cutoff && b.start_ms <= now_ms)
+                .collect();
+            active_buckets.sort_by_key(|b| b.start_ms);
+            for bucket in active_buckets {
+                crate::windows::BudgetCounter::record_actual(
+                    counter.as_ref(),
+                    bucket.start_ms,
+                    bucket.amount_micro_usd,
+                );
+            }
         }
         self.window_counters.insert(window.id.clone(), counter);
     }

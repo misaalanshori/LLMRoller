@@ -397,7 +397,18 @@ pub async fn list_providers(
         return Ok(Vec::new());
     };
 
-    rows.iter().map(provider_from_row).collect()
+    let mut providers: Vec<Provider> = rows
+        .iter()
+        .map(provider_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !actor.is_admin() && !actor.is_system() {
+        for p in &mut providers {
+            if p.ownership_scope == OwnershipScope::Global {
+                p.config_json = "{}".to_string();
+            }
+        }
+    }
+    Ok(providers)
 }
 
 /// Update an existing provider record within an active transaction.
@@ -488,15 +499,20 @@ pub async fn patch_provider_tx(
 /// means list price. Only `subscription_plan` providers apply the multiplier to
 /// the effective cost; the value is stored for every mode so switching modes is
 /// lossless.
-pub async fn set_provider_billing_plan(
-    pool: &SqlitePool,
+pub async fn set_provider_billing_plan_tx(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
     actor: &ActorScope,
     id: ProviderId,
     billing_coverage_mode: &str,
     plan_multiplier_bps: i64,
 ) -> Result<Provider, ProviderError> {
+    let canonical_mode = match billing_coverage_mode {
+        "payg" => "pay_as_you_go",
+        "hybrid_credits" => "subscription_plan",
+        other => other,
+    };
     if !matches!(
-        billing_coverage_mode,
+        canonical_mode,
         "subscription_plan" | "pay_as_you_go" | "shared_grant" | "free_tier"
     ) {
         return Err(ProviderError::Validation(format!(
@@ -508,8 +524,7 @@ pub async fn set_provider_billing_plan(
             "plan_multiplier_bps must be between 0 and 100000".to_string(),
         ));
     }
-    let mut tx = pool.begin().await?;
-    let existing = get_provider_tx(&mut tx, actor, id).await?;
+    let existing = get_provider_tx(tx, actor, id).await?;
     if !actor.is_admin()
         && !actor.is_system()
         && (existing.ownership_scope == OwnershipScope::Global
@@ -520,12 +535,30 @@ pub async fn set_provider_billing_plan(
     sqlx::query(
         "UPDATE providers SET billing_coverage_mode = ?, plan_multiplier_bps = ? WHERE id = ?",
     )
-    .bind(billing_coverage_mode)
+    .bind(canonical_mode)
     .bind(plan_multiplier_bps)
     .bind(id.to_string())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    let updated = get_provider_tx(&mut tx, actor, id).await?;
+    get_provider_tx(tx, actor, id).await
+}
+
+pub async fn set_provider_billing_plan(
+    pool: &SqlitePool,
+    actor: &ActorScope,
+    id: ProviderId,
+    billing_coverage_mode: &str,
+    plan_multiplier_bps: i64,
+) -> Result<Provider, ProviderError> {
+    let mut tx = pool.begin().await?;
+    let updated = set_provider_billing_plan_tx(
+        &mut tx,
+        actor,
+        id,
+        billing_coverage_mode,
+        plan_multiplier_bps,
+    )
+    .await?;
     tx.commit().await?;
     Ok(updated)
 }
@@ -1070,5 +1103,115 @@ fn check_key_access(actor: &ActorScope, key: &UpstreamKey) -> Result<(), Provide
         Ok(())
     } else {
         Err(ProviderError::UpstreamKeyNotFound(key.id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+    use crate::users::{NewUser, create_user};
+    use llmroller_core::rbac::Role as UserRole;
+    use llmroller_core::seams::OsEntropy;
+
+    #[tokio::test]
+    #[doc = "Spec: USR-3, USR-4, PRV-1, USG-10"]
+    async fn standard_user_cannot_read_global_provider_internal_config_json_and_can_update_billing_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("prov.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        let sys = ActorScope::system(
+            llmroller_core::rbac::SystemTask::Writer,
+            llmroller_core::rbac::SystemSeal::store(),
+        );
+        let admin = create_user(
+            &pool,
+            &sys,
+            NewUser {
+                username: "prov_admin",
+                password: "supersecretpassword123",
+                role: UserRole::Admin,
+                must_change_password: false,
+            },
+            &OsEntropy,
+            1_000,
+        )
+        .await
+        .expect("admin");
+        let user = create_user(
+            &pool,
+            &sys,
+            NewUser {
+                username: "prov_user",
+                password: "supersecretpassword123",
+                role: UserRole::User,
+                must_change_password: false,
+            },
+            &OsEntropy,
+            1_000,
+        )
+        .await
+        .expect("user");
+
+        let admin_actor = ActorScope::user(admin.id, UserRole::Admin);
+        let user_actor = ActorScope::user(user.id, UserRole::User);
+
+        let global_p = create_provider(
+            &pool,
+            &admin_actor,
+            NewProvider {
+                name: "GlobalSecret".to_string(),
+                kind: ProviderKind::Openrouter,
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                config_json: r#"{"add_headers":{"x-internal-gateway":"secret-token"}}"#.to_string(),
+                ownership_scope: OwnershipScope::Global,
+                owner_user_id: None,
+                usage_url_cross_origin_ack: false,
+                allow_private_network: false,
+                enabled: true,
+            },
+            1_000,
+        )
+        .await
+        .expect("create global provider");
+
+        let personal_p = create_provider(
+            &pool,
+            &user_actor,
+            NewProvider {
+                name: "UserPersonal".to_string(),
+                kind: ProviderKind::OpencodeGo,
+                base_url: "https://opencode.ai/zen/go/v1".to_string(),
+                config_json: r#"{"ua_policy":"label"}"#.to_string(),
+                ownership_scope: OwnershipScope::Personal,
+                owner_user_id: Some(user.id),
+                usage_url_cross_origin_ack: false,
+                allow_private_network: false,
+                enabled: true,
+            },
+            1_000,
+        )
+        .await
+        .expect("create personal provider");
+
+        let user_list = list_providers(&pool, &user_actor).await.expect("list");
+        let seen_global = user_list.iter().find(|p| p.id == global_p.id).expect("global in list");
+        assert_eq!(seen_global.config_json, "{}");
+
+        let updated = set_provider_billing_plan(
+            &pool,
+            &user_actor,
+            personal_p.id,
+            "subscription_plan",
+            2_000,
+        )
+        .await
+        .expect("set billing plan");
+        assert_eq!(updated.billing_coverage_mode, "subscription_plan");
+        assert_eq!(updated.plan_multiplier_bps, 2_000);
     }
 }

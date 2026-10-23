@@ -96,6 +96,13 @@ pub fn validate_tiers(tiers: &[ContextTier]) -> Result<(), String> {
         if a.min_total_input_tokens < 0 {
             return Err(format!("Tier {i} has negative min_total_input_tokens"));
         }
+        if a.input_per_mtok_micro_usd < 0
+            || a.output_per_mtok_micro_usd < 0
+            || a.cache_read_per_mtok_micro_usd < 0
+            || a.cache_write_per_mtok_micro_usd < 0
+        {
+            return Err(format!("Tier {i} has negative rate"));
+        }
         if let Some(max_a) = a.max_total_input_tokens
             && max_a < a.min_total_input_tokens
         {
@@ -396,7 +403,10 @@ pub fn estimate_input_tokens(body: &[u8]) -> i64 {
                         _ => false,
                     };
 
-                    if (is_binary_key || is_url_data) && raw_str.len() > 1024 {
+                    let is_data_uri = raw_str.starts_with(b"data:");
+                    if (is_url_data || is_data_uri || (is_binary_key && is_mostly_base64(raw_str)))
+                        && raw_str.len() > 1024
+                    {
                         binary_blocks += 1;
                     } else {
                         text_bytes += decoded_len as i64;
@@ -432,6 +442,21 @@ pub fn estimate_input_tokens(body: &[u8]) -> i64 {
     }
 
     div_ceil_i64(text_bytes, 4) + binary_blocks * 1600
+}
+
+
+fn is_mostly_base64(raw_str: &[u8]) -> bool {
+    let payload = if let Some(idx) = raw_str.windows(7).position(|w| w == b"base64,") {
+        &raw_str[idx + 7..]
+    } else {
+        raw_str
+    };
+    let sample_len = payload.len().min(512);
+    sample_len > 0
+        && payload[..sample_len].iter().all(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+        })
 }
 
 #[cfg(test)]

@@ -128,13 +128,11 @@ impl ShutdownSupervisor {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Step 4: Cancel any remaining open streams with Termination::ShutdownCut
-        if self.open_streams_counter.load(Ordering::SeqCst) > 0 {
-            if let Some(cut) = &self.shutdown_cut {
-                cut.store(true, Ordering::SeqCst);
-            }
-            self.shutdown_notify.notify_waiters();
+        // Step 4: Cancel any remaining open streams with Termination::ShutdownCut (REL-3, F-097)
+        if let Some(cut) = &self.shutdown_cut {
+            cut.store(true, Ordering::SeqCst);
         }
+        self.shutdown_notify.notify_waiters();
 
         // Step 5: Background tasks observe the drain flag and stop scheduling work.
         if let Some(stop) = &self.background_stop {

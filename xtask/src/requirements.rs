@@ -158,6 +158,7 @@ impl Registry {
         out: &mut impl Write,
     ) -> Result<(), String> {
         scan.reject_unjustified_mutants_skips()?;
+        scan.reject_empty_test_stubs()?;
         self.reject_unknown_annotations(scan)?;
 
         let selected = self.milestone(milestone);
@@ -169,6 +170,7 @@ impl Registry {
 
         let mut missing = Vec::new();
         let mut partial_only = Vec::new();
+        let mut unlinked_targets = Vec::new();
         for requirement in &selected {
             let full_links = scan.spec_links(&requirement.id);
             let partial_links = scan.partial_links(&requirement.id);
@@ -178,16 +180,20 @@ impl Registry {
                 } else {
                     missing.push(requirement);
                 }
+            } else if !scan.has_spec_link_in_paths(&requirement.id, &requirement.tests) {
+                unlinked_targets.push(requirement);
             }
         }
 
-        let traced = selected.len() - missing.len() - partial_only.len();
+        let traced =
+            selected.len() - missing.len() - partial_only.len() - unlinked_targets.len();
         writeln!(
             out,
-            "{milestone}: {traced}/{} requirements have full Spec links ({} partial-only, {} missing)",
+            "{milestone}: {traced}/{} requirements have full Spec links ({} partial-only, {} missing, {} unlinked-targets)",
             selected.len(),
             partial_only.len(),
-            missing.len()
+            missing.len(),
+            unlinked_targets.len()
         )
         .map_err(|error| format!("cannot write traceability report: {error}"))?;
 
@@ -210,15 +216,26 @@ impl Registry {
             )
             .map_err(|error| format!("cannot write traceability report: {error}"))?;
         }
+        for requirement in &unlinked_targets {
+            writeln!(
+                out,
+                "UNLINKED_TARGET [{}] {}: Spec link not found in any registered test file {:?}",
+                requirement.priority,
+                requirement.id,
+                requirement.tests
+            )
+            .map_err(|error| format!("cannot write traceability report: {error}"))?;
+        }
 
-        if missing.is_empty() && partial_only.is_empty() {
+        if missing.is_empty() && partial_only.is_empty() && unlinked_targets.is_empty() {
             Ok(())
         } else {
             Err(format!(
-                "milestone {milestone} traceability gate failed: {} full, {} partial-only, {} missing",
+                "milestone {milestone} traceability gate failed: {} full, {} partial-only, {} missing, {} unlinked-targets",
                 traced,
                 partial_only.len(),
-                missing.len()
+                missing.len(),
+                unlinked_targets.len()
             ))
         }
     }
@@ -414,8 +431,16 @@ tests = ["crates/core/src/wrr/proptests.rs"]
     fn milestone_gate_rejects_partial_only_and_missing_links() {
         let registry = Registry::parse(REGISTRY).expect("registry must parse");
         let mut scan = Scan::default();
-        scan.record("AUTH-1", true, PathBuf::from("a.rs"));
-        scan.record("SEC-1", false, PathBuf::from("b.rs"));
+        scan.record(
+            "AUTH-1",
+            true,
+            PathBuf::from("tests/e2e_setup_and_auth.rs"),
+        );
+        scan.record(
+            "SEC-1",
+            false,
+            PathBuf::from("crates/store/src/crypto/tests.rs"),
+        );
         let mut output = Vec::new();
         let error = registry
             .traceability("M0", &scan, &mut output)
@@ -429,11 +454,42 @@ tests = ["crates/core/src/wrr/proptests.rs"]
     }
 
     #[test]
+    #[doc = "Spec: MNT-1"]
+    fn milestone_gate_rejects_unlinked_registered_test_targets() {
+        let registry = Registry::parse(REGISTRY).expect("registry must parse");
+        let mut scan = Scan::default();
+        scan.record("AUTH-1", true, PathBuf::from("unrelated/file.rs"));
+        scan.record(
+            "SEC-1",
+            true,
+            PathBuf::from("crates/store/src/crypto/tests.rs"),
+        );
+        let mut output = Vec::new();
+        let error = registry
+            .traceability("M0", &scan, &mut output)
+            .expect_err("unlinked target must fail");
+        assert!(
+            error.contains("1 full, 0 partial-only, 0 missing, 1 unlinked-targets"),
+            "{error}"
+        );
+        let report = String::from_utf8(output).expect("utf-8 report");
+        assert!(report.contains("UNLINKED_TARGET [P0] AUTH-1"), "{report}");
+    }
+
+    #[test]
     fn milestone_gate_passes_when_every_requirement_has_a_spec_link() {
         let registry = Registry::parse(REGISTRY).expect("registry must parse");
         let mut scan = Scan::default();
-        scan.record("AUTH-1", true, PathBuf::from("a.rs"));
-        scan.record("SEC-1", true, PathBuf::from("b.rs"));
+        scan.record(
+            "AUTH-1",
+            true,
+            PathBuf::from("tests/e2e_setup_and_auth.rs"),
+        );
+        scan.record(
+            "SEC-1",
+            true,
+            PathBuf::from("crates/store/src/crypto/tests.rs"),
+        );
         let mut output = Vec::new();
         registry
             .traceability("M0", &scan, &mut output)

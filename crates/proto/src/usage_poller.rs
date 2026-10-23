@@ -40,10 +40,16 @@ pub struct SanitizedUsageSnapshot {
 }
 
 /// Per-key single-flight poller state.
+/// Active key polling interval (`300 s` = `300,000 ms`, SRDD Section 13.3).
+pub const ACTIVE_KEY_POLL_INTERVAL_MS: i64 = 300_000;
+/// Idle key polling interval (`3600 s` = `3,600,000 ms`, SRDD Section 13.3).
+pub const IDLE_KEY_POLL_INTERVAL_MS: i64 = 3_600_000;
+
 #[derive(Debug, Default)]
 pub struct KeyPollerState {
     pub poll_in_flight: AtomicBool,
     pub last_poll_started_ms: std::sync::atomic::AtomicI64,
+    pub next_scheduled_poll_ms: std::sync::atomic::AtomicI64,
 }
 
 impl KeyPollerState {
@@ -60,6 +66,53 @@ impl KeyPollerState {
             .is_ok()
         {
             self.last_poll_started_ms.store(now_ms, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evaluate scheduled background poll eligibility honoring active (`300s`) vs idle (`3600s`)
+    /// cadence, `30s` minimum interval, and `±20%` (`8000..=12000` bps) jitter (`USG-6`, `F-071`).
+    pub fn try_start_scheduled_poll(
+        &self,
+        now_ms: i64,
+        is_active_key: bool,
+        jitter_bps: i64,
+    ) -> bool {
+        let last = self.last_poll_started_ms.load(Ordering::Acquire);
+        if last > 0 && now_ms.saturating_sub(last) < 30_000 {
+            return false;
+        }
+        let next_due = self.next_scheduled_poll_ms.load(Ordering::Acquire);
+        let base_interval = if is_active_key {
+            ACTIVE_KEY_POLL_INTERVAL_MS
+        } else {
+            IDLE_KEY_POLL_INTERVAL_MS
+        };
+        let clamped_jitter = jitter_bps.clamp(8_000, 12_000);
+        let jittered_interval = ((base_interval * clamped_jitter) / 10_000).max(30_000);
+
+        // If a key becomes active while waiting on an idle schedule, allow it after the active interval.
+        let effective_due = if last == 0 {
+            0
+        } else if is_active_key {
+            next_due.min(last + jittered_interval)
+        } else {
+            next_due.max(last + jittered_interval)
+        };
+        if now_ms < effective_due {
+            return false;
+        }
+
+        if self
+            .poll_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.last_poll_started_ms.store(now_ms, Ordering::Release);
+            self.next_scheduled_poll_ms
+                .store(now_ms + jittered_interval, Ordering::Release);
             true
         } else {
             false
@@ -223,12 +276,15 @@ pub fn parse_raw_usage_to_sanitized(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
             let mut windows = Vec::new();
-            if let Some(window) = raw_json
+            if let Some(limits) = raw_json
                 .get("rateLimits")
                 .and_then(serde_json::Value::as_object)
-                .and_then(|limits| limits.get("rolling5h"))
             {
-                windows.push(parse_window_obj("5h", window, now_ms));
+                for (field, label) in [("rolling5h", "5h"), ("weekly", "7d"), ("monthly", "1mo")] {
+                    if let Some(window) = limits.get(field) {
+                        windows.push(parse_window_obj(label, window, now_ms));
+                    }
+                }
             }
             if windows.is_empty()
                 && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())
@@ -270,33 +326,133 @@ pub fn parse_raw_usage_to_sanitized(
                 .get("usage")
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0);
+            let usage_monthly_usd = data
+                .get("usage_monthly")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(usage_usd);
             let limit_usd = data
                 .get("limit")
                 .and_then(serde_json::Value::as_f64)
-                .unwrap_or(100.0);
-            let used_pct = if limit_usd > 0.0 {
-                (usage_usd / limit_usd) * 100.0
-            } else {
-                0.0
-            };
-            let balance = data
+                .or_else(|| {
+                    data.pointer("/effective_budget/limit_usd")
+                        .and_then(serde_json::Value::as_f64)
+                })
+                .filter(|&v| v.is_finite() && v > 0.0);
+            let limit_remaining = data
                 .get("limit_remaining")
                 .and_then(serde_json::Value::as_f64)
-                .unwrap_or_else(|| (limit_usd - usage_usd).max(0.0));
-            let mut windows = vec![parse_window_obj(
-                "1mo",
-                &serde_json::json!({ "used_percent": used_pct }),
-                now_ms,
-            )];
-            windows[0].remaining_micro_usd = Some(usd_to_micro(balance));
-            Some(SanitizedUsageSnapshot {
-                status: "ok".to_string(),
-                plan_name: None,
-                windows,
-                balance_micro_usd: Some(usd_to_micro(balance)),
-            })
+                .or_else(|| {
+                    data.pointer("/effective_budget/remaining_usd")
+                        .and_then(serde_json::Value::as_f64)
+                })
+                .filter(|v| v.is_finite());
+
+            if let Some(limit) = limit_usd {
+                let used_pct = ((usage_monthly_usd / limit) * 100.0).clamp(0.0, 100.0);
+                let balance = limit_remaining.unwrap_or_else(|| (limit - usage_monthly_usd).max(0.0));
+                let mut windows = vec![parse_window_obj(
+                    "1mo",
+                    &serde_json::json!({ "used_percent": used_pct }),
+                    now_ms,
+                )];
+                windows[0].remaining_micro_usd = Some(usd_to_micro(balance));
+                Some(SanitizedUsageSnapshot {
+                    status: "ok".to_string(),
+                    plan_name: None,
+                    windows,
+                    balance_micro_usd: Some(usd_to_micro(balance)),
+                })
+            } else {
+                // F-012: Unlimited OpenRouter keys (`"limit": null`) must not synthesize a $100 cap
+                Some(SanitizedUsageSnapshot {
+                    status: "ok".to_string(),
+                    plan_name: None,
+                    windows: Vec::new(),
+                    balance_micro_usd: limit_remaining.map(usd_to_micro),
+                })
+            }
         }
-        _ => None,
+        ProviderKind::OpenDesignAmr | ProviderKind::Custom => {
+            if raw_json.get("data").is_some() {
+                return parse_raw_usage_to_sanitized(ProviderKind::Openrouter, raw_json);
+            }
+            let plan = raw_json
+                .get("plan")
+                .or_else(|| raw_json.get("plan_name"))
+                .or_else(|| raw_json.get("account").and_then(|a| a.get("plan")))
+                .or_else(|| raw_json.get("user").and_then(|u| u.get("tier")))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let mut windows = Vec::new();
+            if let Some(usage) = raw_json.get("usage").and_then(serde_json::Value::as_object) {
+                for (field, label) in [
+                    ("rolling", "5h"),
+                    ("5h", "5h"),
+                    ("weekly", "7d"),
+                    ("7d", "7d"),
+                    ("monthly", "1mo"),
+                    ("1mo", "1mo"),
+                ] {
+                    if let Some(window) = usage.get(field) {
+                        windows.push(parse_window_obj(label, window, now_ms));
+                    }
+                }
+            }
+            if let Some(limits) = raw_json
+                .get("rateLimits")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (field, label) in [("rolling5h", "5h"), ("weekly", "7d"), ("monthly", "1mo")] {
+                    if let Some(window) = limits.get(field) {
+                        windows.push(parse_window_obj(label, window, now_ms));
+                    }
+                }
+            }
+            if windows.is_empty()
+                && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())
+            {
+                for item in arr {
+                    let label = item
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("window");
+                    windows.push(parse_window_obj(label, item, now_ms));
+                }
+            }
+            let balance_micro_usd = raw_json
+                .get("balance_micro_usd")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| {
+                    raw_json
+                        .get("balance_usd")
+                        .or_else(|| raw_json.get("balanceUsd"))
+                        .and_then(serde_json::Value::as_f64)
+                        .map(usd_to_micro)
+                })
+                .or_else(|| {
+                    raw_json.get("credits").and_then(|credits| {
+                        credits
+                            .get("balance_micro_usd")
+                            .and_then(serde_json::Value::as_i64)
+                            .or_else(|| {
+                                credits
+                                    .get("balanceUsd")
+                                    .and_then(serde_json::Value::as_f64)
+                                    .map(usd_to_micro)
+                            })
+                    })
+                });
+            if plan.is_none() && windows.is_empty() && balance_micro_usd.is_none() {
+                None
+            } else {
+                Some(SanitizedUsageSnapshot {
+                    status: "ok".to_string(),
+                    plan_name: plan,
+                    windows,
+                    balance_micro_usd,
+                })
+            }
+        }
     }
 }
 
@@ -381,5 +537,58 @@ mod tests {
         assert_eq!(parsed.windows[0].kind, "5h");
         assert_eq!(parsed.windows[0].used_percent, 33.0);
         assert_eq!(parsed.windows[1].kind, "1mo");
+    }
+
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1"]
+    fn openrouter_null_limit_does_not_synthesize_fake_100_dollar_cap() {
+        let raw = serde_json::json!({
+            "data": {
+                "usage": 142.75,
+                "usage_daily": 12.0,
+                "usage_weekly": 45.0,
+                "usage_monthly": 142.75,
+                "limit": null,
+                "limit_remaining": null,
+                "is_free_tier": false
+            }
+        });
+        let parsed = parse_raw_usage_to_sanitized(ProviderKind::Openrouter, &raw).expect("parsed");
+        assert!(
+            parsed.windows.is_empty(),
+            "unlimited OpenRouter key must not fabricate a 1mo window"
+        );
+        assert_eq!(parsed.balance_micro_usd, None);
+    }
+
+    #[test]
+    #[doc = "Spec: USG-4, USG-5, USG-6, PRV-1"]
+    fn command_code_weekly_monthly_and_open_design_amr_windows_parse() {
+        let cc_raw = serde_json::json!({
+            "now_ms": 1_792_400_000_000_i64,
+            "rateLimits": {
+                "rolling5h": {"usedPercent": 20.0},
+                "weekly": {"usedPercent": 55.0},
+                "monthly": {"usedPercent": 80.0}
+            }
+        });
+        let cc = parse_raw_usage_to_sanitized(ProviderKind::CommandCode, &cc_raw).expect("cc");
+        assert_eq!(cc.windows.len(), 3);
+        assert_eq!(cc.windows[1].kind, "7d");
+        assert_eq!(cc.windows[2].kind, "1mo");
+
+        let amr_raw = serde_json::json!({
+            "plan": "Design Plan",
+            "usage": {
+                "rolling": {"usedPercent": 15.0},
+                "weekly": {"usedPercent": 35.0}
+            },
+            "balance_usd": 42.5
+        });
+        let amr =
+            parse_raw_usage_to_sanitized(ProviderKind::OpenDesignAmr, &amr_raw).expect("amr");
+        assert_eq!(amr.plan_name.as_deref(), Some("Design Plan"));
+        assert_eq!(amr.windows.len(), 2);
+        assert_eq!(amr.balance_micro_usd, Some(42_500_000));
     }
 }

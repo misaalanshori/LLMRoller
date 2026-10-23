@@ -17,6 +17,7 @@ pub(crate) struct Scan {
     spec: BTreeMap<String, BTreeSet<PathBuf>>,
     partial: BTreeMap<String, BTreeSet<PathBuf>>,
     unjustified_mutants_skips: Vec<String>,
+    empty_test_stubs: Vec<String>,
     pub(crate) files_scanned: usize,
 }
 
@@ -49,6 +50,18 @@ impl Scan {
         self.partial.get(id).map_or(0, BTreeSet::len)
     }
 
+    pub(crate) fn has_spec_link_in_paths(&self, id: &str, allowed_rel_paths: &[String]) -> bool {
+        let Some(recorded_paths) = self.spec.get(id) else {
+            return false;
+        };
+        recorded_paths.iter().any(|recorded| {
+            let norm = recorded.to_string_lossy().replace('\\', "/");
+            allowed_rel_paths.iter().any(|allowed| {
+                norm == *allowed || norm.ends_with(&format!("/{allowed}"))
+            })
+        })
+    }
+
     pub(crate) fn all_ids(&self) -> BTreeSet<&str> {
         self.spec
             .keys()
@@ -72,6 +85,16 @@ impl Scan {
         Err(format!(
             "every #[mutants::skip] requires an `equivalent:` reason comment:\n  {}",
             self.unjustified_mutants_skips.join("\n  ")
+        ))
+    }
+
+    pub(crate) fn reject_empty_test_stubs(&self) -> Result<(), String> {
+        if self.empty_test_stubs.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "empty stub test functions are forbidden by TDD governance:\n  {}",
+            self.empty_test_stubs.join("\n  ")
         ))
     }
 
@@ -112,7 +135,32 @@ impl Scan {
             }
         }
         for (index, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("#[mutants::skip]") {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[test]")
+                || trimmed.starts_with("#[tokio::test")
+                || trimmed.starts_with("#[sqlx::test")
+            {
+                for candidate_idx in (index + 1)..(index + 7).min(lines.len()) {
+                    let candidate = lines[candidate_idx].trim();
+                    if candidate.starts_with("#[") || candidate.starts_with("//") {
+                        continue;
+                    }
+                    if candidate.starts_with("fn ") || candidate.starts_with("async fn ") {
+                        let empty_inline =
+                            candidate.ends_with("{}") || candidate.ends_with("{ }");
+                        let empty_two_line = candidate.ends_with('{')
+                            && lines
+                                .get(candidate_idx + 1)
+                                .is_some_and(|next| next.trim() == "}");
+                        if empty_inline || empty_two_line {
+                            self.empty_test_stubs
+                                .push(format!("{}:{}", path.display(), candidate_idx + 1));
+                        }
+                    }
+                    break;
+                }
+            }
+            if !trimmed.starts_with("#[mutants::skip]") {
                 continue;
             }
             let start = index.saturating_sub(1);
@@ -262,6 +310,31 @@ mod tests {
             .expect_err("unjustified skip must fail");
         assert!(error.contains(":1"), "{error}");
         assert!(error.contains("every #[mutants::skip]"), "{error}");
+    }
+
+    #[test]
+    #[doc = "Spec: MNT-1"]
+    fn flags_empty_test_stubs_and_checks_registered_test_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        fs::create_dir_all(root.join("crates/core/src")).expect("source dir");
+        fs::write(
+            root.join("crates/core/src/lib.rs"),
+            concat!(
+                "#[test]\n",
+                "#[doc = \"Spec: SEC-1\"]\n",
+                "fn empty_stub() {}\n",
+            ),
+        )
+        .expect("source file");
+
+        let scan = Scan::scan_workspace(root).expect("scan");
+        let err = scan
+            .reject_empty_test_stubs()
+            .expect_err("empty test stub must fail");
+        assert!(err.contains("empty stub test functions"), "{err}");
+        assert!(scan.has_spec_link_in_paths("SEC-1", &["crates/core/src/lib.rs".to_string()]));
+        assert!(!scan.has_spec_link_in_paths("SEC-1", &["crates/other/src/lib.rs".to_string()]));
     }
 
     #[test]

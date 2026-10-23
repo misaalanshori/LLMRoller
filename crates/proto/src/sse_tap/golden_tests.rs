@@ -291,3 +291,52 @@ fn test_openrouter_cost_parsing() {
     let u = extract_json_usage(EndpointKind::Chat, &chat_openrouter).expect("extract usage");
     assert_eq!(u.provider_cost_micro_usd, Some(1234));
 }
+
+#[doc = "Spec: API-5, USG-1, USG-2, USG-3, USG-9"]
+#[test]
+fn test_aborted_messages_and_responses_streams_preserve_input_and_estimate_output() {
+    // F-002 & F-003: message_start followed by delta text and abort before message_delta
+    let mut msg_tap = SseUsageTap::new(EndpointKind::Messages);
+    msg_tap.feed_chunk(
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":1,\"cache_read_input_tokens\":40,\"cache_creation\":{\"ephemeral_5m_input_tokens\":15,\"ephemeral_1h_input_tokens\":5},\"output_tokens_details\":{\"thinking_tokens\":9}}}}\n\n",
+    );
+    let delta_400 = "x".repeat(400);
+    let delta_frame = format!(
+        "event: content_block_delta\ndata: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{delta_400}"}}}}\n\n"
+    );
+    msg_tap.feed_chunk(delta_frame.as_bytes());
+    let u = msg_tap.finalize_usage();
+    assert_eq!(u.input_uncached_tokens, 120);
+    assert_eq!(u.cache_read_tokens, 40);
+    assert_eq!(u.cache_write_tokens, 20);
+    assert_eq!(u.reasoning_tokens, 9);
+    assert_eq!(u.output_tokens, 100); // ceil(400 / 4) = 100
+
+    // F-002: message_delta with input_tokens: 0 or null does not clobber message_start input_tokens
+    msg_tap.feed_chunk(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":150}}\n\n",
+    );
+    let u_done = msg_tap.finalize_usage();
+    assert_eq!(u_done.input_uncached_tokens, 120);
+    assert_eq!(u_done.output_tokens, 150);
+    assert_eq!(msg_tap.stop_reason.as_deref(), Some("end_turn"));
+
+    // F-003 & F-006: response.created with output_tokens: 0 followed by abort estimates output
+    let mut resp_tap = SseUsageTap::new(EndpointKind::Responses);
+    resp_tap.feed_chunk(
+        b"data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":80,\"output_tokens\":0}}}\n\n",
+    );
+    resp_tap.feed_chunk(
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"1234567890123456\"}\n\n",
+    );
+    let u_resp = resp_tap.finalize_usage();
+    assert_eq!(u_resp.input_uncached_tokens, 80);
+    assert_eq!(u_resp.output_tokens, 4);
+
+    // F-006: incomplete_details.reason == max_output_tokens normalizes to "length"
+    resp_tap.feed_chunk(
+        b"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":80,\"output_tokens\":32}}}\n\n",
+    );
+    assert_eq!(resp_tap.stop_reason.as_deref(), Some("length"));
+    assert_eq!(resp_tap.finalize_usage().output_tokens, 32);
+}

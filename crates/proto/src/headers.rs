@@ -296,11 +296,11 @@ pub fn apply_response_header_pipeline(
             continue;
         }
 
-        // R3: Retain only allow-listed headers
+        // R3: Retain only allow-listed headers (case-insensitive per RFC 9110 / F-017)
         let is_base_allowed = RESPONSE_BASE_ALLOWLIST.contains(&name_lower.as_str());
         let is_config_allowed = response_header_allow
             .iter()
-            .any(|allowed| allowed.to_ascii_lowercase() == name_lower);
+            .any(|allowed| allowed.eq_ignore_ascii_case(name.as_str()));
         let is_rate_limit_allowed = (tier == PoolTier::Own || is_admin)
             && (name_lower.starts_with("x-ratelimit-")
                 || name_lower.starts_with("anthropic-ratelimit-"));
@@ -412,22 +412,77 @@ pub fn scrub_canary_tokens(input: &str, canaries: &[&str]) -> String {
     scrub_secret_prefixes(&result)
 }
 
-/// Scrub any tokens starting with sk- or llr_ in text.
+/// Allow-listed safe diagnostic request headers persisted on `usage_events.request_headers_json` (`USG-9`, `SEC-6`).
+pub const SAFE_DIAGNOSTIC_HEADERS: [&str; 9] = [
+    "anthropic-version",
+    "content-length",
+    "content-type",
+    "openai-beta",
+    "user-agent",
+    "x-claude-code-session-id",
+    "x-opencode-session",
+    "x-session-id",
+    "x-session-affinity",
+];
+
+/// Extract allow-listed diagnostic request headers as a compact JSON object (`<= 4 KiB`),
+/// scrubbing any secret prefixes (`F-011`, `USG-9`, `SEC-6`).
+#[must_use]
+pub fn extract_safe_diagnostic_headers(headers: &HeaderMap) -> String {
+    let mut map = std::collections::BTreeMap::new();
+    for &name in &SAFE_DIAGNOSTIC_HEADERS {
+        if let Some(val) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let scrubbed = scrub_secret_prefixes(val);
+            map.insert(name.to_string(), scrubbed);
+        }
+    }
+    let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string());
+    if json.len() <= 4096 {
+        json
+    } else {
+        "{}".to_string()
+    }
+}
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// Scrub any tokens starting with `sk-`, `oc_sk_`, or `llr_` followed by `>= 8` token characters
+/// anywhere in `input` (including after `=`, `:`, quotes, or inside JSON strings; `F-010`, `SEC-6`).
 #[must_use]
 pub fn scrub_secret_prefixes(input: &str) -> String {
+    let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
-    for word in input.split_inclusive(|c: char| !c.is_alphanumeric() && c != '-' && c != '_') {
-        let trimmed_word =
-            word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
-        let trailing = &word[trimmed_word.len()..];
-        if (trimmed_word.starts_with("sk-") && trimmed_word.len() > 7)
-            || (trimmed_word.starts_with("llr_") && trimmed_word.len() > 8)
-        {
-            out.push_str("[REDACTED]");
+    let mut i = 0;
+    while i < bytes.len() {
+        let prefix = if bytes[i..].starts_with(b"oc_sk_") {
+            Some("oc_sk_")
+        } else if bytes[i..].starts_with(b"sk-") {
+            Some("sk-")
+        } else if bytes[i..].starts_with(b"llr_") {
+            Some("llr_")
         } else {
-            out.push_str(trimmed_word);
+            None
+        };
+        if let Some(p) = prefix {
+            let prev_is_token = i > 0 && is_token_byte(bytes[i - 1]);
+            if !prev_is_token {
+                let start_tail = i + p.len();
+                let mut end_tail = start_tail;
+                while end_tail < bytes.len() && is_token_byte(bytes[end_tail]) {
+                    end_tail += 1;
+                }
+                if end_tail - start_tail >= 8 {
+                    out.push_str("[REDACTED]");
+                    i = end_tail;
+                    continue;
+                }
+            }
         }
-        out.push_str(trailing);
+        let ch = input[i..].chars().next().expect("valid char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

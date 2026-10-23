@@ -1,12 +1,13 @@
-//! Non-streaming JSON response token and cost extraction across protocols.
+//! Non-streaming JSON token usage, stop_reason, and provider cost extractor across protocols.
 //!
-//! Spec: Section 12.5, Requirements: USG-2, USG-3.
+//! Spec: Section 2.5, Section 6.8, Section 6.9, Section 12.5,
+//! Requirements: API-5, USG-1, USG-2, USG-9.
 
 use crate::adapters::EndpointKind;
-use llmroller_core::pricing::{TokenUsage, parse_provider_cost};
+use llmroller_core::pricing::TokenUsage;
 
-/// Normalized token usage and cost extracted from an upstream response.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Normalized token usage and provider cost extracted from upstream responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExtractedUsage {
     pub input_uncached_tokens: i64,
     pub cache_read_tokens: i64,
@@ -17,80 +18,141 @@ pub struct ExtractedUsage {
 }
 
 impl ExtractedUsage {
-    pub fn to_token_usage(&self) -> TokenUsage {
+    pub fn to_token_usage(self) -> TokenUsage {
         TokenUsage {
             input_uncached: self.input_uncached_tokens,
             cache_read: self.cache_read_tokens,
             cache_write: self.cache_write_tokens,
             output: self.output_tokens,
+            reasoning: self.reasoning_tokens,
         }
     }
 }
 
-/// Extracts normalized token usage from non-streaming JSON responses.
+/// Extracts normalized usage from a parsed JSON response object according to the endpoint protocol.
 pub fn extract_json_usage(
     endpoint: EndpointKind,
     json: &serde_json::Value,
 ) -> Option<ExtractedUsage> {
     match endpoint {
         EndpointKind::Chat => extract_chat_json_usage(json),
-        EndpointKind::Responses => extract_responses_json_usage(json),
+        EndpointKind::Responses | EndpointKind::ResponsesCompact => {
+            extract_responses_json_usage(json)
+        }
         EndpointKind::Messages => extract_messages_json_usage(json),
         _ => None,
     }
 }
 
+/// Extracts normalized `stop_reason` from a parsed JSON response or SSE event (`USG-9`, Section 12.5).
+pub fn extract_json_stop_reason(
+    endpoint: EndpointKind,
+    json: &serde_json::Value,
+) -> Option<String> {
+    match endpoint {
+        EndpointKind::Chat => json
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        EndpointKind::Responses | EndpointKind::ResponsesCompact => {
+            let resp = json.get("response").unwrap_or(json);
+            if let Some(reason) = resp
+                .pointer("/incomplete_details/reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(if reason == "max_output_tokens" {
+                    "length".to_string()
+                } else {
+                    reason.to_string()
+                });
+            }
+            resp.get("status")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|status| match status {
+                    "completed" => Some("stop".to_string()),
+                    "incomplete" => Some("length".to_string()),
+                    "failed" | "cancelled" => Some(status.to_string()),
+                    _ => None,
+                })
+        }
+        EndpointKind::Messages => json
+            .pointer("/delta/stop_reason")
+            .or_else(|| json.pointer("/message/stop_reason"))
+            .or_else(|| json.get("stop_reason"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Extracts usage from OpenAI `chat` format (`POST /v1/chat/completions`).
 pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
     let usage = json.get("usage")?;
-    if !usage.is_object() {
+    if usage.is_null() {
         return None;
     }
+
     let prompt_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let completion_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
-    let prompt_details = usage.get("prompt_tokens_details");
-    let cached_tokens = prompt_details
+    let details = usage.get("prompt_tokens_details");
+    let cache_read_tokens = details
         .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+        .max(0);
+
+    let cache_write_tokens = details
+        .and_then(|d| {
+            d.get("cache_write_tokens")
+                .or_else(|| d.get("cache_creation_input_tokens"))
+        })
         .and_then(|v| v.as_i64())
         .or_else(|| {
             usage
-                .get("prompt_cache_hit_tokens")
+                .get("cache_creation_input_tokens")
                 .and_then(|v| v.as_i64())
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
-    let cache_write_tokens = prompt_details
-        .and_then(|d| d.get("cache_write_tokens"))
+    let input_uncached_tokens =
+        if let Some(miss) = usage.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64()) {
+            miss.max(0)
+        } else {
+            prompt_tokens
+                .saturating_sub(cache_read_tokens)
+                .saturating_sub(cache_write_tokens)
+                .max(0)
+        };
+
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| {
+            d.get("reasoning_tokens")
+                .or_else(|| d.get("thinking_tokens"))
+        })
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
-    let input_uncached_tokens = if let Some(miss) = usage
-        .get("prompt_cache_miss_tokens")
-        .and_then(|v| v.as_i64())
-    {
-        miss
-    } else {
-        (prompt_tokens - cached_tokens - cache_write_tokens).max(0)
-    };
-
-    let comp_details = usage.get("completion_tokens_details");
-    let reasoning_tokens = comp_details
-        .and_then(|d| d.get("reasoning_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let cost_f64 = usage.get("cost").and_then(|v| v.as_f64());
-    let provider_cost_micro_usd = parse_provider_cost(cost_f64);
+    let provider_cost_micro_usd = extract_provider_cost(usage);
 
     Some(ExtractedUsage {
         input_uncached_tokens,
-        cache_read_tokens: cached_tokens,
+        cache_read_tokens,
         cache_write_tokens,
         output_tokens: completion_tokens,
         reasoning_tokens,
@@ -98,51 +160,66 @@ pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsag
     })
 }
 
+/// Extracts usage from OpenAI `responses` format (`POST /v1/responses`).
 pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
-    // Non-streaming responses expose top-level `usage`; streaming terminal events
-    // (`response.completed`, `response.incomplete`, `response.failed`) nest it
-    // under `response.usage` (Section 2.5, Section 12.5).
-    let usage = json.get("usage").or_else(|| {
-        json.get("response")
-            .and_then(|response| response.get("usage"))
-    })?;
-    if !usage.is_object() {
+    let usage = json
+        .get("usage")
+        .or_else(|| json.get("response").and_then(|r| r.get("usage")))?;
+    if usage.is_null() {
         return None;
     }
+
     let input_tokens = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let output_tokens = usage
         .get("output_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
-    let input_details = usage.get("input_tokens_details");
-    let cached_tokens = input_details
+    let in_details = usage.get("input_tokens_details");
+    let cache_read_tokens = in_details
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let cache_write_tokens = input_details
-        .and_then(|d| d.get("cache_write_tokens"))
+        .unwrap_or(0)
+        .max(0);
+    let cache_write_tokens = in_details
+        .and_then(|d| {
+            d.get("cache_write_tokens")
+                .or_else(|| d.get("cache_creation_input_tokens"))
+        })
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .or_else(|| {
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0)
+        .max(0);
 
-    let input_uncached_tokens = (input_tokens - cached_tokens - cache_write_tokens).max(0);
+    let input_uncached_tokens = input_tokens
+        .saturating_sub(cache_read_tokens)
+        .saturating_sub(cache_write_tokens)
+        .max(0);
 
-    let output_details = usage.get("output_tokens_details");
-    let reasoning_tokens = output_details
-        .and_then(|d| d.get("reasoning_tokens"))
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|d| {
+            d.get("reasoning_tokens")
+                .or_else(|| d.get("thinking_tokens"))
+        })
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
-    let cost_f64 = usage.get("cost").and_then(|v| v.as_f64());
-    let provider_cost_micro_usd = parse_provider_cost(cost_f64);
+    let provider_cost_micro_usd = extract_provider_cost(usage);
 
     Some(ExtractedUsage {
         input_uncached_tokens,
-        cache_read_tokens: cached_tokens,
+        cache_read_tokens,
         cache_write_tokens,
         output_tokens,
         reasoning_tokens,
@@ -150,41 +227,87 @@ pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<Extracte
     })
 }
 
+/// Extracts usage from Anthropic `messages` format (`POST /v1/messages`).
+///
+/// Supports both top-level `cache_creation_input_tokens` and nested OpenRouter/Anthropic
+/// `cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` as well as
+/// `output_tokens_details.thinking_tokens` (`F-005`, SRDD Section 12.5).
 pub fn extract_messages_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
-    let usage = json.get("usage")?;
-    if !usage.is_object() {
+    let usage = json
+        .get("usage")
+        .or_else(|| json.get("message").and_then(|m| m.get("usage")))?;
+    if usage.is_null() {
         return None;
     }
-    let input_tokens = usage
+
+    let input_uncached_tokens = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
+    let cache_read_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let cache_write_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            usage.get("cache_creation").map(|cc| {
+                let e5m = cc
+                    .get("ephemeral_5m_input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(0);
+                let e1h = cc
+                    .get("ephemeral_1h_input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .max(0);
+                e5m.saturating_add(e1h)
+            })
+        })
+        .unwrap_or(0)
+        .max(0);
     let output_tokens = usage
         .get("output_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cache_read = usage
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cache_write = usage
-        .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let reasoning_tokens = usage
-        .get("reasoning_tokens")
+        .get("output_tokens_details")
+        .and_then(|d| {
+            d.get("thinking_tokens")
+                .or_else(|| d.get("reasoning_tokens"))
+        })
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let cost_f64 = usage.get("cost").and_then(|v| v.as_f64());
-    let provider_cost_micro_usd = parse_provider_cost(cost_f64);
+        .or_else(|| {
+            usage
+                .get("reasoning_tokens")
+                .or_else(|| usage.get("thinking_tokens"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0)
+        .max(0);
+    let provider_cost_micro_usd = extract_provider_cost(usage);
 
     Some(ExtractedUsage {
-        input_uncached_tokens: input_tokens,
-        cache_read_tokens: cache_read,
-        cache_write_tokens: cache_write,
+        input_uncached_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         output_tokens,
         reasoning_tokens,
         provider_cost_micro_usd,
     })
+}
+
+fn extract_provider_cost(usage: &serde_json::Value) -> Option<i64> {
+    if let Some(cost_f64) = usage.get("cost").and_then(|v| v.as_f64())
+        && cost_f64.is_finite()
+        && (0.0..=1000.0).contains(&cost_f64)
+    {
+        return Some((cost_f64 * 1_000_000.0).round() as i64);
+    }
+    None
 }

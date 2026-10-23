@@ -315,6 +315,89 @@ fn assemble_snapshot(
 /// key, provider, client key, or share can never keep serving a pinned session
 /// (`PRV-8`, `CLK-4`, `SHR-5`). Pins whose key merely changed priority/label are
 /// deliberately kept: they are still valid routes.
+/// Synthesize missing [`CacheInvalidationEvent`] entries by diffing the previous and newly loaded [`ConfigSnapshot`] (`REL-4`, `F-094`, `F-095`).
+pub fn synthesize_snapshot_invalidations(
+    previous: &ConfigSnapshot,
+    next: &ConfigSnapshot,
+    invalidations: &mut Vec<CacheInvalidationEvent>,
+) {
+    for (kid, next_k) in next.upstream_keys.iter() {
+        let changed = previous
+            .upstream_keys
+            .get(kid)
+            .is_none_or(|prev_k| prev_k != next_k);
+        if changed && !invalidations.contains(&CacheInvalidationEvent::UpstreamKeyChanged(*kid)) {
+            invalidations.push(CacheInvalidationEvent::UpstreamKeyChanged(*kid));
+        }
+    }
+    for kid in previous.upstream_keys.keys() {
+        if !next.upstream_keys.contains_key(kid)
+            && !invalidations.contains(&CacheInvalidationEvent::UpstreamKeyChanged(*kid))
+        {
+            invalidations.push(CacheInvalidationEvent::UpstreamKeyChanged(*kid));
+        }
+    }
+
+    for (pid, next_p) in next.providers.iter() {
+        let changed = previous
+            .providers
+            .get(pid)
+            .is_none_or(|prev_p| prev_p != next_p);
+        if changed && !invalidations.contains(&CacheInvalidationEvent::ProviderChanged(*pid)) {
+            invalidations.push(CacheInvalidationEvent::ProviderChanged(*pid));
+        }
+    }
+    for pid in previous.providers.keys() {
+        if !next.providers.contains_key(pid)
+            && !invalidations.contains(&CacheInvalidationEvent::ProviderChanged(*pid))
+        {
+            invalidations.push(CacheInvalidationEvent::ProviderChanged(*pid));
+        }
+    }
+
+    for (kid, next_wins) in next.budget_windows.iter() {
+        let prev_wins = previous.budget_windows.get(kid);
+        for w in next_wins {
+            let changed = prev_wins
+                .and_then(|list| list.iter().find(|pw| pw.id == w.id))
+                .is_none_or(|pw| pw != w);
+            if changed {
+                let ev = CacheInvalidationEvent::BudgetWindowChanged(w.id.clone());
+                if !invalidations.contains(&ev) {
+                    invalidations.push(ev);
+                }
+            }
+        }
+    }
+    for (kid, prev_wins) in previous.budget_windows.iter() {
+        let next_wins = next.budget_windows.get(kid);
+        for pw in prev_wins {
+            if next_wins.is_none_or(|list| !list.iter().any(|nw| nw.id == pw.id)) {
+                let ev = CacheInvalidationEvent::BudgetWindowChanged(pw.id.clone());
+                if !invalidations.contains(&ev) {
+                    invalidations.push(ev);
+                }
+            }
+        }
+    }
+
+    for (mpk, next_routes) in next.routes_by_model.iter() {
+        let changed = previous
+            .routes_by_model
+            .get(mpk)
+            .is_none_or(|prev_routes| prev_routes != next_routes);
+        if changed && !invalidations.contains(&CacheInvalidationEvent::ModelRoutesChanged(*mpk)) {
+            invalidations.push(CacheInvalidationEvent::ModelRoutesChanged(*mpk));
+        }
+    }
+
+    if previous.settings != next.settings
+        && !invalidations.contains(&CacheInvalidationEvent::SettingsChanged)
+    {
+        invalidations.push(CacheInvalidationEvent::SettingsChanged);
+    }
+}
+
 fn evict_invalidated_pins(
     store: &PinStore,
     previous: &ConfigSnapshot,
@@ -636,6 +719,9 @@ fn start_reloader_inner(
 
                 // Store new snapshot atomically
                 shared_snapshot.store(Arc::new(new_snapshot.clone()));
+
+                // Synthesize any missing invalidation events by diffing previous vs new snapshot (F-094, F-095)
+                synthesize_snapshot_invalidations(&current, &new_snapshot, &mut invalidations);
 
                 // Apply CacheInvalidationEvents after arc_swap.store per REL-4
                 runtime_state.apply_invalidations(&invalidations, &new_snapshot, now_ms);

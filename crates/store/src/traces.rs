@@ -328,5 +328,135 @@ pub async fn delete_session_trace_tx(
     Ok((records_deleted, blocks_deleted))
 }
 
+/// Page of raw encrypted session trace records alongside the optional cursor predecessor row for LCP seeding (`TRC-5`).
+#[derive(Debug, Clone)]
+pub struct SessionTraceCursorRow {
+    pub usage_event_id: String,
+    pub request_id: String,
+    pub ts: i64,
+    pub owner_user_id: String,
+    pub client_key_id: String,
+    pub session_hash: String,
+    pub thread_id: String,
+    pub canonical_id: Option<String>,
+    pub protocol: String,
+    pub truncated_content: bool,
+    pub payload_enc: Vec<u8>,
+    pub master_key_id: String,
+}
+
+/// Fetches up to `limit` trace records after an optional `(cursor_ts, cursor_request_id)` cursor,
+/// returning `(predecessor_row, page_rows)` so page 2+ computes exact LCP against the last turn of the previous page (`TRC-5`).
+pub async fn load_session_trace_page_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_hash: &str,
+    owner_user_id: Option<&UserId>,
+    after_cursor: Option<(i64, &str)>,
+    limit: usize,
+) -> Result<(Option<SessionTraceCursorRow>, Vec<SessionTraceCursorRow>), sqlx::Error> {
+    let fetch_limit = (limit.max(1) + usize::from(after_cursor.is_some())) as i64;
+    let rows = match (owner_user_id, after_cursor) {
+        (Some(uid), Some((c_ts, c_req))) => {
+            sqlx::query(
+                "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                        thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+                 FROM trace_records
+                 WHERE session_hash = ? AND owner_user_id = ?
+                   AND (ts > ? OR (ts = ? AND request_id >= ?))
+                 ORDER BY ts ASC, request_id ASC
+                 LIMIT ?",
+            )
+            .bind(session_hash)
+            .bind(uid.to_string())
+            .bind(c_ts)
+            .bind(c_ts)
+            .bind(c_req)
+            .bind(fetch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (Some(uid), None) => {
+            sqlx::query(
+                "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                        thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+                 FROM trace_records
+                 WHERE session_hash = ? AND owner_user_id = ?
+                 ORDER BY ts ASC, request_id ASC
+                 LIMIT ?",
+            )
+            .bind(session_hash)
+            .bind(uid.to_string())
+            .bind(fetch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (None, Some((c_ts, c_req))) => {
+            sqlx::query(
+                "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                        thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+                 FROM trace_records
+                 WHERE session_hash = ?
+                   AND (ts > ? OR (ts = ? AND request_id >= ?))
+                 ORDER BY ts ASC, request_id ASC
+                 LIMIT ?",
+            )
+            .bind(session_hash)
+            .bind(c_ts)
+            .bind(c_ts)
+            .bind(c_req)
+            .bind(fetch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query(
+                "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
+                        thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
+                 FROM trace_records
+                 WHERE session_hash = ?
+                 ORDER BY ts ASC, request_id ASC
+                 LIMIT ?",
+            )
+            .bind(session_hash)
+            .bind(fetch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+    };
+
+    let mut mapped = Vec::with_capacity(rows.len());
+    for r in rows {
+        mapped.push(SessionTraceCursorRow {
+            usage_event_id: r.try_get("usage_event_id")?,
+            request_id: r.try_get("request_id")?,
+            ts: r.try_get("ts")?,
+            owner_user_id: r.try_get("owner_user_id")?,
+            client_key_id: r.try_get("client_key_id")?,
+            session_hash: r.try_get("session_hash")?,
+            thread_id: r
+                .try_get("thread_id")
+                .unwrap_or_else(|_| "main".to_string()),
+            canonical_id: r.try_get("canonical_id").unwrap_or(None),
+            protocol: r.try_get("protocol")?,
+            truncated_content: r.try_get::<i64, _>("truncated_content").unwrap_or(0) == 1,
+            payload_enc: r.try_get("payload_enc")?,
+            master_key_id: r.try_get("master_key_id")?,
+        });
+    }
+
+    if let Some((c_ts, c_req)) = after_cursor
+        && let Some(first) = mapped.first()
+        && first.ts == c_ts
+        && first.request_id == c_req
+    {
+        let pred = mapped.remove(0);
+        mapped.truncate(limit);
+        return Ok((Some(pred), mapped));
+    }
+
+    mapped.truncate(limit);
+    Ok((None, mapped))
+}
+
 #[cfg(test)]
 pub mod tests;

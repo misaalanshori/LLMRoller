@@ -393,3 +393,48 @@ fn test_canary_scrubber_and_csv_sanitizer() {
     assert_eq!(sanitize_csv_cell("\tleading_tab"), "'\tleading_tab");
     assert_eq!(sanitize_csv_cell("normal_text"), "normal_text");
 }
+
+#[doc = "Spec: SEC-6, USG-9, TRN-3, SEC-16"]
+#[test]
+fn test_scrub_secret_prefixes_oc_sk_and_safe_diagnostic_headers() {
+    use crate::headers::{extract_safe_diagnostic_headers, scrub_secret_prefixes};
+
+    // F-010: scrubs oc_sk_, sk-, and llr_ even immediately after `=` or `:` or inside JSON
+    let msg = "key=oc_sk_abcdef123456 and header:sk-or-v1-998877665544 and token=\"llr_abcd1234efgh5678\"";
+    let scrubbed = scrub_secret_prefixes(msg);
+    assert!(!scrubbed.contains("oc_sk_abcdef123456"));
+    assert!(!scrubbed.contains("sk-or-v1-998877665544"));
+    assert!(!scrubbed.contains("llr_abcd1234efgh5678"));
+    assert_eq!(
+        scrubbed,
+        "key=[REDACTED] and header:[REDACTED] and token=\"[REDACTED]\""
+    );
+
+    // F-011: extract_safe_diagnostic_headers retains allow-listed headers and omits Authorization
+    let mut headers = HeaderMap::new();
+    headers.insert(header::USER_AGENT, HeaderValue::from_static("opencode/1.2"));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer llr_secret12345678"),
+    );
+    let diag_json = extract_safe_diagnostic_headers(&headers);
+    assert!(diag_json.contains("\"user-agent\":\"opencode/1.2\""));
+    assert!(diag_json.contains("\"content-type\":\"application/json\""));
+    assert!(!diag_json.contains("llr_secret12345678"));
+
+    // F-017: mixed-case response_header_allow entries match upstream headers
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::HeaderName::from_static("x-custom-upstream"),
+        HeaderValue::from_static("ok"),
+    );
+    let out = apply_response_header_pipeline(
+        &resp_headers,
+        PoolTier::Own,
+        false,
+        "01M5CE420F8JP4KE2B3JC4NX88",
+        &["X-Custom-Upstream".to_string()],
+    );
+    assert_eq!(out.get("x-custom-upstream").expect("allowed header"), "ok");
+}

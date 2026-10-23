@@ -755,10 +755,10 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         )
         .await
         .expect("resp");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = resp.into_body().collect().await.expect("body").to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(json["error"]["code"], "unsupported_aux_endpoint");
+    assert_eq!(json["error"]["code"], "not_found_error");
     assert_eq!(compact_calls.load(Ordering::SeqCst), 2);
     assert_eq!(responses_calls.load(Ordering::SeqCst), 1);
     assert!(
@@ -779,7 +779,7 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         )
         .await
         .expect("resp");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         compact_calls.load(Ordering::SeqCst),
         2,

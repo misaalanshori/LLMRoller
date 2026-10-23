@@ -631,3 +631,32 @@ async fn rotation_reports_aead_tampering_with_exit_code_7() {
 
     pool.close().await;
 }
+
+#[tokio::test]
+#[doc = "Spec: SEC-1, SEC-2, TRC-3"]
+async fn rotate_dek_reencrypts_trace_records_and_trace_blocks() {
+    let (_dir, pool) = migrated_database().await;
+    let entropy = Arc::new(FakeEntropy::new(71));
+    load_or_initialize(&pool, "mk_old", &old_key(), Arc::clone(&entropy), 1_000)
+        .await
+        .expect("initialize instance");
+
+    let old_sealer = XChaCha20Poly1305Sealer::new(old_key(), entropy.clone());
+    seed_all(&pool, &old_sealer, "mk_old", 1).await;
+
+    let report = rotate_master_key(
+        &pool,
+        old_key(),
+        new_key(),
+        "mk_new",
+        Arc::clone(&entropy),
+        2_000,
+    )
+    .await
+    .expect("rotate master key");
+    assert!(report.rows_re_sealed >= 6);
+
+    let new_sealer = XChaCha20Poly1305Sealer::new(new_key(), entropy);
+    assert_all_open_with_new_key(&pool, &new_sealer, "mk_new", 1).await;
+    pool.close().await;
+}

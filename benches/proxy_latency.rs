@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![doc = "Spec: PERF-1, PERF-2, PERF-3, PERF-4, PERF-5"]
 //! End-to-end performance and resource benchmark harness for PERF-1 through PERF-5.
 //!
 //! Spec: ./docs/srdd/7. SRDD - Non-Functional Requirements.md#71-latency-and-capacity-perf

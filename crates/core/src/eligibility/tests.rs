@@ -19,6 +19,7 @@ fn make_valid_candidate(
         provider_kind: ProviderKind::Openrouter,
         provider_ownership: ownership,
         provider_owner_id: Some(owner_id),
+        provider_owner_disabled: false,
         provider_fingerprint: "fp-test".to_string(),
         provider_enabled: true,
         key_enabled: true,
@@ -514,5 +515,47 @@ fn test_c4_intersection_mode_blocks_partial_provider_model() {
     assert_eq!(
         evaluate_candidate(&own, &ctx, &[]),
         Ok(CandidatePoolTier::Own)
+    );
+}
+
+#[doc = "Spec: RTE-3, USR-2, SHR-2"]
+#[test]
+fn check_c3_rejects_shared_route_when_grantor_provider_owner_is_disabled() {
+    let alice = UserId::generate();
+    let bob = UserId::generate();
+    let model_pk = ModelPk::generate();
+
+    let mut alice_shared_route = make_valid_candidate(alice, OwnershipScope::Personal, model_pk);
+    alice_shared_route.provider_owner_disabled = true;
+
+    let share = ShareConfig {
+        share_id: ShareId::generate(),
+        grantor_user_id: alice,
+        grantee_user_id: bob,
+        provider_id: alice_shared_route.provider_id,
+        upstream_key_id: Some(alice_shared_route.upstream_key_id),
+        allowed_models: None,
+        max_monthly_micro_usd: None,
+        accepted_config_fingerprint: Some("fp-test".to_string()),
+        admin_approved_at: None,
+        enabled: true,
+    };
+
+    // Grantee Bob is active (`owner_disabled: false`), but Grantor Alice is disabled (`provider_owner_disabled: true`)
+    let bob_ctx = CallerContext {
+        caller_user_id: &bob,
+        can_use_global: true,
+        owner_disabled: false,
+        model_exposed: None,
+        merge_state: MergeState::Confirmed,
+        present_on_all_global_providers: true,
+        global_exposure_mode: GlobalExposureMode::Union,
+        inbound_protocol: "chat",
+        model_canonical_id: "test-model",
+    };
+
+    assert_eq!(
+        evaluate_candidate(&alice_shared_route, &bob_ctx, &[share]),
+        Err(CheckFailure::C3GrantorDisabled)
     );
 }

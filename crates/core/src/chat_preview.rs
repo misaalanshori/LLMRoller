@@ -46,13 +46,20 @@ pub fn escape_html(input: &str) -> String {
 }
 
 /// Neutralizes malicious HTML/JS tags from assistant markdown while preserving clean markup (SEC-19).
+///
+/// Layer 1: `pulldown-cmark` raw HTML events (`Event::Html`, `Event::InlineHtml`) are converted
+/// into plain `Event::Text` so raw HTML in model output is never interpreted as markup (`F-061`).
+/// Layer 2: `ammonia` enforces the strict tag allowlist and restricts `url_schemes` to `https` and `http`.
 pub fn sanitize_assistant_text(text: &str) -> String {
-    // 1. Render Markdown with pulldown-cmark with raw HTML tags disabled
-    let parser = pulldown_cmark::Parser::new(text);
+    let parser = pulldown_cmark::Parser::new(text).map(|event| match event {
+        pulldown_cmark::Event::Html(raw) | pulldown_cmark::Event::InlineHtml(raw) => {
+            pulldown_cmark::Event::Text(raw)
+        }
+        other => other,
+    });
     let mut html_output = String::new();
     pulldown_cmark::html::push_html(&mut html_output, parser);
 
-    // 2. Strict sanitization with ammonia allowlist per SRDD Section 8.2 (SEC-19)
     let tags = [
         "p",
         "pre",
@@ -85,9 +92,22 @@ pub fn sanitize_assistant_text(text: &str) -> String {
     builder
         .tags(tag_set)
         .link_rel(Some("noopener noreferrer nofollow"))
-        .url_schemes(["https", "http", "mailto"].into_iter().collect());
+        .url_schemes(["https", "http"].into_iter().collect());
 
     builder.clean(&html_output).to_string()
+}
+
+/// Alias for [`sanitize_assistant_text`] matching SRDD Section 8.8 (`SEC-19`).
+#[must_use]
+pub fn sanitize_assistant_markdown(text: &str) -> String {
+    sanitize_assistant_text(text)
+}
+
+/// Returns whether a turn's block reference sequence indicates context compaction or branching
+/// relative to the previous turn (`lcp < prev_refs.len()`, excluding empty `prev_refs`; `F-062`, `TRC-5`).
+#[must_use]
+pub fn is_compacted_or_branched(prev_refs: &[String], curr_refs: &[String]) -> bool {
+    !prev_refs.is_empty() && compute_lcp(prev_refs, curr_refs) < prev_refs.len()
 }
 
 /// Single reconstructed message in the session preview timeline.

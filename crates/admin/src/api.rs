@@ -89,6 +89,19 @@ where
     T: Send + 'static,
     F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, T> + Send + 'static,
 {
+    execute_atomic_mutation_with_invalidations(state, domains, Vec::new(), run).await
+}
+
+async fn execute_atomic_mutation_with_invalidations<T, F>(
+    state: &ApiAppState,
+    domains: Vec<ConfigDomain>,
+    invalidations: Vec<llmroller_core::snapshot::CacheInvalidationEvent>,
+    run: F,
+) -> Result<T, MutationResponseError>
+where
+    T: Send + 'static,
+    F: for<'a> FnOnce(&'a mut Transaction<'_, Sqlite>) -> MutationFuture<'a, T> + Send + 'static,
+{
     use llmroller_core::seams::ExposeSecret as _;
 
     let _ = MUTATION_HANDLED.try_with(|flag| {
@@ -125,7 +138,7 @@ where
 
     if let Some(writer) = &state.writer {
         let result = writer
-            .execute_control(domains, Vec::new(), AdminControlOp { run: Some(op) })
+            .execute_control(domains, invalidations, AdminControlOp { run: Some(op) })
             .await;
         if let Ok(version) = result {
             await_published_version(state, version).await;
@@ -311,11 +324,20 @@ impl ApiAppState {
     /// writer actor; this barrier remains the safety net for legacy direct-SQL
     /// handlers that do not use the writer.
     pub async fn publish_control_change(&self, domains: Vec<ConfigDomain>) {
+        self.publish_control_change_with_invalidations(domains, Vec::new())
+            .await;
+    }
+
+    pub async fn publish_control_change_with_invalidations(
+        &self,
+        domains: Vec<ConfigDomain>,
+        invalidations: Vec<llmroller_core::snapshot::CacheInvalidationEvent>,
+    ) {
         let Some(writer) = &self.writer else {
             return;
         };
         let result = writer
-            .execute_control(domains, Vec::new(), VersionBumpOp)
+            .execute_control(domains, invalidations, VersionBumpOp)
             .await;
         match result {
             Ok(version) => await_published_version(self, version).await,
@@ -362,12 +384,55 @@ fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
         vec![ConfigDomain::Settings]
     } else if path.contains("/users") {
         vec![ConfigDomain::Users]
+    } else if path.contains("/windows") || path.contains("/budget-windows") || path.contains("/budgets") {
+        vec![ConfigDomain::BudgetWindows]
+    } else if path.contains("/service-accounts") {
+        vec![ConfigDomain::ServiceAccounts, ConfigDomain::ClientKeys]
     } else if path.contains("/traces") || path.contains("/sessions") {
         vec![ConfigDomain::Traceability]
     } else {
         // Unknown mutation domain: force a full snapshot rebuild to stay correct.
         Vec::new()
     }
+}
+
+fn invalidations_for_path(path: &str) -> Vec<llmroller_core::snapshot::CacheInvalidationEvent> {
+    use llmroller_core::snapshot::CacheInvalidationEvent;
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    for (idx, seg) in segments.iter().enumerate() {
+        let next = segments.get(idx + 1).copied();
+        match (*seg, next) {
+            ("providers", Some(id)) => {
+                if let Ok(pid) = ProviderId::parse(id) {
+                    out.push(CacheInvalidationEvent::ProviderChanged(pid));
+                }
+            }
+            ("upstream-keys" | "keys", Some(id)) => {
+                if let Ok(kid) = UpstreamKeyId::parse(id) {
+                    out.push(CacheInvalidationEvent::UpstreamKeyChanged(kid));
+                }
+            }
+            ("client-keys", Some(id)) => {
+                if let Ok(ckid) = ClientKeyId::parse(id) {
+                    out.push(CacheInvalidationEvent::ClientKeyChanged(ckid));
+                }
+            }
+            ("budget-windows", Some(id)) => {
+                out.push(CacheInvalidationEvent::BudgetWindowChanged(id.to_string()));
+            }
+            ("users", Some(id)) => {
+                if let Ok(uid) = UserId::parse(id) {
+                    out.push(CacheInvalidationEvent::UserChanged(uid));
+                }
+            }
+            ("settings", _) => {
+                out.push(CacheInvalidationEvent::SettingsChanged);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 struct MutationAudit {
@@ -579,7 +644,10 @@ async fn control_mutation_barrier(
     };
 
     if is_mutation && response.status().is_success() && !handled {
-        state.publish_control_change(domains).await;
+        let invalidations = invalidations_for_path(&path);
+        state
+            .publish_control_change_with_invalidations(domains, invalidations)
+            .await;
         let _ = append_audit_entry_helper(
             &state,
             chrono_like_now_ms(),
@@ -791,6 +859,7 @@ pub struct CreateClientKeyRequest {
 pub struct ClientKeyCreationResponse {
     pub client_key: ClientKey,
     pub token: String,
+    pub raw_token: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1109,7 @@ async fn post_user_client_key_handler(
         StatusCode::CREATED,
         Json(ClientKeyCreationResponse {
             client_key: res.client_key,
+            raw_token: token_str.clone(),
             token: token_str,
         }),
     ))
@@ -1234,20 +1304,58 @@ async fn put_admin_service_account_ip_restrictions_handler(
 }
 
 /// `DELETE /admin/api/service-accounts/{id}` (`CLK-6`).
+async fn collect_service_account_client_keys_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    service_account_id: &str,
+) -> Vec<ClientKeyId> {
+    use sqlx::Row as _;
+    let rows = sqlx::query("SELECT id FROM client_keys WHERE service_account_id = ?")
+        .bind(service_account_id)
+        .fetch_all(&mut **tx)
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|r| r.try_get::<String, _>("id").ok())
+        .filter_map(|s| ClientKeyId::parse(&s).ok())
+        .collect()
+}
+
 async fn delete_admin_service_account_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, MutationResponseError> {
     let actor = authenticate_admin(&state, &headers, true).await?;
-    execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
-        Box::pin(async move {
-            delete_service_account_tx(tx, &actor, &id)
-                .await
-                .map_err(map_service_account_error)
-        })
-    })
+    let mut tx_ro = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|_| writer_busy_error())?;
+    let child_keys = collect_service_account_client_keys_tx(&mut tx_ro, &id).await;
+    let _ = tx_ro.commit().await;
+    let invalidations: Vec<llmroller_core::snapshot::CacheInvalidationEvent> = child_keys
+        .iter()
+        .copied()
+        .map(llmroller_core::snapshot::CacheInvalidationEvent::ClientKeyChanged)
+        .collect();
+    execute_atomic_mutation_with_invalidations(
+        &state,
+        vec![ConfigDomain::ServiceAccounts, ConfigDomain::ClientKeys],
+        invalidations,
+        move |tx| {
+            Box::pin(async move {
+                delete_service_account_tx(tx, &actor, &id)
+                    .await
+                    .map_err(map_service_account_error)
+            })
+        },
+    )
     .await?;
+    if let Some(store) = &state.pin_store {
+        let set: HashSet<ClientKeyId> = child_keys.into_iter().collect();
+        store.invalidate_client_keys(&set);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1380,14 +1488,36 @@ async fn delete_user_service_account_handler(
     Path(id): Path<String>,
 ) -> Result<StatusCode, MutationResponseError> {
     let actor = authenticate_actor(&state, &headers, true).await?;
-    execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
-        Box::pin(async move {
-            delete_service_account_tx(tx, &actor, &id)
-                .await
-                .map_err(map_service_account_error)
-        })
-    })
+    let mut tx_ro = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|_| writer_busy_error())?;
+    let child_keys = collect_service_account_client_keys_tx(&mut tx_ro, &id).await;
+    let _ = tx_ro.commit().await;
+    let invalidations: Vec<llmroller_core::snapshot::CacheInvalidationEvent> = child_keys
+        .iter()
+        .copied()
+        .map(llmroller_core::snapshot::CacheInvalidationEvent::ClientKeyChanged)
+        .collect();
+    execute_atomic_mutation_with_invalidations(
+        &state,
+        vec![ConfigDomain::ServiceAccounts, ConfigDomain::ClientKeys],
+        invalidations,
+        move |tx| {
+            Box::pin(async move {
+                delete_service_account_tx(tx, &actor, &id)
+                    .await
+                    .map_err(map_service_account_error)
+            })
+        },
+    )
     .await?;
+    if let Some(store) = &state.pin_store {
+        let set: HashSet<ClientKeyId> = child_keys.into_iter().collect();
+        store.invalidate_client_keys(&set);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2042,13 +2172,111 @@ fn parse_catalog_prices(
                         now_ms: 0,
                     }
                 });
-                entry.rates = llmroller_core::pricing::Rates {
-                    input_per_mtok_micro_usd: micro(read("input").unwrap_or(0.0)),
-                    output_per_mtok_micro_usd: micro(read("output").unwrap_or(0.0)),
-                    cache_read_per_mtok_micro_usd: micro(read("cache_read").unwrap_or(0.0)),
-                    cache_write_per_mtok_micro_usd: micro(read("cache_write").unwrap_or(0.0)),
+                let in_rate = read("input").unwrap_or(0.0);
+                let out_rate = read("output")
+                    .or_else(|| read("internal_reasoning"))
+                    .unwrap_or(0.0);
+                let cr_rate = read("cache_read")
+                    .or_else(|| read("input_cache_read"))
+                    .unwrap_or(0.0);
+                let cw_rate = read("cache_write")
+                    .or_else(|| read("input_cache_write"))
+                    .unwrap_or(0.0);
+                let rates = llmroller_core::pricing::Rates {
+                    input_per_mtok_micro_usd: micro(in_rate),
+                    output_per_mtok_micro_usd: micro(out_rate),
+                    cache_read_per_mtok_micro_usd: micro(cr_rate),
+                    cache_write_per_mtok_micro_usd: micro(cw_rate),
                 };
-                entry.tiers = tiers;
+                entry.rates = rates;
+                entry.tiers = tiers.clone();
+                if let Ok(norm_id) = llmroller_core::catalog::normalize_model_id(model_id)
+                    && &norm_id != model_id
+                {
+                    model_costs.entry(norm_id.clone()).or_insert_with(|| {
+                        llmroller_store::prices::UpsertPriceParams {
+                            provider_id: String::new(),
+                            provider_kind: String::new(),
+                            upstream_model_id: norm_id,
+                            rates,
+                            tiers,
+                            schedules: Vec::new(),
+                            source: "synced".to_string(),
+                            now_ms: 0,
+                        }
+                    });
+                }
+            }
+        }
+    }
+    // Also support OpenRouter /api/v1/models {"data": [{"id": "...", "pricing": {...}}]} format (F-068).
+    if let Some(data_arr) = catalog.get("data").and_then(serde_json::Value::as_array) {
+        let parse_or_price = |p: &serde_json::Value, key: &str| -> Option<i64> {
+            let v = p.get(key)?;
+            let raw = v
+                .as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+            if !raw.is_finite() || raw < 0.0 {
+                return None;
+            }
+            // OpenRouter PublicPricing reports USD per token (e.g. "0.000003" = $3/MTok = 3_000_000 micro-USD/MTok).
+            let micro_mtok = if raw > 0.0 && raw < 0.01 {
+                (raw * 1_000_000_000_000.0).round() as i64
+            } else {
+                (raw * 1_000_000.0).round() as i64
+            };
+            Some(micro_mtok)
+        };
+        for item in data_arr {
+            let Some(raw_id) = item.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(pricing) = item.get("pricing") else {
+                continue;
+            };
+            let Some(in_micro) = parse_or_price(pricing, "prompt")
+                .or_else(|| parse_or_price(pricing, "input"))
+            else {
+                continue;
+            };
+            let Some(out_micro) = parse_or_price(pricing, "completion")
+                .or_else(|| parse_or_price(pricing, "output"))
+                .or_else(|| parse_or_price(pricing, "internal_reasoning"))
+            else {
+                continue;
+            };
+            let cr_micro = parse_or_price(pricing, "input_cache_read")
+                .or_else(|| parse_or_price(pricing, "cache_read"))
+                .unwrap_or(0);
+            let cw_micro = parse_or_price(pricing, "input_cache_write")
+                .or_else(|| parse_or_price(pricing, "cache_write"))
+                .unwrap_or(0);
+            let rates = llmroller_core::pricing::Rates {
+                input_per_mtok_micro_usd: in_micro,
+                output_per_mtok_micro_usd: out_micro,
+                cache_read_per_mtok_micro_usd: cr_micro,
+                cache_write_per_mtok_micro_usd: cw_micro,
+            };
+            for key_id in [
+                Some(raw_id.to_string()),
+                llmroller_core::catalog::normalize_model_id(raw_id).ok(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                model_costs.insert(
+                    key_id.clone(),
+                    llmroller_store::prices::UpsertPriceParams {
+                        provider_id: String::new(),
+                        provider_kind: String::new(),
+                        upstream_model_id: key_id,
+                        rates,
+                        tiers: Vec::new(),
+                        schedules: Vec::new(),
+                        source: "synced".to_string(),
+                        now_ms: 0,
+                    },
+                );
             }
         }
     }
@@ -2148,7 +2376,11 @@ async fn post_admin_prices_sync_handler(
             }
         }
 
-        let Some(template) = model_costs.get(&model_id) else {
+        let norm_id = llmroller_core::catalog::normalize_model_id(&model_id).ok();
+        let Some(template) = model_costs
+            .get(&model_id)
+            .or_else(|| norm_id.as_deref().and_then(|n| model_costs.get(n)))
+        else {
             continue;
         };
         let manual: Option<String> = sqlx::query_scalar(
@@ -2279,8 +2511,10 @@ async fn list_client_key_sessions_internal(
 
         let (redacted_key_id, redacted_label) = if is_admin || ownership_scope == "personal" {
             (Some(upstream_key_id), key_label)
+        } else if pool_tier == 1 || ownership_scope == "shared" {
+            (None, "shared pool".to_string())
         } else {
-            (None, "pooled".to_string())
+            (None, "global pool".to_string())
         };
 
         pin_last_used.insert(session_hash.clone(), last_used_at);
@@ -2752,19 +2986,42 @@ async fn get_admin_trace_record_handler(
         .map(str::trim)
         .map(str::to_string);
 
-    let _ = append_audit_entry_helper(
-        &state,
-        now_ms,
-        AuditEnvelope {
-            actor_user_id: admin_id.as_deref(),
-            ip_addr: ip_addr.as_deref(),
-            action: "trace.viewed",
-            target_type: "trace",
-            target_id: Some(&request_id),
-            detail_json: "{}",
-        },
+    let session_hash_opt: Option<String> = sqlx::query_scalar(
+        "SELECT session_hash FROM trace_records WHERE request_id = ? LIMIT 1",
     )
-    .await;
+    .bind(&request_id)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .unwrap_or_default();
+    let dedup_target = session_hash_opt.as_deref().unwrap_or(&request_id);
+
+    let recent_audit: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM audit_log WHERE actor_user_id = ? AND action = 'trace.viewed' AND target_id IN (?, ?) AND ts >= ? LIMIT 1",
+    )
+    .bind(&admin_id)
+    .bind(dedup_target)
+    .bind(&request_id)
+    .bind(now_ms - 30 * 60 * 1000)
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .is_some();
+
+    if !recent_audit {
+        let _ = append_audit_entry_helper(
+            &state,
+            now_ms,
+            AuditEnvelope {
+                actor_user_id: admin_id.as_deref(),
+                ip_addr: ip_addr.as_deref(),
+                action: "trace.viewed",
+                target_type: "trace",
+                target_id: Some(dedup_target),
+                detail_json: "{}",
+            },
+        )
+        .await;
+    }
 
     get_trace_record_internal(&state, &request_id, None).await
 }
@@ -3003,9 +3260,11 @@ async fn post_rotate_client_key_handler(
     .map_err(map_client_key_error)?;
 
     use llmroller_core::seams::ExposeSecret as _;
+    let raw = res.raw_token.expose_secret();
     Ok(Json(serde_json::json!({
         "client_key": res.client_key,
-        "raw_token": res.raw_token.expose_secret()
+        "raw_token": raw,
+        "token": raw
     })))
 }
 
@@ -3120,7 +3379,20 @@ async fn post_user_share_handler(
         now_ms,
     )
     .await
-    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+    .map_err(|e| match e {
+        llmroller_store::shares::ShareError::NotFound => {
+            map_price_error(StatusCode::NOT_FOUND, "provider or upstream key not found")
+        }
+        llmroller_store::shares::ShareError::Forbidden => {
+            map_price_error(StatusCode::FORBIDDEN, "forbidden")
+        }
+        llmroller_store::shares::ShareError::ShareOverlap => {
+            map_price_error(StatusCode::CONFLICT, "overlapping share already exists")
+        }
+        llmroller_store::shares::ShareError::Database(err) => {
+            map_price_error(StatusCode::INTERNAL_SERVER_ERROR, err)
+        }
+    })?;
 
     tx.commit()
         .await
@@ -3800,8 +4072,103 @@ fn pin_delete_status(headers: &HeaderMap) -> StatusCode {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct MoveSessionPinRequest {
+    #[serde(alias = "target_upstream_key_id")]
     pub upstream_key_id: String,
     pub canonical_id: Option<String>,
+    pub session_hash: Option<String>,
+    pub client_key_id: Option<String>,
+}
+
+/// Move active session pin via `POST /admin/api/pins/move` (`RTE-11`, `F-108`).
+async fn post_admin_move_pin_body_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<MoveSessionPinRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let session_hash = payload.session_hash.clone().ok_or_else(|| {
+        map_price_error(StatusCode::UNPROCESSABLE_ENTITY, "session_hash is required")
+    })?;
+    post_admin_move_session_pin_handler(State(state), headers, Path(session_hash), Json(payload))
+        .await
+}
+
+/// Move personal session pin via `POST /api/user/pins/move` (`RTE-11`, `USR-3`, `F-108`).
+async fn post_user_move_pin_body_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<MoveSessionPinRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let session_hash = payload.session_hash.clone().ok_or_else(|| {
+        map_price_error(StatusCode::UNPROCESSABLE_ENTITY, "session_hash is required")
+    })?;
+    let target_key = UpstreamKeyId::parse(&payload.upstream_key_id)
+        .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    // Verify target upstream key belongs to caller (USR-3)
+    let key_record = get_upstream_key(&state.auth.pool, &actor, target_key)
+        .await
+        .map_err(map_provider_error)?;
+    if !actor.is_admin() && key_record.owner_user_id != Some(user_id) {
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "upstream key not found",
+        ));
+    }
+
+    let now_ms = state.auth.clock.now_ms();
+    let _ = sqlx::query(
+        "UPDATE pins SET upstream_key_id = ?, last_used_at = ?
+         WHERE session_hash = ?
+           AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
+    )
+    .bind(target_key.to_string())
+    .bind(now_ms)
+    .bind(&session_hash)
+    .bind(user_id.to_string())
+    .execute(&state.auth.pool)
+    .await;
+
+    if let Some(store) = &state.pin_store {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            "SELECT p.client_key_id, m.canonical_id
+             FROM pins p
+             JOIN client_keys ck ON p.client_key_id = ck.id
+             LEFT JOIN models m ON p.model_pk = m.model_pk
+             WHERE p.session_hash = ? AND ck.owner_user_id = ?",
+        )
+        .bind(&session_hash)
+        .bind(user_id.to_string())
+        .fetch_all(&state.auth.pool)
+        .await
+        .unwrap_or_default();
+
+        for r in rows {
+            let ckid_str: String = r.try_get("client_key_id").unwrap_or_default();
+            let model_id: String = r
+                .try_get::<Option<String>, _>("canonical_id")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if let Ok(client_key_id) = ClientKeyId::parse(&ckid_str) {
+                let pin_key = llmroller_core::pins::PinKey {
+                    client_key_id,
+                    session_hash: session_hash.clone(),
+                    canonical_id: model_id,
+                };
+                store.admin_move(&pin_key, target_key, now_ms);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "moved": true,
+        "session_hash": session_hash,
+        "upstream_key_id": target_key.to_string(),
+    })))
 }
 
 /// Admin manually moves session pin to a new upstream key (RTE-11).
@@ -4375,6 +4742,14 @@ async fn post_user_totp_verify_handler(
     let sealer = load_sealer(&state).await?;
     let now_ms = state.auth.clock.now_ms();
 
+    if let Some(uid) = actor.user_id()
+        && !state.auth.check_and_record_totp_replay(uid, &payload.code, now_ms)
+    {
+        return Err(map_price_error(
+            StatusCode::UNAUTHORIZED,
+            "TOTP code already used in this time window",
+        ));
+    }
     llmroller_store::users::confirm_totp(
         &state.auth.pool,
         &actor,
@@ -4463,6 +4838,58 @@ async fn delete_user_session_handler(
         .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Upstream Key Reset Health (PRV-7, F-107)
+// ---------------------------------------------------------------------------
+async fn post_reset_upstream_key_health_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UpstreamKeyId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    let key = get_upstream_key(&state.auth.pool, &actor, id)
+        .await
+        .map_err(map_provider_error)?;
+    if !actor.is_admin() && key.owner_user_id != actor.user_id() {
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "upstream key not found",
+        ));
+    }
+    let key_id_str = id.to_string();
+    execute_atomic_mutation_with_invalidations(
+        &state,
+        vec![ConfigDomain::UpstreamKeys],
+        vec![llmroller_core::snapshot::CacheInvalidationEvent::UpstreamKeyChanged(id)],
+        move |tx| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE upstream_keys
+                     SET health = 'healthy', health_until = NULL, health_version = health_version + 1
+                     WHERE id = ?",
+                )
+                .bind(&key_id_str)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                sqlx::query("DELETE FROM route_protocol_blocks WHERE upstream_key_id = ?")
+                    .bind(&key_id_str)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                Ok(())
+            })
+        },
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "upstream_key_id": id.to_string(),
+        "health": "healthy",
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -5333,6 +5760,219 @@ async fn get_usage_breakdown_internal(
         .collect::<Vec<_>>();
 
     Ok(Json(serde_json::json!({ "breakdown": breakdown })))
+}
+
+/// `GET /api/user/usage/events/{id}/breakdown` (`USG-3`, `USG-10`, `F-070`).
+async fn get_user_usage_event_breakdown_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    get_usage_event_breakdown_internal(&state, Some(user_id.to_string()), &id).await
+}
+
+/// `GET /admin/api/usage/events/{id}/breakdown` (`USG-3`, `USG-10`, `F-070`).
+async fn get_admin_usage_event_breakdown_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_event_breakdown_internal(&state, None, &id).await
+}
+
+async fn get_usage_event_breakdown_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    event_id_or_request_id: &str,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use llmroller_core::pricing::{ContextTier, Rates, Schedule, TokenUsage, div_ceil_i128};
+    use sqlx::Row as _;
+
+    let sql = if owner_user_id.is_some() {
+        "SELECT id, ts, request_id, canonical_id, upstream_key_id,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
+         FROM usage_events
+         WHERE (id = ? OR request_id = ?) AND owner_user_id = ?
+         LIMIT 1"
+    } else {
+        "SELECT id, ts, request_id, canonical_id, upstream_key_id,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
+         FROM usage_events
+         WHERE (id = ? OR request_id = ?)
+         LIMIT 1"
+    };
+
+    let row = if let Some(ref uid) = owner_user_id {
+        sqlx::query(sql)
+            .bind(event_id_or_request_id)
+            .bind(event_id_or_request_id)
+            .bind(uid)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(sql)
+            .bind(event_id_or_request_id)
+            .bind(event_id_or_request_id)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "usage event not found"))?;
+
+    let ts: i64 = row.try_get("ts").unwrap_or(0);
+    let canonical_id: String = row
+        .try_get::<Option<String>, _>("canonical_id")
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let upstream_key_id: Option<String> = row.try_get("upstream_key_id").unwrap_or(None);
+    let in_uncached = row
+        .try_get::<Option<i64>, _>("input_uncached_tokens")
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let cache_read = row
+        .try_get::<Option<i64>, _>("cache_read_tokens")
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let cache_write = row
+        .try_get::<Option<i64>, _>("cache_write_tokens")
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let output = row
+        .try_get::<Option<i64>, _>("output_tokens")
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let cost_micro_usd: i64 = row.try_get("cost_micro_usd").unwrap_or(0);
+    let list_cost_micro_usd: i64 = row
+        .try_get("list_cost_micro_usd")
+        .unwrap_or(cost_micro_usd);
+    let plan_multiplier_bps: i64 = row.try_get("plan_multiplier_bps").unwrap_or(10_000);
+    let billing_coverage_mode: String = row
+        .try_get("billing_coverage_mode")
+        .unwrap_or_else(|_| "pay_as_you_go".to_string());
+
+    // Look up price entry (base rates + tiers_json + schedule_json) for this event (F-070)
+    let mut base_rates = Rates::default();
+    let mut tiers: Vec<ContextTier> = Vec::new();
+    let mut schedules: Vec<Schedule> = Vec::new();
+    let price_row = if let Some(ref uk_id) = upstream_key_id {
+        sqlx::query(
+            "SELECT pr.input_per_mtok_micro_usd, pr.output_per_mtok_micro_usd,
+                    pr.cache_read_per_mtok_micro_usd, pr.cache_write_per_mtok_micro_usd,
+                    pr.tiers_json, pr.schedule_json
+             FROM prices pr
+             LEFT JOIN upstream_keys k ON k.id = ?
+             WHERE pr.upstream_model_id = ?
+             ORDER BY CASE WHEN pr.provider_id = k.provider_id THEN 0
+                           WHEN pr.provider_id = '' THEN 1
+                           ELSE 2 END
+             LIMIT 1",
+        )
+        .bind(uk_id)
+        .bind(&canonical_id)
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        sqlx::query(
+            "SELECT input_per_mtok_micro_usd, output_per_mtok_micro_usd,
+                    cache_read_per_mtok_micro_usd, cache_write_per_mtok_micro_usd,
+                    tiers_json, schedule_json
+             FROM prices
+             WHERE upstream_model_id = ?
+             ORDER BY CASE WHEN provider_id = '' THEN 0 ELSE 1 END
+             LIMIT 1",
+        )
+        .bind(&canonical_id)
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .ok()
+        .flatten()
+    };
+
+    if let Some(pr) = price_row {
+        base_rates = Rates {
+            input_per_mtok_micro_usd: pr.try_get("input_per_mtok_micro_usd").unwrap_or(3_000_000),
+            output_per_mtok_micro_usd: pr.try_get("output_per_mtok_micro_usd").unwrap_or(15_000_000),
+            cache_read_per_mtok_micro_usd: pr.try_get("cache_read_per_mtok_micro_usd").unwrap_or(300_000),
+            cache_write_per_mtok_micro_usd: pr.try_get("cache_write_per_mtok_micro_usd").unwrap_or(3_750_000),
+        };
+        if let Ok(Some(tj)) = pr.try_get::<Option<String>, _>("tiers_json") {
+            tiers = serde_json::from_str(&tj).unwrap_or_default();
+        }
+        if let Ok(Some(sj)) = pr.try_get::<Option<String>, _>("schedule_json") {
+            schedules = serde_json::from_str(&sj).unwrap_or_default();
+        }
+    }
+
+    let tokens = TokenUsage {
+        input_uncached: in_uncached,
+        cache_read,
+        cache_write,
+        output,
+    };
+    let total_input = tokens.total_input();
+    let active_tier = tiers.iter().find(|t| t.matches(total_input));
+    let effective_rates = active_tier.map_or(base_rates, ContextTier::rates);
+    let active_schedule = schedules.iter().find(|s| s.matches(ts));
+    let (mult_num, mult_den) = active_schedule
+        .map_or((1_i64, 1_i64), |s| (s.multiplier_num.max(1), s.multiplier_den.max(1)));
+
+    let line_cost = |tok: i64, rate: i64| -> i64 {
+        let num = (tok as i128) * (rate as i128) * (mult_num as i128);
+        let den = 1_000_000_i128 * (mult_den as i128);
+        div_ceil_i128(num, den) as i64
+    };
+    let input_cost = line_cost(in_uncached, effective_rates.input_per_mtok_micro_usd);
+    let cache_read_cost = line_cost(cache_read, effective_rates.cache_read_per_mtok_micro_usd);
+    let cache_write_cost = line_cost(cache_write, effective_rates.cache_write_per_mtok_micro_usd);
+    let output_cost = line_cost(output, effective_rates.output_per_mtok_micro_usd);
+
+    Ok(Json(serde_json::json!({
+        "id": row.try_get::<String, _>("id").unwrap_or_default(),
+        "request_id": row.try_get::<String, _>("request_id").unwrap_or_default(),
+        "ts": ts,
+        "canonical_id": canonical_id,
+        "rates": effective_rates,
+        "tier_applied": active_tier.is_some(),
+        "schedule_multiplier": {
+            "numerator": mult_num,
+            "denominator": mult_den,
+        },
+        "line_items": {
+            "input_uncached": {
+                "tokens": in_uncached,
+                "rate_per_mtok_micro_usd": effective_rates.input_per_mtok_micro_usd,
+                "subtotal_micro_usd": input_cost,
+            },
+            "cache_read": {
+                "tokens": cache_read,
+                "rate_per_mtok_micro_usd": effective_rates.cache_read_per_mtok_micro_usd,
+                "subtotal_micro_usd": cache_read_cost,
+            },
+            "cache_write": {
+                "tokens": cache_write,
+                "rate_per_mtok_micro_usd": effective_rates.cache_write_per_mtok_micro_usd,
+                "subtotal_micro_usd": cache_write_cost,
+            },
+            "output": {
+                "tokens": output,
+                "rate_per_mtok_micro_usd": effective_rates.output_per_mtok_micro_usd,
+                "subtotal_micro_usd": output_cost,
+            },
+        },
+        "list_cost_micro_usd": list_cost_micro_usd,
+        "cost_micro_usd": cost_micro_usd,
+        "plan_multiplier_bps": plan_multiplier_bps,
+        "billing_coverage_mode": billing_coverage_mode,
+    })))
 }
 
 async fn get_user_usage_events_handler(
@@ -6500,7 +7140,11 @@ async fn control_plane_logging_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let path = req.uri().path().to_string();
+    let raw_path = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| req.uri().path().to_string(), |pq| pq.as_str().to_string());
+    let path = llmroller_proto::scrub::scrub_text(&raw_path);
     let method = req.method().as_str().to_string();
     let is_cp = path.starts_with("/api/user/") || path.starts_with("/admin/api/");
     if !is_cp || path.contains("/logs") {
@@ -6525,7 +7169,7 @@ async fn control_plane_logging_middleware(
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(llmroller_proto::scrub::scrub_text);
     let actor_user_id = crate::auth::authenticate_session(&state.auth, &headers)
         .await
         .ok()
@@ -8118,6 +8762,10 @@ pub fn router(state: ApiAppState) -> Router {
             post(post_test_upstream_key_handler),
         )
         .route(
+            "/api/user/upstream-keys/{id}/reset-health",
+            post(post_reset_upstream_key_health_handler),
+        )
+        .route(
             "/api/user/upstream-keys/{id}/windows",
             get(get_user_budget_windows_handler).post(post_user_budget_window_handler),
         )
@@ -8196,6 +8844,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route("/api/user/shares/{id}", delete(delete_user_share_handler))
         .route("/api/user/pins", get(get_active_pins_handler))
         .route(
+            "/api/user/pins/move",
+            post(post_user_move_pin_body_handler),
+        )
+        .route(
             "/api/user/pins/{client_key_id}/{session_hash}/{canonical_id}",
             delete(delete_user_pin_handler),
         )
@@ -8233,6 +8885,10 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route("/api/user/usage/events", get(get_user_usage_events_handler))
         .route(
+            "/api/user/usage/events/{id}/breakdown",
+            get(get_user_usage_event_breakdown_handler),
+        )
+        .route(
             "/api/user/usage/export.csv",
             get(get_user_usage_export_csv_handler),
         )
@@ -8263,6 +8919,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/upstream-keys/{id}",
             patch(patch_user_upstream_key_handler).delete(delete_user_upstream_key_handler),
+        )
+        .route(
+            "/admin/api/upstream-keys/{id}/reset-health",
+            post(post_reset_upstream_key_health_handler),
         )
         .route(
             "/admin/api/upstream-keys/{id}/windows",
@@ -8386,6 +9046,10 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_admin_usage_events_handler),
         )
         .route(
+            "/admin/api/usage/events/{id}/breakdown",
+            get(get_admin_usage_event_breakdown_handler),
+        )
+        .route(
             "/admin/api/usage/export.csv",
             get(get_admin_usage_export_csv_handler),
         )
@@ -8404,6 +9068,10 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))
+        .route(
+            "/admin/api/pins/move",
+            post(post_admin_move_pin_body_handler),
+        )
         .route("/admin/api/sessions/{hash}/pin", delete(delete_pin_handler))
         .route(
             "/admin/api/sessions/{hash}/move",
@@ -8471,6 +9139,42 @@ mod catalog_sync_tests {
                 "model-a".to_string()
             ]
         );
+    }
+
+    #[test]
+    #[doc = "Spec: USG-3, PRV-2"]
+    fn parses_openrouter_models_data_array_and_normalizes_model_ids() {
+        let catalog = serde_json::json!({
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4-6",
+                    "pricing": {
+                        "prompt": "0.000003",
+                        "completion": "0.000015",
+                        "input_cache_read": "0.0000003",
+                        "input_cache_write": "0.00000375"
+                    }
+                }
+            ]
+        });
+        let (prices, _) = parse_catalog_prices(&catalog);
+        let norm = prices
+            .get("claude-sonnet-4.6")
+            .expect("normalized model id entry");
+        assert_eq!(norm.rates.input_per_mtok_micro_usd, 3_000_000);
+        assert_eq!(norm.rates.output_per_mtok_micro_usd, 15_000_000);
+        assert_eq!(norm.rates.cache_read_per_mtok_micro_usd, 300_000);
+        assert_eq!(norm.rates.cache_write_per_mtok_micro_usd, 3_750_000);
+    }
+
+    #[test]
+    #[doc = "Spec: SEC-19, UI-1, UI-3"]
+    fn templates_have_zero_inline_handlers_and_correct_data_plane_port() {
+        let app_html = include_str!("../../templates/app.html");
+        assert!(!app_html.contains("onchange="));
+        assert!(!app_html.contains("onclick="));
+        assert!(app_html.contains("http://127.0.0.1:8080"));
+        assert!(!app_html.contains("http://127.0.0.1:8082"));
     }
 
     /// Models without a `cost` block are not priced, and the catalogue shape is

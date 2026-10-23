@@ -346,3 +346,41 @@ fn test_prepare_request_blocks_drops_oldest_blocks_first_when_exceeding_4mib() {
         "the newest prompt must be retained"
     );
 }
+
+#[doc = "Spec: TRC-2, TRC-5"]
+#[test]
+fn test_responses_sse_function_call_deltas_and_reasoning_text_delta() {
+    let mut tap = TraceTap::new().0;
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.reasoning_text.delta",
+        "delta": "step 1: check weather"
+    }));
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.output_item.added",
+        "item": {
+            "id": "fc_1",
+            "call_id": "call_weather_1",
+            "type": "function_call",
+            "name": "get_weather",
+            "arguments": ""
+        }
+    }));
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "fc_1",
+        "delta": "{\"city\":"
+    }));
+    tap.feed_sse_data_json(&serde_json::json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "fc_1",
+        "delta": "\"Bandung\"}"
+    }));
+    assert_eq!(tap.output.assistant_reasoning, "step 1: check weather");
+    assert_eq!(tap.output.assistant_tool_calls.len(), 1);
+    assert_eq!(tap.output.assistant_tool_calls[0].id, "call_weather_1");
+    assert_eq!(tap.output.assistant_tool_calls[0].name, "get_weather");
+    assert_eq!(
+        tap.output.assistant_tool_calls[0].arguments_json,
+        "{\"city\":\"Bandung\"}"
+    );
+}

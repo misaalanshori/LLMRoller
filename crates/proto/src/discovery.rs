@@ -34,11 +34,84 @@ pub enum DiscoveryParseError {
     MissingModelArray,
 }
 
-/// Extract upstream model identifiers from an OpenAI or Anthropic `/models` response.
-///
-/// Both protocols return `{"data": [{"id": "..."}]}`; a bare JSON array of
-/// strings or objects is also accepted so custom providers stay usable.
-pub fn parse_models_body(body: &[u8]) -> Result<Vec<String>, DiscoveryParseError> {
+/// Per-model token pricing extracted from an upstream `/models` payload (in micro-USD per MTok; `MDL-1`, `USG-2`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredPricing {
+    pub input_micro_usd_per_mtok: i64,
+    pub output_micro_usd_per_mtok: i64,
+    pub cache_read_micro_usd_per_mtok: i64,
+    pub cache_write_micro_usd_per_mtok: i64,
+    pub reasoning_micro_usd_per_mtok: Option<i64>,
+}
+
+/// Rich model descriptor extracted from an upstream `/models` response (`F-015`, `MDL-1`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub canonical_slug: Option<String>,
+    pub context_window: Option<i64>,
+    pub discovered_pricing: Option<DiscoveredPricing>,
+}
+
+fn parse_usd_per_token_to_micro_per_mtok(val: Option<&Value>) -> Option<i64> {
+    let raw_f64 = match val? {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !raw_f64.is_finite() || raw_f64 < 0.0 {
+        return None;
+    }
+    // OpenRouter PublicPricing reports USD per single token (e.g. "0.000003" = $3/MTok = 3_000_000 micro-USD/MTok).
+    Some((raw_f64 * 1_000_000_000_000.0).round() as i64)
+}
+
+fn parse_discovered_model(value: &Value) -> Option<DiscoveredModel> {
+    let id = model_identifier(value)?;
+    let Value::Object(obj) = value else {
+        return Some(DiscoveredModel {
+            id,
+            canonical_slug: None,
+            context_window: None,
+            discovered_pricing: None,
+        });
+    };
+    let canonical_slug = obj
+        .get("canonical_slug")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let context_window = obj
+        .get("context_length")
+        .or_else(|| obj.get("context_window"))
+        .and_then(Value::as_i64)
+        .filter(|&n| n > 0);
+    let discovered_pricing = obj.get("pricing").and_then(|pricing| {
+        let input = parse_usd_per_token_to_micro_per_mtok(pricing.get("prompt"))?;
+        let output = parse_usd_per_token_to_micro_per_mtok(pricing.get("completion"))?;
+        let cache_read =
+            parse_usd_per_token_to_micro_per_mtok(pricing.get("input_cache_read")).unwrap_or(0);
+        let cache_write =
+            parse_usd_per_token_to_micro_per_mtok(pricing.get("input_cache_write")).unwrap_or(0);
+        let reasoning = parse_usd_per_token_to_micro_per_mtok(pricing.get("internal_reasoning"));
+        Some(DiscoveredPricing {
+            input_micro_usd_per_mtok: input,
+            output_micro_usd_per_mtok: output,
+            cache_read_micro_usd_per_mtok: cache_read,
+            cache_write_micro_usd_per_mtok: cache_write,
+            reasoning_micro_usd_per_mtok: reasoning,
+        })
+    });
+    Some(DiscoveredModel {
+        id,
+        canonical_slug,
+        context_window,
+        discovered_pricing,
+    })
+}
+
+/// Extract rich model descriptors (including OpenRouter `pricing` and `context_length`) from `/models` (`F-015`).
+pub fn parse_models_response(body: &[u8]) -> Result<Vec<DiscoveredModel>, DiscoveryParseError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| DiscoveryParseError::InvalidJson)?;
     let array = match value {
@@ -56,7 +129,18 @@ pub fn parse_models_body(body: &[u8]) -> Result<Vec<String>, DiscoveryParseError
         _ => return Err(DiscoveryParseError::MissingModelArray),
     };
 
-    Ok(array.iter().filter_map(model_identifier).collect())
+    Ok(array.iter().filter_map(parse_discovered_model).collect())
+}
+
+/// Extract upstream model identifiers from an OpenAI or Anthropic `/models` response.
+///
+/// Both protocols return `{"data": [{"id": "..."}]}`; a bare JSON array of
+/// strings or objects is also accepted so custom providers stay usable.
+pub fn parse_models_body(body: &[u8]) -> Result<Vec<String>, DiscoveryParseError> {
+    Ok(parse_models_response(body)?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
 }
 
 fn model_identifier(value: &Value) -> Option<String> {
@@ -246,5 +330,28 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer sk-secret")
         );
+    }
+
+    #[test]
+    #[doc = "Spec: MDL-1, USG-2"]
+    fn discovery_parses_openrouter_public_pricing_fields() {
+        let raw = br#"{"data":[{"id":"anthropic/claude-sonnet-4.6","canonical_slug":"anthropic/claude-4.6-sonnet","context_length":200000,"pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.0000003","input_cache_write":"0.00000375","internal_reasoning":"0.000015"}}]}"#;
+        let models = parse_models_response(raw).expect("openrouter models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "anthropic/claude-sonnet-4.6");
+        assert_eq!(
+            models[0].canonical_slug.as_deref(),
+            Some("anthropic/claude-4.6-sonnet")
+        );
+        assert_eq!(models[0].context_window, Some(200_000));
+        let pricing = models[0]
+            .discovered_pricing
+            .as_ref()
+            .expect("discovered pricing");
+        assert_eq!(pricing.input_micro_usd_per_mtok, 3_000_000);
+        assert_eq!(pricing.output_micro_usd_per_mtok, 15_000_000);
+        assert_eq!(pricing.cache_read_micro_usd_per_mtok, 300_000);
+        assert_eq!(pricing.cache_write_micro_usd_per_mtok, 3_750_000);
+        assert_eq!(pricing.reasoning_micro_usd_per_mtok, Some(15_000_000));
     }
 }

@@ -483,12 +483,12 @@ impl TraceTap {
                     self.append_output_text(delta, false);
                 }
             }
-            Some("response.reasoning_summary_text.delta") => {
+            Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
                     self.append_output_text(delta, true);
                 }
             }
-            Some("response.output_item.done") => {
+            Some("response.output_item.added") => {
                 if let Some(item) = value.get("item")
                     && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
                 {
@@ -513,6 +513,69 @@ impl TraceTap {
                         name,
                         arguments_json: arguments,
                     });
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
+                    if self.output.assistant_tool_calls.is_empty() {
+                        self.output.assistant_tool_calls.push(AssembledToolCall {
+                            id: value
+                                .get("item_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: String::new(),
+                            arguments_json: String::new(),
+                        });
+                    }
+                    if let Some(last) = self.output.assistant_tool_calls.last_mut() {
+                        last.arguments_json.push_str(delta);
+                    }
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = value.get("item")
+                    && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(existing) = self
+                        .output
+                        .assistant_tool_calls
+                        .iter_mut()
+                        .rev()
+                        .find(|tc| tc.id == id || tc.name == name || tc.id.is_empty())
+                    {
+                        if !id.is_empty() {
+                            existing.id = id;
+                        }
+                        if !name.is_empty() {
+                            existing.name = name;
+                        }
+                        if !arguments.is_empty() {
+                            existing.arguments_json = arguments;
+                        }
+                    } else {
+                        self.output.assistant_tool_calls.push(AssembledToolCall {
+                            id,
+                            name,
+                            arguments_json: arguments,
+                        });
+                    }
                 }
             }
             _ => {}

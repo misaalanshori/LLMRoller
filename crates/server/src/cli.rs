@@ -218,6 +218,28 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             "admin listener rejects non-loopback without TLS or trusted proxies".to_string(),
         ));
     }
+    match llmroller_proxy::metrics::check_data_plane_bind_security(&args.listen, false, require_tls)
+    {
+        Ok(true) => {
+            tracing::warn!(
+                "Binding plaintext data-plane on non-loopback address {}; setting llmroller_plaintext_data_plane=1 (SEC-10)",
+                args.listen
+            );
+            llmroller_proxy::metrics::set_plaintext_data_plane(1);
+        }
+        Ok(false) => {
+            llmroller_proxy::metrics::set_plaintext_data_plane(0);
+        }
+        Err(code) => {
+            return Err(CliFailure::new(
+                code,
+                format!(
+                    "Refusing to bind plaintext data-plane on non-loopback {} with LLMROLLER_REQUIRE_TLS=true",
+                    args.listen
+                ),
+            ));
+        }
+    }
     let master_key = load_master_key_from_env().map_err(|e| {
         let code = u8::try_from(e.exit_code()).unwrap_or(3);
         CliFailure::new(code, e.to_string())
@@ -319,7 +341,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     for (key_id, windows) in shared_snapshot.load().budget_windows.iter() {
         let key_ring = rebuilt.key_rings.get(key_id);
         for window in windows {
-            let seed = if window.scope_kind == "route" {
+            let source_ring = if window.scope_kind == "route" {
                 let canonical_id = window.model_pk.and_then(|pk| {
                     shared_snapshot
                         .load()
@@ -327,27 +349,11 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                         .get(&pk)
                         .map(|m| m.canonical_id.clone())
                 });
-                if let Some(cid) = canonical_id
-                    && let Some(route_ring) = rebuilt.route_rings.get(&(*key_id, cid))
-                {
-                    if let Some(period) = window.period_ms {
-                        route_ring.sum_range(clock.now_ms() - period, clock.now_ms())
-                    } else {
-                        route_ring.sum_at(clock.now_ms())
-                    }
-                } else {
-                    0
-                }
-            } else if let Some(ring) = key_ring {
-                if let Some(period) = window.period_ms {
-                    ring.sum_range(clock.now_ms() - period, clock.now_ms())
-                } else {
-                    ring.sum_at(clock.now_ms())
-                }
+                canonical_id.and_then(|cid| rebuilt.route_rings.get(&(*key_id, cid)))
             } else {
-                0
+                key_ring
             };
-            runtime_state.hydrate_window_counter(window, seed, clock.now_ms());
+            runtime_state.hydrate_window_counter_from_ring(window, source_ring, clock.now_ms());
         }
     }
 
@@ -388,6 +394,31 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             }
         }
         runtime_state.health.observe_version(max_health_version);
+    }
+
+    // Seed persisted route-level health cooldowns from model_routes (REL-4, REL-5, F-101).
+    if let Ok(route_rows) = sqlx::query_as::<_, (String, String, String, Option<i64>)>(
+        "SELECT upstream_key_id, model_pk, route_health, route_health_until
+         FROM model_routes
+         WHERE route_health <> 'healthy' AND route_health_until > ?",
+    )
+    .bind(clock.now_ms())
+    .fetch_all(&pool)
+    .await
+    {
+        for (uk_str, mpk_str, _r_health, until_opt) in route_rows {
+            if let (Ok(uk_id), Ok(mpk), Some(until_ms)) = (
+                llmroller_core::ids::UpstreamKeyId::parse(&uk_str),
+                llmroller_core::ids::ModelPk::parse(&mpk_str),
+                until_opt,
+            ) {
+                for proto in ["chat", "responses", "messages"] {
+                    runtime_state
+                        .route_protocol_blocks
+                        .block_protocol(uk_id, mpk, proto, until_ms);
+                }
+            }
+        }
     }
 
     // Seed durable PlanRestricted protocol blocks so restart cannot resurrect
@@ -640,6 +671,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let bg_ready = is_ready.clone();
     let bg_snapshot = shared_snapshot.clone();
     let bg_pin_store = pin_store.clone();
+    let bg_runtime_state = runtime_state.clone();
+    let bg_reloader_tx = reloader_tx.clone();
+    let bg_audit_key = instance_state.audit_hmac_key.clone();
     let wal_path = format!("{}-wal", database.display());
     // The maintenance tick is supervised so a panic in the checkpoint/retention path
     // restarts the job with exponential backoff instead of silently losing it for the
@@ -652,6 +686,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 let bg_ready = bg_ready.clone();
                 let bg_snapshot = bg_snapshot.clone();
                 let bg_pin_store = bg_pin_store.clone();
+                let bg_runtime_state = bg_runtime_state.clone();
+                let bg_reloader_tx = bg_reloader_tx.clone();
+                let bg_audit_key = bg_audit_key.clone();
                 let wal_path = wal_path.clone();
                 async move {
                     let wal_supervisor =
@@ -673,6 +710,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 }
                                 let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
                                 bg_pin_store.sweep(now_ms);
+                                bg_runtime_state.constant_session_detector.sweep_idle(now_ms);
                                 let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
                                 let snapshot = bg_snapshot.load();
                                 let retention_days = snapshot.settings.usage_events_retention_days.max(1);
@@ -692,29 +730,19 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 let _ = llmroller_store::retention::sweep_orphaned_trace_blocks(&bg_pool, cutoff, 1_000).await;
                                 let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
 
-                                // Auto-disable traceability if expiry timestamp reached (TRC-1)
+                                // Auto-disable traceability if expiry timestamp reached (TRC-1, AUD-1, F-093)
                                 if llmroller_core::trace_config::check_auto_disable_expired(
                                     &snapshot.settings.traceability_config,
                                     now_ms,
-                                ) && let Ok(mut tx) = bg_pool.begin().await
-                                {
-                                    let mut updated =
-                                        snapshot.settings.traceability_config.clone();
-                                    updated.enabled = false;
-                                    if let Ok(json) = serde_json::to_string(&updated) {
-                                        let _ = sqlx::query(
-                                            "UPDATE settings SET value = ? WHERE key = 'traceability_config'",
-                                        )
-                                        .bind(json)
-                                        .execute(&mut *tx)
-                                        .await;
-                                        let _ = sqlx::query(
-                                            "UPDATE instance_meta SET config_version = config_version + 1",
-                                        )
-                                        .execute(&mut *tx)
-                                        .await;
-                                        let _ = tx.commit().await;
-                                    }
+                                ) {
+                                    let _ = auto_disable_expired_traceability(
+                                        &bg_pool,
+                                        &snapshot.settings.traceability_config,
+                                        bg_audit_key.expose_secret(),
+                                        Some(&bg_reloader_tx),
+                                        now_ms,
+                                    )
+                                    .await;
                                 }
                             }
                             _ = stop_rx.changed() => break,
@@ -1283,5 +1311,157 @@ mod tests {
             }
             _ => panic!("expected Serve"),
         }
+    }
+}
+
+/// Atomically disables expired content traceability in `settings.value_json`, writes the
+/// `traceability.auto_disabled` audit entry, increments `config_version`, and notifies `Reloader` (`TRC-1`, `AUD-1`, `F-093`).
+pub(crate) async fn auto_disable_expired_traceability(
+    pool: &sqlx::SqlitePool,
+    current_config: &llmroller_core::settings::TraceabilityConfig,
+    audit_hmac_key: &[u8],
+    reloader_tx: Option<&tokio::sync::mpsc::Sender<llmroller_store::writer::ReloadNotification>>,
+    now_ms: i64,
+) -> Result<bool, sqlx::Error> {
+    if !llmroller_core::trace_config::check_auto_disable_expired(current_config, now_ms) {
+        return Ok(false);
+    }
+    let mut updated = current_config.clone();
+    updated.enabled = false;
+    let Ok(json) = serde_json::to_string(&updated) else {
+        return Ok(false);
+    };
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES ('traceability_config', ?, ?)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+    )
+    .bind(&json)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await?;
+
+    let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+    let _ = llmroller_store::audit::append(
+        &mut tx,
+        audit_hmac_key,
+        llmroller_store::audit::AuditEntry {
+            id: &audit_id,
+            ts: now_ms,
+            actor_user_id: None,
+            ip_addr: None,
+            action: "traceability.auto_disabled",
+            target_type: "setting",
+            target_id: Some("traceability_config"),
+            detail_json: Some("{\"reason\":\"auto_disable_at_expired\"}"),
+        },
+    )
+    .await;
+
+    let new_ver = llmroller_store::writer::bump_config_version_tx(&mut tx).await?;
+    tx.commit().await?;
+
+    if let Some(tx_chan) = reloader_tx {
+        let _ = tx_chan
+            .send(llmroller_store::writer::ReloadNotification {
+                min_version: new_ver,
+                changed_domains: vec![
+                    llmroller_core::snapshot::ConfigDomain::Settings,
+                    llmroller_core::snapshot::ConfigDomain::Traceability,
+                ],
+                invalidations: vec![llmroller_core::snapshot::CacheInvalidationEvent::SettingsChanged],
+            })
+            .await;
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod phase7_tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: REL-4, LIM-1"]
+    fn hydrating_window_preserves_original_bucket_timestamps_for_rolling_expiry() {
+        let runtime = llmroller_core::runtime_state::RuntimeState::new();
+        let key_id = llmroller_core::ids::UpstreamKeyId::generate();
+        let period_ms = 5 * 3_600_000; // 5 hours
+        let now_ms = 100 * 3_600_000;
+        let old_bucket_ms = now_ms - period_ms + 300_000; // 4h55m ago (expires in 5m)
+        let recent_bucket_ms = now_ms - 600_000; // 10m ago
+
+        let mut ring = llmroller_core::windows::RollingRing::new(period_ms);
+        ring.record(old_bucket_ms, 4_000_000);
+        ring.record(recent_bucket_ms, 2_000_000);
+
+        let window = llmroller_core::snapshot::SnapshotBudgetWindow {
+            id: "w-rolling-5h".to_string(),
+            scope_kind: "upstream_key".to_string(),
+            upstream_key_id: key_id,
+            model_pk: None,
+            window_kind: "rolling".to_string(),
+            period_ms: Some(period_ms),
+            anchor_at: None,
+            upstream_window_kind: None,
+            limit_micro_usd: 10_000_000,
+            reserve_pct: 0,
+        };
+        runtime.hydrate_window_counter_from_ring(&window, Some(&ring), now_ms);
+        let counter = runtime.window_counter("w-rolling-5h").expect("counter");
+        assert_eq!(counter.local_used(now_ms), 6_000_000);
+        // 6 minutes later, the 4h55m-old bucket must have expired, leaving only 2_000_000!
+        assert_eq!(counter.local_used(now_ms + 360_000), 2_000_000);
+    }
+
+    #[test]
+    #[doc = "Spec: SEC-10, OBS-1"]
+    fn non_loopback_plaintext_bind_fails_when_require_tls_is_true() {
+        assert_eq!(
+            llmroller_proxy::metrics::check_data_plane_bind_security("0.0.0.0:8080", false, true),
+            Err(2)
+        );
+        assert_eq!(
+            llmroller_proxy::metrics::check_data_plane_bind_security("0.0.0.0:8080", false, false),
+            Ok(true)
+        );
+        assert_eq!(
+            llmroller_proxy::metrics::check_data_plane_bind_security("127.0.0.1:8080", false, true),
+            Ok(false)
+        );
+    }
+
+    #[tokio::test]
+    #[doc = "Spec: TRC-1, AUD-1, REL-2"]
+    async fn traceability_auto_disable_updates_value_json_reloads_snapshot_and_audits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("llmroller.db");
+        let pool = open_pool(&db, Role::Writer).await.expect("open pool");
+        migrate(&pool).await.expect("migrate");
+        seed_defaults(&pool, "smooth_weighted_rr", 1_000).await.expect("seed");
+
+        let cfg = llmroller_core::settings::TraceabilityConfig {
+            enabled: true,
+            match_filters: llmroller_core::settings::TraceabilityMatch::default(),
+            retention_days: 7,
+            auto_disable_at: Some(5_000),
+        };
+        let (reloader_tx, mut reloader_rx) = tokio::sync::mpsc::channel(4);
+        let disabled = auto_disable_expired_traceability(
+            &pool,
+            &cfg,
+            b"0123456789abcdef0123456789abcdef",
+            Some(&reloader_tx),
+            6_000,
+        )
+        .await
+        .expect("auto disable");
+        assert!(disabled);
+
+        let loaded = llmroller_store::settings::load_settings(&pool)
+            .await
+            .expect("load settings");
+        assert!(!loaded.traceability_config.enabled);
+        let notif = reloader_rx.try_recv().expect("reloader notified");
+        assert!(notif.changed_domains.contains(&llmroller_core::snapshot::ConfigDomain::Settings));
     }
 }

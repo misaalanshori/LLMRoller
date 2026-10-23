@@ -56,8 +56,8 @@ function onProviderKindChange(kind, selectId) {
     if (!urlInput) return;
     if (kind === 'openrouter') urlInput.value = 'https://openrouter.ai/api/v1';
     else if (kind === 'opencode_go') urlInput.value = 'https://opencode.ai/zen/go/v1';
-    else if (kind === 'command_code') urlInput.value = 'https://api.commandcode.ai/provider/v1';
-    else if (kind === 'open_design_amr') urlInput.value = 'https://amr-link.open-design.ai/v1';
+    else if (kind === 'command_code') urlInput.value = 'https://api.commandcode.ai/v1';
+    else if (kind === 'open_design_amr') urlInput.value = 'https://amr.opendesign.ai/v1';
     else if (kind === 'custom') urlInput.value = '';
 }
 
@@ -194,7 +194,7 @@ document.addEventListener('submit', function(e) {
 // Global Change Listeners
 // ---------------------------------------------------------------------------
 document.addEventListener('change', function(e) {
-    if (e.target.id === 'prov-kind' || e.target.id === 'gp-kind') {
+    if (e.target.id === 'prov-kind' || e.target.id === 'gp-kind' || e.target.id === 'provider-kind-select') {
         onProviderKindChange(e.target.value, e.target.id);
     }
 });
@@ -230,8 +230,9 @@ async function handleCreateClientKey(e) {
         const tbody = document.getElementById('client-keys-body');
         if (tbody) htmx.trigger(tbody, 'load');
 
-        if (data.raw_token) {
-            document.getElementById('revealed-token-text').textContent = data.raw_token;
+        const revealedToken = data.raw_token || data.token;
+        if (revealedToken) {
+            document.getElementById('revealed-token-text').textContent = revealedToken;
             openModal('modal-token-reveal');
         }
     } catch (err) {

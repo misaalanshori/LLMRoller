@@ -186,11 +186,34 @@ pub async fn upsert_discovered_models_tx(
             }
         }
 
-        // Upsert into model_routes
+        // Upsert into model_routes, intersecting provider supported_protocols if configured (MDL-1, RTE-3, PRV-2)
         let pk_str = model_pk.to_string();
         let key_str = upstream_key_id.to_string();
         let raw_str = raw.as_str();
-        let protocols_json = r#"["chat","responses","messages"]"#;
+        let provider_cfg_opt: Option<String> = sqlx::query_scalar(
+            "SELECT p.config_json FROM upstream_keys k JOIN providers p ON p.id = k.provider_id WHERE k.id = ?",
+        )
+        .bind(&key_str)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let protocols_json = if let Some(ref cfg_str) = provider_cfg_opt
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(cfg_str)
+            && let Some(arr) = val.get("supported_protocols").and_then(|v| v.as_array())
+        {
+            let filtered: Vec<&str> = ["chat", "responses", "messages"]
+                .into_iter()
+                .filter(|p| arr.iter().any(|item| item.as_str() == Some(*p)))
+                .collect();
+            if filtered.is_empty() {
+                r#"["chat","responses","messages"]"#.to_string()
+            } else {
+                serde_json::to_string(&filtered)
+                    .unwrap_or_else(|_| r#"["chat","responses","messages"]"#.to_string())
+            }
+        } else {
+            r#"["chat","responses","messages"]"#.to_string()
+        };
 
         sqlx::query(
             r#"INSERT INTO model_routes (
@@ -199,6 +222,9 @@ pub async fn upsert_discovered_models_tx(
                )
                VALUES (?, ?, ?, ?, ?, 'active', NULL, ?)
                ON CONFLICT (upstream_key_id, model_pk) DO UPDATE SET
+                   upstream_model_id = excluded.upstream_model_id,
+                   vendor_prefix = excluded.vendor_prefix,
+                   protocols = excluded.protocols,
                    status = 'active',
                    missing_since = NULL,
                    discovered_at = excluded.discovered_at"#,
@@ -207,7 +233,7 @@ pub async fn upsert_discovered_models_tx(
         .bind(&pk_str)
         .bind(raw_str)
         .bind(vendor_prefix)
-        .bind(protocols_json)
+        .bind(&protocols_json)
         .bind(now_ms)
         .execute(&mut **tx)
         .await?;
@@ -302,6 +328,13 @@ pub async fn merge_models_tx(
         Some(c) => c,
         None => return Ok(()),
     };
+
+    // Repoint any existing model_redirects rows that targeted source_pk so chained merges (A->B, B->C) resolve A->C (MDL-3, MDL-4)
+    sqlx::query("UPDATE model_redirects SET model_pk = ? WHERE model_pk = ?")
+        .bind(&target_str)
+        .bind(&source_str)
+        .execute(&mut **tx)
+        .await?;
 
     // Insert redirect from source canonical_id to target model_pk
     sqlx::query(
@@ -513,10 +546,10 @@ pub async fn load_catalog_snapshot_tx(
             distribution,
             routing_strategy: strategy_str
                 .and_then(|s| s.parse::<llmroller_core::strategy::RoutingStrategy>().ok()),
-            origin: if origin_str == "personal" {
-                ModelOrigin::Personal
-            } else {
-                ModelOrigin::Global
+            origin: match origin_str.as_str() {
+                "personal" => ModelOrigin::Personal,
+                "preset" => ModelOrigin::Preset,
+                _ => ModelOrigin::Global,
             },
             owner_user_id: created_by.and_then(|s| UserId::parse(&s).ok()),
         };
@@ -651,4 +684,100 @@ pub async fn load_catalog_snapshot_tx(
     }
 
     Ok(snapshot)
+}
+
+/// Confirms a pending cross-vendor merge review and optionally merges `source_pk` into `target_pk` (`MDL-2`, `MDL-3`, `MDL-4`).
+pub async fn confirm_merge_review_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    model_pk: &ModelPk,
+    target_pk: Option<&ModelPk>,
+    now_ms: i64,
+) -> Result<bool, sqlx::Error> {
+    if let Some(target) = target_pk
+        && target != model_pk
+    {
+        merge_models_tx(tx, model_pk, target, now_ms).await?;
+        sqlx::query("UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?")
+            .bind(target.to_string())
+            .execute(&mut **tx)
+            .await?;
+        return Ok(true);
+    }
+
+    let res = sqlx::query("UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?")
+        .bind(model_pk.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+    use llmroller_core::catalog::ModelOrigin;
+    use llmroller_core::snapshot::ConfigSnapshot;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    #[doc = "Spec: MDL-1, MDL-2, MDL-3, MDL-4, RTE-3, PRV-2"]
+    async fn chained_model_merge_redirects_and_preset_origin_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("models.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        let mut tx = pool.begin().await.expect("begin");
+        let pk_a = ModelPk::generate();
+        let pk_b = ModelPk::generate();
+        let pk_c = ModelPk::generate();
+
+        sqlx::query("INSERT INTO models (model_pk, canonical_id, origin, merge_state) VALUES (?, 'model-a', 'global', 'pending_review')")
+            .bind(pk_a.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("insert a");
+        sqlx::query("INSERT INTO models (model_pk, canonical_id, origin, merge_state) VALUES (?, 'model-b', 'global', 'pending_review')")
+            .bind(pk_b.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("insert b");
+        sqlx::query("INSERT INTO models (model_pk, canonical_id, origin, merge_state) VALUES (?, 'model-c', 'preset', 'pending_review')")
+            .bind(pk_c.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("insert c");
+
+        // Merge A -> B, then confirm merge review B -> C
+        merge_models_tx(&mut tx, &pk_a, &pk_b, 1_000)
+            .await
+            .expect("merge A -> B");
+        let confirmed = confirm_merge_review_tx(&mut tx, &pk_b, Some(&pk_c), 2_000)
+            .await
+            .expect("confirm merge B -> C");
+        assert!(confirmed);
+
+        let catalog = load_catalog_snapshot_tx(&mut tx)
+            .await
+            .expect("load catalog snapshot");
+        tx.commit().await.expect("commit");
+
+        let model_c = catalog.models.get(&pk_c).expect("model c present");
+        assert_eq!(model_c.origin, ModelOrigin::Preset);
+        assert_eq!(model_c.merge_state, llmroller_core::catalog::MergeState::Confirmed);
+
+        let snap = ConfigSnapshot {
+            models: Arc::new(catalog.models),
+            models_by_canonical: Arc::new(catalog.models_by_canonical),
+            aliases: Arc::new(catalog.aliases),
+            redirects: Arc::new(catalog.redirects),
+            ..ConfigSnapshot::default()
+        };
+
+        assert_eq!(snap.resolve_model("model-a").expect("resolve model-a").id, pk_c);
+        assert_eq!(snap.resolve_model("model-b").expect("resolve model-b").id, pk_c);
+        assert_eq!(snap.resolve_model("model-c").expect("resolve model-c").id, pk_c);
+    }
 }

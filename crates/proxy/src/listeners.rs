@@ -54,6 +54,16 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             "/v1/messages/count_tokens",
             post(crate::orchestrator::post_messages_count_tokens),
         )
+        .route("/v1/v1/messages", post(crate::orchestrator::post_messages))
+        .route(
+            "/v1/v1/messages/count_tokens",
+            post(crate::orchestrator::post_messages_count_tokens),
+        )
+        .route("/messages", post(crate::orchestrator::post_messages))
+        .route(
+            "/messages/count_tokens",
+            post(crate::orchestrator::post_messages_count_tokens),
+        )
         .route(
             "/v1/usage",
             get(crate::usage_passthrough::get_v1_usage_handler),
@@ -90,7 +100,12 @@ async fn healthz_handler() -> Response {
 }
 
 async fn readyz_handler(State(state): State<ProxyAuthState>) -> Response {
-    if state.is_ready.load(Ordering::SeqCst) {
+    let writer_healthy = state
+        .writer
+        .as_ref()
+        .is_none_or(|w| !w.is_sqlite_full() && !w.is_durable_queue_full());
+    let not_draining = !state.shutdown_cut.load(Ordering::Acquire);
+    if state.is_ready.load(Ordering::SeqCst) && not_draining && writer_healthy {
         (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "ready" })),
@@ -125,7 +140,13 @@ fn visible_models(
             continue;
         }
         if let Some(allowed) = &client_key.allowed_models
-            && !allowed.iter().any(|entry| entry == &model.canonical_id)
+            && !allowed.iter().any(|entry| {
+                entry == &model.canonical_id
+                    || snapshot
+                        .aliases
+                        .get(entry)
+                        .is_some_and(|target_pk| *target_pk == model.id)
+            })
         {
             continue;
         }
@@ -186,7 +207,7 @@ async fn v1_models_handler(
     let (models, aliases) = visible_models(&snapshot, &client_key, now);
 
     if headers.contains_key("anthropic-version") {
-        let items: Vec<serde_json::Value> = models
+        let mut items: Vec<serde_json::Value> = models
             .into_iter()
             .map(|(id, display_name, _)| {
                 let display_name = display_name.unwrap_or_else(|| id.clone());
@@ -194,10 +215,20 @@ async fn v1_models_handler(
                     "type": "model",
                     "id": id,
                     "display_name": display_name,
+                    "context_window": 200_000,
                     "created_at": "2026-01-01T00:00:00Z"
                 })
             })
             .collect();
+        for (alias, canonical) in aliases {
+            items.push(serde_json::json!({
+                "type": "model",
+                "id": alias,
+                "display_name": canonical,
+                "context_window": 200_000,
+                "created_at": "2026-01-01T00:00:00Z"
+            }));
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -222,9 +253,11 @@ async fn v1_models_handler(
             "object": "model",
             "created": 1700000000,
             "owned_by": "llmroller",
+            "context_window": 200_000,
             "llmroller": {
                 "available": available,
-                "aliases": model_aliases
+                "aliases": model_aliases,
+                "context_window": 200_000
             }
         }));
     }

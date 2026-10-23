@@ -29,6 +29,9 @@ use crate::shutdown::JobSupervisor;
 /// Scheduled full-catalog refresh cadence required by `MDL-1`.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Auto-recovery probe cadence (`15 min`) for upstream keys marked `Invalid` (`REL-5`, `API-8`, `F-103`).
+const INVALID_KEY_RECOVERY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 /// Per-key upstream discovery request timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -110,10 +113,15 @@ pub fn start_discovery_poller(
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     ticker.tick().await;
 
+                    let mut recovery_ticker = tokio::time::interval(INVALID_KEY_RECOVERY_INTERVAL);
+                    recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    recovery_ticker.tick().await;
+
                     let mut rx_guard = rx_arc.lock().await;
                     loop {
                         let target = tokio::select! {
                             _ = ticker.tick() => DiscoveryTarget::AllEnabled,
+                            _ = recovery_ticker.tick() => DiscoveryTarget::AllEnabled,
                             Some(target) = rx_guard.recv() => target,
                             else => break,
                         };
@@ -304,8 +312,9 @@ async fn discover_key(
         .map_err(|error| error.to_string())?;
 
     // A successful refresh supersedes any PlanRestricted route blocks written
-    // between discovery passes (`API-8`). The in-memory clear is paired with a
-    // durable delete so restart cannot resurrect a superseded block.
+    // between discovery passes (`API-8`) and recovers keys previously marked
+    // `Invalid` (`REL-5`, `F-103`).
+    recover_invalid_key_after_models_probe(runtime_state, Some(writer), key.id);
     runtime_state.clear_route_protocol_blocks(key.id);
     writer.queues.durable_state.lock().insert(
         DurableKey::RouteProtocolClear(key.id.to_string()),
@@ -352,5 +361,72 @@ impl ControlOp for PersistDiscovery {
             );
             Ok(())
         })
+    }
+}
+
+/// Transitions an `Invalid` / quarantined upstream key back to `Healthy` when a `GET /models`
+/// probe succeeds with HTTP 2xx, bumping `health_version` and enqueueing a durable health update (`REL-5`, `API-8`, `F-103`).
+pub fn recover_invalid_key_after_models_probe(
+    runtime_state: &RuntimeState,
+    writer: Option<&WriterHandle>,
+    key_id: UpstreamKeyId,
+) -> bool {
+    let was_unhealthy = runtime_state
+        .key_health
+        .get(&key_id)
+        .is_some_and(|entry| !entry.healthy || entry.quarantine_reason.is_some());
+    if !was_unhealthy {
+        return false;
+    }
+    runtime_state
+        .key_health
+        .insert(key_id, llmroller_core::runtime_state::KeyHealthEntry::default());
+    let version = i64::try_from(runtime_state.health.bump_version()).unwrap_or(i64::MAX);
+    if let Some(writer) = writer {
+        writer.queues.durable_state.lock().insert(
+            DurableKey::KeyHealth(key_id.to_string()),
+            DurableOp::KeyHealthUpdate {
+                key_id: key_id.to_string(),
+                health: "healthy".to_string(),
+                health_until: None,
+                health_version: version,
+            },
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmroller_core::provider::{ProviderAuthConfig, ProviderAuthScheme};
+
+    #[test]
+    #[doc = "Spec: MDL-1, PRV-1, PRV-3"]
+    fn discovery_poller_uses_configured_models_path_and_auth_header_mode() {
+        let mut cfg = ProviderConfig::default();
+        cfg.paths.models = Some("/custom/v2/models".to_string());
+        cfg.auth.models = Some(ProviderAuthScheme {
+            header: "x-api-key".to_string(),
+            prefix: String::new(),
+        });
+        let url = discovery_endpoint(ProviderKind::Custom, "https://api.example.com/", &cfg);
+        assert_eq!(url, "https://api.example.com/custom/v2/models");
+        let headers = discovery_headers(&cfg, "secret-token");
+        assert_eq!(
+            headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("secret-token")
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: REL-5, API-8"]
+    fn successful_models_probe_recovers_invalid_key_to_healthy() {
+        let runtime = RuntimeState::new();
+        let key_id = UpstreamKeyId::generate();
+        runtime.quarantine_key(key_id, "credential_rejected");
+        assert!(!runtime.is_key_routable(key_id, 1_000));
+        assert!(recover_invalid_key_after_models_probe(&runtime, None, key_id));
+        assert!(runtime.is_key_routable(key_id, 1_000));
     }
 }

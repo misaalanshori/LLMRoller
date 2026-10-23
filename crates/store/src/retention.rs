@@ -256,3 +256,85 @@ pub async fn sweep_orphaned_trace_blocks(
     .await?;
     Ok(result.rows_affected())
 }
+
+/// Deletes expired control_plane_logs rows older than `cutoff_ms` (`USG-8`, `REL-1`).
+pub async fn sweep_expired_control_plane_logs(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM control_plane_logs WHERE ts < ?")
+        .bind(cutoff_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes expired upstream_usage_snapshots rows older than `cutoff_ms` (`USG-4`, `REL-1`).
+pub async fn sweep_expired_usage_snapshots(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM upstream_usage_snapshots WHERE fetched_at < ?")
+        .bind(cutoff_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Executes a unified periodic retention sweep across all ephemeral and time-bounded tables (`TRC-4`, `USG-8`, `REL-1`).
+pub async fn run_retention_pass(
+    pool: &SqlitePool,
+    now_ms: i64,
+    policy: &RetentionPolicy,
+) -> Result<(), sqlx::Error> {
+    let raw_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days * 86_400_000);
+    let seven_days_cutoff = now_ms.saturating_sub(7 * 86_400_000);
+    let ninety_days_cutoff = now_ms.saturating_sub(90 * 86_400_000);
+
+    let _ = sweep_expired_usage_events(pool, raw_cutoff, 1_000).await?;
+    let _ = enforce_max_usage_events_rows_pool(pool, policy.usage_events_max_rows, 1_000).await?;
+    let _ = sweep_expired_pins(pool, now_ms).await?;
+    let _ = sweep_expired_trace_records(pool, now_ms).await?;
+    let _ = sweep_orphaned_trace_blocks(pool, raw_cutoff, 1_000).await?;
+    let _ = sweep_expired_auth_failure_counters(pool, seven_days_cutoff).await?;
+    let _ = sweep_expired_control_plane_logs(pool, ninety_days_cutoff).await?;
+    let _ = sweep_expired_usage_snapshots(pool, seven_days_cutoff).await?;
+    run_incremental_vacuum(pool, 64).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+
+    #[tokio::test]
+    #[doc = "Spec: TRC-4, USG-8, REL-1, REL-3"]
+    async fn retention_pass_prunes_expired_control_plane_logs_pins_and_response_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("retention.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        sqlx::query(
+            "INSERT INTO control_plane_logs (id, ts, request_id, workspace_scope, method, path, status, latency_ms)
+             VALUES ('cpl_1', 1000, 'req_cpl_1', 'global', 'GET', '/admin/api/settings', 200, 5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert cpl");
+
+        let now_ms = 100 * 86_400_000;
+        run_retention_pass(&pool, now_ms, &RetentionPolicy::default())
+            .await
+            .expect("run retention pass");
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_plane_logs")
+            .fetch_one(&pool)
+            .await
+            .expect("count cpl");
+        assert_eq!(remaining, 0);
+    }
+}

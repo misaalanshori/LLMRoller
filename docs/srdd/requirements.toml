@@ -707,7 +707,7 @@ priority = "P0"
 milestone = "M6"
 delivering_subphase = "7.5"
 partial_subphases = ["1.1"]
-tests = ["scripts/verify_release_package.sh"]
+tests = ["scripts/verify_release_package.sh", "crates/server/tests/workspace_boundaries.rs"]
 
 [requirements.MNT-1]
 priority = "P0"
@@ -807,7 +807,7 @@ priority = "P0"
 milestone = "M6"
 delivering_subphase = "7.5"
 partial_subphases = ["1.1"]
-tests = ["scripts/verify_release_package.sh"]
+tests = ["scripts/verify_release_package.sh", "crates/server/tests/workspace_boundaries.rs"]
 
 [requirements.SEC-12]
 priority = "P0"

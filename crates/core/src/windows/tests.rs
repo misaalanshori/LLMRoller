@@ -298,3 +298,40 @@ fn test_50_concurrent_try_reserve_at_97_9_pct_caps_at_98_pct() {
     // Final effective used is exactly 9_790_000 + 10 * 1_000 = 9_800_000
     assert_eq!(counter.effective_used(t0 + 1000), 9_800_000);
 }
+
+#[doc = "Spec: LIM-1, LIM-2"]
+#[test]
+fn test_atomic_budget_counter_manual_offset_and_calendar_month_window_guard() {
+    let oct_15 = utc_to_epoch_millis(2025, 10, 15, 0);
+    let nov_01 = utc_to_epoch_millis(2025, 11, 1, 0);
+    let nov_02 = utc_to_epoch_millis(2025, 11, 2, 0);
+
+    // F-065: AnchoredCalendarMonth ignores events before window_start_ms and resets at UTC month boundary
+    let cal_counter = AtomicBudgetCounter::for_window(
+        42,
+        10_000_000,
+        0,
+        WindowKind::AnchoredCalendarMonth,
+        None,
+        Some(utc_to_epoch_millis(2025, 10, 1, 0)),
+        None,
+        oct_15,
+    );
+    cal_counter.record_actual(oct_15, 4_000_000);
+    assert_eq!(cal_counter.effective_used(oct_15 + 1_000), 4_000_000);
+
+    // At November 1 UTC boundary, October spend is reset to 0, and late October events are ignored
+    assert_eq!(cal_counter.effective_used(nov_01), 0);
+    cal_counter.record_actual(oct_15, 2_000_000);
+    assert_eq!(cal_counter.effective_used(nov_02), 0);
+
+    // F-064: ManualOffset applies to local_used and effective_used until period expiry
+    cal_counter.set_manual_offset(Some(ManualOffset {
+        effective_at_ms: nov_01,
+        delta_micro_usd: 1_500_000,
+        period_ms: 86_400_000,
+    }));
+    assert_eq!(cal_counter.local_used(nov_01 + 1_000), 1_500_000);
+    assert_eq!(cal_counter.effective_used(nov_01 + 1_000), 1_500_000);
+    assert_eq!(cal_counter.effective_used(nov_02 + 1_000), 0);
+}

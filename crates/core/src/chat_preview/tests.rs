@@ -168,3 +168,23 @@ fn test_xss_escaping_and_sanitization() {
     assert!(sanitized_safe.contains("<a href=\"https://example.com\""));
     assert!(sanitized_safe.contains("rel=\"noopener noreferrer nofollow\""));
 }
+
+#[doc = "Spec: SEC-19, TRC-5"]
+#[test]
+fn test_raw_html_disabled_mailto_rejected_and_lcp_compaction_detected() {
+    let out = sanitize_assistant_markdown("[mail](mailto:test@example.com) <b>raw_tag</b>");
+    assert!(!out.contains("mailto:"), "mailto: scheme must be stripped: {out}");
+    assert!(
+        !out.contains("<b>raw_tag</b>"),
+        "raw HTML tags in markdown must be escaped as text: {out}"
+    );
+    assert!(out.contains("&lt;b&gt;raw_tag&lt;/b&gt;"));
+
+    // F-062: compaction/branch detection vs identical retry
+    let prev = vec!["b1".to_string(), "b2".to_string(), "b3".to_string()];
+    let retry = vec!["b1".to_string(), "b2".to_string(), "b3".to_string()];
+    let compacted = vec!["b1".to_string(), "b_summary".to_string()];
+    assert!(!is_compacted_or_branched(&[], &prev));
+    assert!(!is_compacted_or_branched(&prev, &retry));
+    assert!(is_compacted_or_branched(&prev, &compacted));
+}

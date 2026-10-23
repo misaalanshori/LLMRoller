@@ -109,6 +109,20 @@ pub struct RollupDelta {
     pub list_cost_micro_usd: i64,
 }
 
+impl RollupDelta {
+    pub fn merge(&mut self, other: &Self) {
+        self.requests += other.requests;
+        self.errors += other.errors;
+        self.input_uncached_tokens += other.input_uncached_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cost_micro_usd += other.cost_micro_usd;
+        self.list_cost_micro_usd += other.list_cost_micro_usd;
+    }
+}
+
 /// Three-queue in-memory usage batcher:
 /// 1. `durable_state`: essential confirmation/pin/link queue
 /// 2. `rollups`: non-dropping aggregated metric queues
@@ -193,6 +207,64 @@ impl ThreeQueueUsageWriter {
             d.list_cost_micro_usd += event.list_cost_micro_usd;
         }
 
+        // 2b. Fold non-final failed attempt charges into 5-minute and hourly rollups (USG-1, USG-3, SHR-6)
+        for att in &attempts {
+            if att.outcome != AttemptOutcome::Success
+                && att.charged_micro_usd > 0
+                && !att.upstream_key_id.is_empty()
+                && att.upstream_key_id.as_str() != event.upstream_key_id.as_deref().unwrap_or("")
+            {
+                let att_bucket_5min = (att.ts / 300_000) * 300_000;
+                let att_r5_key = Rollup5MinKey {
+                    bucket_ms: att_bucket_5min,
+                    upstream_key_id: att.upstream_key_id.clone(),
+                    canonical_id: event.canonical_id.clone().unwrap_or_default(),
+                    client_key_id: event.client_key_id.to_string(),
+                    share_id: att.share_id.clone().unwrap_or_default(),
+                    owner_user_id: event.owner_user_id.to_string(),
+                    provider_scope: if att.share_id.is_some() {
+                        "shared".to_string()
+                    } else {
+                        event
+                            .provider_scope
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string())
+                    },
+                };
+                {
+                    let mut r5_lock = self.rollups_5min.lock();
+                    let d = r5_lock.entry(att_r5_key).or_default();
+                    d.cost_micro_usd += att.charged_micro_usd;
+                }
+
+                let att_bucket_hourly = (att.ts / 3_600_000) * 3_600_000;
+                let att_rh_key = RollupHourlyKey {
+                    hour_ms: att_bucket_hourly,
+                    owner_user_id: event.owner_user_id.to_string(),
+                    client_key_id: event.client_key_id.to_string(),
+                    upstream_key_id: att.upstream_key_id.clone(),
+                    provider_id: event.provider_id.clone().unwrap_or_default(),
+                    provider_scope: if att.share_id.is_some() {
+                        "shared".to_string()
+                    } else {
+                        event
+                            .provider_scope
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string())
+                    },
+                    share_id: att.share_id.clone().unwrap_or_default(),
+                    canonical_id: event.canonical_id.clone().unwrap_or_default(),
+                };
+                {
+                    let mut rh_lock = self.rollups_hourly.lock();
+                    let d = rh_lock.entry(att_rh_key).or_default();
+                    d.errors += 1;
+                    d.cost_micro_usd += att.charged_micro_usd;
+                    d.list_cost_micro_usd += att.charged_micro_usd;
+                }
+            }
+        }
+
         // 3. Enqueue into bounded raw_events, evicting oldest if capacity exceeded (REL-3)
         {
             let mut raw_lock = self.raw_events.lock();
@@ -202,6 +274,35 @@ impl ThreeQueueUsageWriter {
                     .fetch_add(1, Ordering::Relaxed);
             }
             raw_lock.push_back((event, attempts));
+        }
+    }
+
+    /// Restores a previously drained batch into memory if a transaction fails before commit (`REL-1`, `REL-2`).
+    pub fn restore_batch(
+        &self,
+        r5_items: HashMap<Rollup5MinKey, RollupDelta>,
+        rh_items: HashMap<RollupHourlyKey, RollupDelta>,
+        raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)>,
+    ) {
+        if !r5_items.is_empty() {
+            let mut lock = self.rollups_5min.lock();
+            for (k, v) in r5_items {
+                lock.entry(k).or_default().merge(&v);
+            }
+        }
+        if !rh_items.is_empty() {
+            let mut lock = self.rollups_hourly.lock();
+            for (k, v) in rh_items {
+                lock.entry(k).or_default().merge(&v);
+            }
+        }
+        if !raw_items.is_empty() {
+            let mut lock = self.raw_events.lock();
+            for item in raw_items.into_iter().rev() {
+                if lock.len() < self.max_raw_items {
+                    lock.push_front(item);
+                }
+            }
         }
     }
 
@@ -224,6 +325,25 @@ impl ThreeQueueUsageWriter {
             let mut lock = self.raw_events.lock();
             std::mem::take(&mut *lock)
         };
+
+        let r5_backup = r5_items.clone();
+        let rh_backup = rh_items.clone();
+        let raw_backup = raw_items.clone();
+
+        let res = self.flush_to_db_inner(tx, r5_items, rh_items, raw_items).await;
+        if res.is_err() {
+            self.restore_batch(r5_backup, rh_backup, raw_backup);
+        }
+        res
+    }
+
+    async fn flush_to_db_inner(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        r5_items: HashMap<Rollup5MinKey, RollupDelta>,
+        rh_items: HashMap<RollupHourlyKey, RollupDelta>,
+        raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)>,
+    ) -> Result<usize, sqlx::Error> {
 
         // 1. Commit 5-minute rollups
         for (k, d) in r5_items {
@@ -356,6 +476,27 @@ impl ThreeQueueUsageWriter {
     }
 }
 
+fn extract_json_string_field(json_opt: Option<&str>, keys: &[&str], max_len: usize) -> Option<String> {
+    let raw = json_opt?;
+    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = val.as_object()?;
+    for (k, v) in obj {
+        if keys.iter().any(|target| k.eq_ignore_ascii_case(target))
+            && let Some(s) = v.as_str()
+        {
+            let sanitized: String = s
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(max_len)
+                .collect();
+            if !sanitized.is_empty() {
+                return Some(sanitized);
+            }
+        }
+    }
+    None
+}
+
 async fn insert_usage_event(
     tx: &mut Transaction<'_, Sqlite>,
     e: &UsageEventRecord,
@@ -366,6 +507,30 @@ async fn insert_usage_event(
         .filter(|s| !s.trim().is_empty());
     let provider = e.provider_id.as_deref().filter(|s| !s.trim().is_empty());
     let share = e.share_id.as_deref().filter(|s| !s.trim().is_empty());
+    let client_user_agent = extract_json_string_field(
+        e.request_headers_json.as_deref(),
+        &["user-agent"],
+        256,
+    )
+    .or_else(|| {
+        extract_json_string_field(
+            e.metadata_json.as_deref(),
+            &["client_user_agent", "user_agent"],
+            256,
+        )
+    });
+    let client_location = extract_json_string_field(
+        e.metadata_json.as_deref(),
+        &["client_location", "location"],
+        128,
+    )
+    .or_else(|| {
+        extract_json_string_field(
+            e.request_headers_json.as_deref(),
+            &["cf-ipcountry", "x-client-location"],
+            128,
+        )
+    });
 
     sqlx::query(
         r#"INSERT INTO usage_events (
@@ -378,9 +543,10 @@ async fn insert_usage_event(
                cost_micro_usd, cost_source, latency_ms, ttfb_ms,
                pin_outcome, failovers, error_code,
                list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode,
-               service_account_id, stop_reason, request_headers_json, metadata_json
+               service_account_id, stop_reason, client_user_agent, client_location,
+               request_headers_json, metadata_json
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&e.id)
     .bind(e.ts)
@@ -418,6 +584,8 @@ async fn insert_usage_event(
     .bind(&e.billing_coverage_mode)
     .bind(&e.service_account_id)
     .bind(&e.stop_reason)
+    .bind(client_user_agent)
+    .bind(client_location)
     .bind(&e.request_headers_json)
     .bind(&e.metadata_json)
     .execute(&mut **tx)
@@ -450,4 +618,124 @@ async fn insert_usage_attempt(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+    use sqlx::Row as _;
+
+    #[tokio::test]
+    #[doc = "Spec: USG-1, USG-3, SHR-6, USG-9"]
+    async fn failed_attempt_charges_and_client_user_agent_are_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("usage_writer.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        let writer = ThreeQueueUsageWriter::new(100);
+        let req_id = RequestId::generate();
+        let ck_id = ClientKeyId::generate();
+        let uid = UserId::generate();
+
+        let event = UsageEventRecord {
+            id: ulid::Ulid::new().to_string(),
+            ts: 600_000,
+            request_id: req_id,
+            client_key_id: ck_id,
+            owner_user_id: uid,
+            upstream_key_id: Some("uk_final".to_string()),
+            provider_id: Some("prv_1".to_string()),
+            provider_scope: Some("global".to_string()),
+            share_id: None,
+            canonical_id: Some("gpt-5.4".to_string()),
+            upstream_model_id: Some("openai/gpt-5.4".to_string()),
+            endpoint: "chat".to_string(),
+            protocol: Some("chat".to_string()),
+            session_hash: None,
+            status: 200,
+            stream: false,
+            incomplete: false,
+            termination: "completed".to_string(),
+            trace_dropped: false,
+            input_uncached_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            cost_micro_usd: 1_500,
+            cost_source: CostSource::PriceBook,
+            latency_ms: Some(120),
+            ttfb_ms: Some(40),
+            pin_outcome: Some("new_pin".to_string()),
+            failovers: 1,
+            error_code: None,
+            list_cost_micro_usd: 1_500,
+            plan_multiplier_bps: 10_000,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            service_account_id: None,
+            stop_reason: Some("stop".to_string()),
+            request_headers_json: Some(r#"{"user-agent":"ClaudeCode/1.2.3","cf-ipcountry":"US"}"#.to_string()),
+            metadata_json: None,
+        };
+        let attempts = vec![
+            UsageAttemptRecord {
+                request_id: req_id,
+                attempt_no: 1,
+                ts: 599_000,
+                upstream_key_id: "uk_failed_1".to_string(),
+                share_id: None,
+                outcome: AttemptOutcome::Http5xx,
+                http_status: Some(502),
+                bytes_sent: 0,
+                charged_micro_usd: 400,
+                charge_basis: "estimated_input".to_string(),
+            },
+            UsageAttemptRecord {
+                request_id: req_id,
+                attempt_no: 2,
+                ts: 600_000,
+                upstream_key_id: "uk_final".to_string(),
+                share_id: None,
+                outcome: AttemptOutcome::Success,
+                http_status: Some(200),
+                bytes_sent: 512,
+                charged_micro_usd: 1_500,
+                charge_basis: "provider_reported".to_string(),
+            },
+        ];
+
+        writer.enqueue(event, attempts);
+
+        let mut tx = pool.begin().await.expect("begin");
+        writer.flush_to_db(&mut tx).await.expect("flush");
+        tx.commit().await.expect("commit");
+
+        let failed_rollup_cost: i64 = sqlx::query_scalar(
+            "SELECT cost_micro_usd FROM usage_rollups_5min WHERE upstream_key_id = 'uk_failed_1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed attempt rollup");
+        assert_eq!(failed_rollup_cost, 400);
+
+        let row = sqlx::query(
+            "SELECT client_user_agent, client_location FROM usage_events WHERE request_id = ?",
+        )
+        .bind(req_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("usage_event row");
+        assert_eq!(
+            row.try_get::<Option<String>, _>("client_user_agent").unwrap().as_deref(),
+            Some("ClaudeCode/1.2.3")
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("client_location").unwrap().as_deref(),
+            Some("US")
+        );
+    }
 }

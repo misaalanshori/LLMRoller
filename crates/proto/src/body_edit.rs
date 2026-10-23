@@ -394,16 +394,33 @@ pub fn edit_body_with_session_limit(
 
     let strip_injected_usage = !matches!(stream_options_action, StreamOptionsAction::None);
 
+    let encoded_session_field = if let Some((field_name, token)) = session_field {
+        let truncated_token = truncate_utf8(token, session_max_len);
+        let val_json = serde_json::to_string(truncated_token)
+            .map_err(|e| BodyEditError::Json(e.to_string()))?;
+        Some((field_name, val_json))
+    } else {
+        None
+    };
+
     let session_edits_needed = match tier {
         PoolTier::Own => {
-            if let Some((field_name, _)) = session_field {
-                !scan.fields.iter().any(|f| f.key == field_name)
+            if let Some((field_name, ref val_json)) = encoded_session_field {
+                match scan.fields.iter().find(|f| f.key == field_name) {
+                    None => true,
+                    Some(existing) => {
+                        &original[existing.val_start..existing.val_end] != val_json.as_bytes()
+                    }
+                }
             } else {
                 false
             }
         }
         _ => {
-            let has_top_session = scan.fields.iter().any(|f| is_session_key(&f.key));
+            let has_top_session = scan
+                .fields
+                .iter()
+                .any(|f| is_removed_session_key(&f.key, session_field));
             let has_meta_session = scan.metadata_span.as_ref().is_some_and(|range| {
                 serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
                     &original[range.clone()],
@@ -429,7 +446,7 @@ pub fn edit_body_with_session_limit(
     let session_fields_to_remove_count = if tier != PoolTier::Own {
         scan.fields
             .iter()
-            .filter(|f| is_session_key(&f.key))
+            .filter(|f| is_removed_session_key(&f.key, session_field))
             .count()
     } else {
         0
@@ -452,7 +469,7 @@ pub fn edit_body_with_session_limit(
     }
 
     // (b) Insert session field if needed
-    if let Some((field_name, token)) = session_field {
+    if let Some((field_name, ref val_json)) = encoded_session_field {
         let should_insert = match tier {
             PoolTier::Own => !scan.fields.iter().any(|f| f.key == field_name),
             _ => true,
@@ -461,9 +478,6 @@ pub fn edit_body_with_session_limit(
             if inserted_something {
                 buf.push(b',');
             }
-            let truncated_token = truncate_utf8(token, session_max_len);
-            let val_json = serde_json::to_string(truncated_token)
-                .map_err(|e| BodyEditError::Json(e.to_string()))?;
             buf.extend_from_slice(format!("\"{field_name}\":{val_json}").as_bytes());
             inserted_something = true;
         }
@@ -481,6 +495,18 @@ pub fn edit_body_with_session_limit(
         let escaped =
             serde_json::to_string(target).map_err(|e| BodyEditError::Json(e.to_string()))?;
         replacements.push((span.clone(), escaped.into_bytes()));
+    }
+
+    // Own-tier session field value override when higher-precedence header resolved a different session ID (F-016)
+    if tier == PoolTier::Own
+        && let Some((field_name, ref val_json)) = encoded_session_field
+        && let Some(existing) = scan.fields.iter().find(|f| f.key == field_name)
+        && &orig_bytes[existing.val_start..existing.val_end] != val_json.as_bytes()
+    {
+        replacements.push((
+            existing.val_start..existing.val_end,
+            val_json.as_bytes().to_vec(),
+        ));
     }
 
     // Stream options replacement
@@ -526,13 +552,15 @@ pub fn edit_body_with_session_limit(
         }
     }
 
-    // Remove top-level session spans on Shared/Global tier
+    // Remove top-level session spans on Shared/Global tier (including custom session_field key, F-008)
     if tier != PoolTier::Own {
         let mut i = 0;
         while i < scan.fields.len() {
-            if is_session_key(&scan.fields[i].key) {
+            if is_removed_session_key(&scan.fields[i].key, session_field) {
                 let start_idx = i;
-                while i < scan.fields.len() && is_session_key(&scan.fields[i].key) {
+                while i < scan.fields.len()
+                    && is_removed_session_key(&scan.fields[i].key, session_field)
+                {
                     i += 1;
                 }
                 let end_idx = i - 1;
@@ -585,6 +613,10 @@ enum StreamOptionsAction {
 
 fn is_session_key(key: &str) -> bool {
     matches!(key, "session_id" | "prompt_cache_key" | "promptCacheKey")
+}
+
+fn is_removed_session_key(key: &str, session_field: Option<(&str, &str)>) -> bool {
+    is_session_key(key) || session_field.is_some_and(|(field_name, _)| key == field_name)
 }
 
 fn skip_ws(bytes: &[u8], cursor: &mut usize) {
@@ -664,6 +696,8 @@ fn scan_stream_options_obj(
     let text = std::str::from_utf8(obj_slice).map_err(BodyEditError::Utf8)?;
     let mut cursor = 1; // skip {
     let len = obj_slice.len();
+    let mut seen_keys = BTreeSet::new();
+    let mut include_usage_found: Option<(bool, Range<usize>)> = None;
 
     while cursor < len {
         skip_ws(obj_slice, &mut cursor);
@@ -671,31 +705,44 @@ fn scan_stream_options_obj(
             break;
         }
         if obj_slice[cursor] != b'"' {
-            break;
+            return Err(BodyEditError::NotAnObject);
         }
         let key_start = cursor;
         let key_end = scan_string(obj_slice, &mut cursor)?;
         let key_unescaped: String = serde_json::from_str(&text[key_start..key_end])
             .map_err(|e| BodyEditError::Json(e.to_string()))?;
 
+        if !seen_keys.insert(key_unescaped.clone()) {
+            return Err(BodyEditError::DuplicateKey(format!(
+                "duplicate stream_options JSON key: {key_unescaped}"
+            )));
+        }
+
         skip_ws(obj_slice, &mut cursor);
         if cursor >= len || obj_slice[cursor] != b':' {
-            break;
+            return Err(BodyEditError::NotAnObject);
         }
         cursor += 1;
         skip_ws(obj_slice, &mut cursor);
+        if cursor >= len {
+            return Err(BodyEditError::NotAnObject);
+        }
 
         let val_start = cursor;
         if key_unescaped == "include_usage" {
             let val_end = scan_ident(obj_slice, &mut cursor);
             let val_str = &text[val_start..val_end];
             if val_str == "true" {
-                return Ok(Some((true, offset + val_start..offset + val_end)));
+                include_usage_found = Some((true, offset + val_start..offset + val_end));
             } else if val_str == "false" {
-                return Ok(Some((false, offset + val_start..offset + val_end)));
+                include_usage_found = Some((false, offset + val_start..offset + val_end));
+            } else {
+                return Err(BodyEditError::InvalidType(
+                    "stream_options.include_usage must be a boolean".into(),
+                ));
             }
         } else {
-            // skip other values
+            // Skip any valid JSON value (including numbers, booleans, null, strings, objects, arrays; F-007)
             match obj_slice[cursor] {
                 b'"' => {
                     let _ = scan_string(obj_slice, &mut cursor)?;
@@ -706,9 +753,17 @@ fn scan_stream_options_obj(
                 b'[' => {
                     let _ = scan_delimited(obj_slice, &mut cursor, b'[', b']')?;
                 }
-                _ => {
-                    let _ = scan_ident(obj_slice, &mut cursor);
+                b'0'..=b'9' | b'-' => {
+                    let _ = scan_number(obj_slice, &mut cursor);
                 }
+                b't' | b'f' | b'n' => {
+                    let val_end = scan_ident(obj_slice, &mut cursor);
+                    let ident = &text[val_start..val_end];
+                    if !matches!(ident, "true" | "false" | "null") {
+                        return Err(BodyEditError::NotAnObject);
+                    }
+                }
+                _ => return Err(BodyEditError::NotAnObject),
             }
         }
 
@@ -717,7 +772,7 @@ fn scan_stream_options_obj(
             cursor += 1;
         }
     }
-    Ok(None)
+    Ok(include_usage_found)
 }
 
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {

@@ -554,3 +554,78 @@ fn test_invalidate_client_key_evicts_only_that_keys_pins() {
         0
     );
 }
+
+#[doc = "Spec: RTE-2, RTE-10, REL-1, REL-4"]
+#[test]
+fn test_expired_provisional_excludes_tried_keys_and_confirmed_pin_coalesces_persistence() {
+    let store = PinStore::new(10_000);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let pin_key = PinKey {
+        client_key_id: ClientKeyId::generate(),
+        canonical_id: "claude-sonnet-4.6".to_string(),
+        session_hash: "sess-f051-f059".to_string(),
+    };
+    let k1 = UpstreamKeyId::generate();
+    let k2 = UpstreamKeyId::generate();
+
+    // 1. Provisional pin on k1 expires after 50s -> next acquire excludes k1 and picks k2 (F-059)
+    let t1 = store
+        .acquire(
+            &pin_key,
+            &clock,
+            86_400_000,
+            false,
+            300,
+            RoutingScope::PersonalFirst,
+            Some(CandidatePoolTier::Own),
+            |_| true,
+            |_| Some((k1, CandidatePoolTier::Own)),
+        )
+        .expect("t1");
+    assert_eq!(t1.upstream_key_id, k1);
+
+    clock.advance_ms(50_001);
+    let t2 = store
+        .acquire(
+            &pin_key,
+            &clock,
+            86_400_000,
+            false,
+            300,
+            RoutingScope::PersonalFirst,
+            Some(CandidatePoolTier::Own),
+            |_| true,
+            |excluded| {
+                assert!(
+                    excluded.contains(&k1),
+                    "expired provisional key k1 must be excluded on reselect"
+                );
+                Some((k2, CandidatePoolTier::Own))
+            },
+        )
+        .expect("t2");
+    assert_eq!(t2.upstream_key_id, k2);
+    assert_eq!(t2.outcome, PinOutcome::Repin);
+
+    // 2. Confirm on k2 -> sets last_persisted_ms; coalesced persistence triggers only after >= 60s (F-051)
+    let confirmed = store
+        .first_valid_frame(&pin_key, &t2, clock.now_ms(), 86_400_000)
+        .expect("confirmed");
+    assert_eq!(confirmed.state, PinState::Confirmed);
+
+    clock.advance_ms(30_000);
+    assert!(
+        store
+            .take_coalesced_persist(&pin_key, clock.now_ms(), 86_400_000)
+            .is_none(),
+        "must not persist again within 60s coalescing window"
+    );
+
+    clock.advance_ms(30_001);
+    assert!(
+        store
+            .take_coalesced_persist(&pin_key, clock.now_ms(), 86_400_000)
+            .is_some(),
+        "must emit coalesced persist after 60s"
+    );
+}

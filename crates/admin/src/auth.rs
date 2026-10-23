@@ -428,6 +428,8 @@ pub struct AuthAppState {
     pub master_key_id: String,
     pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
+    /// Short-lived replay cache `(user_id, totp_code) -> expires_at_ms` rejecting reuse within 90s (`AUTH-3`, `F-113`).
+    pub used_totp_codes: Arc<Mutex<HashMap<(UserId, String), i64>>>,
 }
 
 impl std::fmt::Debug for AuthAppState {
@@ -456,7 +458,21 @@ impl AuthAppState {
             master_key_id: String::new(),
             audit_hmac_key: None,
             writer: None,
+            used_totp_codes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Reject replayed 6-digit TOTP codes within their 90-second (`±1` step) validity window (`AUTH-3`, `F-113`).
+    pub fn check_and_record_totp_replay(&self, user_id: UserId, code: &str, now_ms: i64) -> bool {
+        let normalized = code.trim().to_string();
+        let mut cache = self.used_totp_codes.lock();
+        cache.retain(|_, &mut exp| exp > now_ms);
+        let key = (user_id, normalized);
+        if cache.get(&key).is_some_and(|&exp| exp > now_ms) {
+            return false;
+        }
+        cache.insert(key, now_ms + 90_000);
+        true
     }
 
     /// Attach the eight-connection read-only pool used for session and login reads
@@ -487,6 +503,9 @@ impl AuthAppState {
             instance_id,
             Arc::new(OsEntropy::new()),
         );
+        if !self.check_and_record_totp_replay(user_id, code, now_ms) {
+            return Ok(false);
+        }
         match llmroller_store::users::verify_login_totp(
             &self.pool,
             user_id,
@@ -499,8 +518,18 @@ impl AuthAppState {
         {
             Ok(_) => Ok(true),
             Err(llmroller_store::users::UserError::InvalidTotp)
-            | Err(llmroller_store::users::UserError::TotpReplay) => Ok(false),
-            Err(_) => Err(AuthError::Internal),
+            | Err(llmroller_store::users::UserError::TotpReplay) => {
+                self.used_totp_codes
+                    .lock()
+                    .remove(&(user_id, code.trim().to_string()));
+                Ok(false)
+            }
+            Err(_) => {
+                self.used_totp_codes
+                    .lock()
+                    .remove(&(user_id, code.trim().to_string()));
+                Err(AuthError::Internal)
+            }
         }
     }
 }
