@@ -316,22 +316,34 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         .accumulators
         .merge_from(&rebuilt.monthly_accumulators);
     runtime_state.rebuild_window_counters(&shared_snapshot.load(), clock.now_ms());
-    for (key_id, ring) in &rebuilt.key_rings {
-        let windows = shared_snapshot
-            .load()
-            .budget_windows
-            .get(key_id)
-            .cloned()
-            .unwrap_or_default();
+    for (key_id, windows) in shared_snapshot.load().budget_windows.iter() {
+        let key_ring = rebuilt.key_rings.get(key_id);
         for window in windows {
             let seed = if window.scope_kind == "route" {
-                0
-            } else if let Some(period) = window.period_ms {
-                ring.sum_range(clock.now_ms() - period, clock.now_ms())
+                let canonical_id = window
+                    .model_pk
+                    .and_then(|pk| shared_snapshot.load().models.get(&pk).map(|m| m.canonical_id.clone()));
+                if let Some(cid) = canonical_id
+                    && let Some(route_ring) = rebuilt.route_rings.get(&(*key_id, cid))
+                {
+                    if let Some(period) = window.period_ms {
+                        route_ring.sum_range(clock.now_ms() - period, clock.now_ms())
+                    } else {
+                        route_ring.sum_at(clock.now_ms())
+                    }
+                } else {
+                    0
+                }
+            } else if let Some(ring) = key_ring {
+                if let Some(period) = window.period_ms {
+                    ring.sum_range(clock.now_ms() - period, clock.now_ms())
+                } else {
+                    ring.sum_at(clock.now_ms())
+                }
             } else {
-                ring.sum_at(clock.now_ms())
+                0
             };
-            runtime_state.hydrate_window_counter(&window, seed, clock.now_ms());
+            runtime_state.hydrate_window_counter(window, seed, clock.now_ms());
         }
     }
 

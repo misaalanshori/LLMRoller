@@ -169,3 +169,79 @@ async fn test_startup_rebuild_under_two_seconds_across_500_keys() {
         "personal spend must NOT be aggregated in User monthly accumulator (USR-5)"
     );
 }
+
+#[doc = "Spec: LIM-1, REL-1, USG-6 - F026 Route-scoped budget windows and multi-day rings hydrate accurately across restarts"]
+#[tokio::test]
+async fn test_route_scoped_rings_and_multi_day_windows_hydrate_across_restart() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let now_ms = 1_700_000_000_000i64;
+    let key_id = UpstreamKeyId::generate();
+    let client_key_id = ClientKeyId::generate();
+    let user_id = UserId::generate();
+
+    let mut tx = pool.begin().await.expect("begin");
+    // Seed 3 buckets for model-a: 10,000 each = 30,000
+    // Seed 2 buckets for model-b: 15,000 each = 30,000
+    for b in 0..3 {
+        let bucket_ms = now_ms - (b + 1) * 300_000;
+        sqlx::query(
+            r#"INSERT INTO usage_rollups_5min (
+                   bucket_ms, upstream_key_id, canonical_id, client_key_id,
+                   owner_user_id, provider_scope, share_id, cost_micro_usd, requests
+               )
+               VALUES (?, ?, 'model-a', ?, ?, 'personal', '', 10000, 1)"#,
+        )
+        .bind(bucket_ms)
+        .bind(key_id.to_string())
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model-a");
+    }
+    for b in 0..2 {
+        let bucket_ms = now_ms - (b + 1) * 300_000;
+        sqlx::query(
+            r#"INSERT INTO usage_rollups_5min (
+                   bucket_ms, upstream_key_id, canonical_id, client_key_id,
+                   owner_user_id, provider_scope, share_id, cost_micro_usd, requests
+               )
+               VALUES (?, ?, 'model-b', ?, ?, 'personal', '', 15000, 1)"#,
+        )
+        .bind(bucket_ms)
+        .bind(key_id.to_string())
+        .bind(client_key_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert model-b");
+    }
+    tx.commit().await.expect("commit");
+
+    let rebuilt = reconstruct_budgets_from_rollups(&pool, now_ms, 7 * 86_400_000)
+        .await
+        .expect("reconstruct");
+
+    // Key ring aggregates all models on key: 30,000 + 30,000 = 60,000
+    let key_ring = rebuilt.key_rings.get(&key_id).expect("key ring");
+    assert_eq!(key_ring.sum_at(now_ms), 60_000);
+
+    // Route rings isolate per-model spend (LIM-1, F026)
+    let ring_a = rebuilt
+        .route_rings
+        .get(&(key_id, "model-a".to_string()))
+        .expect("model-a ring");
+    assert_eq!(ring_a.sum_at(now_ms), 30_000);
+
+    let ring_b = rebuilt
+        .route_rings
+        .get(&(key_id, "model-b".to_string()))
+        .expect("model-b ring");
+    assert_eq!(ring_b.sum_at(now_ms), 30_000);
+
+    assert!(
+        !rebuilt
+            .route_rings
+            .contains_key(&(key_id, "model-unrelated".to_string()))
+    );
+}

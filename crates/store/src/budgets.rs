@@ -13,6 +13,7 @@ use llmroller_core::windows::RollingRing;
 /// In-memory structures rebuilt during startup reconstruction.
 pub struct RebuiltState {
     pub key_rings: HashMap<UpstreamKeyId, RollingRing>,
+    pub route_rings: HashMap<(UpstreamKeyId, String), RollingRing>,
     pub monthly_accumulators: MonthlyAccumulatorRegistry,
 }
 
@@ -20,6 +21,7 @@ impl std::fmt::Debug for RebuiltState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebuiltState")
             .field("key_rings_len", &self.key_rings.len())
+            .field("route_rings_len", &self.route_rings.len())
             .field("monthly_accumulators_len", &self.monthly_accumulators.len())
             .finish()
     }
@@ -63,6 +65,35 @@ pub async fn reconstruct_budgets_from_rollups(
         if let Ok(key_id) = UpstreamKeyId::parse(upstream_key_id_str) {
             let ring = key_rings
                 .entry(key_id)
+                .or_insert_with(|| RollingRing::new(max_window_period_ms));
+            ring.record(ring_bucket_ms, cost_micro_usd);
+        }
+    }
+
+    // Reconstruct route-scoped rings (upstream_key_id, canonical_id) for route windows (LIM-1, F026)
+    let mut route_ring_rows = sqlx::query(
+        r#"SELECT upstream_key_id, canonical_id,
+                  ((bucket_ms + 150000) / ?) * ? AS ring_bucket_ms,
+                  SUM(CASE WHEN cost_micro_usd > 0 THEN cost_micro_usd ELSE 0 END)
+           FROM usage_rollups_5min
+           WHERE bucket_ms >= ? AND upstream_key_id <> '' AND canonical_id <> ''
+           GROUP BY upstream_key_id, canonical_id, ring_bucket_ms
+           ORDER BY ring_bucket_ms"#,
+    )
+    .bind(bucket_width_ms)
+    .bind(bucket_width_ms)
+    .bind(cutoff_ms)
+    .fetch(pool);
+
+    let mut route_rings: HashMap<(UpstreamKeyId, String), RollingRing> = HashMap::new();
+    while let Some(r) = route_ring_rows.try_next().await? {
+        let upstream_key_id_str: &str = r.try_get(0)?;
+        let canonical_id: String = r.try_get(1)?;
+        let ring_bucket_ms: i64 = r.try_get(2)?;
+        let cost_micro_usd: i64 = r.try_get(3)?;
+        if let Ok(key_id) = UpstreamKeyId::parse(upstream_key_id_str) {
+            let ring = route_rings
+                .entry((key_id, canonical_id))
                 .or_insert_with(|| RollingRing::new(max_window_period_ms));
             ring.record(ring_bucket_ms, cost_micro_usd);
         }
@@ -139,6 +170,7 @@ pub async fn reconstruct_budgets_from_rollups(
 
     Ok(RebuiltState {
         key_rings,
+        route_rings,
         monthly_accumulators,
     })
 }
