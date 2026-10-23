@@ -30,6 +30,18 @@ impl ProviderKind {
             Self::Custom => "custom",
         }
     }
+
+    /// Authoritative preset definition document embedded at compile time (PRV-2).
+    #[must_use]
+    pub fn preset_toml(self) -> &'static str {
+        match self {
+            Self::Openrouter => include_str!("../../../presets/openrouter.toml"),
+            Self::OpencodeGo => include_str!("../../../presets/opencode_go.toml"),
+            Self::CommandCode => include_str!("../../../presets/command_code.toml"),
+            Self::OpenDesignAmr => include_str!("../../../presets/open_design_amr.toml"),
+            Self::Custom => include_str!("../../../presets/custom.toml"),
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderKind {
@@ -779,6 +791,22 @@ mod tests {
     }
 
     #[doc = "Spec: PRV-3, API-2 - invalid config_json is reported at write boundaries but tolerated on read"]
+    #[test]
+    #[doc = "Spec: PRV-2"]
+    fn preset_toml_loads_embedded_presets() {
+        for kind in [
+            ProviderKind::Openrouter,
+            ProviderKind::OpencodeGo,
+            ProviderKind::CommandCode,
+            ProviderKind::OpenDesignAmr,
+            ProviderKind::Custom,
+        ] {
+            let toml = kind.preset_toml();
+            assert!(!toml.is_empty(), "preset for {kind:?} must not be empty");
+            assert!(toml.contains("kind ="), "preset must declare kind");
+        }
+    }
+
     #[test]
     fn provider_config_try_from_json_reports_errors() {
         let invalid = r#"{"auth":{"chat":"carrier_pigeon"}}"#;

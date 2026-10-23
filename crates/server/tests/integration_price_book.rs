@@ -369,9 +369,11 @@ async fn test_seed_bundled_prices_seeds_standard_models_idempotently() {
         .expect("price must exist");
     assert_eq!(price.input_per_mtok_micro_usd, 3_000_000);
     assert_eq!(price.output_per_mtok_micro_usd, 15_000_000);
-    let source: String = sqlx::query_scalar("SELECT source FROM prices WHERE upstream_model_id = 'claude-sonnet-4.6'")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("fetch source");
+    let source: String = sqlx::query_scalar(
+        "SELECT source FROM prices WHERE upstream_model_id = 'claude-sonnet-4.6'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("fetch source");
     assert_eq!(source, "bundled");
 }

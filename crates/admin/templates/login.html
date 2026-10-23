@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>LLMRoller - Sign In</title>
+    <style>
+        :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --primary-hover: #2563eb; --error: #ef4444; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 400px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }
+        p.subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 1.5rem; text-align: center; }
+        .form-group { margin-bottom: 1.25rem; }
+        label { display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.375rem; color: #cbd5e1; }
+        input { width: 100%; padding: 0.625rem 0.875rem; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.9375rem; outline: none; transition: border-color 0.2s; }
+        input:focus { border-color: var(--primary); }
+        button { width: 100%; padding: 0.75rem; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 0.9375rem; cursor: pointer; transition: background 0.2s; margin-top: 0.5rem; }
+        button:hover { background: var(--primary-hover); }
+        .alert { display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--error); color: #fca5a5; padding: 0.75rem; border-radius: 6px; font-size: 0.875rem; margin-bottom: 1.25rem; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>LLMRoller</h1>
+        <p class="subtitle">Sign in to your control workspace</p>
+        <div id="error-box" class="alert"></div>
+        <form id="login-form" method="POST" action="/api/auth/login">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" required autofocus placeholder="username">
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password" required placeholder="••••••••••••">
+            </div>
+            <div class="form-group">
+                <label for="totp_code">2FA Code (Optional)</label>
+                <input id="totp_code" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code">
+            </div>
+            <button type="submit" id="submit-btn">Sign In</button>
+        </form>
+    </div>
+    <script>
+        const form = document.getElementById('login-form');
+        const errBox = document.getElementById('error-box');
+        const btn = document.getElementById('submit-btn');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            errBox.style.display = 'none';
+            btn.disabled = true;
+            btn.textContent = 'Signing in...';
+
+            const payload = {
+                username: form.username.value.trim(),
+                password: form.password.value,
+                totp_code: form.totp_code.value.trim() || null
+            };
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'X-CSRF-Token': '{{ csrf_token }}'
+                    },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok) {
+                    if (data.role === 'admin') {
+                        window.location.href = '/admin';
+                    } else {
+                        window.location.href = '/app';
+                    }
+                } else {
+                    errBox.textContent = data.error || ('Authentication failed with status ' + res.status);
+                    errBox.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Sign In';
+                }
+            } catch (err) {
+                form.submit();
+            }
+        });
+    </script>
+</body>
+</html>

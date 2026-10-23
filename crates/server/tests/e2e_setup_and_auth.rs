@@ -767,14 +767,10 @@ async fn test_auth_and_setup_events_append_to_audit_log() {
 
     // 5. Verify the entire hash chain is intact using verify_audit_log
     use llmroller_core::seams::ExposeSecret as _;
-    let report = llmroller_store::audit::verify_audit_log(
-        &pool,
-        audit_key.expose_secret(),
-        None,
-        None,
-    )
-    .await
-    .expect("audit log verification must succeed");
+    let report =
+        llmroller_store::audit::verify_audit_log(&pool, audit_key.expose_secret(), None, None)
+            .await
+            .expect("audit log verification must succeed");
 
     assert_eq!(report.rows_verified, 4);
     assert_eq!(report.max_seq, 4);

@@ -360,7 +360,10 @@ async fn insert_usage_event(
     tx: &mut Transaction<'_, Sqlite>,
     e: &UsageEventRecord,
 ) -> Result<(), sqlx::Error> {
-    let upstream_key = e.upstream_key_id.as_deref().filter(|s| !s.trim().is_empty());
+    let upstream_key = e
+        .upstream_key_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
     let provider = e.provider_id.as_deref().filter(|s| !s.trim().is_empty());
     let share = e.share_id.as_deref().filter(|s| !s.trim().is_empty());
 

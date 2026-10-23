@@ -59,7 +59,7 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                 if !key.enabled || !provider.enabled {
                     continue;
                 }
-                let Some(endpoint) = usage_endpoint(&provider.config_json) else {
+                let Some(endpoint) = usage_endpoint(&provider.config_json, provider.kind) else {
                     continue;
                 };
                 let state = key_states.entry(key.id).or_default();
@@ -97,6 +97,7 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                         provider.kind,
                         &budget_windows,
                         &provider.base_url,
+                        &provider.config_json,
                         &endpoint,
                         provider.allow_private_network,
                     )
@@ -113,14 +114,25 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
     })
 }
 
-fn usage_endpoint(config_json: &str) -> Option<String> {
-    let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
-    config
-        .get("usage_endpoint")
-        .or_else(|| config.get("usage_path"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+fn usage_endpoint(
+    config_json: &str,
+    kind: llmroller_core::provider::ProviderKind,
+) -> Option<String> {
+    if let Ok(config) = serde_json::from_str::<serde_json::Value>(config_json)
+        && let Some(ep) = config
+            .get("usage_endpoint")
+            .or_else(|| config.get("usage_path"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    {
+        return Some(ep.to_string());
+    }
+    match kind {
+        llmroller_core::provider::ProviderKind::Openrouter => Some("/api/v1/auth/key".to_string()),
+        llmroller_core::provider::ProviderKind::OpencodeGo => Some("/usage".to_string()),
+        llmroller_core::provider::ProviderKind::CommandCode => Some("/credits".to_string()),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +145,7 @@ async fn poll_key(
     kind: llmroller_core::provider::ProviderKind,
     budget_windows: &[llmroller_core::snapshot::SnapshotBudgetWindow],
     base_url: &str,
+    config_json: &str,
     endpoint: &str,
     allow_private_network: bool,
 ) -> Result<(), String> {
@@ -158,14 +171,31 @@ async fn poll_key(
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private_network)
         .map_err(|_| "cannot build guarded HTTP client".to_string())?;
+
+    let provider_config = llmroller_core::provider::ProviderConfig::from_json(config_json);
+    let scheme = provider_config
+        .auth
+        .for_endpoint(llmroller_core::provider::ProviderEndpoint::Usage)
+        .unwrap_or_else(|| llmroller_core::provider::ProviderAuthScheme {
+            header: "authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        });
+    let auth_header_val = format!("{}{secret}", scheme.prefix);
+
     let response = client
         .get(&target)
-        .header("authorization", format!("Bearer {secret}"))
+        .header(&scheme.header, auth_header_val)
         .timeout(Duration::from_secs(10))
         .send()
         .await
         .map_err(|error| error.to_string())?;
-    let http_status = i64::from(response.status().as_u16());
+    let status = response.status();
+    let http_status = i64::from(status.as_u16());
+    if !status.is_success() {
+        return Err(format!(
+            "upstream usage endpoint returned HTTP {http_status}"
+        ));
+    }
     let raw_bytes = response
         .bytes()
         .await
@@ -239,11 +269,28 @@ mod tests {
     #[doc = "Spec: USG-4"]
     fn extracts_usage_endpoint_from_provider_config() {
         assert_eq!(
-            usage_endpoint(r#"{"usage_endpoint":"/v1/usage"}"#).as_deref(),
+            usage_endpoint(
+                r#"{"usage_endpoint":"/v1/usage"}"#,
+                llmroller_core::provider::ProviderKind::Custom
+            )
+            .as_deref(),
             Some("/v1/usage")
         );
-        assert_eq!(usage_endpoint(r#"{"usage_path":""}"#), None);
-        assert_eq!(usage_endpoint("{}"), None);
+        assert_eq!(
+            usage_endpoint(
+                r#"{"usage_path":""}"#,
+                llmroller_core::provider::ProviderKind::Custom
+            ),
+            None
+        );
+        assert_eq!(
+            usage_endpoint("{}", llmroller_core::provider::ProviderKind::Custom),
+            None
+        );
+        assert_eq!(
+            usage_endpoint("{}", llmroller_core::provider::ProviderKind::Openrouter).as_deref(),
+            Some("/api/v1/auth/key")
+        );
     }
 
     #[test]

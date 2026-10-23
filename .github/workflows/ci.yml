@@ -52,6 +52,9 @@ jobs:
       - name: Validate Compose manifest
         run: docker compose config --quiet
 
+      - name: Check fuzz targets compile cleanly
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
   test:
     name: test (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

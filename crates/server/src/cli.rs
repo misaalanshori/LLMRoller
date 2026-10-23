@@ -324,11 +324,14 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             .cloned()
             .unwrap_or_default();
         for window in windows {
-            runtime_state.hydrate_window_counter(
-                &window,
-                ring.sum_at(clock.now_ms()),
-                clock.now_ms(),
-            );
+            let seed = if window.scope_kind == "route" {
+                0
+            } else if let Some(period) = window.period_ms {
+                ring.sum_range(clock.now_ms() - period, clock.now_ms())
+            } else {
+                ring.sum_at(clock.now_ms())
+            };
+            runtime_state.hydrate_window_counter(&window, seed, clock.now_ms());
         }
     }
 
@@ -672,6 +675,31 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 let _ = llmroller_store::retention::sweep_expired_auth_failure_counters(&bg_pool, now_ms - 86_400_000).await;
                                 let _ = llmroller_store::retention::sweep_orphaned_trace_blocks(&bg_pool, cutoff, 1_000).await;
                                 let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
+
+                                // Auto-disable traceability if expiry timestamp reached (TRC-1)
+                                if llmroller_core::trace_config::check_auto_disable_expired(
+                                    &snapshot.settings.traceability_config,
+                                    now_ms,
+                                ) && let Ok(mut tx) = bg_pool.begin().await
+                                {
+                                    let mut updated =
+                                        snapshot.settings.traceability_config.clone();
+                                    updated.enabled = false;
+                                    if let Ok(json) = serde_json::to_string(&updated) {
+                                        let _ = sqlx::query(
+                                            "UPDATE settings SET value = ? WHERE key = 'traceability_config'",
+                                        )
+                                        .bind(json)
+                                        .execute(&mut *tx)
+                                        .await;
+                                        let _ = sqlx::query(
+                                            "UPDATE instance_meta SET config_version = config_version + 1",
+                                        )
+                                        .execute(&mut *tx)
+                                        .await;
+                                        let _ = tx.commit().await;
+                                    }
+                                }
                             }
                             _ = stop_rx.changed() => break,
                         }
@@ -706,6 +734,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
 
     let _ = stop_tx.send(true);
     let _ = tokio::join!(data_server, admin_server, metrics_server);
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&pool)
+        .await;
 
     Ok(exit_code)
 }
@@ -998,10 +1029,11 @@ async fn verify_audit_log_command(args: VerifyAuditLogArgs) -> Result<(), CliFai
             CliFailure::new(13, format!("cannot open {}: {error}", database.display()))
         })?;
 
-    let has_meta: Option<i64> = sqlx::query_scalar("SELECT 1 FROM instance_meta WHERE singleton = 1")
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| CliFailure::new(13, e.to_string()))?;
+    let has_meta: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM instance_meta WHERE singleton = 1")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| CliFailure::new(13, e.to_string()))?;
     if has_meta.is_none() {
         return Err(CliFailure::new(10, "instance is uninitialized".to_string()));
     }

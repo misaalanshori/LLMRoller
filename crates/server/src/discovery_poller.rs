@@ -77,6 +77,7 @@ pub fn start_discovery_poller(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let initial_tx = tx.clone();
     let handle = tokio::spawn(async move {
         let sealer = Arc::new(XChaCha20Poly1305Sealer::new(
             deps.master_key.clone(),
@@ -90,6 +91,12 @@ pub fn start_discovery_poller(
         let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+
+        // Trigger initial discovery pass for unpopulated keys shortly after boot (MDL-1)
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = initial_tx.send(DiscoveryTarget::AllEnabled);
+        });
 
         loop {
             let target = tokio::select! {

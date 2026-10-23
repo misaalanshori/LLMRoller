@@ -558,6 +558,14 @@ async fn get_root_redirect(State(state): State<AuthAppState>, headers: HeaderMap
     (StatusCode::SEE_OTHER, [("location", "/login")]).into_response()
 }
 
+use askama::Template as _;
+
+#[derive(Debug, askama::Template)]
+#[template(path = "login.html")]
+pub struct LoginTemplate {
+    pub csrf_token: String,
+}
+
 #[doc = "Spec: SEC-5"]
 async fn get_login_page(State(state): State<AuthAppState>) -> Response {
     let mut raw_csrf = [0_u8; 32];
@@ -574,101 +582,10 @@ async fn get_login_page(State(state): State<AuthAppState>) -> Response {
         "{cookie_name}={csrf_token}; HttpOnly{secure_flag}; SameSite=Strict; Path=/; Max-Age={LOGIN_CSRF_MAX_AGE_SECS}"
     );
 
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="csrf-token" content="{csrf_token}">
-    <title>LLMRoller - Sign In</title>
-    <style>
-        :root {{ --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --primary-hover: #2563eb; --error: #ef4444; }}
-        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-        body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }}
-        .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 400px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
-        h1 {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; text-align: center; }}
-        p.subtitle {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 1.5rem; text-align: center; }}
-        .form-group {{ margin-bottom: 1.25rem; }}
-        label {{ display: block; font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.375rem; color: #cbd5e1; }}
-        input {{ width: 100%; padding: 0.625rem 0.875rem; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.9375rem; outline: none; transition: border-color 0.2s; }}
-        input:focus {{ border-color: var(--primary); }}
-        button {{ width: 100%; padding: 0.75rem; background: var(--primary); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 0.9375rem; cursor: pointer; transition: background 0.2s; margin-top: 0.5rem; }}
-        button:hover {{ background: var(--primary-hover); }}
-        .alert {{ display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--error); color: #fca5a5; padding: 0.75rem; border-radius: 6px; font-size: 0.875rem; margin-bottom: 1.25rem; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>LLMRoller</h1>
-        <p class="subtitle">Sign in to your control workspace</p>
-        <div id="error-box" class="alert"></div>
-        <form id="login-form" method="POST" action="/api/auth/login">
-            <input type="hidden" name="csrf_token" value="{csrf_token}">
-            <div class="form-group">
-                <label for="username">Username</label>
-                <input id="username" name="username" type="text" required autofocus placeholder="username">
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input id="password" name="password" type="password" required placeholder="••••••••••••">
-            </div>
-            <div class="form-group">
-                <label for="totp_code">2FA Code (Optional)</label>
-                <input id="totp_code" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code">
-            </div>
-            <button type="submit" id="submit-btn">Sign In</button>
-        </form>
-    </div>
-    <script>
-        const form = document.getElementById('login-form');
-        const errBox = document.getElementById('error-box');
-        const btn = document.getElementById('submit-btn');
-
-        form.addEventListener('submit', async (e) => {{
-            e.preventDefault();
-            errBox.style.display = 'none';
-            btn.disabled = true;
-            btn.textContent = 'Signing in...';
-
-            const payload = {{
-                username: form.username.value.trim(),
-                password: form.password.value,
-                totp_code: form.totp_code.value.trim() || null
-            }};
-
-            try {{
-                const res = await fetch('/api/auth/login', {{
-                    method: 'POST',
-                    headers: {{
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json',
-                        'X-CSRF-Token': '{csrf_token}'
-                    }},
-                    body: JSON.stringify(payload)
-                }});
-                const data = await res.json().catch(() => ({{}}));
-                if (res.ok) {{
-                    if (data.role === 'admin') {{
-                        window.location.href = '/admin';
-                    }} else {{
-                        window.location.href = '/app';
-                    }}
-                }} else {{
-                    errBox.textContent = data.error || ('Authentication failed with status ' + res.status);
-                    errBox.style.display = 'block';
-                    btn.disabled = false;
-                    btn.textContent = 'Sign In';
-                }}
-            }} catch (err) {{
-                // Fallback to native form post
-                form.submit();
-            }}
-        }});
-    </script>
-</body>
-</html>"#
-    );
+    let template = LoginTemplate {
+        csrf_token: csrf_token.clone(),
+    };
+    let html = template.render().unwrap_or_default();
 
     (
         StatusCode::OK,
@@ -798,7 +715,14 @@ async fn post_login(
     let record = match find_login_record(&state.reader_pool, &payload.username).await {
         Ok(Some(record)) => record,
         Ok(None) => {
-            log_login_failed(&state, &payload.username, client_ip, "user_not_found", now_ms).await;
+            log_login_failed(
+                &state,
+                &payload.username,
+                client_ip,
+                "user_not_found",
+                now_ms,
+            )
+            .await;
             return Err(AuthError::InvalidCredentials);
         }
         Err(_) => return Err(AuthError::Internal),
@@ -808,23 +732,35 @@ async fn post_login(
         state
             .limiter
             .record_failure(&payload.username, client_ip, now_ms);
-        log_login_failed(&state, &payload.username, client_ip, "account_disabled", now_ms).await;
+        log_login_failed(
+            &state,
+            &payload.username,
+            client_ip,
+            "account_disabled",
+            now_ms,
+        )
+        .await;
         return Err(AuthError::AccountDisabled);
     }
 
     let password = payload.password.clone();
     let password_hash = record.password_hash.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        verify_password(&password, &password_hash)
-    })
-    .await
-    .map_err(|_| AuthError::Internal)?;
+    let verified = tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+        .await
+        .map_err(|_| AuthError::Internal)?;
 
     if !verified {
         state
             .limiter
             .record_failure(&payload.username, client_ip, now_ms);
-        log_login_failed(&state, &payload.username, client_ip, "invalid_password", now_ms).await;
+        log_login_failed(
+            &state,
+            &payload.username,
+            client_ip,
+            "invalid_password",
+            now_ms,
+        )
+        .await;
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -957,7 +893,10 @@ async fn post_logout(
         .unwrap_or("");
     if let Some(token) = parse_cookie_value(cookie_header, cookie_name) {
         let id_hash = sha256_hex(token.as_bytes());
-        let session = load_web_session(&state.reader_pool, &id_hash).await.ok().flatten();
+        let session = load_web_session(&state.reader_pool, &id_hash)
+            .await
+            .ok()
+            .flatten();
         let _ = delete_web_session(&state.pool, &id_hash).await;
 
         if let Some(ref audit_key) = state.audit_hmac_key {

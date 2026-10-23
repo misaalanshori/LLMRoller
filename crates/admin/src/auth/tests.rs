@@ -94,7 +94,9 @@ fn client_ip_extraction_honors_trusted_proxies() {
     let mut bad_headers = HeaderMap::new();
     bad_headers.insert(
         "x-forwarded-for",
-        "203.0.113.195, bad_hop, 10.1.2.3".parse().expect("valid header"),
+        "203.0.113.195, bad_hop, 10.1.2.3"
+            .parse()
+            .expect("valid header"),
     );
     let extracted_bad = extract_client_ip(peer, &bad_headers, &trusted);
     assert_eq!(
