@@ -34,7 +34,8 @@ use llmroller_store::providers::{
 };
 use llmroller_store::service_accounts::{
     NewServiceAccount, ServiceAccountError, ServiceAccountPatch, create_service_account_tx,
-    delete_service_account, list_service_accounts, patch_service_account,
+    delete_service_account_tx, list_service_accounts, patch_service_account_tx,
+    set_service_account_cidrs_tx,
 };
 use llmroller_store::settings::{
     RuntimeSettings, SettingsError, load_settings, update_setting, validate_setting,
@@ -1136,10 +1137,118 @@ async fn get_admin_service_accounts_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<llmroller_store::service_accounts::ServiceAccount>>, MutationResponseError> {
     let actor = authenticate_admin(&state, &headers, false).await?;
-    let accounts = list_service_accounts(&state.auth.pool, &actor, Some("personal"), None)
+    let accounts = list_service_accounts(&state.auth.pool, &actor, None, None)
         .await
         .map_err(map_service_account_error)?;
     Ok(Json(accounts))
+}
+
+/// `POST /admin/api/service-accounts` (`CLK-6`).
+async fn post_admin_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Json(payload): Json<NewServiceAccount>,
+) -> Result<
+    (
+        StatusCode,
+        Json<llmroller_store::service_accounts::ServiceAccount>,
+    ),
+    MutationResponseError,
+> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let owner = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let now_ms = state.auth.clock.now_ms();
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            create_service_account_tx(tx, &actor, owner, payload, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+/// `GET /admin/api/service-accounts/{id}` (`CLK-6`).
+async fn get_admin_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let account =
+        llmroller_store::service_accounts::get_service_account(&state.auth.pool, &actor, &id)
+            .await
+            .map_err(map_service_account_error)?;
+    Ok(Json(account))
+}
+
+/// `PATCH /admin/api/service-accounts/{id}` (`CLK-6`).
+async fn patch_admin_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<ServiceAccountPatch>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let now_ms = state.auth.clock.now_ms();
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            patch_service_account_tx(tx, &actor, &id, payload, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
+    Ok(Json(account))
+}
+
+/// `PUT /admin/api/service-accounts/{id}/ip-restrictions` (`CLK-6`, Section 14.k.4).
+async fn put_admin_service_account_ip_restrictions_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<IpRestrictionsRequest>,
+) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    let cidrs = if let Some(text) = payload.allowed_cidrs_text {
+        llmroller_store::service_accounts::parse_cidrs_text(&text)
+            .map_err(map_service_account_error)?
+    } else if payload.allowed_cidrs.is_empty() {
+        None
+    } else {
+        Some(payload.allowed_cidrs)
+    };
+    let now_ms = state.auth.clock.now_ms();
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            set_service_account_cidrs_tx(tx, &actor, &id, cidrs, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
+    Ok(Json(account))
+}
+
+/// `DELETE /admin/api/service-accounts/{id}` (`CLK-6`).
+async fn delete_admin_service_account_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, MutationResponseError> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            delete_service_account_tx(tx, &actor, &id)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/user/service-accounts/{id}/keys` (`CLK-6`).
@@ -1216,9 +1325,14 @@ async fn patch_user_service_account_handler(
 ) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
     let actor = authenticate_actor(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
-    let account = patch_service_account(&state.auth.pool, &actor, &id, payload, now_ms)
-        .await
-        .map_err(map_service_account_error)?;
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            patch_service_account_tx(tx, &actor, &id, payload, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
     Ok(Json(account))
 }
 
@@ -1248,15 +1362,14 @@ async fn put_user_service_account_ip_restrictions_handler(
         Some(payload.allowed_cidrs)
     };
     let now_ms = state.auth.clock.now_ms();
-    let account = llmroller_store::service_accounts::set_service_account_cidrs(
-        &state.auth.pool,
-        &actor,
-        &id,
-        cidrs,
-        now_ms,
-    )
-    .await
-    .map_err(map_service_account_error)?;
+    let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            set_service_account_cidrs_tx(tx, &actor, &id, cidrs, now_ms)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
     Ok(Json(account))
 }
 
@@ -1267,9 +1380,14 @@ async fn delete_user_service_account_handler(
     Path(id): Path<String>,
 ) -> Result<StatusCode, MutationResponseError> {
     let actor = authenticate_actor(&state, &headers, true).await?;
-    delete_service_account(&state.auth.pool, &actor, &id)
-        .await
-        .map_err(map_service_account_error)?;
+    execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
+        Box::pin(async move {
+            delete_service_account_tx(tx, &actor, &id)
+                .await
+                .map_err(map_service_account_error)
+        })
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -7546,7 +7664,17 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route(
             "/admin/api/service-accounts",
-            get(get_admin_service_accounts_handler),
+            get(get_admin_service_accounts_handler).post(post_admin_service_account_handler),
+        )
+        .route(
+            "/admin/api/service-accounts/{id}",
+            get(get_admin_service_account_handler)
+                .patch(patch_admin_service_account_handler)
+                .delete(delete_admin_service_account_handler),
+        )
+        .route(
+            "/admin/api/service-accounts/{id}/ip-restrictions",
+            put(put_admin_service_account_ip_restrictions_handler),
         )
         .route(
             "/admin/api/client-keys/{id}/sessions",

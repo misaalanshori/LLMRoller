@@ -536,6 +536,167 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         .await
         .expect("audit partial response");
     assert_eq!(audit_partial.status(), StatusCode::OK);
+
+    // 15. Admin service account full CRUD lifecycle (CLK-6).
+    let admin_create = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "POST",
+                "/admin/api/service-accounts",
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "admin-agents",
+                    "description": "Global admin runners",
+                    "allowed_cidrs": ["10.0.0.1"]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("admin create response");
+    assert_eq!(admin_create.status(), StatusCode::CREATED);
+    let admin_sa = json_body(admin_create).await;
+    let admin_sa_id = admin_sa["id"].as_str().expect("admin sa id").to_string();
+
+    let admin_get = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "GET",
+                &format!("/admin/api/service-accounts/{admin_sa_id}"),
+                ADMIN_SESSION,
+                "",
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("admin get response");
+    assert_eq!(admin_get.status(), StatusCode::OK);
+    let admin_get_body = json_body(admin_get).await;
+    assert_eq!(admin_get_body["name"], "admin-agents");
+
+    let admin_patch = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PATCH",
+                &format!("/admin/api/service-accounts/{admin_sa_id}"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "admin-agents-renamed",
+                    "disabled": true
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("admin patch response");
+    assert_eq!(admin_patch.status(), StatusCode::OK);
+    let admin_patch_body = json_body(admin_patch).await;
+    assert_eq!(admin_patch_body["name"], "admin-agents-renamed");
+    assert_eq!(admin_patch_body["disabled"], true);
+
+    let admin_cidrs = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PUT",
+                &format!("/admin/api/service-accounts/{admin_sa_id}/ip-restrictions"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "allowed_cidrs": ["192.168.1.0/24"]
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("admin cidrs response");
+    assert_eq!(admin_cidrs.status(), StatusCode::OK);
+    let admin_cidrs_body = json_body(admin_cidrs).await;
+    assert_eq!(
+        admin_cidrs_body["allowed_cidrs"],
+        serde_json::json!(["192.168.1.0/24"])
+    );
+
+    let admin_delete = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "DELETE",
+                &format!("/admin/api/service-accounts/{admin_sa_id}"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("admin delete response");
+    assert_eq!(admin_delete.status(), StatusCode::NO_CONTENT);
+
+    // 16. User patch, CIDR update, and delete through atomic mutations (CLK-6).
+    let user_patch = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "PATCH",
+                &format!("/api/user/service-accounts/{account_id}"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "description": "Updated CI runners description"
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("user patch response");
+    assert_eq!(user_patch.status(), StatusCode::OK);
+    let user_patch_body = json_body(user_patch).await;
+    assert_eq!(
+        user_patch_body["description"],
+        "Updated CI runners description"
+    );
+
+    let user_delete = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "DELETE",
+                &format!("/api/user/service-accounts/{account_id}"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("user delete response");
+    assert_eq!(user_delete.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
