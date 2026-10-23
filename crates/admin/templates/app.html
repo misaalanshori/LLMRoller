@@ -20,6 +20,7 @@
         <button class="tab-btn" data-tab="tab-sessions">Active Sessions</button>
         <button class="tab-btn" data-tab="tab-logs">Logs</button>
         <button class="tab-btn" data-tab="tab-ledger">Usage Ledger</button>
+        <button class="tab-btn" data-tab="tab-audit">Audit Log</button>
     </div>
 
     <!-- Tab: Overview -->
@@ -267,6 +268,34 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             </div>
             <div id="ledger-content" hx-get="/app/partials/ledger" hx-trigger="load">
                 <p class="text-muted text-center" style="padding: 1.5rem;">Loading usage ledger...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Personal Audit Log (AUD-2, SRDD 14.t) -->
+    <div id="tab-audit" class="tab-pane">
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h3>Audit Log</h3>
+                    <p class="card-desc">Review your personal security events and configuration changes.</p>
+                </div>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Seq</th>
+                            <th>Time</th>
+                            <th>Action</th>
+                            <th>Target</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-audit-body" hx-get="/app/partials/audit-log" hx-trigger="load" hx-swap="innerHTML">
+                        <tr><td colspan="5" class="text-center text-muted">Loading audit log entries...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>

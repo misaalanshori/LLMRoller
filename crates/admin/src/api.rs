@@ -1550,26 +1550,63 @@ async fn get_user_web_sessions_handler(
     ))
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AuditLogQuery {
+    pub action: Option<String>,
+    pub target_type: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 /// `GET /api/user/audit-log` (`AUD-2`).
 ///
-/// Returns only rows attributable to the authenticated actor; admins use
-/// `/admin/api/audit-log` for the instance-wide chain.
+/// Returns only rows attributable to the authenticated actor or their resources; admins use
+/// `/admin/api/audit-log` for the instance-wide chain. Hashes are omitted per AUD-2.
 async fn get_user_audit_log_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AuditLogQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, MutationResponseError> {
     let actor = authenticate_actor(&state, &headers, false).await?;
     let user_id = actor
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     use sqlx::Row as _;
     let rows = sqlx::query(
-        "SELECT seq, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json, prev_hash, hash
-         FROM audit_log WHERE actor_user_id = ? ORDER BY seq DESC LIMIT 200",
+        "SELECT seq, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json
+         FROM audit_log
+         WHERE (actor_user_id = ?
+                OR (target_type = 'user' AND target_id = ?)
+                OR (target_type = 'share' AND target_id IN (
+                    SELECT id FROM provider_shares WHERE owner_user_id = ? OR grantee_user_id = ?
+                )))
+           AND (? IS NULL OR action = ?)
+           AND (? IS NULL OR target_type = ?)
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR seq < ?)
+         ORDER BY seq DESC LIMIT ?",
     )
     .bind(user_id.to_string())
-    .fetch_all(&state.auth.pool)
+    .bind(user_id.to_string())
+    .bind(user_id.to_string())
+    .bind(user_id.to_string())
+    .bind(query.action.as_deref())
+    .bind(query.action.as_deref())
+    .bind(query.target_type.as_deref())
+    .bind(query.target_type.as_deref())
+    .bind(query.from)
+    .bind(query.from)
+    .bind(query.to)
+    .bind(query.to)
+    .bind(query.cursor)
+    .bind(query.cursor)
+    .bind(limit)
+    .fetch_all(&state.auth.reader_pool)
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1585,8 +1622,6 @@ async fn get_user_audit_log_handler(
                     "target_type": row.try_get::<String, _>("target_type").unwrap_or_default(),
                     "target_id": row.try_get::<Option<String>, _>("target_id").unwrap_or_default(),
                     "detail_json": row.try_get::<Option<String>, _>("detail_json").unwrap_or_default(),
-                    "prev_hash": row.try_get::<String, _>("prev_hash").unwrap_or_default(),
-                    "hash": row.try_get::<String, _>("hash").unwrap_or_default(),
                 })
             })
             .collect(),
@@ -7304,18 +7339,45 @@ async fn get_partial_admin_catalog_handler(
 async fn get_partial_user_audit_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AuditLogQuery>,
 ) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, false).await?;
     let user_id = actor
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
     use sqlx::Row as _;
     let rows = sqlx::query(
         "SELECT seq, ts, action, target_type, target_id, detail_json
-         FROM audit_log WHERE actor_user_id = ? ORDER BY seq DESC LIMIT 100",
+         FROM audit_log
+         WHERE (actor_user_id = ?
+                OR (target_type = 'user' AND target_id = ?)
+                OR (target_type = 'share' AND target_id IN (
+                    SELECT id FROM provider_shares WHERE owner_user_id = ? OR grantee_user_id = ?
+                )))
+           AND (? IS NULL OR action = ?)
+           AND (? IS NULL OR target_type = ?)
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR seq < ?)
+         ORDER BY seq DESC LIMIT ?",
     )
     .bind(user_id.to_string())
+    .bind(user_id.to_string())
+    .bind(user_id.to_string())
+    .bind(user_id.to_string())
+    .bind(query.action.as_deref())
+    .bind(query.action.as_deref())
+    .bind(query.target_type.as_deref())
+    .bind(query.target_type.as_deref())
+    .bind(query.from)
+    .bind(query.from)
+    .bind(query.to)
+    .bind(query.to)
+    .bind(query.cursor)
+    .bind(query.cursor)
+    .bind(limit)
     .fetch_all(&state.auth.reader_pool)
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;

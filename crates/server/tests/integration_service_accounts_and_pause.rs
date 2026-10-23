@@ -583,7 +583,24 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         .expect("admin resume response");
     assert_eq!(admin_resume.status(), StatusCode::OK);
 
-    // 14. GET /app/partials/audit-log renders user self-scoped audit rows (AUD-2).
+    // 14. GET /api/user/audit-log and GET /app/partials/audit-log with query filters (AUD-2).
+    let audit_log_json = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/api/user/audit-log?limit=10", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("audit log json response");
+    assert_eq!(audit_log_json.status(), StatusCode::OK);
+    let audit_items = json_body(audit_log_json).await;
+    let audit_arr = audit_items.as_array().expect("audit array");
+    assert!(!audit_arr.is_empty());
+    assert!(audit_arr[0].get("hash").is_none());
+    assert!(audit_arr[0].get("prev_hash").is_none());
+
     let audit_partial = ctx
         .app
         .clone()
@@ -595,6 +612,26 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         .await
         .expect("audit partial response");
     assert_eq!(audit_partial.status(), StatusCode::OK);
+
+    // Verify Audit Log tab and container in /app
+    let app_audit_page = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/app", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("app page response");
+    assert_eq!(app_audit_page.status(), StatusCode::OK);
+    let app_audit_bytes = http_body_util::BodyExt::collect(app_audit_page.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    let app_audit_html = std::str::from_utf8(&app_audit_bytes).expect("html");
+    assert!(app_audit_html.contains("data-tab=\"tab-audit\""));
+    assert!(app_audit_html.contains("id=\"tab-audit\""));
 
     // 15. Admin service account full CRUD lifecycle (CLK-6).
     let admin_create = ctx
