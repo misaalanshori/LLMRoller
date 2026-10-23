@@ -316,14 +316,26 @@ pub async fn client_key_auth_middleware(
     let hash: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
     let snapshot = state.snapshot.load();
 
-    // 3. Evaluate gates G1 through G6
+    // 3. Evaluate gates G1 through G6.
+    // RPM rate limiting (G5) applies strictly to inference endpoints (CLK-1, API-2);
+    // administrative/discovery routes like /v1/models, /v1/usage, /v1/key do not consume RPM.
+    let path = request.uri().path();
+    let is_inference = path.starts_with("/v1/chat/completions")
+        || path.starts_with("/v1/messages")
+        || path.starts_with("/v1/responses");
+    let rpm_limiter = if is_inference {
+        Some(&*state.rpm_limiter)
+    } else {
+        None
+    };
+
     let gate_result = evaluate_request_gates(
         &hash,
         Some(client_ip),
         None,
         None,
         &snapshot,
-        Some(&state.rpm_limiter),
+        rpm_limiter,
         now_ms,
     );
 

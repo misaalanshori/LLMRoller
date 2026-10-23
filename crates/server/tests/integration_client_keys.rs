@@ -415,3 +415,55 @@ async fn test_client_key_auth_middleware_and_listeners() {
     assert!(validate_metric_labels(&[("provider_kind", "custom"), ("protocol", "chat")]).is_ok());
     assert!(validate_metric_labels(&[("illegal_label", "val")]).is_err());
 }
+
+#[doc = "Spec: CLK-1, API-2 — non-inference endpoints bypass G5 RPM rate limiter"]
+#[tokio::test]
+async fn test_non_inference_endpoints_do_not_consume_rpm() {
+    let (_dir, pool, user_id) = setup_test_context().await;
+    let user_actor = ActorScope::user(user_id, Role::User);
+    let entropy = OsEntropy;
+    use llmroller_core::seams::Clock as _;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    // Create a client key with strict rate limit: max 1 RPM
+    let res = create_client_key(
+        &pool,
+        &user_actor,
+        user_id,
+        NewClientKey {
+            label: "rpm-test-key".to_string(),
+            service_account_id: None,
+            routing_scope: None,
+            allowed_models: None,
+            rate_limit_rpm: Some(1),
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: None,
+            expires_at: None,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("create client key");
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let raw_token = res.raw_token.expose_secret().to_string();
+
+    let snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::new(Arc::new(snapshot)));
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![]);
+    let app = data_plane_router(auth_state);
+
+    // Repeated GET /v1/models calls should NEVER fail with 429 even though rate_limit_rpm = 1
+    for _ in 0..5 {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("x-api-key", &raw_token)
+            .body(Body::empty())
+            .expect("req");
+        let resp = app.clone().oneshot(req).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}

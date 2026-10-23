@@ -90,6 +90,7 @@ pub enum DurableKey {
     RouteProtocolBlock(String, String, String),
     RouteProtocolClear(String),
     UsageSnapshot(String),
+    ClientKeyTouch(String),
 }
 
 /// Durable operation executed in SQLite with per-item SAVEPOINT.
@@ -115,6 +116,10 @@ pub enum DurableOp {
         updated_at: i64,
     },
     UsageSnapshotInsert(SealedUsageSnapshot),
+    ClientKeyTouchLastUsed {
+        client_key_id: String,
+        last_used_at: i64,
+    },
     HealthVersionUpdate {
         upstream_key_id: String,
         health: String,
@@ -505,6 +510,15 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .execute(&mut *transaction)
             .await
             .map(|_| ()),
+            DurableOp::ClientKeyTouchLastUsed {
+                client_key_id,
+                last_used_at,
+            } => sqlx::query("UPDATE client_keys SET last_used_at = ? WHERE id = ?")
+                .bind(last_used_at)
+                .bind(client_key_id)
+                .execute(&mut *transaction)
+                .await
+                .map(|_| ()),
             DurableOp::RouteProtocolBlockClear { upstream_key_id } => sqlx::query(
                 "DELETE FROM route_protocol_blocks WHERE upstream_key_id = ?",
             )

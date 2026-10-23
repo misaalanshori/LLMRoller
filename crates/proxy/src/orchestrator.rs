@@ -2541,6 +2541,15 @@ impl StreamFinalizer {
         ));
 
         if let Some(writer) = &self.state.writer {
+            writer.queues.durable_state.lock().insert(
+                llmroller_store::writer::DurableKey::ClientKeyTouch(
+                    self.usage.client_key_id.to_string(),
+                ),
+                llmroller_store::writer::DurableOp::ClientKeyTouchLastUsed {
+                    client_key_id: self.usage.client_key_id.to_string(),
+                    last_used_at: finished_ms,
+                },
+            );
             let mut event = self.usage.event(
                 finished_ms,
                 self.http_status,
@@ -4370,6 +4379,13 @@ pub async fn handle_inference_request(
                     });
                 event.trace_dropped = !accepted;
             }
+            writer.queues.durable_state.lock().insert(
+                llmroller_store::writer::DurableKey::ClientKeyTouch(caller.id.to_string()),
+                llmroller_store::writer::DurableOp::ClientKeyTouchLastUsed {
+                    client_key_id: caller.id.to_string(),
+                    last_used_at: now,
+                },
+            );
             writer
                 .queues
                 .usage_writer
