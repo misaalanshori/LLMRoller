@@ -529,9 +529,15 @@ impl TraceTap {
             return;
         }
         self.sse_pending.extend_from_slice(chunk);
-        while let Some(end) = find_frame_delimiter(&self.sse_pending) {
-            let frame: Vec<u8> = self.sse_pending.drain(..end).collect();
+        let mut cursor = 0;
+        while let Some(rel_end) = find_frame_delimiter(&self.sse_pending[cursor..]) {
+            let end = cursor + rel_end;
+            let frame = self.sse_pending[cursor..end].to_vec();
             self.feed_sse_frame(&frame);
+            cursor = end;
+        }
+        if cursor > 0 {
+            self.sse_pending.drain(..cursor);
         }
         if self.sse_pending.len() > MAX_SSE_PENDING_BYTES {
             self.sse_pending.clear();

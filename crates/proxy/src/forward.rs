@@ -135,14 +135,19 @@ impl SseChunkForwarder {
 
         self.partial.extend_from_slice(chunk);
         let mut output = Vec::new();
+        let mut cursor = 0;
 
-        while let Some(idx) = find_frame_delimiter(&self.partial) {
-            let frame: Vec<u8> = self.partial.drain(..idx).collect();
-            if is_injected_usage_frame(&frame) {
-                // Suppress this frame from forwarding to the client!
-                continue;
+        while let Some(rel_idx) = find_frame_delimiter(&self.partial[cursor..]) {
+            let idx = cursor + rel_idx;
+            let frame = &self.partial[cursor..idx];
+            if !is_injected_usage_frame(frame) {
+                output.push(Bytes::copy_from_slice(frame));
             }
-            output.push(Bytes::from(frame));
+            cursor = idx;
+        }
+
+        if cursor > 0 {
+            self.partial.drain(..cursor);
         }
 
         // Bound partial buffer at 64 KiB to prevent memory exhaustion

@@ -196,6 +196,17 @@ impl LoadTracker {
             }
         }
     }
+
+    /// Prune load counters for an invalidated or deleted key (RTE-3, PERF-3).
+    pub fn prune_key(&self, key_id: UpstreamKeyId) {
+        self.routes
+            .retain(|route, _| route.upstream_key_id != key_id);
+    }
+
+    /// Prune load counters for an invalidated or deleted model (RTE-3, PERF-3).
+    pub fn prune_model(&self, model_pk: ModelPk) {
+        self.routes.retain(|route, _| route.model_pk != model_pk);
+    }
 }
 
 impl RouteLoadTracker for LoadTracker {
@@ -782,6 +793,7 @@ impl RuntimeState {
                 CacheInvalidationEvent::UpstreamKeyChanged(key_id) => {
                     if !snapshot.upstream_keys.contains_key(key_id) {
                         self.key_health.remove(key_id);
+                        self.load_tracker.prune_key(*key_id);
                     }
                     self.health.bump_version();
                     rebuild_windows = true;
@@ -809,6 +821,7 @@ impl RuntimeState {
                 }
                 CacheInvalidationEvent::ModelRoutesChanged(model_pk) => {
                     self.selectors.reset_model(*model_pk);
+                    self.load_tracker.prune_model(*model_pk);
                     self.health.bump_version();
                 }
                 CacheInvalidationEvent::StrategyChanged

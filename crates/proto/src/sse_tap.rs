@@ -180,7 +180,9 @@ impl SseUsageTap {
     /// Merges cumulative `message_delta` usage with the last observed message usage.
     fn merge_messages_usage(&mut self, usage: &serde_json::Value) {
         let mut merged = self.observed_usage.unwrap_or_default();
-        if let Some(tokens) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+        if let Some(tokens) = usage.get("input_tokens").and_then(|v| v.as_i64())
+            && (tokens > 0 || merged.input_uncached_tokens == 0)
+        {
             merged.input_uncached_tokens = tokens;
         }
         if let Some(tokens) = usage

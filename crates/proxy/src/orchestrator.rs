@@ -41,7 +41,7 @@ use llmroller_core::pricing::{
 use llmroller_core::provider::{ProviderAuthScheme, ProviderEndpoint, ProviderKind};
 use llmroller_core::rbac::{PoolTier, Role, RoutingScope};
 use llmroller_core::runtime_state::RuntimeState;
-use llmroller_core::seams::{Clock as _, ExposeSecret as _, OsEntropy, SystemClock};
+use llmroller_core::seams::{Clock as _, EntropySource, ExposeSecret as _, OsEntropy, SystemClock};
 use llmroller_core::snapshot::{
     ConfigSnapshot, ProviderRecord, SnapshotModel, SnapshotModelRoute, UpstreamKeyRecord,
 };
@@ -248,6 +248,20 @@ async fn load_response_link(
     state: &ProxyAuthState,
     response_id: &str,
 ) -> Result<Option<ResponseLinkRow>, sqlx::Error> {
+    if let Some(writer) = &state.writer {
+        let guard = writer.queues.durable_state.lock();
+        match guard.get(&llmroller_store::writer::DurableKey::ResponseLink(
+            response_id.to_string(),
+        )) {
+            Some(llmroller_store::writer::DurableOp::ResponseLinkUpsert(row)) => {
+                return Ok(Some(row.clone()));
+            }
+            Some(llmroller_store::writer::DurableOp::ResponseLinkDelete { .. }) => {
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
     let mut tx = state.pool.begin().await?;
     let link = llmroller_store::pins::get_response_link_tx(&mut tx, response_id).await?;
     tx.commit().await?;
@@ -1757,6 +1771,7 @@ fn select_next_candidate(
     eligible: &[RouteCandidate],
     tried: &[UpstreamKeyId],
     now: i64,
+    entropy: &dyn EntropySource,
 ) -> Option<RouteCandidate> {
     let candidates: Vec<(RouteId, i64)> = eligible
         .iter()
@@ -1778,7 +1793,7 @@ fn select_next_candidate(
         &group_key,
         &candidates,
         now,
-        &OsEntropy,
+        entropy,
         Some(runtime.load_tracker.as_ref()),
     )?;
     let candidate = eligible
@@ -1810,6 +1825,7 @@ struct PinFailureContext<'a> {
     tier_candidates: &'a [RouteCandidate],
     eligible_keys: &'a HashSet<UpstreamKeyId>,
     now: i64,
+    entropy: &'a dyn EntropySource,
 }
 
 impl PinFailureContext<'_> {
@@ -1825,6 +1841,7 @@ impl PinFailureContext<'_> {
             self.tier_candidates,
             tried,
             self.now,
+            self.entropy,
         )
         .map(|candidate| (candidate.upstream_key_id, candidate.pool_tier))
     }
@@ -2600,6 +2617,49 @@ impl StreamFinalizer {
                 .enqueue(event, std::mem::take(&mut self.attempts));
         }
 
+        let ep = match self.usage.endpoint_str.as_str() {
+            "chat" => "chat",
+            "responses" => "responses",
+            "messages" => "messages",
+            "responses_compact" => "responses_compact",
+            _ => "chat",
+        };
+        crate::metrics::record_tokens(
+            ep,
+            "2xx",
+            "stream",
+            &self.usage.canonical_model,
+            "input",
+            extracted.input_uncached_tokens.max(0) as u64,
+        );
+        crate::metrics::record_tokens(
+            ep,
+            "2xx",
+            "stream",
+            &self.usage.canonical_model,
+            "output",
+            extracted.output_tokens.max(0) as u64,
+        );
+        if extracted.cache_read_tokens > 0 {
+            crate::metrics::record_tokens(
+                ep,
+                "2xx",
+                "stream",
+                &self.usage.canonical_model,
+                "cache_read",
+                extracted.cache_read_tokens as u64,
+            );
+        }
+        if cost.cost_micro_usd > 0 {
+            crate::metrics::record_cost(
+                ep,
+                "2xx",
+                "stream",
+                &self.usage.canonical_model,
+                cost.cost_micro_usd as u64,
+            );
+        }
+
         if let Some(link) = &self.response_link {
             let status = if termination.is_incomplete() {
                 "incomplete"
@@ -2775,6 +2835,32 @@ pub async fn handle_inference_request(
         _ => endpoint_str,
     };
     let aux_label = aux_endpoint_label(endpoint);
+
+    let encoding = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    let body = if !encoding.is_empty() && encoding != "identity" {
+        match crate::forward::decompress_chunk(encoding, &body) {
+            Ok(decompressed) => Bytes::from(decompressed),
+            Err(e) => {
+                crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "invalid_encoding",
+                            "message": format!("failed to decompress request body: {e}")
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
 
     // 1. Acquire preflight memory budget permit (up to 2,000 ms)
     let permit = match state
@@ -3238,6 +3324,7 @@ pub async fn handle_inference_request(
                     &tier_candidates,
                     tried,
                     now,
+                    state.entropy.as_ref(),
                 )
                 .map(|candidate| (candidate.upstream_key_id, candidate.pool_tier))
             },
@@ -3266,6 +3353,7 @@ pub async fn handle_inference_request(
         tier_candidates: &tier_candidates,
         eligible_keys: &eligible_keys,
         now,
+        entropy: state.entropy.as_ref(),
     };
     let mut pinned_order = ordered;
     let mut tried: Vec<UpstreamKeyId> = Vec::new();
@@ -3297,6 +3385,7 @@ pub async fn handle_inference_request(
                 &tier_candidates,
                 &tried,
                 now,
+                state.entropy.as_ref(),
             ) {
                 Some(candidate) => candidate,
                 None => break,
@@ -3893,6 +3982,11 @@ pub async fn handle_inference_request(
                 }
 
                 let ttfb_ms = (now_ms() - attempt_started).max(0);
+                crate::metrics::record_upstream_ttfb(
+                    endpoint_str,
+                    &candidate.provider_kind.to_string(),
+                    ttfb_ms as f64 / 1000.0,
+                );
                 state.runtime_state.record_upstream_success(
                     &origin,
                     candidate.upstream_key_id,
@@ -4393,6 +4487,47 @@ pub async fn handle_inference_request(
         }
 
         crate::metrics::record_request_metric(endpoint_str, "2xx", "completed");
+        crate::metrics::record_tokens(
+            endpoint_str,
+            "2xx",
+            "completed",
+            &model.canonical_id,
+            "input",
+            extracted.input_uncached_tokens.max(0) as u64,
+        );
+        crate::metrics::record_tokens(
+            endpoint_str,
+            "2xx",
+            "completed",
+            &model.canonical_id,
+            "output",
+            extracted.output_tokens.max(0) as u64,
+        );
+        if extracted.cache_read_tokens > 0 {
+            crate::metrics::record_tokens(
+                endpoint_str,
+                "2xx",
+                "completed",
+                &model.canonical_id,
+                "cache_read",
+                extracted.cache_read_tokens as u64,
+            );
+        }
+        if cost.cost_micro_usd > 0 {
+            crate::metrics::record_cost(
+                endpoint_str,
+                "2xx",
+                "completed",
+                &model.canonical_id,
+                cost.cost_micro_usd as u64,
+            );
+        }
+        let latency_duration = (now_ms() - attempt_started).max(0);
+        crate::metrics::record_upstream_ttfb(
+            endpoint_str,
+            &candidate.provider_kind.to_string(),
+            latency_duration as f64 / 1000.0,
+        );
         let mut builder = Response::builder().status(status_value);
         for (name, value) in response_headers {
             if let Some(name) = name {

@@ -53,6 +53,82 @@ pub fn record_request_metric(
     metrics::counter!("llmroller_requests_total", "endpoint" => endpoint, "status_class" => status_class, "outcome" => outcome).increment(1);
 }
 
+/// Record input/output/cached tokens with closed-allowlist labels (OBS-1).
+pub fn record_tokens(
+    endpoint: &'static str,
+    status_class: &'static str,
+    outcome: &'static str,
+    model_id: &str,
+    reason: &'static str,
+    count: u64,
+) {
+    if count == 0 {
+        return;
+    }
+    let _ = get_or_init_prometheus_recorder();
+    let bucket = model_bucket(model_id);
+    let labels = [
+        ("endpoint", endpoint),
+        ("status_class", status_class),
+        ("outcome", outcome),
+        ("reason", reason),
+        ("model_bucket", bucket.as_str()),
+    ];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!(
+        "llmroller_tokens_total",
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+        "outcome" => outcome,
+        "reason" => reason,
+        "model_bucket" => bucket,
+    )
+    .increment(count);
+}
+
+/// Record cost in micro-USD with closed-allowlist labels (OBS-1).
+pub fn record_cost(
+    endpoint: &'static str,
+    status_class: &'static str,
+    outcome: &'static str,
+    model_id: &str,
+    micro_usd: u64,
+) {
+    if micro_usd == 0 {
+        return;
+    }
+    let _ = get_or_init_prometheus_recorder();
+    let bucket = model_bucket(model_id);
+    let labels = [
+        ("endpoint", endpoint),
+        ("status_class", status_class),
+        ("outcome", outcome),
+        ("model_bucket", bucket.as_str()),
+    ];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!(
+        "llmroller_cost_micro_usd_total",
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+        "outcome" => outcome,
+        "model_bucket" => bucket,
+    )
+    .increment(micro_usd);
+}
+
+/// Record upstream TTFB in seconds (OBS-1).
+pub fn record_upstream_ttfb(endpoint: &'static str, provider_kind: &str, seconds: f64) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("endpoint", endpoint), ("provider_kind", provider_kind)];
+    let _ = validate_metric_labels(&labels);
+    metrics::histogram!(
+        "llmroller_upstream_ttfb_seconds",
+        "endpoint" => endpoint,
+        "provider_kind" => provider_kind.to_owned(),
+    )
+    .record(seconds);
+}
+
 /// Maximum number of distinct canonical model IDs tracked as their own
 /// `model_bucket`; everything else is grouped under `"other"` (OBS-1).
 const MAX_MODEL_BUCKETS: usize = 50;

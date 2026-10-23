@@ -107,6 +107,49 @@ impl PinStore {
         self.entries.is_empty()
     }
 
+    /// Resolve an active confirmed pin matching client_key_id and session_hash (Section 13.4, USG-7).
+    ///
+    /// When `canonical_model` is provided, looks up that exact route pin.
+    /// When omitted, selects the most recently used active pin for this session.
+    #[must_use]
+    pub fn find_active_pin(
+        &self,
+        client_key_id: &ClientKeyId,
+        session_hash: &str,
+        canonical_model: Option<&str>,
+        now_ms: i64,
+    ) -> Option<UpstreamKeyId> {
+        if let Some(model) = canonical_model {
+            let key = PinKey {
+                client_key_id: *client_key_id,
+                session_hash: session_hash.to_string(),
+                canonical_id: model.to_string(),
+            };
+            if let Some(entry_arc) = self.entries.get(&key) {
+                let entry = entry_arc.lock();
+                if entry.expires_ms > now_ms && entry.state == PinState::Confirmed {
+                    return Some(entry.upstream_key_id);
+                }
+            }
+            return None;
+        }
+
+        let mut best: Option<(i64, UpstreamKeyId)> = None;
+        for item in self.entries.iter() {
+            let (k, arc) = (item.key(), item.value());
+            if k.client_key_id == *client_key_id && k.session_hash == session_hash {
+                let entry = arc.lock();
+                if entry.expires_ms > now_ms
+                    && entry.state == PinState::Confirmed
+                    && best.is_none_or(|(ts, _)| entry.last_used_ms > ts)
+                {
+                    best = Some((entry.last_used_ms, entry.upstream_key_id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// Acquires a pin for the given session key according to the state machine (Section 10.4).
     #[allow(clippy::too_many_arguments)]
     pub fn acquire<F>(

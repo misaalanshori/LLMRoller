@@ -58,6 +58,8 @@ pub struct ProxyAuthState {
     pub sealer_pool: Option<Arc<llmroller_store::traces::SealerPool>>,
     pub http_client_public: reqwest::Client,
     pub http_client_private_allowed: reqwest::Client,
+    pub clock: Arc<dyn llmroller_core::seams::Clock>,
+    pub entropy: Arc<dyn llmroller_core::seams::EntropySource>,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -99,6 +101,8 @@ impl ProxyAuthState {
                 .expect("the public HTTP client requires a working TLS backend"),
             http_client_private_allowed: crate::ssrf::create_guarded_client(true)
                 .expect("the private-network HTTP client requires a working TLS backend"),
+            clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+            entropy: Arc::new(llmroller_core::seams::OsEntropy),
         }
     }
 
@@ -181,16 +185,31 @@ impl ProxyAuthState {
             }
         };
 
-        let _ = sqlx::query(
-            "INSERT INTO auth_failure_counters (minute_ms, reason, ip_prefix, count)
-             VALUES (?, ?, ?, 1)
-             ON CONFLICT(minute_ms, reason, ip_prefix) DO UPDATE SET count = count + 1",
-        )
-        .bind(minute_ms)
-        .bind(reason)
-        .bind(prefix_str)
-        .execute(&self.pool)
-        .await;
+        if let Some(writer) = &self.writer {
+            writer.queues.durable_state.lock().insert(
+                llmroller_store::writer::DurableKey::AuthFailureCounter(
+                    minute_ms,
+                    reason.to_string(),
+                    prefix_str.clone(),
+                ),
+                llmroller_store::writer::DurableOp::AuthFailureCounterIncrement {
+                    minute_ms,
+                    reason: reason.to_string(),
+                    ip_prefix: prefix_str,
+                },
+            );
+        } else {
+            let _ = sqlx::query(
+                "INSERT INTO auth_failure_counters (minute_ms, reason, ip_prefix, count)
+                 VALUES (?, ?, ?, 1)
+                 ON CONFLICT(minute_ms, reason, ip_prefix) DO UPDATE SET count = count + 1",
+            )
+            .bind(minute_ms)
+            .bind(reason)
+            .bind(prefix_str)
+            .execute(&self.pool)
+            .await;
+        }
     }
 
     /// Check if the given client IP has exceeded the bad-token rate limit.

@@ -295,6 +295,10 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
     assert_eq!(CLOSED_LABEL_ALLOWLIST.len(), 10);
 
     // 5. Query /metrics and verify real Prometheus metrics are rendered with closed allowlist labels (OBS-1)
+    llmroller_proxy::metrics::record_tokens("chat", "2xx", "completed", "gpt-4o", "input", 100);
+    llmroller_proxy::metrics::record_cost("chat", "2xx", "completed", "gpt-4o", 500);
+    llmroller_proxy::metrics::record_upstream_ttfb("chat", "openrouter", 0.123);
+
     use http_body_util::BodyExt as _;
     use llmroller_proxy::listeners::metrics_router;
     let metrics_app = metrics_router();
@@ -315,6 +319,18 @@ async fn test_headless_cli_harnesses_and_egress_sandbox() {
     assert!(
         metrics_text.contains("llmroller_requests_total"),
         "metrics must contain llmroller_requests_total, got: {metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("llmroller_tokens_total"),
+        "metrics must contain llmroller_tokens_total, got: {metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("llmroller_cost_micro_usd_total"),
+        "metrics must contain llmroller_cost_micro_usd_total, got: {metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("llmroller_upstream_ttfb_seconds"),
+        "metrics must contain llmroller_upstream_ttfb_seconds, got: {metrics_text}"
     );
     assert!(
         metrics_text.contains("endpoint="),

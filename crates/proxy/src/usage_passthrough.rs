@@ -127,6 +127,8 @@ fn resolve_usage_key(
     snapshot: &ConfigSnapshot,
     caller: &ClientKeyRecord,
     params: &UsageQueryParams,
+    session_hash: Option<&str>,
+    pin_store: Option<&llmroller_core::pins::PinStore>,
     now: i64,
 ) -> Result<Option<UpstreamKeyId>, UsageKeyNotFound> {
     if let Some(raw) = &params.upstream_key_id {
@@ -137,6 +139,15 @@ fn resolve_usage_key(
             Some(key) => Ok(Some(key.id)),
             None => Err(UsageKeyNotFound(format!("upstream key '{raw}' not found"))),
         };
+    }
+
+    // Step 2: Active session pin (Section 13.4, USG-7)
+    if let (Some(sess_hash), Some(store)) = (session_hash, pin_store)
+        && let Some(pinned_key) =
+            store.find_active_pin(&caller.id, sess_hash, params.model.as_deref(), now)
+        && let Some(key) = accessible_key(snapshot, &pinned_key, caller)
+    {
+        return Ok(Some(key.id));
     }
 
     let scope = crate::orchestrator::parse_scope(&caller.routing_scope);
@@ -548,10 +559,33 @@ pub async fn get_v1_usage_handler(
         .collect();
     let (sess_id, _step) =
         llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
+    let fallback = [0u8; 32];
+    use llmroller_core::seams::ExposeSecret as _;
+    let secret = state
+        .session_hmac_secret
+        .as_ref()
+        .map(|s| s.expose_secret())
+        .unwrap_or(&fallback);
+    let session_hash = if !sess_id.is_empty() {
+        Some(llmroller_core::session::compute_session_hash(
+            secret,
+            &client_key.owner_user_id,
+            &sess_id,
+        ))
+    } else {
+        None
+    };
 
     let now = SystemClock::new().now_ms();
     let snapshot = state.snapshot.load();
-    let target_key = match resolve_usage_key(&snapshot, &client_key, &params, now) {
+    let target_key = match resolve_usage_key(
+        &snapshot,
+        &client_key,
+        &params,
+        session_hash.as_deref(),
+        Some(&state.pin_store),
+        now,
+    ) {
         Ok(key) => key,
         Err(UsageKeyNotFound(message)) => return not_found(&message),
     };
@@ -736,7 +770,7 @@ pub async fn get_v1_usage_raw_handler(
     let snapshot = state.snapshot.load();
     let has_explicit_target = params.upstream_key_id.is_some() || params.model.is_some();
     let target_key = if has_explicit_target {
-        match resolve_usage_key(&snapshot, &client_key, &params, now) {
+        match resolve_usage_key(&snapshot, &client_key, &params, None, None, now) {
             Ok(key) => key,
             Err(UsageKeyNotFound(message)) => return not_found(&message),
         }

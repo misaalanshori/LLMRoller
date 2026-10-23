@@ -137,6 +137,17 @@ impl RollingRing {
         }
         total
     }
+
+    /// Sums spend recorded in the specified half-open interval `[start_ms, end_ms]`.
+    pub fn sum_range(&self, start_ms: i64, end_ms: i64) -> i64 {
+        let mut total: i64 = 0;
+        for bucket in &self.buckets {
+            if bucket.start_ms >= start_ms && bucket.start_ms <= end_ms {
+                total += bucket.amount_micro_usd;
+            }
+        }
+        total
+    }
 }
 
 /// Manual calibration delta inserted into the ring bucket for effective_at.
