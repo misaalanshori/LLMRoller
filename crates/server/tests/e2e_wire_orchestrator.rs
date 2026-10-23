@@ -148,6 +148,20 @@ async fn mock_chat_handler(
         return response;
     }
 
+    if headers.contains_key("x-fail-429-once-then-200")
+        && state.chat_calls.load(Ordering::SeqCst) == 1
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("retry-after", "1"),
+                ("content-type", "application/json"),
+            ],
+            Json(serde_json::json!({ "error": "transient rate limit" })),
+        )
+            .into_response();
+    }
+
     if headers.contains_key("x-fail-429") {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1820,6 +1834,41 @@ async fn test_key_health_transition_is_persisted() {
     assert!(
         health_until.is_some(),
         "a persisted cooldown must carry its retry deadline"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: RTE-8 - F022 Short Retry-After (<=2s) on attempt 1 sleeps and retries candidate successfully"]
+async fn test_retry_after_short_sleep_retries_candidate_successfully() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f022_retry_after.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xEE; 32]);
+    let token = seed_global_route_with_secrets(
+        &pool,
+        &master_key,
+        mock_addr,
+        &[("sk-f022", 1)],
+        "{}",
+    )
+    .await;
+
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = chat_request_with_header(&token, "x-fail-429-once-then-200", "1");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "short Retry-After <=2s should succeed on retry rather than failing over"
+    );
+    assert_eq!(
+        mock_state.chat_calls.load(Ordering::SeqCst),
+        2,
+        "upstream must have been called twice (initial 429 + retry 200)"
     );
 }
 

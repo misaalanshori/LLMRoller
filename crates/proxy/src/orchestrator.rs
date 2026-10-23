@@ -3572,7 +3572,7 @@ pub async fn handle_inference_request(
         }
 
         let attempt_started = now_ms();
-        let response = match request_builder.send().await {
+        let mut response = match request_builder.send().await {
             Ok(response) => response,
             Err(_) => {
                 let _ = state.runtime_state.record_upstream_failure(
@@ -3620,7 +3620,37 @@ pub async fn handle_inference_request(
             }
         };
 
-        let status = response.status();
+        let mut status = response.status();
+
+        // For status 429: if Retry-After <= 2 s, sleep Retry-After once on attempt 1
+        // and retry the same key to preserve prompt cache (Section 10.5, RTE-8).
+        if status == StatusCode::TOO_MANY_REQUESTS && attempt_no == 1 {
+            let delay = retry_after_ms(response.headers());
+            if let Some(delay_ms) = delay && delay_ms <= 2000 {
+                attempts.push(attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    llmroller_core::usage::AttemptOutcome::Http429,
+                    Some(status.as_u16()),
+                    body.len(),
+                    0,
+                    "none",
+                ));
+                tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+
+                let mut retry_builder = client.post(&target_url).body(edited_body.clone());
+                for (name, value) in &outbound_headers {
+                    retry_builder = retry_builder.header(name, value);
+                }
+                if let Ok(retry_resp) = retry_builder.send().await {
+                    response = retry_resp;
+                    status = response.status();
+                }
+            }
+        }
+
         if !status.is_success() {
             last_retry_after_ms = retry_after_ms(response.headers());
             let upstream_headers = response.headers().clone();
