@@ -21,6 +21,9 @@ pub struct BaseTemplate {
     pub csrf_token: String,
     pub traceability_enabled: bool,
     pub is_admin: bool,
+    pub ui_theme: String,
+    pub ui_nav_layout: String,
+    pub ui_locale: String,
     pub content: String,
 }
 
@@ -72,12 +75,25 @@ pub async fn get_app_ui(
             Err(_) => false,
         };
 
+    let prefs: Option<(String, String, String)> =
+        sqlx::query_as("SELECT ui_theme, ui_nav_layout, ui_locale FROM users WHERE id = ?")
+            .bind(session.user.id.to_string())
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+            .unwrap_or(None);
+
+    let (ui_theme, ui_nav_layout, ui_locale) =
+        prefs.unwrap_or_else(|| ("dark".to_string(), "top_tabs".to_string(), "en".to_string()));
+
     let app_content = AppTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Personal Workspace".to_string(),
         csrf_token,
         traceability_enabled,
         is_admin: session.user.role == Role::Admin,
+        ui_theme,
+        ui_nav_layout,
+        ui_locale,
         content: app_content,
     };
 
@@ -139,12 +155,25 @@ pub async fn get_admin_ui(
             Err(_) => false,
         };
 
+    let prefs: Option<(String, String, String)> =
+        sqlx::query_as("SELECT ui_theme, ui_nav_layout, ui_locale FROM users WHERE id = ?")
+            .bind(session.user.id.to_string())
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+            .unwrap_or(None);
+
+    let (ui_theme, ui_nav_layout, ui_locale) =
+        prefs.unwrap_or_else(|| ("dark".to_string(), "top_tabs".to_string(), "en".to_string()));
+
     let admin_content = AdminTemplate {}.render().unwrap_or_default();
     let base = BaseTemplate {
         title: "Admin Console".to_string(),
         csrf_token,
         traceability_enabled,
         is_admin: true,
+        ui_theme,
+        ui_nav_layout,
+        ui_locale,
         content: admin_content,
     };
 

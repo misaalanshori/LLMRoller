@@ -1119,12 +1119,38 @@ fn map_service_account_error(err: ServiceAccountError) -> (StatusCode, Json<serd
         ServiceAccountError::Validation(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "validation_error")
         }
+        ServiceAccountError::QuotaExceeded { .. } => {
+            (StatusCode::CONFLICT, "resource_quota_exceeded")
+        }
         ServiceAccountError::Sqlx(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
     };
     (
         status,
         Json(serde_json::json!({"error": {"code": code, "message": err.to_string()}})),
     )
+}
+
+/// `GET /admin/api/service-accounts` (`CLK-6`).
+async fn get_admin_service_accounts_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<llmroller_store::service_accounts::ServiceAccount>>, MutationResponseError> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let accounts = list_service_accounts(&state.auth.pool, &actor, Some("personal"), None)
+        .await
+        .map_err(map_service_account_error)?;
+    Ok(Json(accounts))
+}
+
+/// `POST /api/user/service-accounts/{id}/keys` (`CLK-6`).
+async fn post_user_service_account_keys_handler(
+    state: State<ApiAppState>,
+    headers: HeaderMap,
+    Path(service_account_id): Path<String>,
+    Json(mut payload): Json<CreateClientKeyRequest>,
+) -> Result<(StatusCode, Json<ClientKeyCreationResponse>), (StatusCode, Json<serde_json::Value>)> {
+    payload.service_account_id = Some(service_account_id);
+    post_user_client_key_handler(state, headers, Json(payload)).await
 }
 
 /// `GET /api/user/service-accounts` (`CLK-6`, Section 14.j).
@@ -1253,6 +1279,34 @@ pub struct UpdatePreferencesRequest {
     pub ui_nav_layout: Option<String>,
     pub ui_locale: Option<String>,
     pub default_routing_scope: Option<String>,
+}
+
+/// `GET /api/user/preferences` (`UI-5`, `UI-6`).
+async fn get_user_preferences_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT ui_theme, ui_nav_layout, ui_locale, default_routing_scope FROM users WHERE id = ?",
+    )
+    .bind(user_id.to_string())
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "user not found"))?;
+
+    Ok(Json(serde_json::json!({
+        "ui_theme": row.try_get::<String, _>("ui_theme").unwrap_or_else(|_| "dark".to_string()),
+        "ui_nav_layout": row.try_get::<String, _>("ui_nav_layout").unwrap_or_else(|_| "top_tabs".to_string()),
+        "ui_locale": row.try_get::<String, _>("ui_locale").unwrap_or_else(|_| "en".to_string()),
+        "default_routing_scope": row.try_get::<String, _>("default_routing_scope").unwrap_or_else(|_| "personal_first".to_string()),
+    })))
 }
 
 /// `PATCH /api/user/preferences` (`UI-5`, `UI-6`).
@@ -2160,17 +2214,37 @@ async fn get_admin_session_preview_handler(
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
     .is_some();
 
+    let ip_addr = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .map(str::to_string);
+
+    let owner_user_id: Option<String> = sqlx::query_scalar(
+        "SELECT owner_user_id FROM trace_records WHERE session_hash = ? LIMIT 1",
+    )
+    .bind(&session_hash)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .unwrap_or_default();
+
+    let detail = serde_json::json!({
+        "session_owner_user_id": owner_user_id,
+    })
+    .to_string();
+
     if !recent_audit {
         let _ = append_audit_entry_helper(
             &state,
             now_ms,
             AuditEnvelope {
                 actor_user_id: admin_id.as_deref(),
-                ip_addr: None,
+                ip_addr: ip_addr.as_deref(),
                 action: "trace.viewed",
                 target_type: "session",
                 target_id: Some(&session_hash),
-                detail_json: "{}",
+                detail_json: &detail,
             },
         )
         .await;
@@ -2504,7 +2578,30 @@ async fn get_admin_trace_record_handler(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let _actor = authenticate_admin(&state, &headers, false).await?;
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let admin_id = actor.user_id().map(|u| u.to_string());
+    let now_ms = state.auth.clock.now_ms();
+    let ip_addr = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .map(str::to_string);
+
+    let _ = append_audit_entry_helper(
+        &state,
+        now_ms,
+        AuditEnvelope {
+            actor_user_id: admin_id.as_deref(),
+            ip_addr: ip_addr.as_deref(),
+            action: "trace.viewed",
+            target_type: "trace",
+            target_id: Some(&request_id),
+            detail_json: "{}",
+        },
+    )
+    .await;
+
     get_trace_record_internal(&state, &request_id, None).await
 }
 
@@ -2588,19 +2685,16 @@ async fn delete_admin_session_trace_handler(
     let _actor = authenticate_admin(&state, &headers, true).await?;
 
     use sqlx::Row as _;
-    let row = sqlx::query("SELECT owner_user_id FROM trace_records WHERE session_hash = ? LIMIT 1")
-        .bind(&session_hash)
-        .fetch_optional(&state.auth.pool)
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let rows =
+        sqlx::query("SELECT DISTINCT owner_user_id FROM trace_records WHERE session_hash = ?")
+            .bind(&session_hash)
+            .fetch_all(&state.auth.pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let Some(r) = row else {
+    if rows.is_empty() {
         return Ok(StatusCode::NO_CONTENT);
-    };
-
-    let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
-    let owner_user_id = llmroller_core::ids::UserId::parse(&owner_str)
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+    }
 
     let mut tx = state
         .auth
@@ -2609,9 +2703,17 @@ async fn delete_admin_session_trace_handler(
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    llmroller_store::traces::delete_session_trace_tx(&mut tx, &owner_user_id, &session_hash)
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for r in rows {
+        let owner_str: String = r.try_get("owner_user_id").unwrap_or_default();
+        if let Ok(owner_user_id) = llmroller_core::ids::UserId::parse(&owner_str) {
+            let _ = llmroller_store::traces::delete_session_trace_tx(
+                &mut tx,
+                &owner_user_id,
+                &session_hash,
+            )
+            .await;
+        }
+    }
 
     tx.commit()
         .await
@@ -3078,6 +3180,96 @@ async fn delete_admin_user_handler(
     }
 }
 
+/// `POST /admin/api/users/{id}/totp/reset` (`AUTH-9`, `SEC-4`).
+async fn post_admin_reset_totp_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UserId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+
+    execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
+        Box::pin(async move {
+            llmroller_store::users::clear_totp_tx(tx, &actor, id)
+                .await
+                .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+            sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(Json(
+        serde_json::json!({ "reset": true, "user_id": id.to_string() }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminResetPasswordRequest {
+    pub temporary_password: Option<String>,
+}
+
+/// `POST /admin/api/users/{id}/reset-password` (`AUTH-4`, `SEC-5`).
+async fn post_admin_reset_password_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<UserId>,
+    Json(payload): Json<AdminResetPasswordRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+
+    let temp_password = payload.temporary_password.unwrap_or_else(|| {
+        let mut bytes = [0u8; 16];
+        state.auth.entropy.fill_bytes(&mut bytes);
+        let hex_suffix = llmroller_store::crypto::sha256_hex(&bytes);
+        format!("Temp-{}", &hex_suffix[..16])
+    });
+
+    let entropy = state.auth.entropy.clone();
+    let pw_clone = temp_password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || {
+        llmroller_store::users::hash_password(&pw_clone, entropy.as_ref())
+    })
+    .await
+    .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed"))?
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+
+    execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
+            )
+            .bind(password_hash)
+            .bind(id.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            if res.rows_affected() == 0 {
+                return Err(map_price_error(StatusCode::NOT_FOUND, "user not found"));
+            }
+
+            sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "reset",
+        "user_id": id.to_string(),
+        "temporary_password": temp_password,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Model Catalog & Aliases (/admin/api/models)
 // ---------------------------------------------------------------------------
@@ -3440,6 +3632,84 @@ fn pin_delete_status(headers: &HeaderMap) -> StatusCode {
     } else {
         StatusCode::NO_CONTENT
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MoveSessionPinRequest {
+    pub upstream_key_id: String,
+    pub canonical_id: Option<String>,
+}
+
+/// Admin manually moves session pin to a new upstream key (RTE-11).
+async fn post_admin_move_session_pin_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(session_hash): Path<String>,
+    Json(payload): Json<MoveSessionPinRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, true).await?;
+    let target_key = UpstreamKeyId::parse(&payload.upstream_key_id)
+        .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    let now_ms = state.auth.clock.now_ms();
+
+    if let Some(ref cid) = payload.canonical_id {
+        let _ = sqlx::query(
+            "UPDATE pins SET upstream_key_id = ?, last_used_at = ?
+             WHERE session_hash = ? AND model_pk IN (SELECT model_pk FROM models WHERE canonical_id = ?)",
+        )
+        .bind(target_key.to_string())
+        .bind(now_ms)
+        .bind(&session_hash)
+        .bind(cid)
+        .execute(&state.auth.pool)
+        .await;
+    } else {
+        let _ = sqlx::query(
+            "UPDATE pins SET upstream_key_id = ?, last_used_at = ? WHERE session_hash = ?",
+        )
+        .bind(target_key.to_string())
+        .bind(now_ms)
+        .bind(&session_hash)
+        .execute(&state.auth.pool)
+        .await;
+    }
+
+    if let Some(store) = &state.pin_store {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            "SELECT p.client_key_id, m.canonical_id
+             FROM pins p
+             LEFT JOIN models m ON p.model_pk = m.model_pk
+             WHERE p.session_hash = ?",
+        )
+        .bind(&session_hash)
+        .fetch_all(&state.auth.pool)
+        .await
+        .unwrap_or_default();
+
+        for r in rows {
+            let ckid_str: String = r.try_get("client_key_id").unwrap_or_default();
+            let model_id: String = r
+                .try_get::<Option<String>, _>("canonical_id")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if let Ok(client_key_id) = ClientKeyId::parse(&ckid_str) {
+                let pin_key = llmroller_core::pins::PinKey {
+                    client_key_id,
+                    session_hash: session_hash.clone(),
+                    canonical_id: model_id,
+                };
+                store.admin_move(&pin_key, target_key, now_ms);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "moved": true,
+        "session_hash": session_hash,
+        "upstream_key_id": target_key.to_string(),
+    })))
 }
 
 /// Admin-wide unpin: every tenant's pin for the session hash is removed.
@@ -5262,36 +5532,38 @@ async fn get_logs_internal(
 
     // Default stream: inference
     let sql = if actor_user_id.is_some() {
-        "SELECT id, ts, request_id, client_key_id, owner_user_id, canonical_id, endpoint, protocol,
-                session_hash, status, stream, incomplete, termination, input_uncached_tokens,
-                cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                cost_micro_usd, latency_ms, ttfb_ms, stop_reason, service_account_id,
-                error_code, pin_outcome, failovers
-         FROM usage_events
-         WHERE owner_user_id = ?
-           AND (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)
-           AND (? IS NULL OR status = ?)
-           AND (? IS NULL OR client_key_id = ?)
-           AND (? IS NULL OR service_account_id = ?)
-           AND (? IS NULL OR id < ?)
-         ORDER BY id DESC LIMIT ?"
+        "SELECT e.id, e.ts, e.request_id, e.client_key_id, e.owner_user_id, e.canonical_id, e.endpoint, e.protocol,
+                e.session_hash, e.status, e.stream, e.incomplete, e.termination, e.input_uncached_tokens,
+                e.cache_read_tokens, e.cache_write_tokens, e.output_tokens, e.reasoning_tokens,
+                e.cost_micro_usd, e.latency_ms, e.ttfb_ms, e.stop_reason, e.service_account_id,
+                e.error_code, e.pin_outcome, e.failovers, ck.label AS client_key_label
+         FROM usage_events e
+         LEFT JOIN client_keys ck ON e.client_key_id = ck.id
+         WHERE e.owner_user_id = ?
+           AND (? IS NULL OR e.ts >= ?)
+           AND (? IS NULL OR e.ts <= ?)
+           AND (? IS NULL OR e.canonical_id = ?)
+           AND (? IS NULL OR e.status = ?)
+           AND (? IS NULL OR e.client_key_id = ?)
+           AND (? IS NULL OR e.service_account_id = ?)
+           AND (? IS NULL OR e.id < ?)
+         ORDER BY e.id DESC LIMIT ?"
     } else {
-        "SELECT id, ts, request_id, client_key_id, owner_user_id, canonical_id, endpoint, protocol,
-                session_hash, status, stream, incomplete, termination, input_uncached_tokens,
-                cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                cost_micro_usd, latency_ms, ttfb_ms, stop_reason, service_account_id,
-                error_code, pin_outcome, failovers
-         FROM usage_events
-         WHERE (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)
-           AND (? IS NULL OR status = ?)
-           AND (? IS NULL OR client_key_id = ?)
-           AND (? IS NULL OR service_account_id = ?)
-           AND (? IS NULL OR id < ?)
-         ORDER BY id DESC LIMIT ?"
+        "SELECT e.id, e.ts, e.request_id, e.client_key_id, e.owner_user_id, e.canonical_id, e.endpoint, e.protocol,
+                e.session_hash, e.status, e.stream, e.incomplete, e.termination, e.input_uncached_tokens,
+                e.cache_read_tokens, e.cache_write_tokens, e.output_tokens, e.reasoning_tokens,
+                e.cost_micro_usd, e.latency_ms, e.ttfb_ms, e.stop_reason, e.service_account_id,
+                e.error_code, e.pin_outcome, e.failovers, ck.label AS client_key_label
+         FROM usage_events e
+         LEFT JOIN client_keys ck ON e.client_key_id = ck.id
+         WHERE (? IS NULL OR e.ts >= ?)
+           AND (? IS NULL OR e.ts <= ?)
+           AND (? IS NULL OR e.canonical_id = ?)
+           AND (? IS NULL OR e.status = ?)
+           AND (? IS NULL OR e.client_key_id = ?)
+           AND (? IS NULL OR e.service_account_id = ?)
+           AND (? IS NULL OR e.id < ?)
+         ORDER BY e.id DESC LIMIT ?"
     };
 
     let rows = if let Some(ref uid) = actor_user_id {
@@ -5355,6 +5627,7 @@ async fn get_logs_internal(
                 "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
                 "model": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
                 "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
+                "client_key_label": r.try_get::<Option<String>, _>("client_key_label").unwrap_or_default(),
                 "service_account_id": r.try_get::<Option<String>, _>("service_account_id").unwrap_or_default(),
                 "session_hash": r.try_get::<Option<String>, _>("session_hash").unwrap_or_default(),
                 "endpoint": r.try_get::<String, _>("endpoint").unwrap_or_default(),
@@ -5440,11 +5713,20 @@ async fn get_log_detail_internal(
         .into_iter()
         .map(|ar| {
             let kid: String = ar.try_get("upstream_key_id").unwrap_or_default();
+            let share_id: Option<String> = ar.try_get("share_id").unwrap_or_default();
+            let kid_projected = if is_admin {
+                Some(kid)
+            } else if share_id.is_some() {
+                Some("shared pool".to_string())
+            } else {
+                Some("global pool".to_string())
+            };
+
             serde_json::json!({
                 "attempt_no": ar.try_get::<i64, _>("attempt_no").unwrap_or(1),
                 "ts": ar.try_get::<i64, _>("ts").unwrap_or(0),
-                "upstream_key_id": kid,
-                "share_id": ar.try_get::<Option<String>, _>("share_id").unwrap_or_default(),
+                "upstream_key_id": kid_projected,
+                "share_id": share_id,
                 "outcome": ar.try_get::<String, _>("outcome").unwrap_or_default(),
                 "http_status": ar.try_get::<Option<i64>, _>("http_status").unwrap_or_default(),
                 "bytes_sent": ar.try_get::<i64, _>("bytes_sent").unwrap_or(0),
@@ -6683,7 +6965,7 @@ async fn get_partial_admin_users_handler(
     use sqlx::Row as _;
     let rows = sqlx::query(
         "SELECT id, username, role, can_use_global_providers, global_budget_micro_usd_month, disabled
-         FROM users ORDER BY created_at ASC",
+         FROM users ORDER BY created_at ASC LIMIT 200",
     )
     .fetch_all(&state.auth.pool)
     .await
@@ -6901,6 +7183,64 @@ async fn get_partial_admin_catalog_handler(
     Ok(Html(html))
 }
 
+async fn get_partial_user_audit_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT seq, ts, action, target_type, target_id, detail_json
+         FROM audit_log WHERE actor_user_id = ? ORDER BY seq DESC LIMIT 100",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if rows.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"5\" class=\"text-center text-muted\">No audit log entries recorded yet.</td></tr>".to_string(),
+        ));
+    }
+
+    let mut html = String::new();
+    for r in rows {
+        let seq: i64 = r.try_get("seq").unwrap_or(0);
+        let ts: i64 = r.try_get("ts").unwrap_or(0);
+        let action: String = r.try_get("action").unwrap_or_default();
+        let action = escape_html(&action);
+        let target_type: String = r
+            .try_get::<Option<String>, _>("target_type")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "—".to_string());
+        let target_id: Option<String> = r.try_get("target_id").unwrap_or_default();
+        let target_str = target_id.map_or(target_type.clone(), |tid| {
+            let short = if tid.len() > 8 { &tid[..8] } else { &tid };
+            format!("{target_type} ({short})")
+        });
+        let target_str = escape_html(&target_str);
+        let payload: String = r.try_get("detail_json").unwrap_or_default();
+        let payload = escape_html(&payload);
+
+        html.push_str(&format!(
+            "<tr>\
+                <td><code>#{seq}</code></td>\
+                <td>{ts}</td>\
+                <td><span class=\"badge badge-info\">{action}</span></td>\
+                <td>{target_str}</td>\
+                <td style=\"font-family: monospace; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\">{payload}</td>\
+            </tr>"
+        ));
+    }
+
+    Ok(Html(html))
+}
+
 async fn get_partial_admin_audit_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -6987,6 +7327,10 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_partial_shares_incoming_handler),
         )
         .route("/app/partials/matrix", get(get_partial_matrix_handler))
+        .route(
+            "/app/partials/audit-log",
+            get(get_partial_user_audit_handler),
+        )
         .route("/admin", get(crate::ui::get_admin_ui))
         .route(
             "/admin/partials/overview",
@@ -7092,8 +7436,12 @@ pub fn router(state: ApiAppState) -> Router {
             put(put_user_service_account_ip_restrictions_handler),
         )
         .route(
+            "/api/user/service-accounts/{id}/keys",
+            post(post_user_service_account_keys_handler),
+        )
+        .route(
             "/api/user/preferences",
-            patch(patch_user_preferences_handler),
+            get(get_user_preferences_handler).patch(patch_user_preferences_handler),
         )
         .route("/api/user/web-sessions", get(get_user_web_sessions_handler))
         .route("/api/user/audit-log", get(get_user_audit_log_handler))
@@ -7189,6 +7537,18 @@ pub fn router(state: ApiAppState) -> Router {
             delete(delete_user_client_key_handler),
         )
         .route(
+            "/admin/api/client-keys/{id}/pause",
+            post(post_pause_client_key_handler),
+        )
+        .route(
+            "/admin/api/client-keys/{id}/resume",
+            post(post_resume_client_key_handler),
+        )
+        .route(
+            "/admin/api/service-accounts",
+            get(get_admin_service_accounts_handler),
+        )
+        .route(
             "/admin/api/client-keys/{id}/sessions",
             get(get_admin_client_key_sessions_handler),
         )
@@ -7224,6 +7584,14 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/users/{id}",
             patch(patch_admin_user_handler).delete(delete_admin_user_handler),
+        )
+        .route(
+            "/admin/api/users/{id}/totp/reset",
+            post(post_admin_reset_totp_handler),
+        )
+        .route(
+            "/admin/api/users/{id}/reset-password",
+            post(post_admin_reset_password_handler),
         )
         .route("/admin/api/models", get(get_admin_models_handler))
         .route(
@@ -7287,6 +7655,10 @@ pub fn router(state: ApiAppState) -> Router {
         .route("/admin/api/audit-log", get(get_admin_audit_log_handler))
         .route("/admin/api/pins", get(get_active_pins_handler))
         .route("/admin/api/sessions/{hash}/pin", delete(delete_pin_handler))
+        .route(
+            "/admin/api/sessions/{hash}/move",
+            post(post_admin_move_session_pin_handler),
+        )
         .route(
             "/admin/api/prices",
             put(put_admin_price_handler).delete(delete_admin_price_handler),

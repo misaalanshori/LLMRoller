@@ -435,6 +435,107 @@ async fn service_account_crud_cidrs_key_pause_and_preferences() {
         .await
         .expect("invalid prefs response");
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 10. GET /api/user/preferences returns stored preferences (UI-5).
+    let get_prefs = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/api/user/preferences", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("get prefs response");
+    assert_eq!(get_prefs.status(), StatusCode::OK);
+    let prefs_body = json_body(get_prefs).await;
+    assert_eq!(prefs_body["ui_theme"], "light");
+    assert_eq!(prefs_body["ui_nav_layout"], "sidebar");
+    assert_eq!(prefs_body["ui_locale"], "en");
+
+    // 11. Child key creation via POST /api/user/service-accounts/{id}/keys (CLK-6).
+    let sa_key_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "POST",
+                &format!("/api/user/service-accounts/{account_id}/keys"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "label": "sa-child-key"
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+        )
+        .await
+        .expect("sa key response");
+    assert_eq!(sa_key_response.status(), StatusCode::CREATED);
+
+    // 12. GET /admin/api/service-accounts (CLK-6).
+    let admin_sa_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/admin/api/service-accounts", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("admin sa list response");
+    assert_eq!(admin_sa_list.status(), StatusCode::OK);
+
+    // 13. Admin pause and resume endpoints (/admin/api/client-keys/{id}/pause|resume).
+    let admin_pause = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "POST",
+                &format!("/admin/api/client-keys/{key_id}/pause"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("admin pause response");
+    assert_eq!(admin_pause.status(), StatusCode::OK);
+
+    let admin_resume = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed(
+                "POST",
+                &format!("/admin/api/client-keys/{key_id}/resume"),
+                ADMIN_SESSION,
+                ADMIN_CSRF,
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("admin resume response");
+    assert_eq!(admin_resume.status(), StatusCode::OK);
+
+    // 14. GET /app/partials/audit-log renders user self-scoped audit rows (AUD-2).
+    let audit_partial = ctx
+        .app
+        .clone()
+        .oneshot(
+            authed("GET", "/app/partials/audit-log", ADMIN_SESSION, "")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("audit partial response");
+    assert_eq!(audit_partial.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

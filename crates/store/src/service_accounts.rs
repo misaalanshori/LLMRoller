@@ -20,6 +20,9 @@ use thiserror::Error;
 /// Maximum number of CIDR entries accepted for one Service Account (`CLK-6`).
 pub const MAX_SERVICE_ACCOUNT_CIDRS: usize = 64;
 
+/// Maximum number of personal Service Accounts per user per SEC-8.
+pub const MAX_SERVICE_ACCOUNTS_PER_USER: usize = 20;
+
 /// Service Account repository errors.
 #[derive(Debug, Error)]
 pub enum ServiceAccountError {
@@ -33,6 +36,8 @@ pub enum ServiceAccountError {
     NameTaken,
     #[error("validation error: {0}")]
     Validation(String),
+    #[error("resource quota exceeded for {resource}: limit is {limit}")]
+    QuotaExceeded { resource: String, limit: usize },
 }
 
 /// Stored Service Account entity.
@@ -207,6 +212,21 @@ pub async fn create_service_account_tx(
     }
     if !actor.is_admin() && !actor.is_system() && actor.user_id() != Some(owner_user_id) {
         return Err(ServiceAccountError::Forbidden);
+    }
+    if workspace_scope == "personal" {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM service_accounts WHERE workspace_scope = 'personal' AND owner_user_id = ?",
+        )
+        .bind(owner_user_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+
+        if count as usize >= MAX_SERVICE_ACCOUNTS_PER_USER {
+            return Err(ServiceAccountError::QuotaExceeded {
+                resource: "service_accounts".to_string(),
+                limit: MAX_SERVICE_ACCOUNTS_PER_USER,
+            });
+        }
     }
     let cidrs = match new_account.allowed_cidrs {
         Some(list) => normalize_cidrs(&list)?,
