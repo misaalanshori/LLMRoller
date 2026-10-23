@@ -200,6 +200,9 @@ impl ThreeTierLoginLimiter {
         // Tier 1: 20 failures per 15 minutes per IP
         {
             let mut ip_map = self.ip_failures.lock();
+            if ip_map.len() > 10_000 {
+                ip_map.retain(|_, v| !v.is_empty());
+            }
             let attempts = ip_map.entry(client_key).or_default();
             attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_15M_MS);
             if attempts.len() >= MAX_FAILURES_PER_IP_15M {
@@ -210,6 +213,9 @@ impl ThreeTierLoginLimiter {
         // Tier 2: 5 failures per 15 minutes per (username, IP)
         {
             let mut user_ip_map = self.user_ip_failures.lock();
+            if user_ip_map.len() > 10_000 {
+                user_ip_map.retain(|_, v| !v.is_empty());
+            }
             let key = (username.to_ascii_lowercase(), client_key);
             let attempts = user_ip_map.entry(key).or_default();
             attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_15M_MS);
@@ -221,6 +227,9 @@ impl ThreeTierLoginLimiter {
         // Tier 3: Across all IPs for this username, > 50 failures per 1 hour
         {
             let mut user_map = self.username_failures.lock();
+            if user_map.len() > 10_000 {
+                user_map.retain(|_, v| !v.is_empty());
+            }
             let attempts = user_map.entry(username.to_ascii_lowercase()).or_default();
             attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_1H_MS);
             if attempts.len() >= USERNAME_ATTACK_THRESHOLD_1H {
@@ -349,13 +358,14 @@ pub fn extract_client_ip(
 
     let entries: Vec<&str> = xff.split(',').map(str::trim).collect();
     for entry in entries.into_iter().rev() {
-        if let Ok(ip) = entry.parse::<IpAddr>() {
-            let is_proxy = trusted_proxies
-                .iter()
-                .any(|p| p.trim() == entry || cidr_contains(p.trim(), ip));
-            if !is_proxy {
-                return ip;
-            }
+        let Ok(ip) = entry.parse::<IpAddr>() else {
+            break;
+        };
+        let is_proxy = trusted_proxies
+            .iter()
+            .any(|p| p.trim() == entry || cidr_contains(p.trim(), ip));
+        if !is_proxy {
+            return ip;
         }
     }
 
@@ -416,6 +426,8 @@ pub struct AuthAppState {
     pub master_key: Option<llmroller_store::crypto::MasterKey>,
     /// Identifier of the active master key, bound into the TOTP AAD.
     pub master_key_id: String,
+    pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
+    pub writer: Option<llmroller_store::writer::WriterHandle>,
 }
 
 impl std::fmt::Debug for AuthAppState {
@@ -442,6 +454,8 @@ impl AuthAppState {
             argon2_semaphore: Arc::new(Semaphore::new(parallelism)),
             master_key: None,
             master_key_id: String::new(),
+            audit_hmac_key: None,
+            writer: None,
         }
     }
 
@@ -668,6 +682,40 @@ async fn get_login_page(State(state): State<AuthAppState>) -> Response {
         .into_response()
 }
 
+async fn log_login_failed(
+    state: &AuthAppState,
+    username: &str,
+    ip: IpAddr,
+    reason: &str,
+    now_ms: i64,
+) {
+    let Some(ref audit_key) = state.audit_hmac_key else {
+        return;
+    };
+    use llmroller_core::seams::ExposeSecret as _;
+    let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+    let ip_str = ip.to_string();
+    let detail = format!("{{\"username\":{username:?},\"reason\":{reason:?}}}");
+    if let Ok(mut tx) = state.pool.begin().await {
+        let _ = llmroller_store::audit::append(
+            &mut tx,
+            audit_key.expose_secret(),
+            llmroller_store::audit::AuditEntry {
+                id: &audit_id,
+                ts: now_ms,
+                actor_user_id: None,
+                ip_addr: Some(&ip_str),
+                action: "auth.login.failed",
+                target_type: "user",
+                target_id: Some(username),
+                detail_json: Some(&detail),
+            },
+        )
+        .await;
+        let _ = tx.commit().await;
+    }
+}
+
 #[doc = "Spec: AUTH-7, Spec: AUTH-8, Spec: SEC-4, Spec: SEC-5"]
 async fn post_login(
     State(state): State<AuthAppState>,
@@ -747,22 +795,36 @@ async fn post_login(
         .map_err(|_| AuthError::Internal)?;
 
     // 4. Lookup user and verify password
-    let record = find_login_record(&state.reader_pool, &payload.username)
-        .await
-        .map_err(|_| AuthError::Internal)?
-        .ok_or(AuthError::InvalidCredentials)?;
+    let record = match find_login_record(&state.reader_pool, &payload.username).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            log_login_failed(&state, &payload.username, client_ip, "user_not_found", now_ms).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+        Err(_) => return Err(AuthError::Internal),
+    };
 
     if record.user.disabled {
         state
             .limiter
             .record_failure(&payload.username, client_ip, now_ms);
+        log_login_failed(&state, &payload.username, client_ip, "account_disabled", now_ms).await;
         return Err(AuthError::AccountDisabled);
     }
 
-    if !verify_password(&payload.password, &record.password_hash) {
+    let password = payload.password.clone();
+    let password_hash = record.password_hash.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        verify_password(&password, &password_hash)
+    })
+    .await
+    .map_err(|_| AuthError::Internal)?;
+
+    if !verified {
         state
             .limiter
             .record_failure(&payload.username, client_ip, now_ms);
+        log_login_failed(&state, &payload.username, client_ip, "invalid_password", now_ms).await;
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -778,6 +840,7 @@ async fn post_login(
             state
                 .limiter
                 .record_failure(&payload.username, client_ip, now_ms);
+            log_login_failed(&state, &payload.username, client_ip, "invalid_totp", now_ms).await;
             return Err(AuthError::InvalidCredentials);
         }
     } else if limiter_outcome == LimiterOutcome::EnforceTotpOrDelay {
@@ -786,6 +849,32 @@ async fn post_login(
 
     // Record login success in rate limiter
     state.limiter.record_success(&payload.username, client_ip);
+
+    // Audit log success (AUD-1, SEC-13, F048)
+    if let Some(ref audit_key) = state.audit_hmac_key {
+        use llmroller_core::seams::ExposeSecret as _;
+        let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+        let uid_str = record.user.id.to_string();
+        let ip_str = client_ip.to_string();
+        if let Ok(mut tx) = state.pool.begin().await {
+            let _ = llmroller_store::audit::append(
+                &mut tx,
+                audit_key.expose_secret(),
+                llmroller_store::audit::AuditEntry {
+                    id: &audit_id,
+                    ts: now_ms,
+                    actor_user_id: Some(&uid_str),
+                    ip_addr: Some(&ip_str),
+                    action: "auth.login.succeeded",
+                    target_type: "user",
+                    target_id: Some(&uid_str),
+                    detail_json: Some("{}"),
+                },
+            )
+            .await;
+            let _ = tx.commit().await;
+        }
+    }
 
     // 6. Issue 256-bit session token and random 256-bit CSRF token per AUTH-7 / SEC-5
     let mut raw_session = [0_u8; 32];
@@ -868,7 +957,33 @@ async fn post_logout(
         .unwrap_or("");
     if let Some(token) = parse_cookie_value(cookie_header, cookie_name) {
         let id_hash = sha256_hex(token.as_bytes());
+        let session = load_web_session(&state.reader_pool, &id_hash).await.ok().flatten();
         let _ = delete_web_session(&state.pool, &id_hash).await;
+
+        if let Some(ref audit_key) = state.audit_hmac_key {
+            use llmroller_core::seams::ExposeSecret as _;
+            let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+            let uid_str = session.as_ref().map(|s| s.user.id.to_string());
+            let now_ms = state.clock.now_ms();
+            if let Ok(mut tx) = state.pool.begin().await {
+                let _ = llmroller_store::audit::append(
+                    &mut tx,
+                    audit_key.expose_secret(),
+                    llmroller_store::audit::AuditEntry {
+                        id: &audit_id,
+                        ts: now_ms,
+                        actor_user_id: uid_str.as_deref(),
+                        ip_addr: None,
+                        action: "auth.logout",
+                        target_type: "web_session",
+                        target_id: Some(&id_hash),
+                        detail_json: Some("{}"),
+                    },
+                )
+                .await;
+                let _ = tx.commit().await;
+            }
+        }
     }
 
     let secure_flag = if state.config.dev_insecure_cookies {

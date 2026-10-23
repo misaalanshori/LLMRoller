@@ -78,6 +78,7 @@ async fn test_traceability_settings_confirm_purge_guard_and_auto_disable() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
 
@@ -225,6 +226,7 @@ async fn test_rbac_isolated_sessions_and_preview() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -484,6 +486,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);

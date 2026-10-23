@@ -93,6 +93,7 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -278,6 +279,7 @@ async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -433,6 +435,7 @@ async fn test_usage_explorer_summary_events_and_formula_safe_csv_export() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -606,6 +609,7 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -884,6 +888,7 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -998,6 +1003,7 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -1150,6 +1156,7 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);
@@ -1280,6 +1287,7 @@ async fn test_overview_analytics_dashboard_kpis_and_models_breakdown() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);

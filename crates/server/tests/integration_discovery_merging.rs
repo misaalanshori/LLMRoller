@@ -172,6 +172,7 @@ async fn setup() -> TestContext {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(SystemClock::new()),
         entropy: Arc::new(DeterministicRng::new(3)),
+        audit_hmac_key: None,
     };
     let mut api_state =
         ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());

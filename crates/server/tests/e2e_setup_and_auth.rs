@@ -43,6 +43,7 @@ async fn setup_test_env() -> (TempDir, sqlx::SqlitePool, SetupAppState, AuthAppS
         data_dir: directory.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: entropy.clone(),
+        audit_hmac_key: None,
     };
 
     let auth_config = AuthConfig {
@@ -646,4 +647,149 @@ async fn login_requires_totp_and_rejects_replayed_codes() {
         .await
         .expect("record");
     assert!(record.user.totp_enabled);
+}
+
+#[tokio::test]
+#[doc = "Spec: AUTH-1, Spec: AUD-1, Spec: SEC-13, Spec: AUTH-7"]
+async fn test_auth_and_setup_events_append_to_audit_log() {
+    use llmroller_core::seams::SecretBytes;
+    let (_dir, pool, mut setup_state, mut auth_state) = setup_test_env().await;
+    let audit_key = SecretBytes::new(Box::new([42u8; 32]));
+    setup_state.audit_hmac_key = Some(audit_key.clone());
+    auth_state.audit_hmac_key = Some(audit_key.clone());
+
+    let token = setup_state.expected_token.clone().expect("token");
+    let app = control_plane_router(setup_state, auth_state);
+
+    // 1. First admin setup appends setup.completed
+    let setup_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/setup")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"setup_token":"{token}","username":"admin_audit","password":"Password12345!#"}}"#
+                )))
+                .expect("request builder"),
+        )
+        .await
+        .expect("setup response");
+    assert_eq!(setup_resp.status(), StatusCode::CREATED);
+
+    // Fetch CSRF token for login
+    let login_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/login")
+                .body(Body::empty())
+                .expect("request builder"),
+        )
+        .await
+        .expect("login page");
+    let csrf = login_page
+        .headers()
+        .get("x-csrf-token")
+        .expect("csrf")
+        .to_str()
+        .expect("to_str")
+        .to_string();
+    let login_csrf_cookie = login_page
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("set cookie")
+        .to_str()
+        .expect("to_str")
+        .to_string();
+
+    // 2. Failed login appends auth.login.failed
+    let fail_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-csrf-token", &csrf)
+                .header(header::COOKIE, &login_csrf_cookie)
+                .body(Body::from(
+                    r#"{"username":"admin_audit","password":"WrongPassword123!"}"#,
+                ))
+                .expect("request builder"),
+        )
+        .await
+        .expect("fail response");
+    assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Successful login appends auth.login.succeeded
+    let login_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-csrf-token", &csrf)
+                .header(header::COOKIE, &login_csrf_cookie)
+                .body(Body::from(
+                    r#"{"username":"admin_audit","password":"Password12345!#"}"#,
+                ))
+                .expect("request builder"),
+        )
+        .await
+        .expect("login response");
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    let session_cookie = login_resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session cookie")
+        .to_str()
+        .expect("to_str")
+        .to_string();
+
+    // 4. Logout appends auth.logout
+    let logout_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header(header::COOKIE, &session_cookie)
+                .body(Body::empty())
+                .expect("request builder"),
+        )
+        .await
+        .expect("logout response");
+    assert_eq!(logout_resp.status(), StatusCode::OK);
+
+    // 5. Verify the entire hash chain is intact using verify_audit_log
+    use llmroller_core::seams::ExposeSecret as _;
+    let report = llmroller_store::audit::verify_audit_log(
+        &pool,
+        audit_key.expose_secret(),
+        None,
+        None,
+    )
+    .await
+    .expect("audit log verification must succeed");
+
+    assert_eq!(report.rows_verified, 4);
+    assert_eq!(report.max_seq, 4);
+
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_log ORDER BY seq ASC")
+        .fetch_all(&pool)
+        .await
+        .expect("fetch actions");
+    assert_eq!(
+        actions,
+        vec![
+            "setup.completed",
+            "auth.login.failed",
+            "auth.login.succeeded",
+            "auth.logout"
+        ]
+    );
 }

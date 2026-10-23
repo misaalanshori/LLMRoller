@@ -151,6 +151,7 @@ pub struct SetupAppState {
     pub data_dir: PathBuf,
     pub clock: Arc<dyn Clock>,
     pub entropy: Arc<dyn EntropySource>,
+    pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
 }
 
 impl std::fmt::Debug for SetupAppState {
@@ -173,6 +174,7 @@ impl SetupAppState {
             data_dir,
             clock: Arc::new(SystemClock::new()),
             entropy: Arc::new(OsEntropy::new()),
+            audit_hmac_key: None,
         }
     }
 }
@@ -405,6 +407,28 @@ async fn post_setup(
             .bind(now_ms)
             .execute(&mut *transaction)
             .await;
+
+    // Append setup.completed audit entry inside the same transaction (AUTH-1, AUD-1, F047)
+    if let Some(ref audit_key) = state.audit_hmac_key {
+        use llmroller_core::seams::ExposeSecret as _;
+        let audit_id = llmroller_core::ids::RequestId::generate().to_string();
+        let uid_str = id.to_string();
+        let _ = llmroller_store::audit::append(
+            &mut transaction,
+            audit_key.expose_secret(),
+            llmroller_store::audit::AuditEntry {
+                id: &audit_id,
+                ts: now_ms,
+                actor_user_id: Some(&uid_str),
+                ip_addr: None,
+                action: "setup.completed",
+                target_type: "instance_meta",
+                target_id: Some("singleton"),
+                detail_json: Some("{\"first_admin_created\":true}"),
+            },
+        )
+        .await;
+    }
 
     transaction.commit().await?;
     drop(connection);

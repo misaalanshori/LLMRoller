@@ -158,6 +158,7 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         data_dir: dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state, api_state);

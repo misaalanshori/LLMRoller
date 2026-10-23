@@ -237,17 +237,18 @@ pub fn extract_client_ip(
 
     let entries: Vec<&str> = forwarded_for.split(',').map(str::trim).collect();
     for entry in entries.into_iter().rev() {
-        if let Ok(ip) = entry.parse::<IpAddr>() {
-            let is_proxy = trusted_proxies.iter().any(|cidr| {
-                cidr.trim() == entry
-                    || cidr
-                        .trim()
-                        .parse::<IpNet>()
-                        .is_ok_and(|net| net.contains(&ip))
-            });
-            if !is_proxy {
-                return ip;
-            }
+        let Ok(ip) = entry.parse::<IpAddr>() else {
+            break;
+        };
+        let is_proxy = trusted_proxies.iter().any(|cidr| {
+            cidr.trim() == entry
+                || cidr
+                    .trim()
+                    .parse::<IpNet>()
+                    .is_ok_and(|net| net.contains(&ip))
+        });
+        if !is_proxy {
+            return ip;
         }
     }
 
@@ -499,6 +500,18 @@ mod tests {
         // 4. Empty trusted proxies -> returns peer IP even if XFF present
         assert_eq!(
             extract_client_ip(peer_addr, &headers, &[]),
+            "10.0.0.1".parse::<IpAddr>().expect("parse ip")
+        );
+
+        // 5. Unparseable token in XFF stops right-to-left traversal immediately (F091, SEC-12)
+        headers.insert(
+            "x-forwarded-for",
+            "1.1.1.1, malformed_ip, 172.16.0.1"
+                .parse()
+                .expect("parse header"),
+        );
+        assert_eq!(
+            extract_client_ip(peer_addr, &headers, &trusted_proxies),
             "10.0.0.1".parse::<IpAddr>().expect("parse ip")
         );
     }

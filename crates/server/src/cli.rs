@@ -480,12 +480,15 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         .with_reader_pool(reader_pool.clone());
     auth_state.master_key = Some(master_key.clone());
     auth_state.master_key_id = master_key_id.clone();
+    auth_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
+    auth_state.writer = Some(writer_handle.clone());
     let setup_state = llmroller_admin::SetupAppState {
         pool: pool.clone(),
         expected_token: setup_token,
         data_dir: data_dir.clone(),
         clock: clock.clone(),
         entropy: entropy.clone(),
+        audit_hmac_key: Some(instance_state.audit_hmac_key.clone()),
     };
     let mut api_state = llmroller_admin::ApiAppState::new(
         auth_state.clone(),

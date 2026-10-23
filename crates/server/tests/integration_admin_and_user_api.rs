@@ -242,6 +242,7 @@ fn build_app(harness: &Harness, pin_store: Arc<PinStore>) -> axum::Router {
         data_dir: harness._dir.path().to_path_buf(),
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
     };
     let mut api_state = ApiAppState::new(
         auth_state.clone(),
