@@ -7423,6 +7423,247 @@ async fn get_partial_admin_audit_handler(
     Ok(Html(html))
 }
 
+fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &str) -> String {
+    let mut out = String::from("<div class=\"table-container\"><table class=\"data-table\"><thead><tr>");
+    if is_api {
+        out.push_str("<th>Time</th><th>Status</th><th>Endpoint</th><th>User</th><th>Duration</th></tr></thead><tbody>");
+    } else {
+        out.push_str("<th>Time</th><th>Status</th><th>Model</th><th>User / Key</th><th>Duration</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>");
+    }
+
+    let Some(rows) = json.get("rows").and_then(|r| r.as_array()) else {
+        let cols = if is_api { 5 } else { 7 };
+        out.push_str(&format!("<tr><td colspan=\"{cols}\" class=\"text-center text-muted\">No log entries found.</td></tr></tbody></table></div>"));
+        return out;
+    };
+    if rows.is_empty() {
+        let cols = if is_api { 5 } else { 7 };
+        out.push_str(&format!("<tr><td colspan=\"{cols}\" class=\"text-center text-muted\">No log entries found.</td></tr></tbody></table></div>"));
+        return out;
+    }
+
+    if is_api {
+        for r in rows {
+            let ts = r.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let status = r.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
+            let endpoint = escape_html(r.get("path").and_then(|v| v.as_str()).unwrap_or("/"));
+            let method = escape_html(r.get("method").and_then(|v| v.as_str()).unwrap_or("GET"));
+            let user = escape_html(r.get("actor_user_id").and_then(|v| v.as_str()).unwrap_or("-"));
+            let dur = escape_html(r.get("duration_formatted").and_then(|v| v.as_str()).unwrap_or("-"));
+
+            let status_badge = if (200..300).contains(&status) {
+                format!("<span class=\"badge badge-success\">● {status}</span>")
+            } else if (400..500).contains(&status) {
+                format!("<span class=\"badge badge-warning\">● {status}</span>")
+            } else {
+                format!("<span class=\"badge badge-danger\">● {status}</span>")
+            };
+
+            out.push_str(&format!(
+                "<tr><td>{ts}</td><td>{status_badge}</td><td><code>{method} {endpoint}</code></td><td>{user}</td><td>{dur}</td></tr>"
+            ));
+        }
+    } else {
+        out.push_str("<th>Time</th><th>Status</th><th>Model</th><th>User / Key</th><th>Duration</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>");
+        for r in rows {
+            let req_id = escape_html(r.get("request_id").and_then(|v| v.as_str()).unwrap_or(""));
+            let ts = r.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let status = r.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
+            let model = escape_html(r.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("-"));
+            let key_label = escape_html(r.get("client_key_label").and_then(|v| v.as_str()).unwrap_or("-"));
+            let latency_ms = r.get("latency_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
+            let cost_formatted = escape_html(r.get("cost_formatted").and_then(|v| v.as_str()).unwrap_or("—"));
+            let total_tokens = r.get("total_tokens").and_then(|v| v.as_i64()).map(|t| t.to_string()).unwrap_or_else(|| "—".to_string());
+
+            let status_badge = if status == 200 {
+                "<span class=\"badge badge-success\">● 200</span>".to_string()
+            } else if status == 429 {
+                "<span class=\"badge badge-warning\">● 429 Rejected</span>".to_string()
+            } else {
+                format!("<span class=\"badge badge-danger\">● {status}</span>")
+            };
+
+            out.push_str(&format!(
+                "<tr style=\"cursor:pointer;\" hx-get=\"{detail_base}/{req_id}\" hx-target=\"#drawer-content\" data-action=\"open-drawer\">\
+                    <td>{ts}</td>\
+                    <td>{status_badge}</td>\
+                    <td><strong>{model}</strong></td>\
+                    <td>{key_label}</td>\
+                    <td>{latency_ms}</td>\
+                    <td>{total_tokens}</td>\
+                    <td>{cost_formatted}</td>\
+                </tr>"
+            ));
+        }
+    }
+    out.push_str("</tbody></table></div>");
+    out
+}
+
+fn render_log_detail_drawer_html(json: &serde_json::Value) -> String {
+    let req_id = escape_html(json.get("request_id").and_then(|v| v.as_str()).unwrap_or(""));
+    let status = json.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
+    let model = escape_html(json.get("model").and_then(|v| v.as_str()).unwrap_or("-"));
+    let ts = json.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let latency_ms = json.get("latency_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
+    let ttfb_ms = json.get("ttfb_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
+    let endpoint = escape_html(json.get("endpoint").and_then(|v| v.as_str()).unwrap_or("-"));
+    let protocol = escape_html(json.get("protocol").and_then(|v| v.as_str()).unwrap_or("-"));
+    let stream = json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stop_reason = escape_html(json.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("—"));
+
+    let tokens = json.get("tokens");
+    let input_tokens = tokens.and_then(|t| t.get("input")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let output_tokens = tokens.and_then(|t| t.get("output")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let reasoning_tokens = tokens.and_then(|t| t.get("reasoning")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let cache_read = tokens.and_then(|t| t.get("cache_read")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let cache_write = tokens.and_then(|t| t.get("cache_write")).and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let cost_obj = json.get("cost");
+    let cost_usd = cost_obj.and_then(|c| c.get("cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+    let list_cost_usd = cost_obj.and_then(|c| c.get("list_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+    let coverage_mode = escape_html(cost_obj.and_then(|c| c.get("billing_coverage_mode")).and_then(|v| v.as_str()).unwrap_or("pay_as_you_go"));
+
+    let identity = json.get("identity");
+    let client_key = escape_html(identity.and_then(|i| i.get("client_key_id")).and_then(|v| v.as_str()).unwrap_or("-"));
+    let sa_id = escape_html(identity.and_then(|i| i.get("service_account_id")).and_then(|v| v.as_str()).unwrap_or("-"));
+
+    let session_hash = escape_html(json.get("session_hash").and_then(|v| v.as_str()).unwrap_or("-"));
+    let user_agent = escape_html(json.get("client_user_agent").and_then(|v| v.as_str()).unwrap_or("-"));
+
+    let mut attempts_html = String::new();
+    if let Some(attempts) = json.get("attempts").and_then(|a| a.as_array()) {
+        for a in attempts {
+            let att_no = a.get("attempt_no").and_then(|v| v.as_i64()).unwrap_or(1);
+            let outcome = escape_html(a.get("outcome").and_then(|v| v.as_str()).unwrap_or("-"));
+            let key = escape_html(a.get("upstream_key_id").and_then(|v| v.as_str()).unwrap_or("-"));
+            attempts_html.push_str(&format!("<li>Attempt {att_no}: {outcome} (key: {key})</li>"));
+        }
+    }
+    if attempts_html.is_empty() {
+        attempts_html = "<li>1 attempt (served)</li>".to_string();
+    }
+
+    format!(
+        "<div class=\"drawer-header\">\
+            <div><strong>Log Detail</strong> <span class=\"badge badge-info\">{status}</span></div>\
+            <button class=\"btn btn-xs btn-ghost\" data-action=\"close-drawer\">&times;</button>\
+        </div>\
+        <div class=\"drawer-body\">\
+            <div class=\"drawer-section\">\
+                <h2>{model}</h2>\
+                <p class=\"text-muted\">{ts} · {latency_ms}</p>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>1. Request</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Request ID:</span><code>{req_id}</code></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">HTTP status:</span><span>{status}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Stop reason:</span><span>{stop_reason}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Endpoint:</span><code>{endpoint}</code></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Protocol:</span><span>{protocol}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Streaming:</span><span>{}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Time to first token:</span><span>{ttfb_ms}</span></div>\
+                </div>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>2. Model</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Canonical Model:</span><span>{model}</span></div>\
+                </div>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>3. Tokens &amp; Cost</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Input tokens:</span><span>{input_tokens}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Output tokens:</span><span>{output_tokens}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Reasoning tokens:</span><span>{reasoning_tokens}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Cache read:</span><span>{cache_read}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Cache write:</span><span>{cache_write}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Billed cost:</span><span>${cost_usd:.6}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">List cost:</span><span>${list_cost_usd:.6}</span></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Coverage mode:</span><span class=\"badge badge-info\">{coverage_mode}</span></div>\
+                </div>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>4. Identity</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Client key:</span><code>{client_key}</code></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Service account:</span><span>{sa_id}</span></div>\
+                </div>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>5. Client</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Session hash:</span><code>{session_hash}</code></div>\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">User Agent:</span><span>{user_agent}</span></div>\
+                </div>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>6. Upstream Attempts</h4>\
+                <ul style=\"padding-left: 1.25rem; font-size: 0.8125rem;\">{attempts_html}</ul>\
+            </div>\
+            <div class=\"drawer-section\">\
+                <h4>7. Trace & Diagnostics</h4>\
+                <div class=\"key-val-list\">\
+                    <div class=\"key-val-row\"><span class=\"key-val-label\">Has Content Trace:</span><span>{}</span></div>\
+                </div>\
+            </div>\
+        </div>",
+        if stream { "Yes" } else { "No" },
+        if json.get("has_trace").and_then(|v| v.as_bool()).unwrap_or(false) { "Yes" } else { "No" }
+    )
+}
+
+async fn get_partial_user_logs_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let uid = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    let is_api = query.stream.as_deref() == Some("api");
+    let json_res = get_logs_internal(&state, Some(uid.to_string()), query).await?;
+    let html = render_logs_table_html(&json_res.0, is_api, "/app/partials/logs");
+    Ok(Html(html))
+}
+
+async fn get_partial_user_log_detail_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let detail_json = get_log_detail_internal(&state, &actor, &request_id).await?;
+    let html = render_log_detail_drawer_html(&detail_json.0);
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_logs_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    let is_api = query.stream.as_deref() == Some("api");
+    let json_res = get_logs_internal(&state, None, query).await?;
+    let html = render_logs_table_html(&json_res.0, is_api, "/admin/partials/logs");
+    Ok(Html(html))
+}
+
+async fn get_partial_admin_log_detail_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    let detail_json = get_log_detail_internal(&state, &actor, &request_id).await?;
+    let html = render_log_detail_drawer_html(&detail_json.0);
+    Ok(Html(html))
+}
+
 pub fn router(state: ApiAppState) -> Router {
     Router::new()
         // Web UI screens & HTMX Partials
@@ -7449,6 +7690,11 @@ pub fn router(state: ApiAppState) -> Router {
             "/app/partials/audit-log",
             get(get_partial_user_audit_handler),
         )
+        .route("/app/partials/logs", get(get_partial_user_logs_handler))
+        .route(
+            "/app/partials/logs/{request_id}",
+            get(get_partial_user_log_detail_handler),
+        )
         .route("/admin", get(crate::ui::get_admin_ui))
         .route(
             "/admin/partials/overview",
@@ -7469,6 +7715,11 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/partials/audit",
             get(get_partial_admin_audit_handler),
+        )
+        .route("/admin/partials/logs", get(get_partial_admin_logs_handler))
+        .route(
+            "/admin/partials/logs/{request_id}",
+            get(get_partial_admin_log_detail_handler),
         )
         // User endpoints
         .route(

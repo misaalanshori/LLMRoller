@@ -164,3 +164,15 @@ h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.25rem; }
 .chat-reasoning pre { font-family: ui-monospace, monospace; font-size: 0.8125rem; white-space: pre-wrap; color: #fde68a; margin-top: 0.5rem; }
 .chat-tool-call { background: #0d1527; border: 1px dashed #3b82f6; border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
 .chat-tool-call pre { font-size: 0.75rem; color: #93c5fd; overflow-x: auto; margin-top: 0.25rem; }
+
+/* Inspection Drawer (SRDD 14.m) */
+.inspection-drawer { position: fixed; top: 0; right: 0; width: 480px; max-width: 90vw; height: 100vh; background: #0f172a; border-left: 1px solid var(--border); z-index: 1000; display: flex; flex-direction: column; box-shadow: -4px 0 24px rgba(0,0,0,0.5); }
+.drawer-header { height: 52px; padding: 0 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.drawer-body { overflow-y: auto; flex: 1; padding: 1.25rem; display: flex; flex-direction: column; gap: 1.25rem; }
+.drawer-section { border-top: 1px solid var(--border); padding-top: 1rem; }
+.drawer-section:first-child { border-top: none; padding-top: 0; }
+.drawer-section h4 { font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.5rem; }
+.key-val-list { display: flex; flex-direction: column; gap: 0.375rem; font-size: 0.8125rem; }
+.key-val-row { display: flex; justify-content: space-between; align-items: center; }
+.key-val-label { color: var(--muted); }
+.segmented-pill { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }

@@ -989,7 +989,7 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
     use axum::http::header;
     use llmroller_core::ids::{ClientKeyId, RequestId, UsageEventId};
 
-    let (dir, pool, master_key, _admin_id) = setup_dashboard_test_db().await;
+    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
@@ -1046,6 +1046,26 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
     .await
     .expect("session");
     let cookie = format!("llmroller_session={raw_session}");
+
+    let admin_session = "usg9_admin_session_token_12345678";
+    let admin_id_hash = llmroller_store::crypto::sha256_hex(admin_session.as_bytes());
+    let admin_csrf = llmroller_admin::auth::derive_session_csrf(admin_session);
+    let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &admin_id_hash,
+            user_id: admin_id,
+            csrf_hash: &admin_csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("admin session");
+    let admin_cookie = format!("llmroller_session={admin_session}");
 
     let ev_id = UsageEventId::generate();
     let req_id = RequestId::generate();
@@ -1129,11 +1149,85 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
         .expect("csv req");
-    let csv_res = app.oneshot(csv_req).await.expect("res");
+    let csv_res = app.clone().oneshot(csv_req).await.expect("csv res");
     assert_eq!(csv_res.status(), StatusCode::OK);
     let csv_bytes = csv_res.into_body().collect().await.expect("b").to_bytes();
     let csv_str = std::str::from_utf8(&csv_bytes).expect("utf8");
     assert!(csv_str.contains("gpt-4o"));
+
+    // 4. GET /app/partials/logs?stream=inference (USG-9, SRDD 14.l)
+    let p_inf_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/logs?stream=inference")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let p_inf_res = app.clone().oneshot(p_inf_req).await.expect("res");
+    assert_eq!(p_inf_res.status(), StatusCode::OK);
+    let p_inf_bytes = p_inf_res.into_body().collect().await.expect("b").to_bytes();
+    let p_inf_html = std::str::from_utf8(&p_inf_bytes).expect("utf8");
+    assert!(p_inf_html.contains("gpt-4o"));
+    assert!(p_inf_html.contains("● 200"));
+    assert!(p_inf_html.contains("data-action=\"open-drawer\""));
+
+    // 5. GET /app/partials/logs?stream=api (USG-9, SRDD 14.l)
+    let p_api_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/logs?stream=api")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let p_api_res = app.clone().oneshot(p_api_req).await.expect("res");
+    assert_eq!(p_api_res.status(), StatusCode::OK);
+    let p_api_bytes = p_api_res.into_body().collect().await.expect("b").to_bytes();
+    let p_api_html = std::str::from_utf8(&p_api_bytes).expect("utf8");
+    assert!(p_api_html.contains("<th>Endpoint</th>"));
+
+    // 6. GET /app/partials/logs/{request_id} (USG-9, SRDD 14.m 7-section drawer)
+    let p_detail_req = Request::builder()
+        .method("GET")
+        .uri(format!("/app/partials/logs/{}", req_id))
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let p_detail_res = app.clone().oneshot(p_detail_req).await.expect("res");
+    assert_eq!(p_detail_res.status(), StatusCode::OK);
+    let p_detail_bytes = p_detail_res.into_body().collect().await.expect("b").to_bytes();
+    let p_detail_html = std::str::from_utf8(&p_detail_bytes).expect("utf8");
+    assert!(p_detail_html.contains("Log Detail"));
+    assert!(p_detail_html.contains("1. Request"));
+    assert!(p_detail_html.contains("3. Tokens &amp; Cost"));
+    assert!(p_detail_html.contains("gpt-4o"));
+    assert!(p_detail_html.contains("data-action=\"close-drawer\""));
+
+    // 7. GET /app and GET /admin contain the Logs tab and pane container
+    let app_req = Request::builder()
+        .method("GET")
+        .uri("/app")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let app_res = app.clone().oneshot(app_req).await.expect("res");
+    assert_eq!(app_res.status(), StatusCode::OK);
+    let app_bytes = app_res.into_body().collect().await.expect("b").to_bytes();
+    let app_html = std::str::from_utf8(&app_bytes).expect("utf8");
+    assert!(app_html.contains("data-tab=\"tab-logs\""));
+    assert!(app_html.contains("id=\"tab-logs\""));
+    assert!(app_html.contains("id=\"right-inspection-drawer\""));
+
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri("/admin")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let admin_res = app.oneshot(admin_req).await.expect("res");
+    assert_eq!(admin_res.status(), StatusCode::OK);
+    let admin_bytes = admin_res.into_body().collect().await.expect("b").to_bytes();
+    let admin_html = std::str::from_utf8(&admin_bytes).expect("utf8");
+    assert!(admin_html.contains("data-tab=\"tab-adm-logs\""));
+    assert!(admin_html.contains("id=\"tab-adm-logs\""));
+    assert!(admin_html.contains("id=\"right-inspection-drawer\""));
 }
 
 #[doc = "Spec: USG-10 — Usage Ledger, 5-Token Summary Strip, and Plan Coverage Multipliers"]

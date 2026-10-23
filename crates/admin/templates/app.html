@@ -18,6 +18,7 @@
         <button class="tab-btn" data-tab="tab-sharing">Sharing</button>
         <button class="tab-btn" data-tab="tab-matrix">Routing Matrix</button>
         <button class="tab-btn" data-tab="tab-sessions">Active Sessions</button>
+        <button class="tab-btn" data-tab="tab-logs">Logs</button>
     </div>
 
     <!-- Tab: Overview -->
@@ -231,6 +232,28 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             </div>
         </div>
     </div>
+
+    <!-- Tab: Logs Explorer (USG-9, SRDD 14.l) -->
+    <div id="tab-logs" class="tab-pane">
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h3>Logs</h3>
+                    <p class="card-desc">Every inference and console API request in this organization, newest first. Kept for 30 days.</p>
+                </div>
+                <div class="header-actions">
+                    <div class="segmented-pill">
+                        <button class="btn btn-xs btn-primary" hx-get="/app/partials/logs?stream=inference" hx-target="#logs-table-container">Inference</button>
+                        <button class="btn btn-xs btn-outline" hx-get="/app/partials/logs?stream=api" hx-target="#logs-table-container">API</button>
+                    </div>
+                    <a href="/api/user/logs/export.csv" class="btn btn-sm btn-outline">Export CSV</a>
+                </div>
+            </div>
+            <div id="logs-table-container" hx-get="/app/partials/logs?stream=inference" hx-trigger="load">
+                <p class="text-muted text-center" style="padding: 1.5rem;">Loading logs...</p>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Modal: New Client Key -->
@@ -417,4 +440,9 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             <button type="button" class="btn btn-ghost" data-modal-close="modal-chat-preview">Close</button>
         </div>
     </div>
+</div>
+
+<!-- Inspection Drawer: Request Details (USG-9, SRDD 14.m) -->
+<div id="right-inspection-drawer" class="inspection-drawer" style="display: none;">
+    <div id="drawer-content"></div>
 </div>

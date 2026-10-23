@@ -139,6 +139,19 @@ document.addEventListener('click', function(e) {
         return;
     }
 
+    // 9. Open/Close Inspection Drawer (SRDD 14.m)
+    const drawerOpen = e.target.closest('[data-action="open-drawer"]');
+    if (drawerOpen) {
+        const drawer = document.getElementById('right-inspection-drawer');
+        if (drawer) drawer.style.display = 'flex';
+    }
+    const drawerClose = e.target.closest('[data-action="close-drawer"]');
+    if (drawerClose) {
+        const drawer = document.getElementById('right-inspection-drawer');
+        if (drawer) drawer.style.display = 'none';
+        return;
+    }
+
     // 9. Save Setting
     const saveSettingBtn = e.target.closest('[data-action="save-setting"]');
     if (saveSettingBtn) {
