@@ -42,6 +42,7 @@ jobs:
         run: |
           cargo xtask doc-consistency
           cargo xtask docs-bundle --check
+          cargo xtask migration-check
           cargo xtask traceability --milestone M6
 
       - name: Supply-chain policy

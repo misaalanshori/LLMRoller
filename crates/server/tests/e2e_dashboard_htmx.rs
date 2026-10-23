@@ -1192,7 +1192,12 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
         .expect("req");
     let p_detail_res = app.clone().oneshot(p_detail_req).await.expect("res");
     assert_eq!(p_detail_res.status(), StatusCode::OK);
-    let p_detail_bytes = p_detail_res.into_body().collect().await.expect("b").to_bytes();
+    let p_detail_bytes = p_detail_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
     let p_detail_html = std::str::from_utf8(&p_detail_bytes).expect("utf8");
     assert!(p_detail_html.contains("Log Detail"));
     assert!(p_detail_html.contains("1. Request"));
@@ -1370,7 +1375,12 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
         .expect("req");
     let p_ledger_res = app.clone().oneshot(p_ledger_req).await.expect("res");
     assert_eq!(p_ledger_res.status(), StatusCode::OK);
-    let p_ledger_bytes = p_ledger_res.into_body().collect().await.expect("b").to_bytes();
+    let p_ledger_bytes = p_ledger_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
     let p_ledger_html = std::str::from_utf8(&p_ledger_bytes).expect("utf8");
     assert!(p_ledger_html.contains("Total tokens"));
     assert!(p_ledger_html.contains("Plan Covered Savings"));
@@ -1432,7 +1442,12 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
         .expect("req");
     let p_adm_ledger_res = app.oneshot(p_adm_ledger_req).await.expect("res");
     assert_eq!(p_adm_ledger_res.status(), StatusCode::OK);
-    let p_adm_ledger_bytes = p_adm_ledger_res.into_body().collect().await.expect("b").to_bytes();
+    let p_adm_ledger_bytes = p_adm_ledger_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
     let p_adm_ledger_html = std::str::from_utf8(&p_adm_ledger_bytes).expect("utf8");
     assert!(p_adm_ledger_html.contains("Total tokens"));
 }

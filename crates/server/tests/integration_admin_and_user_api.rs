@@ -513,7 +513,11 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .header(header::COOKIE, &harness.alice_key.cookie)
         .body(Body::empty())
         .expect("sessions request");
-    let response = app.clone().oneshot(request).await.expect("sessions response");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("sessions response");
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
@@ -542,10 +546,11 @@ async fn test_client_key_sessions_report_live_session_pins() {
     let global_prov_id = ProviderId::generate();
     let global_key_id = UpstreamKeyId::generate();
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
-    let model_pk: String = sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = 'gpt-4o'")
-        .fetch_one(&harness.pool)
-        .await
-        .expect("model_pk");
+    let model_pk: String =
+        sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = 'gpt-4o'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("model_pk");
 
     sqlx::query(
         "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, created_at)
@@ -593,7 +598,11 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .header(header::COOKIE, &harness.alice_key.cookie)
         .body(Body::empty())
         .expect("user sessions request");
-    let user_res = app.clone().oneshot(user_req).await.expect("user sessions response");
+    let user_res = app
+        .clone()
+        .oneshot(user_req)
+        .await
+        .expect("user sessions response");
     assert_eq!(user_res.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(user_res.into_body(), 64 * 1024)
         .await
@@ -605,11 +614,18 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .find(|s| s["session_hash"] == "global-session-hash")
         .expect("global session present");
     let global_pins = global_sess["current_pins"].as_array().expect("global pins");
-    assert!(global_pins[0]["upstream_key_id"].is_null(), "global key id must be redacted to null for standard users");
-    assert_eq!(global_pins[0]["key_label"], "pooled", "global key label must be masked to pooled");
+    assert!(
+        global_pins[0]["upstream_key_id"].is_null(),
+        "global key id must be redacted to null for standard users"
+    );
+    assert_eq!(
+        global_pins[0]["key_label"], "pooled",
+        "global key label must be masked to pooled"
+    );
 
     // Admin queries sessions: receives full unredacted key details
-    let (admin_cookie, _admin_csrf) = insert_session(&harness.pool, harness.admin, "admin_sessions_token_12345").await;
+    let (admin_cookie, _admin_csrf) =
+        insert_session(&harness.pool, harness.admin, "admin_sessions_token_12345").await;
     let admin_req = Request::builder()
         .method("GET")
         .uri(format!(
@@ -619,7 +635,10 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .header(header::COOKIE, &admin_cookie)
         .body(Body::empty())
         .expect("admin sessions request");
-    let admin_res = app.oneshot(admin_req).await.expect("admin sessions response");
+    let admin_res = app
+        .oneshot(admin_req)
+        .await
+        .expect("admin sessions response");
     assert_eq!(admin_res.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(admin_res.into_body(), 64 * 1024)
         .await
@@ -630,8 +649,13 @@ async fn test_client_key_sessions_report_live_session_pins() {
         .iter()
         .find(|s| s["session_hash"] == "global-session-hash")
         .expect("global session present");
-    let admin_global_pins = admin_global_sess["current_pins"].as_array().expect("admin global pins");
-    assert_eq!(admin_global_pins[0]["upstream_key_id"], global_key_id.to_string());
+    let admin_global_pins = admin_global_sess["current_pins"]
+        .as_array()
+        .expect("admin global pins");
+    assert_eq!(
+        admin_global_pins[0]["upstream_key_id"],
+        global_key_id.to_string()
+    );
     assert_eq!(admin_global_pins[0]["key_label"], "global-secret-key");
 }
 

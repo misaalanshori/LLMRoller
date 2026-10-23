@@ -5,6 +5,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-1.md#11-sub-phase-11-cargo-workspace-xtask-governance-tools-foundational-docker-scaffolding-and-multi-arch-ci-matrix
 
 mod docs_bundle;
+mod migration_check;
 mod requirements;
 mod source_scan;
 
@@ -17,7 +18,8 @@ const USAGE: &str = "\
 usage:
   cargo xtask traceability --milestone M<N>
   cargo xtask doc-consistency
-  cargo xtask docs-bundle [--check]";
+  cargo xtask docs-bundle [--check]
+  cargo xtask migration-check";
 
 /// Requirement prefixes defined by SRDD Section 0.2. `G` covers the goal IDs
 /// when they are written with a hyphen; prose-only identifiers such as `ADR-12`
@@ -50,6 +52,12 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             let registry = Registry::load(&root)?;
             let scan = source_scan::Scan::scan_workspace(&root)?;
             registry.traceability(&milestone, &scan, &mut std::io::stdout())
+        }
+        "migration-check" => {
+            if !rest.is_empty() {
+                return Err(format!("migration-check takes no arguments\n{USAGE}"));
+            }
+            migration_check::run(&root)
         }
         "doc-consistency" => {
             if !rest.is_empty() {

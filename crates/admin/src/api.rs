@@ -7497,7 +7497,8 @@ async fn get_partial_admin_audit_handler(
 }
 
 fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &str) -> String {
-    let mut out = String::from("<div class=\"table-container\"><table class=\"data-table\"><thead><tr>");
+    let mut out =
+        String::from("<div class=\"table-container\"><table class=\"data-table\"><thead><tr>");
     if is_api {
         out.push_str("<th>Time</th><th>Status</th><th>Endpoint</th><th>User</th><th>Duration</th></tr></thead><tbody>");
     } else {
@@ -7521,8 +7522,16 @@ fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &
             let status = r.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
             let endpoint = escape_html(r.get("path").and_then(|v| v.as_str()).unwrap_or("/"));
             let method = escape_html(r.get("method").and_then(|v| v.as_str()).unwrap_or("GET"));
-            let user = escape_html(r.get("actor_user_id").and_then(|v| v.as_str()).unwrap_or("-"));
-            let dur = escape_html(r.get("duration_formatted").and_then(|v| v.as_str()).unwrap_or("-"));
+            let user = escape_html(
+                r.get("actor_user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
+            let dur = escape_html(
+                r.get("duration_formatted")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
 
             let status_badge = if (200..300).contains(&status) {
                 format!("<span class=\"badge badge-success\">● {status}</span>")
@@ -7542,11 +7551,31 @@ fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &
             let req_id = escape_html(r.get("request_id").and_then(|v| v.as_str()).unwrap_or(""));
             let ts = r.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
             let status = r.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
-            let model = escape_html(r.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("-"));
-            let key_label = escape_html(r.get("client_key_label").and_then(|v| v.as_str()).unwrap_or("-"));
-            let latency_ms = r.get("latency_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
-            let cost_formatted = escape_html(r.get("cost_formatted").and_then(|v| v.as_str()).unwrap_or("—"));
-            let total_tokens = r.get("total_tokens").and_then(|v| v.as_i64()).map(|t| t.to_string()).unwrap_or_else(|| "—".to_string());
+            let model = escape_html(
+                r.get("canonical_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
+            let key_label = escape_html(
+                r.get("client_key_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
+            let latency_ms = r
+                .get("latency_ms")
+                .and_then(|v| v.as_i64())
+                .map(|l| format!("{l} ms"))
+                .unwrap_or_else(|| "—".to_string());
+            let cost_formatted = escape_html(
+                r.get("cost_formatted")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("—"),
+            );
+            let total_tokens = r
+                .get("total_tokens")
+                .and_then(|v| v.as_i64())
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "—".to_string());
 
             let status_badge = if status == 200 {
                 "<span class=\"badge badge-success\">● 200</span>".to_string()
@@ -7574,43 +7603,114 @@ fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &
 }
 
 fn render_log_detail_drawer_html(json: &serde_json::Value) -> String {
-    let req_id = escape_html(json.get("request_id").and_then(|v| v.as_str()).unwrap_or(""));
+    let req_id = escape_html(
+        json.get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
     let status = json.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
     let model = escape_html(json.get("model").and_then(|v| v.as_str()).unwrap_or("-"));
     let ts = json.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-    let latency_ms = json.get("latency_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
-    let ttfb_ms = json.get("ttfb_ms").and_then(|v| v.as_i64()).map(|l| format!("{l} ms")).unwrap_or_else(|| "—".to_string());
+    let latency_ms = json
+        .get("latency_ms")
+        .and_then(|v| v.as_i64())
+        .map(|l| format!("{l} ms"))
+        .unwrap_or_else(|| "—".to_string());
+    let ttfb_ms = json
+        .get("ttfb_ms")
+        .and_then(|v| v.as_i64())
+        .map(|l| format!("{l} ms"))
+        .unwrap_or_else(|| "—".to_string());
     let endpoint = escape_html(json.get("endpoint").and_then(|v| v.as_str()).unwrap_or("-"));
     let protocol = escape_html(json.get("protocol").and_then(|v| v.as_str()).unwrap_or("-"));
-    let stream = json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let stop_reason = escape_html(json.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("—"));
+    let stream = json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let stop_reason = escape_html(
+        json.get("stop_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("—"),
+    );
 
     let tokens = json.get("tokens");
-    let input_tokens = tokens.and_then(|t| t.get("input")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let output_tokens = tokens.and_then(|t| t.get("output")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let reasoning_tokens = tokens.and_then(|t| t.get("reasoning")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let cache_read = tokens.and_then(|t| t.get("cache_read")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let cache_write = tokens.and_then(|t| t.get("cache_write")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let input_tokens = tokens
+        .and_then(|t| t.get("input"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = tokens
+        .and_then(|t| t.get("output"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let reasoning_tokens = tokens
+        .and_then(|t| t.get("reasoning"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cache_read = tokens
+        .and_then(|t| t.get("cache_read"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cache_write = tokens
+        .and_then(|t| t.get("cache_write"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let cost_obj = json.get("cost");
-    let cost_usd = cost_obj.and_then(|c| c.get("cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-    let list_cost_usd = cost_obj.and_then(|c| c.get("list_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-    let coverage_mode = escape_html(cost_obj.and_then(|c| c.get("billing_coverage_mode")).and_then(|v| v.as_str()).unwrap_or("pay_as_you_go"));
+    let cost_usd = cost_obj
+        .and_then(|c| c.get("cost_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as f64
+        / 1_000_000.0;
+    let list_cost_usd = cost_obj
+        .and_then(|c| c.get("list_cost_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as f64
+        / 1_000_000.0;
+    let coverage_mode = escape_html(
+        cost_obj
+            .and_then(|c| c.get("billing_coverage_mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("pay_as_you_go"),
+    );
 
     let identity = json.get("identity");
-    let client_key = escape_html(identity.and_then(|i| i.get("client_key_id")).and_then(|v| v.as_str()).unwrap_or("-"));
-    let sa_id = escape_html(identity.and_then(|i| i.get("service_account_id")).and_then(|v| v.as_str()).unwrap_or("-"));
+    let client_key = escape_html(
+        identity
+            .and_then(|i| i.get("client_key_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
+    let sa_id = escape_html(
+        identity
+            .and_then(|i| i.get("service_account_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
 
-    let session_hash = escape_html(json.get("session_hash").and_then(|v| v.as_str()).unwrap_or("-"));
-    let user_agent = escape_html(json.get("client_user_agent").and_then(|v| v.as_str()).unwrap_or("-"));
+    let session_hash = escape_html(
+        json.get("session_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
+    let user_agent = escape_html(
+        json.get("client_user_agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+    );
 
     let mut attempts_html = String::new();
     if let Some(attempts) = json.get("attempts").and_then(|a| a.as_array()) {
         for a in attempts {
             let att_no = a.get("attempt_no").and_then(|v| v.as_i64()).unwrap_or(1);
             let outcome = escape_html(a.get("outcome").and_then(|v| v.as_str()).unwrap_or("-"));
-            let key = escape_html(a.get("upstream_key_id").and_then(|v| v.as_str()).unwrap_or("-"));
-            attempts_html.push_str(&format!("<li>Attempt {att_no}: {outcome} (key: {key})</li>"));
+            let key = escape_html(
+                a.get("upstream_key_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-"),
+            );
+            attempts_html.push_str(&format!(
+                "<li>Attempt {att_no}: {outcome} (key: {key})</li>"
+            ));
         }
     }
     if attempts_html.is_empty() {
@@ -7684,7 +7784,15 @@ fn render_log_detail_drawer_html(json: &serde_json::Value) -> String {
             </div>\
         </div>",
         if stream { "Yes" } else { "No" },
-        if json.get("has_trace").and_then(|v| v.as_bool()).unwrap_or(false) { "Yes" } else { "No" }
+        if json
+            .get("has_trace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "Yes"
+        } else {
+            "No"
+        }
     )
 }
 
@@ -7739,15 +7847,52 @@ async fn get_partial_admin_log_detail_handler(
 
 fn render_usage_ledger_html(json: &serde_json::Value) -> String {
     let summary = json.get("summary");
-    let total_tokens = escape_html(summary.and_then(|s| s.get("total_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
-    let input_tokens = escape_html(summary.and_then(|s| s.get("input_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
-    let output_tokens = escape_html(summary.and_then(|s| s.get("output_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
-    let cache_read = escape_html(summary.and_then(|s| s.get("cache_read_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
-    let cache_write = escape_html(summary.and_then(|s| s.get("cache_write_tokens_formatted")).and_then(|v| v.as_str()).unwrap_or("0"));
+    let total_tokens = escape_html(
+        summary
+            .and_then(|s| s.get("total_tokens_formatted"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    );
+    let input_tokens = escape_html(
+        summary
+            .and_then(|s| s.get("input_tokens_formatted"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    );
+    let output_tokens = escape_html(
+        summary
+            .and_then(|s| s.get("output_tokens_formatted"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    );
+    let cache_read = escape_html(
+        summary
+            .and_then(|s| s.get("cache_read_tokens_formatted"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    );
+    let cache_write = escape_html(
+        summary
+            .and_then(|s| s.get("cache_write_tokens_formatted"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    );
 
-    let billed_usd = summary.and_then(|s| s.get("billed_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-    let list_usd = summary.and_then(|s| s.get("list_cost_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-    let savings_usd = summary.and_then(|s| s.get("plan_covered_savings_micro_usd")).and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
+    let billed_usd = summary
+        .and_then(|s| s.get("billed_cost_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as f64
+        / 1_000_000.0;
+    let list_usd = summary
+        .and_then(|s| s.get("list_cost_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as f64
+        / 1_000_000.0;
+    let savings_usd = summary
+        .and_then(|s| s.get("plan_covered_savings_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as f64
+        / 1_000_000.0;
 
     let mut out = format!(
         "<div class=\"card\" style=\"margin-bottom: 1.5rem;\">\
@@ -7780,7 +7925,11 @@ fn render_usage_ledger_html(json: &serde_json::Value) -> String {
                 <tbody>"
     );
 
-    let Some(rows) = json.get("rows").or_else(|| json.get("items")).and_then(|i| i.as_array()) else {
+    let Some(rows) = json
+        .get("rows")
+        .or_else(|| json.get("items"))
+        .and_then(|i| i.as_array())
+    else {
         out.push_str("<tr><td colspan=\"8\" class=\"text-center text-muted\">No usage records found.</td></tr></tbody></table></div>");
         return out;
     };
@@ -7792,18 +7941,48 @@ fn render_usage_ledger_html(json: &serde_json::Value) -> String {
 
     for it in rows {
         let ts = it.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-        let initiator = escape_html(it.get("client_key_id").and_then(|v| v.as_str()).unwrap_or("-"));
-        let model = escape_html(it.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("-"));
+        let initiator = escape_html(
+            it.get("client_key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+        );
+        let model = escape_html(
+            it.get("canonical_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+        );
         let in_tok = it.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let out_tok = it.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let cr_tok = it.get("cache_read_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let cw_tok = it.get("cache_write_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let cost_usd = it.get("cost_micro_usd").and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-        let list_usd = it.get("list_cost_micro_usd").and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 1_000_000.0;
-        let coverage = it.get("billing_coverage_mode").and_then(|v| v.as_str()).unwrap_or("pay_as_you_go");
+        let out_tok = it
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cr_tok = it
+            .get("cache_read_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cw_tok = it
+            .get("cache_write_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cost_usd = it
+            .get("cost_micro_usd")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as f64
+            / 1_000_000.0;
+        let list_usd = it
+            .get("list_cost_micro_usd")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as f64
+            / 1_000_000.0;
+        let coverage = it
+            .get("billing_coverage_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pay_as_you_go");
 
         let credits_used = if coverage == "subscription_plan" {
-            format!("<span style=\"text-decoration: line-through;\">${list_usd:.4}</span> <span class=\"badge badge-success\">Covered by plan credits</span>")
+            format!(
+                "<span style=\"text-decoration: line-through;\">${list_usd:.4}</span> <span class=\"badge badge-success\">Covered by plan credits</span>"
+            )
         } else {
             format!("<span>${cost_usd:.4}</span>")
         };
@@ -7882,10 +8061,7 @@ pub fn router(state: ApiAppState) -> Router {
             "/app/partials/logs/{request_id}",
             get(get_partial_user_log_detail_handler),
         )
-        .route(
-            "/app/partials/ledger",
-            get(get_partial_user_ledger_handler),
-        )
+        .route("/app/partials/ledger", get(get_partial_user_ledger_handler))
         .route("/admin", get(crate::ui::get_admin_ui))
         .route(
             "/admin/partials/overview",

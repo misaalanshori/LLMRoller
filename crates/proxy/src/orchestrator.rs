@@ -3626,7 +3626,9 @@ pub async fn handle_inference_request(
         // and retry the same key to preserve prompt cache (Section 10.5, RTE-8).
         if status == StatusCode::TOO_MANY_REQUESTS && attempt_no == 1 {
             let delay = retry_after_ms(response.headers());
-            if let Some(delay_ms) = delay && delay_ms <= 2000 {
+            if let Some(delay_ms) = delay
+                && delay_ms <= 2000
+            {
                 attempts.push(attempt_record(
                     request_id,
                     attempt_no as i64,

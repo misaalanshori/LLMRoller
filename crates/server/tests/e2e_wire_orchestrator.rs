@@ -153,10 +153,7 @@ async fn mock_chat_handler(
     {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [
-                ("retry-after", "1"),
-                ("content-type", "application/json"),
-            ],
+            [("retry-after", "1"), ("content-type", "application/json")],
             Json(serde_json::json!({ "error": "transient rate limit" })),
         )
             .into_response();
@@ -1847,14 +1844,9 @@ async fn test_retry_after_short_sleep_retries_candidate_successfully() {
         .expect("writer pool");
     migrate(&pool).await.expect("migrate");
     let master_key = MasterKey::from_bytes([0xEE; 32]);
-    let token = seed_global_route_with_secrets(
-        &pool,
-        &master_key,
-        mock_addr,
-        &[("sk-f022", 1)],
-        "{}",
-    )
-    .await;
+    let token =
+        seed_global_route_with_secrets(&pool, &master_key, mock_addr, &[("sk-f022", 1)], "{}")
+            .await;
 
     let app = build_wire_app(&pool, &master_key).await;
 

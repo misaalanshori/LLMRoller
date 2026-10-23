@@ -1114,6 +1114,16 @@ CREATE INDEX idx_client_keys_service_account ON client_keys(service_account_id);
 CREATE UNIQUE INDEX uq_client_keys_prev_hash ON client_keys(prev_key_hash)
   WHERE prev_key_hash IS NOT NULL;
 
+CREATE TRIGGER trg_client_keys_sa_owner_ins BEFORE INSERT ON client_keys
+WHEN NEW.service_account_id IS NOT NULL
+ AND NEW.owner_user_id IS NOT (SELECT owner_user_id FROM service_accounts WHERE id = NEW.service_account_id)
+BEGIN SELECT RAISE(ABORT, 'client_keys.owner_user_id must equal service_accounts.owner_user_id'); END;
+
+CREATE TRIGGER trg_client_keys_sa_owner_upd BEFORE UPDATE OF owner_user_id, service_account_id ON client_keys
+WHEN NEW.service_account_id IS NOT NULL
+ AND NEW.owner_user_id IS NOT (SELECT owner_user_id FROM service_accounts WHERE id = NEW.service_account_id)
+BEGIN SELECT RAISE(ABORT, 'client_keys.owner_user_id must equal service_accounts.owner_user_id'); END;
+
 CREATE TRIGGER trg_client_keys_hash_disjoint_ins BEFORE INSERT ON client_keys
 WHEN EXISTS (
   SELECT 1 FROM client_keys c
@@ -1141,6 +1151,9 @@ CREATE TABLE providers (
   usage_url_cross_origin_ack INTEGER NOT NULL DEFAULT 0 CHECK (usage_url_cross_origin_ack IN (0, 1)),
   allow_private_network INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
+  billing_coverage_mode TEXT NOT NULL DEFAULT 'pay_as_you_go'
+    CHECK (billing_coverage_mode IN ('subscription_plan', 'pay_as_you_go', 'shared_grant', 'free_tier')),
+  plan_multiplier_bps INTEGER NOT NULL DEFAULT 10000 CHECK (plan_multiplier_bps >= 0),
   created_at INTEGER NOT NULL,
   CHECK (
     (ownership_scope = 'global' AND owner_user_id IS NULL) OR
@@ -1485,6 +1498,7 @@ CREATE TABLE usage_rollups_hourly (
   output_tokens INTEGER NOT NULL,
   reasoning_tokens INTEGER NOT NULL,
   cost_micro_usd INTEGER NOT NULL,
+  list_cost_micro_usd INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (hour_ms, client_key_id, upstream_key_id, canonical_id, share_id)
 );
 CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);

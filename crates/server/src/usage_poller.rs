@@ -57,7 +57,8 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
             .run_supervised(stop_rx, move |mut job_stop| {
                 let deps = deps.clone();
                 async move {
-                    let key_states: Arc<DashMap<UpstreamKeyId, KeyPollerState>> = Arc::new(DashMap::new());
+                    let key_states: Arc<DashMap<UpstreamKeyId, KeyPollerState>> =
+                        Arc::new(DashMap::new());
                     let poller = UsagePoller::default();
                     while !*job_stop.borrow_and_update() {
                         tokio::select! {
@@ -73,7 +74,9 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                             if !key.enabled || !provider.enabled {
                                 continue;
                             }
-                            let Some(endpoint) = usage_endpoint(&provider.config_json, provider.kind) else {
+                            let Some(endpoint) =
+                                usage_endpoint(&provider.config_json, provider.kind)
+                            else {
                                 continue;
                             };
                             let state = key_states.entry(key.id).or_default();

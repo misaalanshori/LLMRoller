@@ -320,9 +320,13 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         let key_ring = rebuilt.key_rings.get(key_id);
         for window in windows {
             let seed = if window.scope_kind == "route" {
-                let canonical_id = window
-                    .model_pk
-                    .and_then(|pk| shared_snapshot.load().models.get(&pk).map(|m| m.canonical_id.clone()));
+                let canonical_id = window.model_pk.and_then(|pk| {
+                    shared_snapshot
+                        .load()
+                        .models
+                        .get(&pk)
+                        .map(|m| m.canonical_id.clone())
+                });
                 if let Some(cid) = canonical_id
                     && let Some(route_ring) = rebuilt.route_rings.get(&(*key_id, cid))
                 {
