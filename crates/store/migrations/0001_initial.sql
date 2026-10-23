@@ -149,6 +149,11 @@ CREATE TABLE providers (
   usage_url_cross_origin_ack INTEGER NOT NULL DEFAULT 0 CHECK (usage_url_cross_origin_ack IN (0, 1)),
   allow_private_network INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
+  -- Subscription coverage: plan multiplier applied to list price for
+  -- `subscription_plan` providers (`USG-10`, Section 9.3.3).
+  billing_coverage_mode TEXT NOT NULL DEFAULT 'pay_as_you_go'
+    CHECK (billing_coverage_mode IN ('subscription_plan', 'pay_as_you_go', 'shared_grant', 'free_tier')),
+  plan_multiplier_bps INTEGER NOT NULL DEFAULT 10000 CHECK (plan_multiplier_bps >= 0),
   created_at INTEGER NOT NULL,
   CHECK (
     (ownership_scope = 'global' AND owner_user_id IS NULL) OR
@@ -493,6 +498,8 @@ CREATE TABLE usage_rollups_hourly (
   output_tokens INTEGER NOT NULL,
   reasoning_tokens INTEGER NOT NULL,
   cost_micro_usd INTEGER NOT NULL,
+  -- Unadjusted price-book cost before `plan_multiplier_bps` (`USG-10`).
+  list_cost_micro_usd INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (hour_ms, client_key_id, upstream_key_id, canonical_id, share_id)
 );
 CREATE INDEX idx_rollups_owner_hour ON usage_rollups_hourly(owner_user_id, hour_ms);

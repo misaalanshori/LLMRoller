@@ -158,6 +158,11 @@ define_ulid_id! {
     UsageEventId
 }
 
+define_ulid_id! {
+    /// Identifier of one configured budget window (`LIM-1`).
+    BudgetWindowId
+}
+
 /// Validate that a string is a canonical 26-character Crockford base32 ULID.
 ///
 /// # Errors

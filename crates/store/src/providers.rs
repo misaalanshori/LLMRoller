@@ -68,6 +68,11 @@ pub struct Provider {
     pub usage_url_cross_origin_ack: bool,
     pub allow_private_network: bool,
     pub enabled: bool,
+    /// Coverage mode applied when pricing requests served by this provider (`USG-10`).
+    pub billing_coverage_mode: String,
+    /// Plan multiplier in basis points applied to the list price for
+    /// `subscription_plan` coverage (`USG-10`); `10000` = 1.0x.
+    pub plan_multiplier_bps: i64,
     pub created_at: i64,
 }
 
@@ -284,6 +289,8 @@ pub async fn create_provider_tx(
         usage_url_cross_origin_ack: new_provider.usage_url_cross_origin_ack,
         allow_private_network: new_provider.allow_private_network,
         enabled: new_provider.enabled,
+        billing_coverage_mode: "pay_as_you_go".to_string(),
+        plan_multiplier_bps: 10_000,
         created_at: now_ms,
     })
 }
@@ -422,8 +429,59 @@ pub async fn patch_provider_tx(
         usage_url_cross_origin_ack: new_usage_ack,
         allow_private_network: new_private_net,
         enabled: new_enabled,
+        billing_coverage_mode: existing.billing_coverage_mode,
+        plan_multiplier_bps: existing.plan_multiplier_bps,
         created_at: existing.created_at,
     })
+}
+
+/// Updates the subscription coverage mode and plan multiplier of a provider (`USG-10`).
+///
+/// `billing_coverage_mode` must be one of the four spec values, and
+/// `plan_multiplier_bps` is a non-negative basis-point multiplier where `10_000`
+/// means list price. Only `subscription_plan` providers apply the multiplier to
+/// the effective cost; the value is stored for every mode so switching modes is
+/// lossless.
+pub async fn set_provider_billing_plan(
+    pool: &SqlitePool,
+    actor: &ActorScope,
+    id: ProviderId,
+    billing_coverage_mode: &str,
+    plan_multiplier_bps: i64,
+) -> Result<Provider, ProviderError> {
+    if !matches!(
+        billing_coverage_mode,
+        "subscription_plan" | "pay_as_you_go" | "shared_grant" | "free_tier"
+    ) {
+        return Err(ProviderError::Validation(format!(
+            "invalid billing_coverage_mode: {billing_coverage_mode}"
+        )));
+    }
+    if !(0..=100_000).contains(&plan_multiplier_bps) {
+        return Err(ProviderError::Validation(
+            "plan_multiplier_bps must be between 0 and 100000".to_string(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let existing = get_provider_tx(&mut tx, actor, id).await?;
+    if !actor.is_admin()
+        && !actor.is_system()
+        && (existing.ownership_scope == OwnershipScope::Global
+            || existing.owner_user_id != actor.user_id())
+    {
+        return Err(ProviderError::ProviderNotFound(id));
+    }
+    sqlx::query(
+        "UPDATE providers SET billing_coverage_mode = ?, plan_multiplier_bps = ? WHERE id = ?",
+    )
+    .bind(billing_coverage_mode)
+    .bind(plan_multiplier_bps)
+    .bind(id.to_string())
+    .execute(&mut *tx)
+    .await?;
+    let updated = get_provider_tx(&mut tx, actor, id).await?;
+    tx.commit().await?;
+    Ok(updated)
 }
 
 /// Update an existing provider record, recomputing its share configuration fingerprint.
@@ -811,6 +869,8 @@ pub async fn load_provider_records_tx(
                 usage_url_cross_origin_ack: p.usage_url_cross_origin_ack,
                 allow_private_network: p.allow_private_network,
                 enabled: p.enabled,
+                billing_coverage_mode: p.billing_coverage_mode,
+                plan_multiplier_bps: p.plan_multiplier_bps,
             },
         );
     }
@@ -876,6 +936,10 @@ fn provider_from_row(row: &SqliteRow) -> Result<Provider, ProviderError> {
     let usage_ack: i64 = row.try_get("usage_url_cross_origin_ack")?;
     let private_net: i64 = row.try_get("allow_private_network")?;
     let enabled: i64 = row.try_get("enabled")?;
+    let billing_coverage_mode: String = row
+        .try_get("billing_coverage_mode")
+        .unwrap_or_else(|_| "pay_as_you_go".to_string());
+    let plan_multiplier_bps: i64 = row.try_get("plan_multiplier_bps").unwrap_or(10_000);
 
     Ok(Provider {
         id: provider_id,
@@ -889,6 +953,8 @@ fn provider_from_row(row: &SqliteRow) -> Result<Provider, ProviderError> {
         usage_url_cross_origin_ack: usage_ack != 0,
         allow_private_network: private_net != 0,
         enabled: enabled != 0,
+        billing_coverage_mode,
+        plan_multiplier_bps,
         created_at: row.try_get("created_at")?,
     })
 }

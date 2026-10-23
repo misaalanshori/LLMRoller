@@ -62,6 +62,10 @@ pub struct ProviderRecord {
     pub usage_url_cross_origin_ack: bool,
     pub allow_private_network: bool,
     pub enabled: bool,
+    /// Subscription coverage mode used when pricing this provider (`USG-10`).
+    pub billing_coverage_mode: String,
+    /// Basis-point multiplier applied to list price for `subscription_plan`.
+    pub plan_multiplier_bps: i64,
 }
 
 /// In-memory projection of an upstream key for hot-path routing.

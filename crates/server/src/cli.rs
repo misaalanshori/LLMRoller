@@ -655,6 +655,16 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 let cutoff = now_ms - retention_days.saturating_mul(86_400_000);
                                 let _ = llmroller_store::retention::sweep_expired_usage_events(&bg_pool, cutoff, 5_000).await;
                                 let _ = llmroller_store::retention::enforce_max_usage_events_rows_pool(&bg_pool, max_rows, 5_000).await;
+                                // Derived data and side tables share the same tick (F038):
+                                // rollups keep at least 31 days for long-range charts,
+                                // usage snapshots 90 days, abuse counters one day, and
+                                // content-addressed trace blocks one full trace window.
+                                let rollup_cutoff = now_ms - retention_days.max(31).saturating_mul(86_400_000);
+                                let _ = llmroller_store::retention::sweep_expired_usage_rollups_5min(&bg_pool, rollup_cutoff, 5_000).await;
+                                let _ = llmroller_store::retention::sweep_expired_usage_rollups_hourly(&bg_pool, rollup_cutoff, 5_000).await;
+                                let _ = llmroller_store::retention::sweep_expired_upstream_usage_snapshots(&bg_pool, now_ms - 90_i64 * 86_400_000, 1_000).await;
+                                let _ = llmroller_store::retention::sweep_expired_auth_failure_counters(&bg_pool, now_ms - 86_400_000).await;
+                                let _ = llmroller_store::retention::sweep_orphaned_trace_blocks(&bg_pool, cutoff, 1_000).await;
                                 let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
                             }
                             _ = stop_rx.changed() => break,

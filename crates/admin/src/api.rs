@@ -7,7 +7,7 @@
 //! Spec: ./docs/srdd/9. SRDD - Data Model.md#933-closed-runtime-settings-registry
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#20-sub-phase-20-minimal-control-plane-json-crud-for-providers-keys-client-keys-and-settings
 
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, Response};
@@ -2337,25 +2337,65 @@ async fn get_session_preview_internal(
         }));
     }
 
-    let pin_rows = sqlx::query(
-        "SELECT p.upstream_key_id, m.canonical_id, p.pool_tier, k.label as key_label
+    // `USR-4` / `SEC-17`: a standard user only sees pins of their own client keys,
+    // and pooled (`global` / `shared`) key identities are redacted even then.
+    let pin_sql = if owner_user_id.is_some() {
+        "SELECT p.upstream_key_id, m.canonical_id, p.pool_tier, pv.ownership_scope,
+                k.label as key_label
          FROM pins p
          LEFT JOIN models m ON p.model_pk = m.model_pk
          LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
-         WHERE p.session_hash = ?",
-    )
-    .bind(session_hash)
-    .fetch_all(&state.auth.pool)
-    .await
+         LEFT JOIN providers pv ON pv.id = k.provider_id
+         JOIN client_keys ck ON ck.id = p.client_key_id
+         WHERE p.session_hash = ? AND ck.owner_user_id = ?"
+    } else {
+        "SELECT p.upstream_key_id, m.canonical_id, p.pool_tier, pv.ownership_scope,
+                k.label as key_label
+         FROM pins p
+         LEFT JOIN models m ON p.model_pk = m.model_pk
+         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
+         LEFT JOIN providers pv ON pv.id = k.provider_id
+         WHERE p.session_hash = ?"
+    };
+    let pin_rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(pin_sql)
+            .bind(session_hash)
+            .bind(uid)
+            .fetch_all(&state.auth.pool)
+            .await
+    } else {
+        sqlx::query(pin_sql)
+            .bind(session_hash)
+            .fetch_all(&state.auth.pool)
+            .await
+    }
     .unwrap_or_default();
 
     let mut current_pins = Vec::new();
     for pr in pin_rows {
+        let scope: String = pr.try_get("ownership_scope").unwrap_or_default();
+        let redact = owner_user_id.is_some() && scope != "personal";
+        let upstream_key_id = pr
+            .try_get::<Option<String>, _>("upstream_key_id")
+            .unwrap_or_default()
+            .filter(|_| !redact)
+            .map(|value| escape_html(&value));
+        let key_label = pr
+            .try_get::<Option<String>, _>("key_label")
+            .unwrap_or_default()
+            .map(|value| {
+                if redact {
+                    "pooled".to_string()
+                } else {
+                    escape_html(&value)
+                }
+            });
         current_pins.push(serde_json::json!({
-            "upstream_key_id": pr.try_get::<Option<String>, _>("upstream_key_id").unwrap_or_default().map(|value| escape_html(&value)),
+            "upstream_key_id": upstream_key_id,
             "canonical_id": pr.try_get::<Option<String>, _>("canonical_id").unwrap_or_default().map(|value| escape_html(&value)),
             "pool_tier": pr.try_get::<i64, _>("pool_tier").unwrap_or(1),
-            "key_label": pr.try_get::<Option<String>, _>("key_label").unwrap_or_default().map(|value| escape_html(&value)),
+            "key_label": key_label,
+            "redacted": redact,
         }));
     }
 
@@ -2503,16 +2543,46 @@ async fn delete_admin_session_trace_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteTracesQuery {
+    /// Optional ISO-millisecond cutoff: only turns at or before this timestamp are
+    /// removed. Absent means "all recorded turns" (TRC-6 admin purge).
+    pub before_ts: Option<i64>,
+}
+
 async fn delete_admin_traces_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    Query(query): Query<DeleteTracesQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
-    let now_ms = state.auth.clock.now_ms();
-    let _ = sqlx::query("DELETE FROM trace_records WHERE expires_at <= ?")
-        .bind(now_ms)
-        .execute(&state.auth.pool)
-        .await;
+    // Deleting expired rows only would leave every live trace and every sealed
+    // block orphaned (F039). Purge both tables in one writer transaction.
+    execute_atomic_mutation(&state, vec![], move |tx| {
+        Box::pin(async move {
+            match query.before_ts {
+                Some(cutoff) => {
+                    sqlx::query("DELETE FROM trace_records WHERE ts <= ?")
+                        .bind(cutoff)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                }
+                None => {
+                    sqlx::query("DELETE FROM trace_records")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                }
+            }
+            sqlx::query("DELETE FROM trace_blocks")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3880,7 +3950,7 @@ async fn post_test_upstream_key_handler(
     use sqlx::Row as _;
     let key = sqlx::query(
         "SELECT k.id, k.owner_user_id, k.secret_enc, k.master_key_id, p.id AS provider_id,
-                p.ownership_scope, p.base_url, p.kind, p.allow_private_network
+                p.ownership_scope, p.base_url, p.kind, p.config_json, p.allow_private_network
          FROM upstream_keys k
          JOIN providers p ON k.provider_id = p.id
          WHERE k.id = ?",
@@ -3907,6 +3977,8 @@ async fn post_test_upstream_key_handler(
     let key_master_key_id: String = key.try_get("master_key_id").unwrap_or_default();
     let provider_id: String = key.try_get("provider_id").unwrap_or_default();
     let base_url: String = key.try_get("base_url").unwrap_or_default();
+    let kind_text: String = key.try_get("kind").unwrap_or_default();
+    let config_json: String = key.try_get("config_json").unwrap_or_default();
     let allow_private: bool = key.try_get::<i64, _>("allow_private_network").unwrap_or(0) != 0;
 
     let instance_id_vec: Vec<u8> =
@@ -3935,7 +4007,14 @@ async fn post_test_upstream_key_handler(
         .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot open key"))?;
     let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
-    let target = format!("{}/models", base_url.trim_end_matches('/'));
+    // Probe the provider's configured discovery endpoint with its configured auth
+    // scheme instead of assuming `Bearer` against `/models` (`PRV-6`, F044).
+    let provider_kind = kind_text
+        .parse::<llmroller_core::provider::ProviderKind>()
+        .unwrap_or(llmroller_core::provider::ProviderKind::Custom);
+    let provider_config = llmroller_core::provider::ProviderConfig::from_json(&config_json);
+    let target =
+        llmroller_proto::discovery::discovery_endpoint(provider_kind, &base_url, &provider_config);
     if llmroller_core::ssrf::validate_url(&target, allow_private).is_err() {
         return Err(map_price_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3945,12 +4024,15 @@ async fn post_test_upstream_key_handler(
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let started = std::time::Instant::now();
-    let response = client
+    let mut probe = client
         .get(&target)
-        .header("authorization", format!("Bearer {secret}"))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
+        .timeout(std::time::Duration::from_secs(10));
+    for (name, value) in llmroller_proto::discovery::discovery_headers(&provider_config, &secret) {
+        if let Some(name) = name {
+            probe = probe.header(name, value);
+        }
+    }
+    let response = probe.send().await;
     let latency_ms = started.elapsed().as_millis() as i64;
 
     let (status, http_status, message) = match response {
@@ -3998,6 +4080,409 @@ pub struct UsageFilterParams {
     pub after: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateBudgetWindowRequest {
+    pub scope_kind: String,
+    pub model_pk: Option<String>,
+    pub window_kind: String,
+    pub period_ms: Option<i64>,
+    pub anchor_at: Option<i64>,
+    pub upstream_window_kind: Option<String>,
+    pub limit_micro_usd: i64,
+    pub reserve_pct: Option<i64>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct PatchBudgetWindowRequest {
+    pub window_kind: Option<String>,
+    pub period_ms: Option<i64>,
+    pub anchor_at: Option<i64>,
+    pub upstream_window_kind: Option<String>,
+    pub limit_micro_usd: Option<i64>,
+    pub reserve_pct: Option<i64>,
+}
+
+/// Validate a budget-window definition against the schema checks in Section 9.1
+/// before it reaches SQLite so callers get `422` instead of a constraint error.
+fn validate_budget_window(
+    scope_kind: &str,
+    model_pk: Option<&str>,
+    window_kind: &str,
+    period_ms: Option<i64>,
+    limit_micro_usd: i64,
+    reserve_pct: i64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !matches!(scope_kind, "upstream_key" | "route") {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "scope_kind must be upstream_key or route",
+        ));
+    }
+    if !matches!(
+        window_kind,
+        "rolling" | "anchored_fixed" | "anchored_calendar_month" | "anchored_provider"
+    ) {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid window_kind",
+        ));
+    }
+    if scope_kind == "route" && model_pk.is_none() {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route windows require model_pk",
+        ));
+    }
+    if scope_kind == "upstream_key" && model_pk.is_some() {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "upstream_key windows must not set model_pk",
+        ));
+    }
+    match (window_kind, period_ms) {
+        ("anchored_calendar_month", None) => {}
+        ("anchored_calendar_month", Some(_)) => {
+            return Err(map_price_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "anchored_calendar_month windows derive their period and must not set period_ms",
+            ));
+        }
+        (_, Some(period)) if (3_600_000..=2_678_400_000).contains(&period) => {}
+        (_, _) => {
+            return Err(map_price_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "period_ms must be between 1 hour and 31 days",
+            ));
+        }
+    }
+    if limit_micro_usd <= 0 {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit_micro_usd must be positive",
+        ));
+    }
+    if !(0..=50).contains(&reserve_pct) {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reserve_pct must be between 0 and 50",
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure the caller may manage windows on `upstream_key_id` (`USR-3`, `SEC-17`).
+async fn authorize_budget_window_key(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    upstream_key_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT k.owner_user_id, p.ownership_scope
+         FROM upstream_keys k JOIN providers p ON p.id = k.provider_id
+         WHERE k.id = ?",
+    )
+    .bind(upstream_key_id)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "upstream key not found"))?;
+    if actor.is_admin() || actor.is_system() {
+        return Ok(());
+    }
+    let scope: String = row.try_get("ownership_scope").unwrap_or_default();
+    let owner: Option<String> = row.try_get("owner_user_id").unwrap_or_default();
+    let caller = actor.user_id().map(|id| id.to_string());
+    if scope == "personal" && owner == caller {
+        return Ok(());
+    }
+    Err(map_price_error(
+        StatusCode::NOT_FOUND,
+        "upstream key not found",
+    ))
+}
+
+async fn list_budget_windows_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    upstream_key_id: &str,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    authorize_budget_window_key(state, actor, upstream_key_id).await?;
+    let rows = sqlx::query(
+        "SELECT id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms,
+                anchor_at, upstream_window_kind, limit_micro_usd, reserve_pct
+         FROM budget_windows WHERE upstream_key_id = ? ORDER BY id ASC",
+    )
+    .bind(upstream_key_id)
+    .fetch_all(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let windows = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "scope_kind": row.try_get::<String, _>("scope_kind").unwrap_or_default(),
+                "upstream_key_id": row.try_get::<String, _>("upstream_key_id").unwrap_or_default(),
+                "model_pk": row.try_get::<Option<String>, _>("model_pk").unwrap_or_default(),
+                "window_kind": row.try_get::<String, _>("window_kind").unwrap_or_default(),
+                "period_ms": row.try_get::<Option<i64>, _>("period_ms").unwrap_or_default(),
+                "anchor_at": row.try_get::<Option<i64>, _>("anchor_at").unwrap_or_default(),
+                "upstream_window_kind": row
+                    .try_get::<Option<String>, _>("upstream_window_kind")
+                    .unwrap_or_default(),
+                "limit_micro_usd": row.try_get::<i64, _>("limit_micro_usd").unwrap_or(0),
+                "reserve_pct": row.try_get::<i64, _>("reserve_pct").unwrap_or(2),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "data": windows })))
+}
+
+async fn create_budget_window_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    upstream_key_id: String,
+    payload: CreateBudgetWindowRequest,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    authorize_budget_window_key(state, actor, &upstream_key_id).await?;
+    validate_budget_window(
+        &payload.scope_kind,
+        payload.model_pk.as_deref(),
+        &payload.window_kind,
+        payload.period_ms,
+        payload.limit_micro_usd,
+        payload.reserve_pct.unwrap_or(2),
+    )?;
+    let id = llmroller_core::ids::BudgetWindowId::generate().to_string();
+    let model_pk = payload.model_pk.clone();
+    let window_kind = payload.window_kind.clone();
+    let scope_kind = payload.scope_kind.clone();
+    let created_id = id.clone();
+    execute_atomic_mutation(state, vec![ConfigDomain::BudgetWindows], move |tx| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO budget_windows
+                 (id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms, anchor_at,
+                  upstream_window_kind, limit_micro_usd, reserve_pct)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&created_id)
+            .bind(&scope_kind)
+            .bind(&upstream_key_id)
+            .bind(&model_pk)
+            .bind(&window_kind)
+            .bind(payload.period_ms)
+            .bind(payload.anchor_at)
+            .bind(&payload.upstream_window_kind)
+            .bind(payload.limit_micro_usd)
+            .bind(payload.reserve_pct.unwrap_or(2))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            Ok(serde_json::json!({ "id": created_id }))
+        })
+    })
+    .await
+    .map(|body| (StatusCode::CREATED, Json(body)))
+}
+
+async fn delete_budget_window_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    id: String,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let key: Option<String> =
+        sqlx::query_scalar("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.auth.reader_pool)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let key = key.ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
+    authorize_budget_window_key(state, actor, &key).await?;
+    execute_atomic_mutation(state, vec![ConfigDomain::BudgetWindows], move |tx| {
+        Box::pin(async move {
+            sqlx::query("DELETE FROM budget_windows WHERE id = ?")
+                .bind(&id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_user_budget_windows_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    list_budget_windows_internal(&state, &actor, &id).await
+}
+
+async fn post_user_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateBudgetWindowRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    create_budget_window_internal(&state, &actor, id, payload).await
+}
+
+async fn delete_user_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    delete_budget_window_internal(&state, &actor, id).await
+}
+
+async fn get_admin_budget_windows_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    list_budget_windows_internal(&state, &actor, &id).await
+}
+
+async fn post_admin_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateBudgetWindowRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    create_budget_window_internal(&state, &actor, id, payload).await
+}
+
+async fn delete_admin_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    delete_budget_window_internal(&state, &actor, id).await
+}
+
+async fn patch_budget_window_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    id: String,
+    payload: PatchBudgetWindowRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT scope_kind, upstream_key_id, model_pk, window_kind, period_ms, anchor_at,
+                upstream_window_kind, limit_micro_usd, reserve_pct
+         FROM budget_windows WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
+
+    let upstream_key_id: String = row.try_get("upstream_key_id").unwrap_or_default();
+    authorize_budget_window_key(state, actor, &upstream_key_id).await?;
+
+    let scope_kind: String = row.try_get("scope_kind").unwrap_or_default();
+    let model_pk: Option<String> = row.try_get("model_pk").unwrap_or_default();
+    let window_kind: String = row
+        .try_get::<String, _>("window_kind")
+        .unwrap_or_else(|_| "rolling".to_string());
+    let window_kind = payload.window_kind.unwrap_or(window_kind);
+    let period_ms = payload.period_ms.or_else(|| {
+        row.try_get::<Option<i64>, _>("period_ms")
+            .unwrap_or_default()
+    });
+    let anchor_at = payload.anchor_at.or_else(|| {
+        row.try_get::<Option<i64>, _>("anchor_at")
+            .unwrap_or_default()
+    });
+    let upstream_window_kind = payload.upstream_window_kind.or_else(|| {
+        row.try_get::<Option<String>, _>("upstream_window_kind")
+            .unwrap_or_default()
+    });
+    let limit_micro_usd = payload
+        .limit_micro_usd
+        .unwrap_or_else(|| row.try_get::<i64, _>("limit_micro_usd").unwrap_or(0));
+    let reserve_pct = payload
+        .reserve_pct
+        .unwrap_or_else(|| row.try_get::<i64, _>("reserve_pct").unwrap_or(2));
+
+    validate_budget_window(
+        &scope_kind,
+        model_pk.as_deref(),
+        &window_kind,
+        period_ms,
+        limit_micro_usd,
+        reserve_pct,
+    )?;
+
+    let updated = serde_json::json!({
+        "id": id.clone(),
+        "scope_kind": scope_kind,
+        "upstream_key_id": upstream_key_id,
+        "model_pk": model_pk,
+        "window_kind": window_kind,
+        "period_ms": period_ms,
+        "anchor_at": anchor_at,
+        "upstream_window_kind": upstream_window_kind,
+        "limit_micro_usd": limit_micro_usd,
+        "reserve_pct": reserve_pct,
+    });
+    let response = updated.clone();
+    execute_atomic_mutation(state, vec![ConfigDomain::BudgetWindows], move |tx| {
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE budget_windows SET window_kind = ?, period_ms = ?, anchor_at = ?,
+                        upstream_window_kind = ?, limit_micro_usd = ?, reserve_pct = ?
+                 WHERE id = ?",
+            )
+            .bind(&window_kind)
+            .bind(period_ms)
+            .bind(anchor_at)
+            .bind(&upstream_window_kind)
+            .bind(limit_micro_usd)
+            .bind(reserve_pct)
+            .bind(&id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn patch_user_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<PatchBudgetWindowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    patch_budget_window_internal(&state, &actor, id, payload).await
+}
+
+async fn patch_admin_budget_window_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<PatchBudgetWindowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    patch_budget_window_internal(&state, &actor, id, payload).await
+}
+
 async fn get_user_usage_summary_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -4026,52 +4511,104 @@ async fn get_usage_summary_internal(
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use sqlx::Row as _;
-    let query_str = if owner_user_id.is_some() {
-        "SELECT COUNT(*) as total_requests,
+    // USG-1/USG-2: aggregate from the hourly rollups instead of scanning raw
+    // `usage_events`; the rollups carry the same token/cost columns and are
+    // written in the same transaction batch as the raw rows (`REL-3`).
+    let rollup_sql = if owner_user_id.is_some() {
+        "SELECT COALESCE(SUM(requests), 0) as total_requests,
                 COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
                 COALESCE(SUM(output_tokens), 0) as output_tokens,
                 COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
-         FROM usage_events
+         FROM usage_rollups_hourly
          WHERE owner_user_id = ?
-           AND (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)"
+           AND (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)"
     } else {
-        "SELECT COUNT(*) as total_requests,
+        "SELECT COALESCE(SUM(requests), 0) as total_requests,
                 COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
                 COALESCE(SUM(output_tokens), 0) as output_tokens,
                 COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
-         FROM usage_events
-         WHERE (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)"
+         FROM usage_rollups_hourly
+         WHERE (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)"
     };
 
     let row = if let Some(ref uid) = owner_user_id {
-        sqlx::query(query_str)
+        sqlx::query(rollup_sql)
             .bind(uid)
             .bind(params.since)
             .bind(params.since)
             .bind(params.until)
             .bind(params.until)
-            .fetch_one(&state.auth.pool)
+            .fetch_one(&state.auth.reader_pool)
             .await
     } else {
-        sqlx::query(query_str)
+        sqlx::query(rollup_sql)
             .bind(params.since)
             .bind(params.since)
             .bind(params.until)
             .bind(params.until)
-            .fetch_one(&state.auth.pool)
+            .fetch_one(&state.auth.reader_pool)
             .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let total_requests: i64 = row.try_get("total_requests").unwrap_or(0);
-    let input_tokens: i64 = row.try_get("input_tokens").unwrap_or(0);
-    let cached_tokens: i64 = row.try_get("cached_tokens").unwrap_or(0);
-    let output_tokens: i64 = row.try_get("output_tokens").unwrap_or(0);
-    let total_cost_micro_usd: i64 = row.try_get("total_cost_micro_usd").unwrap_or(0);
+    let mut total_requests: i64 = row.try_get("total_requests").unwrap_or(0);
+    let mut input_tokens: i64 = row.try_get("input_tokens").unwrap_or(0);
+    let mut cached_tokens: i64 = row.try_get("cached_tokens").unwrap_or(0);
+    let mut output_tokens: i64 = row.try_get("output_tokens").unwrap_or(0);
+    let mut total_cost_micro_usd: i64 = row.try_get("total_cost_micro_usd").unwrap_or(0);
+
+    if total_requests == 0 {
+        // Synthetic fixtures and freshly restored databases may have raw events
+        // without rollups; keep the endpoint useful instead of returning zero.
+        let event_sql = if owner_user_id.is_some() {
+            "SELECT COUNT(*) as total_requests,
+                    COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                    COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
+             FROM usage_events
+             WHERE owner_user_id = ?
+               AND (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)"
+        } else {
+            "SELECT COUNT(*) as total_requests,
+                    COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
+                    COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
+             FROM usage_events
+             WHERE (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)"
+        };
+        let fallback = if let Some(ref uid) = owner_user_id {
+            sqlx::query(event_sql)
+                .bind(uid)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until)
+                .fetch_one(&state.auth.reader_pool)
+                .await
+        } else {
+            sqlx::query(event_sql)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until)
+                .fetch_one(&state.auth.reader_pool)
+                .await
+        }
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        total_requests = fallback.try_get("total_requests").unwrap_or(0);
+        input_tokens = fallback.try_get("input_tokens").unwrap_or(0);
+        cached_tokens = fallback.try_get("cached_tokens").unwrap_or(0);
+        output_tokens = fallback.try_get("output_tokens").unwrap_or(0);
+        total_cost_micro_usd = fallback.try_get("total_cost_micro_usd").unwrap_or(0);
+    }
 
     let total_input = (input_tokens + cached_tokens).max(1) as f64;
     let cache_hit_rate = (cached_tokens as f64 / total_input * 1000.0).round() / 1000.0;
@@ -4084,6 +4621,188 @@ async fn get_usage_summary_internal(
         "total_cost_micro_usd": total_cost_micro_usd,
         "cache_hit_rate": cache_hit_rate,
     })))
+}
+
+/// `GET /api/user/usage/timeseries` (`USG-1`): hourly buckets from the rollups.
+async fn get_user_usage_timeseries_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    get_usage_timeseries_internal(&state, Some(user_id.to_string()), params).await
+}
+
+async fn get_admin_usage_timeseries_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_timeseries_internal(&state, None, params).await
+}
+
+async fn get_usage_timeseries_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    params: UsageFilterParams,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    // Hourly buckets keep the payload small enough for the uPlot consumer while
+    // still covering multi-week ranges (`USG-1`, `REL-3`).
+    let sql = if owner_user_id.is_some() {
+        "SELECT hour_ms AS bucket_ms,
+                COALESCE(SUM(requests), 0) AS requests,
+                COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM usage_rollups_hourly
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)
+         GROUP BY hour_ms ORDER BY hour_ms ASC"
+    } else {
+        "SELECT hour_ms AS bucket_ms,
+                COALESCE(SUM(requests), 0) AS requests,
+                COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM usage_rollups_hourly
+         WHERE (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)
+         GROUP BY hour_ms ORDER BY hour_ms ASC"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(sql)
+            .bind(uid)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(sql)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let series = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "bucket_ms": row.try_get::<i64, _>("bucket_ms").unwrap_or(0),
+                "requests": row.try_get::<i64, _>("requests").unwrap_or(0),
+                "cost_micro_usd": row.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
+                "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or(0),
+                "cached_tokens": row.try_get::<i64, _>("cached_tokens").unwrap_or(0),
+                "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({ "series": series })))
+}
+
+/// `GET /api/user/usage/breakdown` (`USG-2`): per-model totals from the rollups.
+async fn get_user_usage_breakdown_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    let user_id = actor
+        .user_id()
+        .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
+    get_usage_breakdown_internal(&state, Some(user_id.to_string()), params).await
+}
+
+async fn get_admin_usage_breakdown_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    get_usage_breakdown_internal(&state, None, params).await
+}
+
+async fn get_usage_breakdown_internal(
+    state: &ApiAppState,
+    owner_user_id: Option<String>,
+    params: UsageFilterParams,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let sql = if owner_user_id.is_some() {
+        "SELECT canonical_id,
+                COALESCE(SUM(requests), 0) AS requests,
+                COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM usage_rollups_hourly
+         WHERE owner_user_id = ?
+           AND (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)
+         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+    } else {
+        "SELECT canonical_id,
+                COALESCE(SUM(requests), 0) AS requests,
+                COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
+                COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM usage_rollups_hourly
+         WHERE (? IS NULL OR hour_ms >= ?)
+           AND (? IS NULL OR hour_ms <= ?)
+         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+    };
+
+    let rows = if let Some(ref uid) = owner_user_id {
+        sqlx::query(sql)
+            .bind(uid)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    } else {
+        sqlx::query(sql)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .fetch_all(&state.auth.reader_pool)
+            .await
+    }
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let breakdown = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "canonical_id": row.try_get::<String, _>("canonical_id").unwrap_or_default(),
+                "requests": row.try_get::<i64, _>("requests").unwrap_or(0),
+                "cost_micro_usd": row.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
+                "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or(0),
+                "cached_tokens": row.try_get::<i64, _>("cached_tokens").unwrap_or(0),
+                "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({ "breakdown": breakdown })))
 }
 
 async fn get_user_usage_events_handler(
@@ -5196,6 +5915,14 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/upstream-keys/{id}/test",
             post(post_test_upstream_key_handler),
         )
+        .route(
+            "/api/user/upstream-keys/{id}/windows",
+            get(get_user_budget_windows_handler).post(post_user_budget_window_handler),
+        )
+        .route(
+            "/api/user/budget-windows/{id}",
+            patch(patch_user_budget_window_handler).delete(delete_user_budget_window_handler),
+        )
         .route("/api/user/routes", get(get_user_routes_handler))
         .route(
             "/api/user/routes/{key_id}/{canonical_id}",
@@ -5290,6 +6017,14 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/usage/summary",
             get(get_user_usage_summary_handler),
         )
+        .route(
+            "/api/user/usage/timeseries",
+            get(get_user_usage_timeseries_handler),
+        )
+        .route(
+            "/api/user/usage/breakdown",
+            get(get_user_usage_breakdown_handler),
+        )
         .route("/api/user/usage/events", get(get_user_usage_events_handler))
         .route(
             "/api/user/usage/export.csv",
@@ -5311,6 +6046,14 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/upstream-keys/{id}",
             patch(patch_user_upstream_key_handler).delete(delete_user_upstream_key_handler),
+        )
+        .route(
+            "/admin/api/upstream-keys/{id}/windows",
+            get(get_admin_budget_windows_handler).post(post_admin_budget_window_handler),
+        )
+        .route(
+            "/admin/api/budget-windows/{id}",
+            patch(patch_admin_budget_window_handler).delete(delete_admin_budget_window_handler),
         )
         .route(
             "/admin/api/client-keys/{id}",
@@ -5384,6 +6127,14 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_admin_usage_summary_handler),
         )
         .route(
+            "/admin/api/usage/timeseries",
+            get(get_admin_usage_timeseries_handler),
+        )
+        .route(
+            "/admin/api/usage/breakdown",
+            get(get_admin_usage_breakdown_handler),
+        )
+        .route(
             "/admin/api/usage/events",
             get(get_admin_usage_events_handler),
         )
@@ -5443,7 +6194,11 @@ mod catalog_sync_tests {
         assert_eq!(tier.output_per_mtok_micro_usd, 22_500_000);
         assert_eq!(
             aliases.get("vendor/model-a").cloned().unwrap_or_default(),
-            vec!["model-a".to_string(), "model-a-latest".to_string(), "model-a".to_string()]
+            vec![
+                "model-a".to_string(),
+                "model-a-latest".to_string(),
+                "model-a".to_string()
+            ]
         );
     }
 

@@ -1667,6 +1667,8 @@ fn eligibility_route(
             usage_url_cross_origin_ack: false,
             allow_private_network: candidate.allow_private_network,
             enabled: false,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            plan_multiplier_bps: 10_000,
         });
     let key = snapshot
         .upstream_keys
@@ -1852,6 +1854,7 @@ fn estimate_cost_micro_usd(
     snapshot: &ConfigSnapshot,
     candidate: &RouteCandidate,
     input_tokens: i64,
+    max_output_tokens: Option<i64>,
 ) -> i64 {
     let fallback = Rates::from(&snapshot.settings.unpriced_fallback_rates);
     let rates = snapshot
@@ -1861,7 +1864,22 @@ fn estimate_cost_micro_usd(
             &candidate.upstream_model_id,
         )
         .map_or(fallback, |entry| entry.base_rates);
-    estimate_reservation_cost_micro_usd(input_tokens, 0.0, &rates, None, None)
+    estimate_reservation_cost_micro_usd(input_tokens, 0.0, &rates, max_output_tokens, None)
+}
+
+/// Extract the caller's requested output-token ceiling for the pre-flight
+/// reservation (`LIM-1`): `max_output_tokens` (Responses), `max_completion_tokens`
+/// (o-series Chat), or `max_tokens` (Chat/Messages), in that precedence order.
+fn requested_max_output_tokens(body: &[u8]) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    ["max_output_tokens", "max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|key| {
+            value
+                .get(*key)
+                .and_then(serde_json::Value::as_i64)
+                .filter(|tokens| *tokens > 0)
+        })
 }
 
 /// Fail-closed AEAD unsealing using only the immutable snapshot.
@@ -3088,15 +3106,20 @@ pub async fn handle_inference_request(
         .collect();
 
     // Stage 1: Gate G7 monthly caps are reserved before any upstream connection.
-    let estimate = estimate_cost_micro_usd(&snapshot, &tier_candidates[0], 0).max(
-        estimate_reservation_cost_micro_usd(
-            estimate_input_tokens(&body),
-            0.0,
-            &Rates::from(&snapshot.settings.unpriced_fallback_rates),
-            None,
-            None,
-        ),
-    );
+    let requested_output = requested_max_output_tokens(&body);
+    let estimate = estimate_cost_micro_usd(
+        &snapshot,
+        &tier_candidates[0],
+        estimate_input_tokens(&body),
+        requested_output,
+    )
+    .max(estimate_reservation_cost_micro_usd(
+        estimate_input_tokens(&body),
+        0.0,
+        &Rates::from(&snapshot.settings.unpriced_fallback_rates),
+        requested_output,
+        None,
+    ));
     let client_guard = match state.runtime_state.accumulators.try_reserve(
         llmroller_core::accumulators::BudgetScopeId::ClientKey(caller.id),
         caller.budget_micro_usd_month,
@@ -3297,7 +3320,7 @@ pub async fn handle_inference_request(
                     Rates::from(&snapshot.settings.unpriced_fallback_rates),
                     |entry| entry.base_rates,
                 ),
-            None,
+            requested_output,
             None,
         );
         let mut cap_guards = match reserve_candidate_caps(
@@ -4430,6 +4453,25 @@ mod tests {
     use llmroller_core::rbac::Role;
     use llmroller_core::shares::ShareConfig;
     use llmroller_core::snapshot::UserRecord;
+
+    #[test]
+    #[doc = "Spec: LIM-1 — the pre-flight reservation honors the caller's output-token ceiling"]
+    fn requested_max_output_tokens_reads_every_protocol_spelling() {
+        let responses = br#"{"model":"m","input":"hi","max_output_tokens":4096}"#;
+        assert_eq!(requested_max_output_tokens(responses), Some(4096));
+        let chat = br#"{"model":"m","messages":[],"max_completion_tokens":2048}"#;
+        assert_eq!(requested_max_output_tokens(chat), Some(2048));
+        let messages = br#"{"model":"m","messages":[],"max_tokens":512}"#;
+        assert_eq!(requested_max_output_tokens(messages), Some(512));
+        // Precedence: the Responses ceiling wins when several are present.
+        let both = br#"{"max_tokens":1,"max_output_tokens":9}"#;
+        assert_eq!(requested_max_output_tokens(both), Some(9));
+        // Absent, zero, negative, or non-JSON bodies fall back to the 8192 default.
+        assert_eq!(requested_max_output_tokens(br#"{"messages":[]}"#), None);
+        assert_eq!(requested_max_output_tokens(br#"{"max_tokens":0}"#), None);
+        assert_eq!(requested_max_output_tokens(br#"{"max_tokens":-5}"#), None);
+        assert_eq!(requested_max_output_tokens(b"not json"), None);
+    }
 
     #[test]
     #[doc = "Spec: REL-1 — F02 open_streams tracks live SSE bodies"]

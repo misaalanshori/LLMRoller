@@ -319,6 +319,25 @@ pub fn compute_request_cost(
     }
 }
 
+/// Applies a provider's subscription coverage to a list-price cost (`USG-10`).
+///
+/// Only `subscription_plan` coverage scales the effective cost by
+/// `plan_multiplier_bps` (10_000 = 1.0x, 5_000 = 50%); `pay_as_you_go`,
+/// `shared_grant`, and `free_tier` always charge the unadjusted list price.
+#[must_use]
+pub fn apply_plan_multiplier(
+    list_cost_micro_usd: i64,
+    plan_multiplier_bps: i64,
+    billing_coverage_mode: &str,
+) -> i64 {
+    if billing_coverage_mode != "subscription_plan" {
+        return list_cost_micro_usd;
+    }
+    let bps = plan_multiplier_bps.clamp(0, 100_000);
+    let scaled = (i128::from(list_cost_micro_usd) * i128::from(bps) + 5_000) / 10_000;
+    i64::try_from(scaled).unwrap_or(i64::MAX)
+}
+
 /// Streaming binary-aware JSON string tokenizer counting text vs binary blocks.
 ///
 /// Walks JSON string values without building a DOM:

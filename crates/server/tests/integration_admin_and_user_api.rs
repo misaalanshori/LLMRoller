@@ -535,3 +535,153 @@ async fn test_client_key_sessions_report_live_session_pins() {
     assert_eq!(pins[0]["key_label"], "alice-upstream");
     assert_eq!(pins[0]["pool_tier"], 1);
 }
+
+#[doc = "Spec: LIM-1 — budget window CRUD endpoints with validation and RBAC scoping"]
+#[tokio::test]
+async fn test_budget_window_crud_endpoints_and_validation() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+
+    // 1. Alice creates a rolling budget window on her own upstream key
+    let create_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/user/upstream-keys/{}/windows",
+            harness.alice_key.upstream_key_id
+        ))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{
+                "scope_kind": "upstream_key",
+                "window_kind": "rolling",
+                "period_ms": 86400000,
+                "limit_micro_usd": 5000000,
+                "reserve_pct": 5
+            }"#,
+        ))
+        .expect("create req");
+    let resp = app.clone().oneshot(create_req).await.expect("create resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let window_id = body["id"].as_str().expect("window id").to_string();
+
+    // 2. Alice lists windows for her key
+    let list_req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/user/upstream-keys/{}/windows",
+            harness.alice_key.upstream_key_id
+        ))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("list req");
+    let resp = app.clone().oneshot(list_req).await.expect("list resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let windows = body["data"].as_array().expect("data array");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], window_id);
+    assert_eq!(windows[0]["limit_micro_usd"], 5000000);
+    assert_eq!(windows[0]["reserve_pct"], 5);
+
+    // 3. Alice patches the window
+    let patch_req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/user/budget-windows/{window_id}"))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"limit_micro_usd": 10000000}"#))
+        .expect("patch req");
+    let resp = app.clone().oneshot(patch_req).await.expect("patch resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. Bob tries to access Alice's key's windows -> 404 (no existence oracle)
+    let bob_req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/user/upstream-keys/{}/windows",
+            harness.alice_key.upstream_key_id
+        ))
+        .header(header::COOKIE, &harness.bob_key.cookie)
+        .body(Body::empty())
+        .expect("bob req");
+    let resp = app.clone().oneshot(bob_req).await.expect("bob resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 5. Validation failure: negative limit -> 422
+    let invalid_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/user/upstream-keys/{}/windows",
+            harness.alice_key.upstream_key_id
+        ))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{
+                "scope_kind": "upstream_key",
+                "window_kind": "rolling",
+                "period_ms": 86400000,
+                "limit_micro_usd": -100
+            }"#,
+        ))
+        .expect("invalid req");
+    let resp = app.clone().oneshot(invalid_req).await.expect("invalid resp");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 6. Alice deletes the window -> 204
+    let del_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/user/budget-windows/{window_id}"))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .body(Body::empty())
+        .expect("del req");
+    let resp = app.clone().oneshot(del_req).await.expect("del resp");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[doc = "Spec: USG-1, USG-2 — usage timeseries and breakdown endpoints aggregate from rollups"]
+#[tokio::test]
+async fn test_usage_timeseries_and_breakdown_rollups() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+
+    // Insert hourly rollups for Alice
+    sqlx::query(
+        "INSERT INTO usage_rollups_hourly (hour_ms, owner_user_id, client_key_id, upstream_key_id, provider_id, provider_scope, share_id, canonical_id, requests, errors, input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, cost_micro_usd, list_cost_micro_usd)
+         VALUES (3600000, ?, 'ck1', 'uk1', 'p1', 'personal', '', 'gpt-4o', 10, 0, 1000, 200, 0, 500, 0, 15000, 15000),
+                (7200000, ?, 'ck1', 'uk1', 'p1', 'personal', '', 'claude-3-5-sonnet', 5, 0, 2000, 0, 0, 800, 0, 25000, 25000)",
+    )
+    .bind(harness.alice_key.client_key_id.to_string())
+    .bind(harness.alice_key.client_key_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .expect("insert rollups");
+
+    // Query timeseries as Alice
+    let ts_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/usage/timeseries")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("ts req");
+    let resp = app.clone().oneshot(ts_req).await.expect("ts resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Query breakdown as Alice
+    let bd_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/usage/breakdown")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("bd req");
+    let resp = app.clone().oneshot(bd_req).await.expect("bd resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+}

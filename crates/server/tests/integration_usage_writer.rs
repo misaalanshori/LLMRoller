@@ -629,6 +629,46 @@ async fn test_retention_sweeper_and_wal_checkpoint_supervisor() {
 
     tx.commit().await.expect("commit");
 
+    // Side-table sweepers (F038): rollups, upstream snapshots, auth counters, orphan trace blocks.
+    sqlx::query(
+        "INSERT INTO usage_rollups_5min (bucket_ms, upstream_key_id, canonical_id, client_key_id, owner_user_id, provider_scope, share_id, cost_micro_usd, requests)
+         VALUES (1000, 'k', 'm', 'c', 'u', 'global', '', 100, 1),
+                (5000, 'k', 'm', 'c', 'u', 'global', '', 100, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert 5min rollups");
+    let swept_5m = llmroller_store::retention::sweep_expired_usage_rollups_5min(&pool, 3000, 100)
+        .await
+        .expect("sweep 5min");
+    assert_eq!(swept_5m, 1);
+
+    sqlx::query(
+        "INSERT INTO usage_rollups_hourly (hour_ms, owner_user_id, client_key_id, upstream_key_id, provider_id, provider_scope, share_id, canonical_id, requests, errors, input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, cost_micro_usd, list_cost_micro_usd)
+         VALUES (1000, 'u', 'c', 'k', 'p', 'global', '', 'm', 1, 0, 10, 0, 0, 10, 0, 100, 100),
+                (5000, 'u', 'c', 'k', 'p', 'global', '', 'm', 1, 0, 10, 0, 0, 10, 0, 100, 100)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert hourly rollups");
+    let swept_hourly = llmroller_store::retention::sweep_expired_usage_rollups_hourly(&pool, 3000, 100)
+        .await
+        .expect("sweep hourly");
+    assert_eq!(swept_hourly, 1);
+
+    sqlx::query(
+        "INSERT INTO auth_failure_counters (minute_ms, reason, ip_prefix, count)
+         VALUES (1000, 'unknown_key', '127.0.0.0/24', 5),
+                (5000, 'unknown_key', '127.0.0.0/24', 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert auth counters");
+    let swept_auth = llmroller_store::retention::sweep_expired_auth_failure_counters(&pool, 3000)
+        .await
+        .expect("sweep auth");
+    assert_eq!(swept_auth, 1);
+
     // Incremental vacuum (500 pages)
     run_incremental_vacuum(&pool, 500)
         .await

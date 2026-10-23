@@ -161,3 +161,98 @@ pub async fn run_incremental_vacuum(pool: &SqlitePool, pages: u32) -> Result<(),
         .await?;
     Ok(())
 }
+
+/// Deletes 5-minute usage rollup buckets older than `cutoff_ms` in bounded
+/// chunks (REL-3). Rollups are derived data, so they are swept on their own
+/// schedule independent of `usage_events` row pruning.
+pub async fn sweep_expired_usage_rollups_5min(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM usage_rollups_5min WHERE rowid IN (
+             SELECT rowid FROM usage_rollups_5min WHERE bucket_ms < ? ORDER BY bucket_ms LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes hourly usage rollup buckets older than `cutoff_ms` in bounded chunks.
+pub async fn sweep_expired_usage_rollups_hourly(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM usage_rollups_hourly WHERE rowid IN (
+             SELECT rowid FROM usage_rollups_hourly WHERE hour_ms < ? ORDER BY hour_ms LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes upstream usage snapshots fetched before `cutoff_ms` in bounded chunks.
+pub async fn sweep_expired_upstream_usage_snapshots(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM upstream_usage_snapshots WHERE id IN (
+             SELECT id FROM upstream_usage_snapshots WHERE fetched_at < ? ORDER BY fetched_at LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes auth-failure counter buckets older than `cutoff_ms`.
+///
+/// Counters are per-minute rows used for abuse detection; a day of history is
+/// enough for the admin audit view, and unbounded growth would otherwise keep
+/// every failed probe forever.
+pub async fn sweep_expired_auth_failure_counters(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM auth_failure_counters WHERE minute_ms < ?")
+        .bind(cutoff_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes content-addressed trace blocks that have not been referenced since
+/// `cutoff_ms` (REL-3, TRC-2).
+///
+/// Blocks are shared across turns, so they are only collected once nothing has
+/// touched them for a full retention window; `trace_records` expires first and
+/// leaves the blocks behind.
+pub async fn sweep_orphaned_trace_blocks(
+    pool: &SqlitePool,
+    cutoff_ms: i64,
+    chunk_limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM trace_blocks WHERE rowid IN (
+             SELECT rowid FROM trace_blocks WHERE last_referenced_at < ? ORDER BY last_referenced_at LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
