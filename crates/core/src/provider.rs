@@ -547,6 +547,33 @@ impl ProviderConfig {
             .filter(|ms| *ms > 0)
             .map_or(DEFAULT_STREAM_IDLE_TIMEOUT_MS as u64, |ms| ms as u64)
     }
+
+    /// Effective first-activity timeout in milliseconds (SRDD Section 10.5.2).
+    #[must_use]
+    pub fn first_activity_timeout_ms(&self) -> u64 {
+        self.timeouts
+            .first_activity_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map_or(60_000, |ms| ms as u64)
+    }
+
+    /// Effective first-valid-frame timeout in milliseconds (SRDD Section 10.5.2).
+    #[must_use]
+    pub fn first_valid_frame_timeout_ms(&self) -> u64 {
+        self.timeouts
+            .first_valid_frame_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map_or(180_000, |ms| ms as u64)
+    }
+
+    /// Effective non-streaming response body timeout in milliseconds (SRDD Section 10.5.2).
+    #[must_use]
+    pub fn nonstream_response_timeout_ms(&self) -> u64 {
+        self.timeouts
+            .nonstream_response_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map_or(600_000, |ms| ms as u64)
+    }
 }
 
 #[cfg(test)]

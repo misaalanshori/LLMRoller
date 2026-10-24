@@ -89,9 +89,6 @@ const PROTOCOL_BLOCK_MS: i64 = 6 * 60 * 60 * 1_000;
 /// How long an auxiliary endpoint probe result is cached (API-8).
 const AUX_UNSUPPORTED_TTL_MS: i64 = 60 * 60 * 1_000;
 
-/// Maximum idle time while waiting for an upstream chunk.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Pre-flight admission error when memory budget is saturated.
 #[derive(Debug, Error)]
 pub enum GatewayBusyError {
@@ -3961,14 +3958,27 @@ pub async fn handle_inference_request(
         }
 
         let attempt_started = now_ms();
-        let mut response = match request_builder.send().await {
-            Ok(response) => response,
-            Err(_) => {
+        let activity_timeout = Duration::from_millis(candidate.config.first_activity_timeout_ms());
+        let send_res = tokio::time::timeout(activity_timeout, request_builder.send()).await;
+        let mut response = match send_res {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => {
+                let is_timeout = send_res.is_err();
+                let attempt_outcome = if is_timeout {
+                    llmroller_core::usage::AttemptOutcome::WaitTimeout
+                } else {
+                    llmroller_core::usage::AttemptOutcome::ConnectError
+                };
+                let try_outcome = if is_timeout {
+                    TryOutcome::WaitTimeout
+                } else {
+                    TryOutcome::HostFailure
+                };
                 let _ = state.runtime_state.record_upstream_failure(
                     &origin,
                     candidate.upstream_key_id,
                     caller.id,
-                    llmroller_core::usage::AttemptOutcome::ConnectError,
+                    attempt_outcome,
                     None,
                     now,
                 );
@@ -3983,7 +3993,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
-                    llmroller_core::usage::AttemptOutcome::ConnectError,
+                    attempt_outcome,
                     Some(502),
                     body.len(),
                     0,
@@ -4004,7 +4014,7 @@ pub async fn handle_inference_request(
                 }
                 failovers += 1;
                 crate::metrics::record_failover();
-                try_outcomes.push(TryOutcome::HostFailure);
+                try_outcomes.push(try_outcome);
                 continue;
             }
         };
@@ -4359,8 +4369,10 @@ pub async fn handle_inference_request(
                 let mut first_chunk: Option<Bytes> = None;
                 let mut failure = false;
 
+                let frame_timeout =
+                    Duration::from_millis(candidate.config.first_valid_frame_timeout_ms());
                 loop {
-                    let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.next()).await;
+                    let next = tokio::time::timeout(frame_timeout, upstream.next()).await;
                     match next {
                         Ok(Some(Ok(chunk))) => {
                             tap.feed_chunk(&chunk);
@@ -4731,15 +4743,29 @@ pub async fn handle_inference_request(
         let status_value = response.status();
         let content_type = response.headers().get(CONTENT_TYPE).cloned();
         let content_encoding = upstream_content_encoding(response.headers());
-        let body_bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(_) => {
+        let nonstream_timeout =
+            Duration::from_millis(candidate.config.nonstream_response_timeout_ms());
+        let body_read = tokio::time::timeout(nonstream_timeout, response.bytes()).await;
+        let body_bytes = match body_read {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) | Err(_) => {
+                let is_timeout = body_read.is_err();
+                let attempt_outcome = if is_timeout {
+                    llmroller_core::usage::AttemptOutcome::WaitTimeout
+                } else {
+                    llmroller_core::usage::AttemptOutcome::ConnectError
+                };
+                let try_outcome = if is_timeout {
+                    TryOutcome::WaitTimeout
+                } else {
+                    TryOutcome::HostFailure
+                };
                 attempts.push(attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
-                    llmroller_core::usage::AttemptOutcome::ConnectError,
+                    attempt_outcome,
                     Some(502),
                     body.len(),
                     0,
@@ -4747,7 +4773,7 @@ pub async fn handle_inference_request(
                 ));
                 failovers += 1;
                 crate::metrics::record_failover();
-                try_outcomes.push(TryOutcome::HostFailure);
+                try_outcomes.push(try_outcome);
                 continue;
             }
         };
