@@ -517,6 +517,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.runtime_state = runtime_state.clone();
     proxy_auth_state.reader_pool = reader_pool.clone();
     proxy_auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
+    proxy_auth_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
     proxy_auth_state.writer = Some(writer_handle.clone());
     proxy_auth_state.master_key = Some(master_key.clone());
     proxy_auth_state.master_key_id = Some(master_key_id.clone());

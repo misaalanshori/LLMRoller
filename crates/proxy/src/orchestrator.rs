@@ -2333,6 +2333,9 @@ struct SessionPinContext<'a> {
     protocol: &'a str,
     session_hmac_secret: Option<&'a [u8]>,
     runtime_state: &'a RuntimeState,
+    writer: Option<&'a WriterHandle>,
+    audit_hmac_key: Option<&'a [u8]>,
+    pool: Option<&'a sqlx::SqlitePool>,
     now_ms: i64,
 }
 
@@ -2371,6 +2374,9 @@ fn resolve_session(
         protocol,
         session_hmac_secret,
         runtime_state,
+        writer,
+        audit_hmac_key,
+        pool,
         now_ms,
     } = *context;
     let header_vec: Vec<(String, String)> = headers
@@ -2423,6 +2429,43 @@ fn resolve_session(
         );
         if newly_flagged {
             crate::metrics::record_constant_session_suspected();
+            if let Some(writer) = writer {
+                writer.queues.durable_state.lock().insert(
+                    llmroller_store::writer::DurableKey::ClientKeyConstantSessionFlag(
+                        client_key.id.to_string(),
+                    ),
+                    llmroller_store::writer::DurableOp::ClientKeyConstantSessionFlag {
+                        client_key_id: client_key.id.to_string(),
+                        flagged_at: now_ms,
+                    },
+                );
+            }
+            if let (Some(audit_key), Some(pool)) = (audit_hmac_key, pool) {
+                let pool = pool.clone();
+                let audit_key = audit_key.to_vec();
+                let client_key_id = client_key.id.to_string();
+                tokio::spawn(async move {
+                    if let Ok(mut tx) = pool.begin().await {
+                        let audit_id = RequestId::generate().to_string();
+                        let _ = llmroller_store::audit::append(
+                            &mut tx,
+                            &audit_key,
+                            llmroller_store::audit::AuditEntry {
+                                id: &audit_id,
+                                ts: now_ms,
+                                actor_user_id: None,
+                                ip_addr: None,
+                                action: "session.constant_id_suspected",
+                                target_type: "client_key",
+                                target_id: Some(&client_key_id),
+                                detail_json: None,
+                            },
+                        )
+                        .await;
+                        let _ = tx.commit().await;
+                    }
+                });
+            }
         }
     }
 
@@ -3656,6 +3699,9 @@ pub async fn handle_inference_request(
             protocol,
             session_hmac_secret,
             runtime_state: &state.runtime_state,
+            writer: state.writer.as_ref(),
+            audit_hmac_key: state.audit_hmac_key.as_ref().map(|k| k.expose_secret()),
+            pool: Some(&state.pool),
             now_ms: now,
         },
     );
@@ -5761,6 +5807,9 @@ mod tests {
                 protocol: "chat",
                 session_hmac_secret,
                 runtime_state: runtime,
+                writer: None,
+                audit_hmac_key: None,
+                pool: None,
                 now_ms,
             },
         )
@@ -5780,6 +5829,9 @@ mod tests {
                 protocol: "chat",
                 session_hmac_secret: Some(b"instance-session-secret-32-bytes"),
                 runtime_state: runtime,
+                writer: None,
+                audit_hmac_key: None,
+                pool: None,
                 now_ms: 1_000,
             },
         )

@@ -91,6 +91,7 @@ pub enum DurableKey {
     RouteProtocolClear(String),
     UsageSnapshot(String),
     ClientKeyTouch(String),
+    ClientKeyConstantSessionFlag(String),
     AuthFailureCounter(i64, String, String),
 }
 
@@ -120,6 +121,10 @@ pub enum DurableOp {
     ClientKeyTouchLastUsed {
         client_key_id: String,
         last_used_at: i64,
+    },
+    ClientKeyConstantSessionFlag {
+        client_key_id: String,
+        flagged_at: i64,
     },
     AuthFailureCounterIncrement {
         minute_ms: i64,
@@ -547,6 +552,17 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 .execute(&mut *transaction)
                 .await
                 .map(|_| ()),
+            DurableOp::ClientKeyConstantSessionFlag {
+                client_key_id,
+                flagged_at,
+            } => sqlx::query(
+                "UPDATE client_keys SET constant_session_flagged_at = ? WHERE id = ? AND constant_session_flagged_at IS NULL",
+            )
+            .bind(flagged_at)
+            .bind(client_key_id)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
             DurableOp::AuthFailureCounterIncrement {
                 minute_ms,
                 reason,
