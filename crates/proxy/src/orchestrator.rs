@@ -4182,22 +4182,71 @@ pub async fn handle_inference_request(
                     // effect; moderation 403s must never quarantine or fail over.
                     let outcome =
                         llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
-                    if matches!(status.as_u16(), 401..=403)
-                        || status == StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error()
-                    {
-                        attempts.push(attempt_record(
+                    let mut att = attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    );
+                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                    attempts.push(att);
+
+                    if let Some(writer) = &state.writer {
+                        let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                            .providers
+                            .get(&candidate.provider_id)
+                            .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                            .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
+                        let usage = UsageContext {
                             request_id,
-                            attempt_no as i64,
+                            client_key_id: caller.id,
+                            owner_user_id: caller.owner_user_id,
+                            canonical_model: model.canonical_id.clone(),
+                            upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                            provider_id: Some(candidate.provider_id.to_string()),
+                            provider_scope: Some(provider_scope_label(&candidate).to_string()),
+                            share_id: candidate.share_id.map(|share| share.to_string()),
+                            upstream_model_id: candidate.upstream_model_id.clone(),
+                            endpoint_str: endpoint_str.to_string(),
+                            session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                            pin_outcome: pin_ticket
+                                .as_ref()
+                                .map(|ticket| ticket.outcome.as_str().to_string()),
+                            failovers,
+                            error_code: Some(if class == ErrorClass::Unclassified403 {
+                                "upstream_error".to_string()
+                            } else {
+                                "invalid_request_error".to_string()
+                            }),
+                            billing_coverage_mode,
+                            plan_multiplier_bps,
+                            service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+                            request_headers_json: request_headers_json.clone(),
+                        };
+                        let event = usage.event(
                             now,
-                            candidate.upstream_key_id,
-                            outcome,
-                            Some(status.as_u16()),
-                            body.len(),
+                            status.as_u16(),
+                            is_streaming,
+                            false,
+                            "completed",
+                            &llmroller_proto::json_usage::ExtractedUsage::default(),
                             0,
-                            "none",
-                        ));
+                            CostSource::PriceBook,
+                            None,
+                            None,
+                            Some(now_ms() - attempt_started),
+                        );
+                        writer
+                            .queues
+                            .usage_writer
+                            .enqueue(event, std::mem::take(&mut attempts));
                     }
+
                     crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
                     return upstream_error_response(
                         status,
@@ -4365,9 +4414,77 @@ pub async fn handle_inference_request(
                     ));
                 }
                 ErrorClass::Other(_) => {
+                    let outcome =
+                        llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
+                    let mut att = attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        0,
+                        "none",
+                    );
+                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                    attempts.push(att);
+
+                    if let Some(writer) = &state.writer {
+                        let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                            .providers
+                            .get(&candidate.provider_id)
+                            .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                            .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
+                        let usage = UsageContext {
+                            request_id,
+                            client_key_id: caller.id,
+                            owner_user_id: caller.owner_user_id,
+                            canonical_model: model.canonical_id.clone(),
+                            upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                            provider_id: Some(candidate.provider_id.to_string()),
+                            provider_scope: Some(provider_scope_label(&candidate).to_string()),
+                            share_id: candidate.share_id.map(|share| share.to_string()),
+                            upstream_model_id: candidate.upstream_model_id.clone(),
+                            endpoint_str: endpoint_str.to_string(),
+                            session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                            pin_outcome: pin_ticket
+                                .as_ref()
+                                .map(|ticket| ticket.outcome.as_str().to_string()),
+                            failovers,
+                            error_code: Some("upstream_error".to_string()),
+                            billing_coverage_mode,
+                            plan_multiplier_bps,
+                            service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+                            request_headers_json: request_headers_json.clone(),
+                        };
+                        let event = usage.event(
+                            now,
+                            status.as_u16(),
+                            is_streaming,
+                            false,
+                            "completed",
+                            &llmroller_proto::json_usage::ExtractedUsage::default(),
+                            0,
+                            CostSource::PriceBook,
+                            None,
+                            None,
+                            Some(now_ms() - attempt_started),
+                        );
+                        writer
+                            .queues
+                            .usage_writer
+                            .enqueue(event, std::mem::take(&mut attempts));
+                    }
+
                     // Non-retryable status (for example 405 or a redirect): pass it
                     // through without health effects or failover.
-                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    let metric_class = if status.is_client_error() {
+                        "4xx"
+                    } else {
+                        "5xx"
+                    };
+                    crate::metrics::record_request_metric(endpoint_str, metric_class, "error");
                     return upstream_error_response(
                         status,
                         &upstream_headers,
