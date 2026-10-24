@@ -988,6 +988,7 @@ mod tests {
     fn explicit_global_upstream_key_lookup_is_admin_only() {
         use llmroller_core::ids::{ProviderId, UserId};
         use llmroller_core::provider::ProviderKind;
+        use llmroller_core::rbac::RoutingScope;
         use llmroller_core::snapshot::{ProviderRecord, UserRecord};
 
         let mut snapshot = ConfigSnapshot::default();
@@ -1006,6 +1007,7 @@ mod tests {
                 disabled: false,
                 can_use_global_providers: true,
                 global_budget_micro_usd_month: None,
+                default_routing_scope: RoutingScope::PersonalFirst,
             },
         );
         users.insert(
@@ -1017,6 +1019,7 @@ mod tests {
                 disabled: false,
                 can_use_global_providers: true,
                 global_budget_micro_usd_month: None,
+                default_routing_scope: RoutingScope::PersonalFirst,
             },
         );
         snapshot.users = Arc::new(users);

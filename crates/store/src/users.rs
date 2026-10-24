@@ -489,7 +489,7 @@ pub async fn load_user_records(
     pool: &SqlitePool,
 ) -> Result<HashMap<UserId, UserRecord>, UserError> {
     let rows = sqlx::query(
-        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month
+        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month, default_routing_scope
          FROM users",
     )
     .fetch_all(pool)
@@ -502,7 +502,7 @@ pub async fn load_user_records_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
 ) -> Result<HashMap<UserId, UserRecord>, UserError> {
     let rows = sqlx::query(
-        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month
+        "SELECT id, username, role, disabled, can_use_global_providers, global_budget_micro_usd_month, default_routing_scope
          FROM users",
     )
     .fetch_all(&mut **tx)
@@ -521,6 +521,10 @@ fn parse_user_records(rows: &[SqliteRow]) -> Result<HashMap<UserId, UserRecord>,
         let disabled: i64 = row.try_get("disabled")?;
         let can_use_global: i64 = row.try_get("can_use_global_providers")?;
         let global_budget: Option<i64> = row.try_get("global_budget_micro_usd_month")?;
+        let default_scope_str: String = row
+            .try_get("default_routing_scope")
+            .unwrap_or_else(|_| "personal_first".to_string());
+        let default_routing_scope = default_scope_str.parse().unwrap_or_default();
 
         map.insert(
             user_id,
@@ -531,6 +535,7 @@ fn parse_user_records(rows: &[SqliteRow]) -> Result<HashMap<UserId, UserRecord>,
                 disabled: disabled != 0,
                 can_use_global_providers: can_use_global != 0,
                 global_budget_micro_usd_month: global_budget,
+                default_routing_scope,
             },
         );
     }

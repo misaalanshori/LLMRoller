@@ -14,7 +14,7 @@ use crate::client_key::{
     generate_client_key, rotate_client_key_in_place,
 };
 use crate::ids::{ClientKeyId, UserId};
-use crate::rbac::Role;
+use crate::rbac::{Role, RoutingScope};
 use crate::seams::DeterministicRng;
 use crate::snapshot::{ConfigSnapshot, ServiceAccountRecord, UserRecord};
 
@@ -35,6 +35,7 @@ fn setup_test_snapshot(
             disabled: user_disabled,
             can_use_global_providers: true,
             global_budget_micro_usd_month: None,
+            default_routing_scope: RoutingScope::PersonalFirst,
         },
     );
 
@@ -127,6 +128,7 @@ fn test_client_key_grace_rotation() {
                 disabled: false,
                 can_use_global_providers: true,
                 global_budget_micro_usd_month: None,
+                default_routing_scope: RoutingScope::PersonalFirst,
             },
         );
         ConfigSnapshot {

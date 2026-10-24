@@ -12,7 +12,7 @@ use crate::client_key::{ClientKeyRecord, HashRole};
 use crate::ids::{ClientKeyId, ModelPk, ProviderId, UpstreamKeyId, UserId};
 use crate::pricing::PriceEntry;
 use crate::provider::{ProviderConfig, ProviderKind};
-use crate::rbac::{OwnershipScope, Role};
+use crate::rbac::{OwnershipScope, Role, RoutingScope};
 use crate::settings::RuntimeSettings;
 use crate::shares::ShareConfig;
 use crate::strategy::RoutingStrategy;
@@ -44,6 +44,7 @@ pub struct UserRecord {
     pub disabled: bool,
     pub can_use_global_providers: bool,
     pub global_budget_micro_usd_month: Option<i64>,
+    pub default_routing_scope: RoutingScope,
 }
 
 /// In-memory projection of a provider for hot-path routing.

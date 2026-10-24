@@ -438,7 +438,7 @@ fn hard_route_checks(
     let key = snapshot.upstream_keys.get(&link.upstream_key_id);
     let provider = key.and_then(|key| snapshot.providers.get(&key.provider_id));
     let model = snapshot.models.get(&link.model_pk);
-    let scope = parse_scope(&caller.routing_scope);
+    let scope = resolve_caller_scope(caller, snapshot);
 
     let c1 = key.is_some_and(|key| key.enabled)
         && provider.is_some_and(|provider| provider.enabled)
@@ -1222,7 +1222,7 @@ pub async fn post_messages_count_tokens(
         );
     }
 
-    let scope = parse_scope(&caller.routing_scope);
+    let scope = resolve_caller_scope(&caller, &snapshot);
     let mut candidates: Vec<RouteCandidate> =
         collect_candidates(&snapshot, &model, &caller, scope, now)
             .into_iter()
@@ -1564,6 +1564,23 @@ fn spawn_credential_probe(
 /// Parse a client key routing scope, failing closed to the safest default.
 pub(crate) fn parse_scope(scope: &str) -> RoutingScope {
     scope.parse().unwrap_or_default()
+}
+
+/// Resolve the effective routing scope for a client key, honoring `inherit`
+/// against `users.default_routing_scope` (Section 11.2, CLK-3, F-048).
+pub(crate) fn resolve_caller_scope(
+    caller: &ClientKeyRecord,
+    snapshot: &ConfigSnapshot,
+) -> RoutingScope {
+    if caller.routing_scope == "inherit" {
+        snapshot
+            .users
+            .get(&caller.owner_user_id)
+            .map(|u| u.default_routing_scope)
+            .unwrap_or_default()
+    } else {
+        caller.routing_scope.parse().unwrap_or_default()
+    }
 }
 
 /// Whether a discovered route is currently routable by health state.
@@ -3452,7 +3469,7 @@ pub async fn handle_inference_request(
         );
     }
 
-    let scope = parse_scope(&caller.routing_scope);
+    let scope = resolve_caller_scope(&caller, &snapshot);
     // Trace mode is decided exactly once at request start (TRC-1).
     let trace_config = &snapshot.settings.traceability_config;
     let trace_enabled = state.sealer_pool.is_some()
@@ -5667,6 +5684,7 @@ mod tests {
                     disabled: false,
                     can_use_global_providers: true,
                     global_budget_micro_usd_month: user_cap,
+                    default_routing_scope: RoutingScope::PersonalFirst,
                 },
             )])),
             shares_by_grantee: Arc::new(HashMap::from([(
@@ -6046,5 +6064,41 @@ mod tests {
         assert!(!tap.is_complete_at_eof());
         tap.feed_chunk(b"data: [DONE]\n\n");
         assert!(tap.is_complete_at_eof());
+    }
+
+    #[test]
+    #[doc = "Spec: CLK-3, RTE-3 - routing scope inherit resolves against users.default_routing_scope"]
+    fn routing_scope_inherit_resolves_against_user_default() {
+        let user_id = UserId::generate();
+        let user = UserRecord {
+            id: user_id,
+            username: "scoped".to_string(),
+            role: Role::User,
+            disabled: false,
+            can_use_global_providers: true,
+            global_budget_micro_usd_month: None,
+            default_routing_scope: RoutingScope::GlobalOnly,
+        };
+        let snapshot = ConfigSnapshot {
+            users: Arc::new(HashMap::from([(user_id, user)])),
+            ..ConfigSnapshot::default()
+        };
+
+        let mut key = session_test_key("flag");
+        key.owner_user_id = user_id;
+        key.routing_scope = "inherit".to_string();
+
+        assert_eq!(
+            resolve_caller_scope(&key, &snapshot),
+            RoutingScope::GlobalOnly,
+            "routing_scope == 'inherit' must resolve to the user's default_routing_scope"
+        );
+
+        key.routing_scope = "own_only".to_string();
+        assert_eq!(
+            resolve_caller_scope(&key, &snapshot),
+            RoutingScope::OwnOnly,
+            "explicit routing_scope overrides user default"
+        );
     }
 }
