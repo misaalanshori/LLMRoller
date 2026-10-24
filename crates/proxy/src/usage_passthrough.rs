@@ -121,6 +121,7 @@ fn accessible_key<'a>(
 }
 
 /// Resolve the upstream key whose windows a usage response should describe.
+#[derive(Debug)]
 struct UsageKeyNotFound(String);
 
 fn resolve_usage_key(
@@ -136,6 +137,19 @@ fn resolve_usage_key(
             return Err(UsageKeyNotFound(format!("upstream key '{raw}' not found")));
         };
         return match accessible_key(snapshot, &key_id, caller) {
+            // `USG-7`, `USR-4`, `SEC-16`: global keys belong to the shared pool.
+            // Returning their usage to a standard user would let them probe
+            // arbitrary global key ULIDs (existence and spend), so explicit
+            // global-key lookups are admin-only.
+            Some(key)
+                if snapshot
+                    .providers
+                    .get(&key.provider_id)
+                    .is_some_and(|provider| provider.ownership_scope == OwnershipScope::Global)
+                    && !is_admin(snapshot, caller) =>
+            {
+                Err(UsageKeyNotFound(format!("upstream key '{raw}' not found")))
+            }
             Some(key) => Ok(Some(key.id)),
             None => Err(UsageKeyNotFound(format!("upstream key '{raw}' not found"))),
         };
@@ -944,5 +958,126 @@ mod tests {
         )
         .expect("default openrouter url");
         assert_eq!(default_or, "https://openrouter.ai/api/v1/key");
+    }
+
+    fn caller(user_id: llmroller_core::ids::UserId) -> ClientKeyRecord {
+        ClientKeyRecord {
+            id: llmroller_core::ids::ClientKeyId::generate(),
+            owner_user_id: user_id,
+            label: "test".to_string(),
+            prefix: "llr_test".to_string(),
+            key_hash: [0; 32],
+            prev_key_hash: None,
+            prev_key_expires_at: None,
+            routing_scope: "inherit".to_string(),
+            allowed_models: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: "off".to_string(),
+            service_account_id: None,
+            disabled: false,
+            paused_at: None,
+            revoked_at: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    #[doc = "Spec: USG-7, USR-4, SEC-16"]
+    fn explicit_global_upstream_key_lookup_is_admin_only() {
+        use llmroller_core::ids::{ProviderId, UserId};
+        use llmroller_core::provider::ProviderKind;
+        use llmroller_core::snapshot::{ProviderRecord, UserRecord};
+
+        let mut snapshot = ConfigSnapshot::default();
+        let standard_id = UserId::generate();
+        let admin_id = UserId::generate();
+        let provider_id = ProviderId::generate();
+        let key_id = UpstreamKeyId::generate();
+
+        let mut users = std::collections::HashMap::new();
+        users.insert(
+            standard_id,
+            UserRecord {
+                id: standard_id,
+                username: "standard".to_string(),
+                role: Role::User,
+                disabled: false,
+                can_use_global_providers: true,
+                global_budget_micro_usd_month: None,
+            },
+        );
+        users.insert(
+            admin_id,
+            UserRecord {
+                id: admin_id,
+                username: "admin".to_string(),
+                role: Role::Admin,
+                disabled: false,
+                can_use_global_providers: true,
+                global_budget_micro_usd_month: None,
+            },
+        );
+        snapshot.users = Arc::new(users);
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            provider_id,
+            ProviderRecord {
+                id: provider_id,
+                ownership_scope: OwnershipScope::Global,
+                owner_user_id: None,
+                kind: ProviderKind::Openrouter,
+                name: "global".to_string(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                config_json: "{}".to_string(),
+                config: llmroller_core::provider::ProviderConfig::default(),
+                share_config_fingerprint: String::new(),
+                usage_url_cross_origin_ack: false,
+                allow_private_network: false,
+                enabled: true,
+                billing_coverage_mode: "pay_as_you_go".to_string(),
+                plan_multiplier_bps: 10_000,
+            },
+        );
+        snapshot.providers = Arc::new(providers);
+
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(
+            key_id,
+            UpstreamKeyRecord {
+                id: key_id,
+                provider_id,
+                owner_user_id: None,
+                label: "global key".to_string(),
+                secret_last4: "1234".to_string(),
+                secret_enc: Vec::new(),
+                master_key_id: "mk".to_string(),
+                enabled: true,
+                priority: 0,
+                strict_tier: 0,
+                health: "healthy".to_string(),
+                health_version: 1,
+            },
+        );
+        snapshot.upstream_keys = Arc::new(keys);
+
+        let standard = caller(standard_id);
+        let admin = caller(admin_id);
+        let params = UsageQueryParams {
+            session_id: None,
+            model: None,
+            upstream_key_id: Some(key_id.to_string()),
+            fresh: None,
+        };
+        assert!(
+            resolve_usage_key(&snapshot, &standard, &params, None, None, 0).is_err(),
+            "standard users must not probe arbitrary global upstream keys"
+        );
+        assert_eq!(
+            resolve_usage_key(&snapshot, &admin, &params, None, None, 0).expect("admin lookup"),
+            Some(key_id)
+        );
     }
 }

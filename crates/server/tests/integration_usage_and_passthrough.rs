@@ -725,7 +725,9 @@ async fn test_usage_fresh_roles_stale_header_and_missing_snapshot_404() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(mock_state.calls.load(Ordering::SeqCst), 1);
 
-    // Global key: fresh=1 is ignored for a standard user, cached sanitized data is served.
+    // Global key: explicit global-key lookups are admin-only (`USG-7`, `USR-4`,
+    // `SEC-16`, audit `F-024`). A standard user must not be able to probe
+    // arbitrary global key ULIDs, and the request must not poll upstream.
     let global_uri = format!("/v1/usage?upstream_key_id={}&fresh=1", global_key.id);
     let response = app
         .clone()
@@ -738,31 +740,12 @@ async fn test_usage_fresh_roles_stale_header_and_missing_snapshot_404() {
         )
         .await
         .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         mock_state.calls.load(Ordering::SeqCst),
         1,
-        "global fresh requests must not trigger upstream polling"
+        "rejected global probes must not trigger upstream polling"
     );
-    let stale_ms = response
-        .headers()
-        .get("x-llmroller-usage-stale-ms")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .expect("numeric stale header");
-    assert!(stale_ms > 60_000, "old snapshot must be reported stale");
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(
-        json["source_provider_usage"]["windows"][0]["used_percent"],
-        20.0
-    );
-    assert!(json["source_provider_usage"].get("raw_field").is_none());
 
     // Stored-only endpoint: no snapshot for this key means 404, not an empty success.
     let raw_missing = format!("/v1/usage/raw?upstream_key_id={}", no_snapshot_key.id);
