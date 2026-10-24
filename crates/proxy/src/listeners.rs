@@ -120,8 +120,24 @@ async fn readyz_handler(State(state): State<ProxyAuthState>) -> Response {
     }
 }
 
-/// Canonical models paired with their display name and route availability.
-type VisibleModels = (Vec<(String, Option<String>, bool)>, Vec<(String, String)>);
+/// Canonical models paired with their display name, route availability, and the
+/// discovered context window (if the upstream advertised one).
+type VisibleModels = (
+    Vec<(String, Option<String>, bool, Option<i64>)>,
+    Vec<(String, String, Option<i64>)>,
+);
+
+/// Adds the discovered `context_window` only when it is actually known, so the
+/// proxy never fabricates a capability value (`F-031`, `MDL-1`).
+fn with_context_window(
+    mut value: serde_json::Value,
+    context_window: Option<i64>,
+) -> serde_json::Value {
+    if let Some(context_window) = context_window {
+        value["context_window"] = serde_json::json!(context_window);
+    }
+    value
+}
 
 /// Project the caller-visible models and aliases from the immutable snapshot (`MDL-7`).
 fn visible_models(
@@ -132,7 +148,7 @@ fn visible_models(
     use std::collections::HashSet;
 
     let scope = crate::orchestrator::parse_scope(&client_key.routing_scope);
-    let mut visible: Vec<(String, Option<String>, bool)> = Vec::new();
+    let mut visible: Vec<(String, Option<String>, bool, Option<i64>)> = Vec::new();
     let mut visible_ids = HashSet::new();
 
     for model in snapshot.models.values() {
@@ -170,6 +186,7 @@ fn visible_models(
             model.canonical_id.clone(),
             model.display_name.clone(),
             available,
+            model.context_window,
         ));
     }
 
@@ -190,7 +207,11 @@ fn visible_models(
         {
             continue;
         }
-        aliases.push((alias.clone(), model.canonical_id.clone()));
+        aliases.push((
+            alias.clone(),
+            model.canonical_id.clone(),
+            model.context_window,
+        ));
     }
     aliases.sort();
 
@@ -209,25 +230,29 @@ async fn v1_models_handler(
     if headers.contains_key("anthropic-version") {
         let mut items: Vec<serde_json::Value> = models
             .into_iter()
-            .map(|(id, display_name, _)| {
+            .map(|(id, display_name, _, context_window)| {
                 let display_name = display_name.unwrap_or_else(|| id.clone());
-                serde_json::json!({
-                    "type": "model",
-                    "id": id,
-                    "display_name": display_name,
-                    "context_window": 200_000,
-                    "created_at": "2026-01-01T00:00:00Z"
-                })
+                with_context_window(
+                    serde_json::json!({
+                        "type": "model",
+                        "id": id,
+                        "display_name": display_name,
+                        "created_at": "2026-01-01T00:00:00Z"
+                    }),
+                    context_window,
+                )
             })
             .collect();
-        for (alias, canonical) in aliases {
-            items.push(serde_json::json!({
-                "type": "model",
-                "id": alias,
-                "display_name": canonical,
-                "context_window": 200_000,
-                "created_at": "2026-01-01T00:00:00Z"
-            }));
+        for (alias, canonical, context_window) in aliases {
+            items.push(with_context_window(
+                serde_json::json!({
+                    "type": "model",
+                    "id": alias,
+                    "display_name": canonical,
+                    "created_at": "2026-01-01T00:00:00Z"
+                }),
+                context_window,
+            ));
         }
         return (
             StatusCode::OK,
@@ -242,35 +267,41 @@ async fn v1_models_handler(
     }
 
     let mut data = Vec::new();
-    for (id, _, available) in models {
+    for (id, _, available, context_window) in models {
         let model_aliases: Vec<&str> = aliases
             .iter()
-            .filter(|(_, canonical)| canonical == &id)
-            .map(|(alias, _)| alias.as_str())
+            .filter(|(_, canonical, _)| canonical == &id)
+            .map(|(alias, _, _)| alias.as_str())
             .collect();
-        data.push(serde_json::json!({
+        let mut item = serde_json::json!({
             "id": id,
             "object": "model",
             "created": 1700000000,
             "owned_by": "llmroller",
-            "context_window": 200_000,
             "llmroller": {
                 "available": available,
-                "aliases": model_aliases,
-                "context_window": 200_000
+                "aliases": model_aliases
             }
-        }));
+        });
+        if let Some(context_window) = context_window {
+            item["context_window"] = serde_json::json!(context_window);
+            item["llmroller"]["context_window"] = serde_json::json!(context_window);
+        }
+        data.push(item);
     }
-    for (alias, canonical) in aliases {
-        data.push(serde_json::json!({
-            "id": alias,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "llmroller",
-            "llmroller": {
-                "alias_of": canonical
-            }
-        }));
+    for (alias, canonical, context_window) in aliases {
+        data.push(with_context_window(
+            serde_json::json!({
+                "id": alias,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "llmroller",
+                "llmroller": {
+                    "alias_of": canonical
+                }
+            }),
+            context_window,
+        ));
     }
     (
         StatusCode::OK,
@@ -280,4 +311,81 @@ async fn v1_models_handler(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmroller_core::catalog::{MergeState, ModelOrigin};
+    use llmroller_core::ids::{ClientKeyId, ModelPk, UserId};
+    use llmroller_core::snapshot::{ConfigSnapshot, SnapshotModel};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn model(canonical: &str, context_window: Option<i64>) -> SnapshotModel {
+        SnapshotModel {
+            id: ModelPk::generate(),
+            canonical_id: canonical.to_string(),
+            display_name: None,
+            context_window,
+            exposed: None,
+            merge_state: MergeState::Confirmed,
+            majority_vendor_prefix: None,
+            distribution: "weighted".to_string(),
+            routing_strategy: None,
+            origin: ModelOrigin::Global,
+            owner_user_id: None,
+        }
+    }
+
+    #[test]
+    #[doc = "Spec: API-1, MDL-1, MDL-4"]
+    fn models_endpoint_emits_discovered_context_windows_not_a_fixed_constant() {
+        let mut snapshot = ConfigSnapshot::default();
+        let mut models = HashMap::new();
+        for model in [
+            model("large-context", Some(1_000_000)),
+            model("small-context", Some(16_384)),
+        ] {
+            models.insert(model.id, model);
+        }
+        snapshot.models = Arc::new(models);
+        let client_key = ClientKeyRecord {
+            id: ClientKeyId::generate(),
+            owner_user_id: UserId::generate(),
+            label: "test".to_string(),
+            prefix: "llr_test".to_string(),
+            key_hash: [0; 32],
+            prev_key_hash: None,
+            prev_key_expires_at: None,
+            routing_scope: "personal_first".to_string(),
+            allowed_models: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: "off".to_string(),
+            service_account_id: None,
+            disabled: false,
+            paused_at: None,
+            revoked_at: None,
+            expires_at: None,
+        };
+
+        let (visible, _) = visible_models(&snapshot, &client_key, 0);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|(id, _, _, context)| (id.as_str(), *context))
+                .collect::<Vec<_>>(),
+            vec![
+                ("large-context", Some(1_000_000)),
+                ("small-context", Some(16_384)),
+            ]
+        );
+        assert!(
+            with_context_window(serde_json::json!({"id": "x"}), None)
+                .get("context_window")
+                .is_none()
+        );
+    }
 }

@@ -7,9 +7,21 @@ use sqlx::{Connection, SqlitePool};
 use thiserror::Error;
 
 /// Current schema version understood by this build.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const INITIAL_SCHEMA_SQL: &str = include_str!("../migrations/0001_initial.sql");
+
+/// Forward-only incremental migrations applied after the initial schema, in
+/// ascending target-version order. Each entry is `(target_version, SQL)`.
+///
+/// The initial DDL is kept frozen at version 1 so fresh and upgraded databases
+/// converge on exactly the same schema: a fresh database applies `0001` and then
+/// every incremental file, while an existing database applies only the files
+/// whose target version is newer than its recorded version.
+const INCREMENTAL_MIGRATIONS: &[(i64, &str)] = &[(
+    2,
+    include_str!("../migrations/0002_model_context_window.sql"),
+)];
 
 /// Schema migration failures with their required startup exit codes.
 #[derive(Debug, Error)]
@@ -55,6 +67,10 @@ impl MigrationError {
 /// version row commit atomically, so an interrupted first migration leaves an
 /// empty database rather than a partial schema.
 ///
+/// An existing older database applies each incremental migration newer than its
+/// recorded version, one transaction per version, so a crash mid-upgrade leaves
+/// the previous version intact.
+///
 /// # Errors
 ///
 /// Returns [`MigrationError::SchemaTooNew`] for a newer database and
@@ -88,8 +104,11 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), MigrationError> {
                 supported: SCHEMA_VERSION,
             });
         }
-        if version != SCHEMA_VERSION {
+        if version < 1 {
             return Err(MigrationError::UnrecognizedDatabase);
+        }
+        if version < SCHEMA_VERSION {
+            apply_incremental_migrations(&mut connection, version).await?;
         }
         drop(connection);
         return verify_auto_vacuum(pool).await;
@@ -108,14 +127,37 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), MigrationError> {
     sqlx::raw_sql(INITIAL_SCHEMA_SQL)
         .execute(&mut *transaction)
         .await?;
-    sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (?)")
-        .bind(SCHEMA_VERSION)
+    sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (1)")
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
+
+    apply_incremental_migrations(&mut connection, 1).await?;
     drop(connection);
 
     verify_auto_vacuum(pool).await
+}
+
+/// Applies every incremental migration whose target version is newer than
+/// `from_version`, in ascending order. Each version is its own transaction and
+/// records its version row before committing.
+async fn apply_incremental_migrations(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    from_version: i64,
+) -> Result<(), MigrationError> {
+    for (target, sql) in INCREMENTAL_MIGRATIONS {
+        if *target <= from_version {
+            continue;
+        }
+        let mut transaction = connection.begin().await?;
+        sqlx::raw_sql(*sql).execute(&mut *transaction).await?;
+        sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (?)")
+            .bind(*target)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+    }
+    Ok(())
 }
 
 /// Assert that the connected database uses incremental auto-vacuum.

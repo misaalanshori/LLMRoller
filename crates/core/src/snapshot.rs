@@ -104,6 +104,8 @@ pub struct SnapshotModel {
     pub id: ModelPk,
     pub canonical_id: String,
     pub display_name: Option<String>,
+    /// Discovered context length in tokens, when the upstream advertised one (`MDL-1`, `F-031`).
+    pub context_window: Option<i64>,
     pub exposed: Option<bool>,
     pub merge_state: MergeState,
     /// Majority `vendor_prefix` across routes when `merge_state = pending_review`.
@@ -432,6 +434,7 @@ mod tests {
             id: pk,
             canonical_id: canonical.to_string(),
             display_name: None,
+            context_window: None,
             exposed: None,
             merge_state: MergeState::Confirmed,
             majority_vendor_prefix: None,

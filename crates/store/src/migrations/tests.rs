@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
-use super::{MigrationError, SCHEMA_VERSION, migrate, verify_auto_vacuum};
+use super::{INITIAL_SCHEMA_SQL, MigrationError, SCHEMA_VERSION, migrate, verify_auto_vacuum};
 use crate::pool::{Role, open_pool};
 
 const USER_A: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -600,5 +600,68 @@ async fn alias_trigger_rejects_canonical_id_collisions() {
         .await
         .expect("non-canonical alias must be accepted");
 
+    pool.close().await;
+}
+
+#[tokio::test]
+#[doc = "Spec: MDL-1, API-1"]
+async fn version_one_database_upgrades_to_version_two_without_losing_rows() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("upgrade.db");
+    let pool = open_pool(&path, Role::Writer)
+        .await
+        .expect("writer pool must open");
+
+    // Build a genuine version-1 database: the frozen initial DDL plus its
+    // version row, exactly as the previous release would have left it.
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&pool)
+        .await
+        .expect("incremental auto-vacuum");
+    sqlx::query("VACUUM").execute(&pool).await.expect("vacuum");
+    sqlx::raw_sql(INITIAL_SCHEMA_SQL)
+        .execute(&pool)
+        .await
+        .expect("version 1 schema");
+    sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (1)")
+        .execute(&pool)
+        .await
+        .expect("version 1 row");
+    sqlx::query("INSERT INTO models (model_pk, canonical_id) VALUES (?, 'vendor/legacy')")
+        .bind(MODEL_PK)
+        .execute(&pool)
+        .await
+        .expect("legacy model");
+
+    // Version 1 has no context_window column yet.
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('models')")
+        .fetch_all(&pool)
+        .await
+        .expect("version 1 columns");
+    assert!(!columns.iter().any(|name| name == "context_window"));
+
+    migrate(&pool).await.expect("upgrade must succeed");
+
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _llmroller_schema")
+        .fetch_one(&pool)
+        .await
+        .expect("schema version");
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(version, 2);
+
+    let (canonical_id, context_window): (String, Option<i64>) =
+        sqlx::query_as("SELECT canonical_id, context_window FROM models WHERE model_pk = ?")
+            .bind(MODEL_PK)
+            .fetch_one(&pool)
+            .await
+            .expect("legacy row must survive the upgrade");
+    assert_eq!(canonical_id, "vendor/legacy");
+    assert_eq!(
+        context_window, None,
+        "unknown context windows stay NULL instead of being fabricated"
+    );
+
+    // Re-running is a no-op and must not re-apply the ALTER TABLE.
+    migrate(&pool).await.expect("upgrade must be idempotent");
     pool.close().await;
 }

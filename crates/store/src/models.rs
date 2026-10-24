@@ -39,6 +39,32 @@ pub async fn upsert_discovered_models_tx(
     discovered_raw_models: &[String],
     response_bytes_len: usize,
 ) -> Result<DiscoveryResult, sqlx::Error> {
+    upsert_discovered_models_with_context_tx(
+        tx,
+        upstream_key_id,
+        is_global,
+        owner_user_id,
+        now_ms,
+        discovered_raw_models,
+        &HashMap::new(),
+        response_bytes_len,
+    )
+    .await
+}
+
+/// Upserts discovered models while persisting optional advertised `context_window`
+/// values keyed by upstream model id (`MDL-1`, `F-031`).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_discovered_models_with_context_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    upstream_key_id: &UpstreamKeyId,
+    is_global: bool,
+    owner_user_id: Option<&UserId>,
+    now_ms: i64,
+    discovered_raw_models: &[String],
+    context_windows: &HashMap<String, i64>,
+    response_bytes_len: usize,
+) -> Result<DiscoveryResult, sqlx::Error> {
     // Check 2 MiB (2_097_152 bytes) or > 1,000 models partial guard (MDL-1)
     let is_partial = discovered_raw_models.len() > 1000 || response_bytes_len > 2 * 1024 * 1024;
 
@@ -167,6 +193,18 @@ pub async fn upsert_discovered_models_tx(
         };
 
         discovered_pks.push(model_pk);
+
+        // Persist the advertised capability. Multiple providers may report the
+        // same model, so keep the largest observed context window (`F-031`).
+        if let Some(context_window) = context_windows.get(raw.as_str()) {
+            sqlx::query(
+                "UPDATE models SET context_window = MAX(COALESCE(context_window, 0), ?) WHERE model_pk = ?",
+            )
+            .bind(*context_window)
+            .bind(model_pk.to_string())
+            .execute(&mut **tx)
+            .await?;
+        }
 
         // Check if route exists with different vendor_prefix across keys -> pending_review (MDL-2)
         if let Some(ref vp) = vendor_prefix {
@@ -506,7 +544,7 @@ pub async fn load_catalog_snapshot_tx(
     let mut snapshot = CatalogSnapshot::default();
 
     let rows = sqlx::query(
-        "SELECT model_pk, canonical_id, display_name, exposed, distribution,
+        "SELECT model_pk, canonical_id, display_name, context_window, exposed, distribution,
                 routing_strategy, merge_state, origin, created_by_user_id
          FROM models",
     )
@@ -536,6 +574,7 @@ pub async fn load_catalog_snapshot_tx(
             id: pk,
             canonical_id: canonical_id.clone(),
             display_name: row.try_get("display_name").unwrap_or(None),
+            context_window: row.try_get("context_window").unwrap_or(None),
             exposed: exposed.map(|v| v != 0),
             merge_state: if merge_str == "pending_review" {
                 MergeState::PendingReview

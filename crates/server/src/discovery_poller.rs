@@ -15,10 +15,10 @@ use llmroller_core::provider::{ProviderConfig, ProviderKind};
 use llmroller_core::runtime_state::RuntimeState;
 use llmroller_core::seams::{Clock as _, ExposeSecret as _};
 use llmroller_proto::discovery::{
-    DiscoveryTarget, MAX_DISCOVERY_BYTES, discovery_endpoint, discovery_headers, parse_models_body,
+    DiscoveryTarget, MAX_DISCOVERY_BYTES, discovery_endpoint, discovery_headers,
 };
 use llmroller_store::crypto::{MasterKey, SecretSealer as _, XChaCha20Poly1305Sealer};
-use llmroller_store::models::{is_valid_upstream_model_id, upsert_discovered_models_tx};
+use llmroller_store::models::is_valid_upstream_model_id;
 use llmroller_store::writer::{ControlOp, DurableKey, DurableOp, WriterError, WriterHandle};
 use sqlx::{Row as _, Sqlite, SqlitePool, Transaction};
 use tokio::sync::{mpsc, watch};
@@ -285,14 +285,25 @@ async fn discover_key(
         return Ok(());
     }
 
-    let models = parse_models_body(&body).map_err(|error| error.to_string())?;
-    let invalid = models
+    let discovered = llmroller_proto::discovery::parse_models_response(&body)
+        .map_err(|error| error.to_string())?;
+    let invalid = discovered
         .iter()
-        .filter(|model| !is_valid_upstream_model_id(model))
+        .filter(|model| !is_valid_upstream_model_id(&model.id))
         .count();
     if invalid > 0 {
         tracing::warn!(key = %key.id, skipped = invalid, "skipping invalid upstream model IDs");
     }
+    let mut context_windows = std::collections::HashMap::new();
+    let models: Vec<String> = discovered
+        .into_iter()
+        .map(|model| {
+            if let Some(context_window) = model.context_window {
+                context_windows.insert(model.id.clone(), context_window);
+            }
+            model.id
+        })
+        .collect();
 
     let op = PersistDiscovery {
         key_id: key.id,
@@ -300,6 +311,7 @@ async fn discover_key(
         owner_user_id: key.owner_user_id,
         now_ms: llmroller_core::seams::SystemClock::new().now_ms(),
         models,
+        context_windows,
         response_bytes_len: body.len(),
     };
     writer
@@ -331,6 +343,7 @@ struct PersistDiscovery {
     owner_user_id: Option<UserId>,
     now_ms: i64,
     models: Vec<String>,
+    context_windows: std::collections::HashMap<String, i64>,
     response_bytes_len: usize,
 }
 
@@ -340,13 +353,14 @@ impl ControlOp for PersistDiscovery {
         tx: &'a mut Transaction<'_, Sqlite>,
     ) -> Pin<Box<dyn Future<Output = Result<(), WriterError>> + Send + 'a>> {
         Box::pin(async move {
-            let result = upsert_discovered_models_tx(
+            let result = llmroller_store::models::upsert_discovered_models_with_context_tx(
                 tx,
                 &self.key_id,
                 self.is_global,
                 self.owner_user_id.as_ref(),
                 self.now_ms,
                 &self.models,
+                &self.context_windows,
                 self.response_bytes_len,
             )
             .await?;
