@@ -210,3 +210,51 @@ fn test_openrouter_adapter_stateless_responses_and_messages_session_support() {
     assert!(cc.supports_session_body_on_endpoint(EndpointKind::Chat));
     assert!(!cc.supports_session_body_on_endpoint(EndpointKind::Messages));
 }
+
+#[doc = "Spec: API-8, MDL-1, REL-5"]
+#[test]
+fn test_is_model_not_found_error_matching() {
+    use crate::adapters::is_model_not_found_error;
+
+    // Built-in phrasings
+    assert!(is_model_not_found_error(
+        404,
+        b"{\"error\":{\"message\":\"No endpoints found for deepseek/deepseek-v4.1\"}}",
+        None
+    ));
+    assert!(is_model_not_found_error(
+        404,
+        b"{\"error\":{\"code\":\"model_not_found\"}}",
+        None
+    ));
+    assert!(is_model_not_found_error(
+        404,
+        b"{\"error\":\"The requested model does not exist.\"}",
+        None
+    ));
+    assert!(is_model_not_found_error(
+        404,
+        b"model identifier is invalid",
+        None
+    ));
+    assert!(is_model_not_found_error(
+        404,
+        b"Unknown model: claude-3-5-sonnet",
+        None
+    ));
+
+    // Status other than 404 is not model_not_found
+    assert!(!is_model_not_found_error(400, b"model_not_found", None));
+    assert!(!is_model_not_found_error(404, b"page not found", None));
+
+    // Custom classifier overrides
+    let custom = ErrorClassifiers {
+        model_not_found_substrings: vec!["custom_model_missing".to_string()],
+        ..ErrorClassifiers::default()
+    };
+    assert!(is_model_not_found_error(
+        404,
+        b"custom_model_missing",
+        Some(&custom)
+    ));
+}

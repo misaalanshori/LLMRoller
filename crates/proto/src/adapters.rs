@@ -63,6 +63,36 @@ const PLAN_RESTRICTED_SUBSTRINGS: [&str; 2] = ["upgrade_required", "not availabl
 const CREDENTIAL_INVALID_SUBSTRINGS: [&str; 3] =
     ["invalid_api_key", "invalid x-api-key", "unauthorized"];
 
+pub const MODEL_NOT_FOUND_SUBSTRINGS: [&str; 6] = [
+    "model_not_found",
+    "does not exist",
+    "no endpoints found",
+    "model identifier is invalid",
+    "model not found",
+    "unknown model",
+];
+
+/// Whether an upstream 404 response matches model-not-found patterns (Section 10.5, MDL-1, REL-5).
+#[must_use]
+pub fn is_model_not_found_error(
+    status: u16,
+    body_8k: &[u8],
+    classifiers: Option<&ErrorClassifiers>,
+) -> bool {
+    if status != 404 {
+        return false;
+    }
+    let body_str = String::from_utf8_lossy(body_8k).to_ascii_lowercase();
+    if let Some(custom) = classifiers
+        && ErrorClassifiers::matches(&custom.model_not_found_substrings, &body_str)
+    {
+        return true;
+    }
+    MODEL_NOT_FOUND_SUBSTRINGS
+        .iter()
+        .any(|sub| body_str.contains(sub))
+}
+
 /// Classify an upstream error response against the five ordered classes per Section 10.5.2.
 #[must_use]
 pub fn classify_error(status: u16, body_8k: &[u8]) -> ErrorClass {

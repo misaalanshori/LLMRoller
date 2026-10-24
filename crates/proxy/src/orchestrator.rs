@@ -839,6 +839,31 @@ fn enqueue_route_protocol_block(
     );
 }
 
+/// Coalesced durable route health update (API-8, REL-5, F-038).
+fn enqueue_route_health_update(
+    state: &ProxyAuthState,
+    key_id: UpstreamKeyId,
+    model_pk: ModelPk,
+    route_health: &str,
+    route_health_until: Option<i64>,
+    last_error: Option<String>,
+) {
+    let Some(writer) = &state.writer else {
+        return;
+    };
+    writer.queues.durable_state.lock().insert(
+        DurableKey::RouteHealth(key_id.to_string(), model_pk.to_string()),
+        DurableOp::RouteHealthUpdate {
+            upstream_key_id: key_id.to_string(),
+            model_pk: model_pk.to_string(),
+            route_health: route_health.to_string(),
+            route_health_until,
+            health_version: 1,
+            last_error,
+        },
+    );
+}
+
 /// Extract the upstream response id from a non-streaming `responses` payload.
 fn json_response_id(value: &serde_json::Value) -> Option<&str> {
     value.get("id").and_then(|id| id.as_str())
@@ -4095,28 +4120,41 @@ pub async fn handle_inference_request(
             let retry_after_secs =
                 last_retry_after_ms.map(|delay| u64::try_from((delay / 1000).max(1)).unwrap_or(1));
 
-            let is_model_not_found_404 = status == StatusCode::NOT_FOUND && {
-                let body_lower = String::from_utf8_lossy(classify_prefix).to_ascii_lowercase();
-                llmroller_core::provider::ErrorClassifiers::matches(
-                    &candidate
-                        .config
-                        .error_classifiers
-                        .model_not_found_substrings,
-                    &body_lower,
-                ) || body_lower.contains("model_not_found")
-                    || body_lower.contains("does not exist")
-                    || body_lower.contains("no endpoints found")
-            };
+            let is_model_not_found_404 = llmroller_proto::adapters::is_model_not_found_error(
+                status.as_u16(),
+                classify_prefix,
+                Some(&candidate.config.error_classifiers),
+            );
             if is_model_not_found_404 {
-                let _ = state.runtime_state.record_upstream_failure(
-                    &origin,
+                let until = now.saturating_add(600_000);
+                state.runtime_state.block_route_protocol(
                     candidate.upstream_key_id,
-                    caller.id,
-                    llmroller_core::usage::AttemptOutcome::Http429,
-                    Some(600_000),
-                    now,
+                    candidate.model_pk,
+                    protocol,
+                    until,
                 );
-                try_outcomes.push(TryOutcome::HostFailure);
+                enqueue_route_protocol_block(
+                    &state,
+                    candidate.upstream_key_id,
+                    candidate.model_pk,
+                    protocol,
+                    "model_not_found_404",
+                    until,
+                );
+                enqueue_route_health_update(
+                    &state,
+                    candidate.upstream_key_id,
+                    candidate.model_pk,
+                    "unavailable",
+                    Some(until),
+                    Some("model_not_found_404".to_string()),
+                );
+                if let Some(ref tx) = state.discovery_tx {
+                    let _ = tx.send(llmroller_proto::discovery::DiscoveryTarget::Key(
+                        candidate.upstream_key_id,
+                    ));
+                }
+                try_outcomes.push(TryOutcome::Unavailable);
                 let mut att = attempt_record(
                     request_id,
                     attempt_no as i64,

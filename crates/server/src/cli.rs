@@ -522,6 +522,17 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.master_key_id = Some(master_key_id.clone());
     proxy_auth_state.instance_id = Some(instance_state.instance_id);
     proxy_auth_state.sealer_pool = Some(sealer_pool.clone());
+    let (discovery_tx, _discovery_task) =
+        llmroller_server::discovery_poller::start_discovery_poller(
+            llmroller_server::discovery_poller::DiscoveryPollerDeps {
+                pool: pool.clone(),
+                writer: writer_handle.clone(),
+                runtime_state: runtime_state.clone(),
+                master_key: master_key.clone(),
+                instance_id: instance_state.instance_id,
+            },
+        );
+    proxy_auth_state.discovery_tx = Some(discovery_tx.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
 
     let auth_config = llmroller_admin::auth::AuthConfig {
@@ -555,16 +566,6 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         reloader_handle.version_receiver(),
     );
     api_state.attach_pin_store(pin_store.clone());
-    let (discovery_tx, _discovery_task) =
-        llmroller_server::discovery_poller::start_discovery_poller(
-            llmroller_server::discovery_poller::DiscoveryPollerDeps {
-                pool: pool.clone(),
-                writer: writer_handle.clone(),
-                runtime_state: runtime_state.clone(),
-                master_key: master_key.clone(),
-                instance_id: instance_state.instance_id,
-            },
-        );
     api_state.discovery_tx = Some(discovery_tx);
     // Sealing happens on the dedicated OS pool. This bridge only moves the
     // sealed payload into the single writer's queue; it never opens SQLite

@@ -59,6 +59,8 @@ pub struct ProxyAuthState {
     pub http_client_private_allowed: reqwest::Client,
     pub clock: Arc<dyn llmroller_core::seams::Clock>,
     pub entropy: Arc<dyn llmroller_core::seams::EntropySource>,
+    pub discovery_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<llmroller_proto::discovery::DiscoveryTarget>>,
 }
 
 impl std::fmt::Debug for ProxyAuthState {
@@ -102,7 +104,17 @@ impl ProxyAuthState {
                 .expect("the private-network HTTP client requires a working TLS backend"),
             clock: Arc::new(llmroller_core::seams::SystemClock::new()),
             entropy: Arc::new(llmroller_core::seams::OsEntropy),
+            discovery_tx: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_discovery_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<llmroller_proto::discovery::DiscoveryTarget>,
+    ) -> Self {
+        self.discovery_tx = Some(tx);
+        self
     }
 
     /// Select the pooled outbound client matching the provider's egress policy.
