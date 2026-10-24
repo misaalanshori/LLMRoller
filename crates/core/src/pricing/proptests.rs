@@ -319,7 +319,7 @@ fn test_subscription_plan_multiplier_dual_cost_math() {
 }
 
 #[test]
-#[doc = "Spec: USG-3, LIM-2"]
+#[doc = "Spec: USG-3, LIM-1"]
 fn cjk_text_without_spaces_is_not_misclassified_as_base64_media() {
     let cjk = "你好世界".repeat(2000); // 24,000 UTF-8 bytes, 0 ASCII spaces
     let body = format!(

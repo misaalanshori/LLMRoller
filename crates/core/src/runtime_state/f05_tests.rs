@@ -256,7 +256,7 @@ fn reserve_key_windows_filters_route_windows_by_model() {
 }
 
 #[test]
-#[doc = "Spec: USG-6, LIM-1, LIM-2"]
+#[doc = "Spec: USG-6, LIM-1"]
 fn reconcile_upstream_usage_honors_reserve_pct_and_preserves_local_delta() {
     let runtime = RuntimeState::new();
     let key = UpstreamKeyId::generate();

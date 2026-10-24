@@ -299,7 +299,7 @@ fn test_50_concurrent_try_reserve_at_97_9_pct_caps_at_98_pct() {
     assert_eq!(counter.effective_used(t0 + 1000), 9_800_000);
 }
 
-#[doc = "Spec: LIM-1, LIM-2"]
+#[doc = "Spec: LIM-1"]
 #[test]
 fn test_atomic_budget_counter_manual_offset_and_calendar_month_window_guard() {
     let oct_15 = utc_to_epoch_millis(2025, 10, 15, 0);

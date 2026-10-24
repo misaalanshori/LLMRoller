@@ -256,9 +256,118 @@ pub fn build_protocol_error_response(
     response
 }
 
+/// Maps a stable LLMRoller error code onto the OpenAI `type` vocabulary.
+///
+/// The OpenAI schema only requires a string, but clients branch on the
+/// conventional values, so keep the vocabulary stable and predictable.
+#[must_use]
+fn openai_error_type_for_code(code: &str) -> &'static str {
+    match code {
+        // Authentication / authorization.
+        "authentication_error"
+        | "permission_error"
+        | "model_disabled"
+        | "ip_restricted"
+        | "service_account_disabled"
+        | "client_key_paused" => "permission_error",
+        // Credits / rate shaping.
+        "rate_limit_error"
+        | "client_key_budget_exhausted"
+        | "user_budget_exhausted"
+        | "provider_share_budget_exhausted"
+        | "rate_limit_exceeded" => "rate_limit_error",
+        // Request shape.
+        "invalid_request_error"
+        | "invalid_encoding"
+        | "model_not_found"
+        | "model_redirect_loop"
+        | "ambiguous_model_id"
+        | "response_not_found" => "invalid_request_error",
+        // Missing resources.
+        "not_found_error" => "not_found_error",
+        // Provider/transport failures.
+        "upstream_unreachable"
+        | "upstream_error"
+        | "gateway_busy"
+        | "no_eligible_route"
+        | "upstream_truncated"
+        | "timeout_error" => "server_error",
+        _ => "server_error",
+    }
+}
+
+/// Maps a stable LLMRoller error code onto the Anthropic `error.type` enum
+/// (`AnthropicMessagesErrorResponse`, OpenRouter OpenAPI).
+///
+/// `server_error` is not a member of that enum, so transport failures must be
+/// reported as `api_error` and saturation as `overloaded_error`.
+#[must_use]
+fn anthropic_error_type_for_code(code: &str) -> &'static str {
+    match code {
+        "authentication_error" => "authentication_error",
+        "permission_error"
+        | "model_disabled"
+        | "ip_restricted"
+        | "service_account_disabled"
+        | "client_key_paused" => "permission_error",
+        "rate_limit_error"
+        | "client_key_budget_exhausted"
+        | "user_budget_exhausted"
+        | "provider_share_budget_exhausted"
+        | "rate_limit_exceeded" => "rate_limit_error",
+        "invalid_request_error"
+        | "invalid_encoding"
+        | "model_not_found"
+        | "model_redirect_loop"
+        | "ambiguous_model_id"
+        | "response_not_found" => "invalid_request_error",
+        "not_found_error" => "not_found_error",
+        "gateway_busy" | "no_eligible_route" => "overloaded_error",
+        "timeout_error" => "timeout_error",
+        _ => "api_error",
+    }
+}
+
+/// Builds a schema-conformant error envelope for the request's wire protocol.
+///
+/// This is the single entry point every data-plane error return must use so
+/// OpenAI callers always receive `type`/`param` and Anthropic callers always
+/// receive `type`/`code`/`request_id` (`F-021`), and so `Retry-After` can never
+/// be forgotten on a 429/503 (`F-022`).
+fn protocol_error(
+    is_messages_path: bool,
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    request_id: Option<&str>,
+    retry_after_secs: Option<u64>,
+) -> Response {
+    let message = message.into();
+    let error_type = if is_messages_path {
+        anthropic_error_type_for_code(code)
+    } else {
+        openai_error_type_for_code(code)
+    };
+    build_protocol_error_response(
+        is_messages_path,
+        status,
+        error_type,
+        code,
+        &message,
+        request_id,
+        retry_after_secs,
+    )
+}
+
 fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    let msg = message.into();
-    build_protocol_error_response(false, status, code, code, &msg, None, None)
+    protocol_error(false, status, code, message, None, None)
+}
+
+/// Anthropic errors always carry a concrete `request_id`, so generate one when
+/// the caller has not created it yet (schema requires the field).
+fn messages_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    let request_id = RequestId::generate().to_string();
+    protocol_error(true, status, code, message, Some(&request_id), None)
 }
 
 fn response_not_found(response_id: &str) -> Response {
@@ -274,15 +383,14 @@ fn permission_error(message: impl Into<String>) -> Response {
 }
 
 fn rate_limit_error(retry_after_secs: u64) -> Response {
-    let mut response = json_error(
+    protocol_error(
+        false,
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
         "the upstream key that holds this response is temporarily unavailable",
-    );
-    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-        response.headers_mut().insert("retry-after", value);
-    }
-    response
+        None,
+        Some(retry_after_secs),
+    )
 }
 
 /// Load one durable response link for a routed Responses operation.
@@ -938,7 +1046,7 @@ pub async fn post_messages_count_tokens(
     let scan = match scan_top_level(&body) {
         Ok(scan) => scan,
         Err(error) => {
-            return json_error(
+            return messages_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 error.to_string(),
@@ -946,7 +1054,7 @@ pub async fn post_messages_count_tokens(
         }
     };
     let Some((ref model_str, _)) = scan.model else {
-        return json_error(
+        return messages_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "model is required in request body",
@@ -956,10 +1064,14 @@ pub async fn post_messages_count_tokens(
     let model = match snapshot.resolve_model(model_str) {
         Ok(model) => model.clone(),
         Err(llmroller_core::snapshot::SnapshotResolveError::KillSwitched) => {
-            return permission_error(format!("model {model_str} is disabled"));
+            return messages_error(
+                StatusCode::FORBIDDEN,
+                "model_disabled",
+                format!("model {model_str} is disabled"),
+            );
         }
         Err(_) => {
-            return json_error(
+            return messages_error(
                 StatusCode::NOT_FOUND,
                 "model_not_found",
                 format!("model {model_str} not found in catalog"),
@@ -971,10 +1083,11 @@ pub async fn post_messages_count_tokens(
             .iter()
             .any(|entry| entry == &model.canonical_id || entry == model_str)
     {
-        return permission_error(format!(
-            "model {} not permitted on this key",
-            model.canonical_id
-        ));
+        return messages_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            format!("model {} not permitted on this key", model.canonical_id),
+        );
     }
 
     let scope = parse_scope(&caller.routing_scope);
@@ -1012,9 +1125,9 @@ pub async fn post_messages_count_tokens(
 
     if candidates.is_empty() {
         if had_candidates {
-            return aux_endpoint_unsupported_error();
+            return aux_endpoint_unsupported_error(true);
         }
-        return json_error(
+        return messages_error(
             StatusCode::NOT_FOUND,
             "not_found_error",
             "no eligible upstream supports native Anthropic token counting",
@@ -1102,10 +1215,10 @@ pub async fn post_messages_count_tokens(
     }
 
     if aux_unsupported_seen {
-        return aux_endpoint_unsupported_error();
+        return aux_endpoint_unsupported_error(true);
     }
 
-    json_error(
+    messages_error(
         StatusCode::NOT_FOUND,
         "not_found_error",
         "no eligible upstream supports native Anthropic token counting",
@@ -1251,14 +1364,14 @@ const fn aux_endpoint_label(endpoint: EndpointKind) -> Option<&'static str> {
     }
 }
 
-fn aux_endpoint_unsupported_error() -> Response {
-    build_protocol_error_response(
-        true,
+fn aux_endpoint_unsupported_error(is_messages: bool) -> Response {
+    let request_id = RequestId::generate().to_string();
+    protocol_error(
+        is_messages,
         StatusCode::NOT_FOUND,
         "not_found_error",
-        "not_found_error",
         "no eligible upstream supports this auxiliary endpoint",
-        None,
+        Some(&request_id),
         None,
     )
 }
@@ -1556,6 +1669,7 @@ fn build_upstream_headers(
         (scheme.header.as_str(), scheme.prefix.as_str())
     });
     let auth_value = format!("{auth_prefix}{secret}");
+    let is_messages = matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens);
     let mut outbound = apply_request_header_pipeline(
         inbound,
         candidate.pool_tier(),
@@ -1565,15 +1679,21 @@ fn build_upstream_headers(
     )
     .map_err(|error| {
         Box::new(match error {
-            HeaderPipelineError::Smuggling(reason) => json_error(
+            HeaderPipelineError::Smuggling(reason) => protocol_error(
+                is_messages,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 reason.to_string(),
+                None,
+                None,
             ),
-            HeaderPipelineError::InvalidHeaderValue(reason) => json_error(
+            HeaderPipelineError::InvalidHeaderValue(reason) => protocol_error(
+                is_messages,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid_provider_config",
                 reason,
+                None,
+                None,
             ),
         })
     })?;
@@ -1587,10 +1707,13 @@ fn build_upstream_headers(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
     let resolved_ua = resolve_user_agent(policy, incoming_ua).map_err(|reason| {
-        Box::new(json_error(
+        Box::new(protocol_error(
+            is_messages,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             reason.to_string(),
+            None,
+            None,
         ))
     })?;
     if let Ok(value) = HeaderValue::from_str(&resolved_ua) {
@@ -2281,7 +2404,10 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<i64> {
         .map(|seconds| seconds.saturating_mul(1000))
 }
 
-fn gate_error_response(error: &llmroller_core::accumulators::GateG7Error) -> Response {
+fn gate_error_response(
+    error: &llmroller_core::accumulators::GateG7Error,
+    is_messages: bool,
+) -> Response {
     use llmroller_core::accumulators::GateG7Error;
     let (code, used, cap, retry_after) = match error {
         GateG7Error::ClientKeyBudgetExhausted {
@@ -2314,22 +2440,46 @@ fn gate_error_response(error: &llmroller_core::accumulators::GateG7Error) -> Res
         ),
     };
 
-    let mut response = (
+    let message = format!("monthly budget cap exhausted (used {used} of {cap} micro-USD)");
+    let mut response = protocol_error(
+        is_messages,
         StatusCode::TOO_MANY_REQUESTS,
-        Json(serde_json::json!({
+        code,
+        message.clone(),
+        None,
+        // `F-022`: every 429 must advertise a retry horizon.
+        Some(retry_after.unwrap_or(60)),
+    );
+    // Surface the counters the control plane and clients use to explain the cap.
+    let body = if is_messages {
+        serde_json::json!({
+            "type": "error",
             "error": {
+                "type": "rate_limit_error",
                 "code": code,
-                "message": "monthly budget cap exhausted",
+                "message": message,
                 "used_micro_usd": used,
-                "budget_micro_usd": cap
+                "budget_micro_usd": cap,
+            },
+            "request_id": serde_json::Value::Null,
+        })
+    } else {
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "rate_limit_error",
+                "param": serde_json::Value::Null,
+                "code": code,
+                "used_micro_usd": used,
+                "budget_micro_usd": cap,
             }
-        })),
-    )
-        .into_response();
-    if let Some(seconds) = retry_after
-        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
-    {
-        response.headers_mut().insert("retry-after", value);
+        })
+    };
+    if let Ok(bytes) = serde_json::to_vec(&body) {
+        *response.body_mut() = Body::from(bytes);
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
     response
 }
@@ -2950,6 +3100,11 @@ pub async fn handle_inference_request(
         _ => endpoint_str,
     };
     let aux_label = aux_endpoint_label(endpoint);
+    // `F-021`, `F-022`: one protocol flag and one request id are established
+    // before any early return so every error envelope is schema-conformant.
+    let is_messages = matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens);
+    let request_id = RequestId::generate();
+    let request_id_str = request_id.to_string();
     // `SEC-6`, `USG-9` (`F-011`): persist only the closed allow-list of
     // diagnostic request headers, scrubbed of secrets, for every event path.
     let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
@@ -2966,16 +3121,14 @@ pub async fn handle_inference_request(
             Ok(decompressed) => Bytes::from(decompressed),
             Err(e) => {
                 crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-                return (
+                return protocol_error(
+                    is_messages,
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "code": "invalid_encoding",
-                            "message": format!("failed to decompress request body: {e}")
-                        }
-                    })),
-                )
-                    .into_response();
+                    "invalid_encoding",
+                    format!("failed to decompress request body: {e}"),
+                    Some(&request_id_str),
+                    None,
+                );
             }
         }
     } else {
@@ -2991,17 +3144,14 @@ pub async fn handle_inference_request(
         Ok(permit) => permit,
         Err(error) => {
             crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-            return (
+            return protocol_error(
+                is_messages,
                 error.status_code(),
-                [("retry-after", error.retry_after_secs().to_string())],
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "gateway_busy",
-                        "message": error.to_string()
-                    }
-                })),
-            )
-                .into_response();
+                "gateway_busy",
+                error.to_string(),
+                Some(&request_id_str),
+                Some(error.retry_after_secs()),
+            );
         }
     };
 
@@ -3010,31 +3160,27 @@ pub async fn handle_inference_request(
         Ok(scan) => scan,
         Err(error) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return (
+            return protocol_error(
+                is_messages,
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "invalid_request_error",
-                        "message": error.to_string()
-                    }
-                })),
-            )
-                .into_response();
+                "invalid_request_error",
+                error.to_string(),
+                Some(&request_id_str),
+                None,
+            );
         }
     };
 
     let Some((ref model_str, _)) = scan.model else {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-        return (
+        return protocol_error(
+            is_messages,
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "invalid_request_error",
-                    "message": "model is required in request body"
-                }
-            })),
-        )
-            .into_response();
+            "invalid_request_error",
+            "model is required in request body",
+            Some(&request_id_str),
+            None,
+        );
     };
 
     // Compaction is a one-shot operation; force the non-streaming path even if the
@@ -3043,7 +3189,6 @@ pub async fn handle_inference_request(
         && scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
     let store_flag = response_store_flag(&scan, &body);
     let now = now_ms();
-    let request_id = RequestId::generate();
 
     let snapshot = state.snapshot.load();
     // 3. Canonical model resolution is a pure in-memory lookup (PERF-1).
@@ -3051,59 +3196,59 @@ pub async fn handle_inference_request(
         Ok(model) => model.clone(),
         Err(llmroller_core::snapshot::SnapshotResolveError::NotFound) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return (
+            return protocol_error(
+                is_messages,
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "model_not_found",
-                        "message": format!("model {model_str} not found in catalog")
-                    }
-                })),
-            )
-                .into_response();
+                "model_not_found",
+                format!("model {model_str} not found in catalog"),
+                Some(&request_id_str),
+                None,
+            );
         }
         Err(llmroller_core::snapshot::SnapshotResolveError::Ambiguous) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return build_protocol_error_response(
-                matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
+            return protocol_error(
+                is_messages,
                 StatusCode::CONFLICT,
-                "invalid_request_error",
                 "ambiguous_model_id",
-                &format!("model {model_str} matches more than one catalog entry"),
-                Some(&request_id.to_string()),
+                format!("model {model_str} matches more than one catalog entry"),
+                Some(&request_id_str),
                 None,
             );
         }
         Err(llmroller_core::snapshot::SnapshotResolveError::KillSwitched) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return (
+            return protocol_error(
+                is_messages,
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "model_disabled",
-                        "message": format!("model {model_str} is disabled")
-                    }
-                })),
-            )
-                .into_response();
+                "model_disabled",
+                format!("model {model_str} is disabled"),
+                Some(&request_id_str),
+                None,
+            );
         }
         Err(llmroller_core::snapshot::SnapshotResolveError::RedirectLoop) => {
             crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-            return (
+            return protocol_error(
+                is_messages,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "model_redirect_loop",
-                        "message": "catalog redirect chain contains a cycle"
-                    }
-                })),
-            )
-                .into_response();
+                "model_redirect_loop",
+                "catalog redirect chain contains a cycle",
+                Some(&request_id_str),
+                None,
+            );
         }
     };
 
     let Some(caller) = client_key.clone() else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return protocol_error(
+            is_messages,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "authentication required",
+            Some(&request_id_str),
+            None,
+        );
     };
     // Response header policy R4 depends on the caller role, not the request path (SEC-16).
     let is_admin = snapshot
@@ -3118,16 +3263,14 @@ pub async fn handle_inference_request(
             .any(|entry| entry == &model.canonical_id || entry == model_str)
     {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-        return (
+        return protocol_error(
+            is_messages,
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "permission_error",
-                    "message": format!("model {} not permitted on this key", model.canonical_id)
-                }
-            })),
-        )
-            .into_response();
+            "permission_error",
+            format!("model {} not permitted on this key", model.canonical_id),
+            Some(&request_id_str),
+            None,
+        );
     }
 
     let scope = parse_scope(&caller.routing_scope);
@@ -3225,15 +3368,14 @@ pub async fn handle_inference_request(
         if candidates.is_empty() {
             crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
             if aux_label.is_some() && had_candidates {
-                return aux_endpoint_unsupported_error();
+                return aux_endpoint_unsupported_error(is_messages);
             }
-            return build_protocol_error_response(
-                matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
+            return protocol_error(
+                is_messages,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
                 "no_eligible_route",
                 "no eligible upstream route available for this caller",
-                Some(&request_id.to_string()),
+                Some(&request_id_str),
                 Some(1),
             );
         }
@@ -3281,28 +3423,25 @@ pub async fn handle_inference_request(
                 Ok(selection) => selection,
                 Err(PoolSelectionError::MonthlyCapExhausted) => {
                     crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-                    return build_protocol_error_response(
-                        matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens),
+                    return protocol_error(
+                        is_messages,
                         StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_error",
-                        "no_eligible_route",
+                        "client_key_budget_exhausted",
                         "monthly budget capacity exhausted",
-                        Some(&request_id.to_string()),
+                        Some(&request_id_str),
                         Some(60),
                     );
                 }
                 Err(PoolSelectionError::NoEligibleRoute) => {
                     crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-                    return (
+                    return protocol_error(
+                        is_messages,
                         StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": {
-                                "code": "no_healthy_key",
-                                "message": "no eligible upstream route available for this caller"
-                            }
-                        })),
-                    )
-                        .into_response();
+                        "no_eligible_route",
+                        "no eligible upstream route available for this caller",
+                        Some(&request_id_str),
+                        Some(1),
+                    );
                 }
             };
 
@@ -3320,16 +3459,14 @@ pub async fn handle_inference_request(
 
     if tier_candidates.is_empty() {
         crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-        return (
+        return protocol_error(
+            is_messages,
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "no_healthy_key",
-                    "message": "no eligible upstream route available for this caller"
-                }
-            })),
-        )
-            .into_response();
+            "no_eligible_route",
+            "no eligible upstream route available for this caller",
+            Some(&request_id_str),
+            Some(1),
+        );
     }
 
     let eligible_keys: HashSet<UpstreamKeyId> = tier_candidates
@@ -3361,7 +3498,7 @@ pub async fn handle_inference_request(
         Ok(guard) => Some(guard),
         Err(error) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-            return gate_error_response(&error);
+            return gate_error_response(&error, is_messages);
         }
     };
     let mut client_guard = client_guard;
@@ -4817,7 +4954,7 @@ pub async fn handle_inference_request(
 
     if let Some(error) = last_cap_error.take() {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
-        return gate_error_response(&error);
+        return gate_error_response(&error, is_messages);
     }
 
     let (terminal_status, terminal_code, terminal_retry_after, terminal_body) =
@@ -4874,16 +5011,14 @@ pub async fn handle_inference_request(
 
     let mut response = terminal_body.map_or_else(
         || {
-            (
+            protocol_error(
+                is_messages,
                 terminal_status,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": terminal_code,
-                        "message": "all upstream attempts failed"
-                    }
-                })),
+                terminal_code,
+                "all upstream attempts failed",
+                Some(&request_id_str),
+                terminal_retry_after,
             )
-                .into_response()
         },
         |body| {
             (
@@ -5293,9 +5428,10 @@ mod tests {
         );
     }
 
-    #[test]
-    #[doc = "Spec: API-1, API-2, API-8, RTE-7, RTE-8, RTE-9, RTE-12, RTE-13, RTE-14, REL-3, REL-5, USG-1, USG-2, USG-3, USG-9, USG-10, LIM-1, LIM-2, SHR-2, SHR-6, CLK-3, CLK-7, MDL-1, MDL-4, AUD-1, OBS-1, PRV-3, SEC-9, TRN-3"]
-    fn error_envelope_and_failure_charge_and_origin_key_conformance() {
+    #[tokio::test]
+    #[doc = "Spec: API-1, API-2, API-8, RTE-7, RTE-8, RTE-9, RTE-12, RTE-13, RTE-14, REL-3, REL-5, USG-1, USG-2, USG-3, USG-9, USG-10, LIM-1, SHR-2, SHR-6, CLK-3, CLK-7, MDL-1, MDL-4, AUD-1, OBS-1, PRV-3, SEC-9, TRN-3"]
+    async fn error_envelope_and_failure_charge_and_origin_key_conformance() {
+        use http_body_util::BodyExt;
         let msg_resp = build_protocol_error_response(
             true,
             StatusCode::NOT_FOUND,
@@ -5306,6 +5442,19 @@ mod tests {
             None,
         );
         assert_eq!(msg_resp.status(), StatusCode::NOT_FOUND);
+        let msg_body = msg_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect msg response body")
+            .to_bytes();
+        let msg_json: serde_json::Value =
+            serde_json::from_slice(&msg_body).expect("parse msg error json");
+        assert_eq!(msg_json["type"], "error");
+        assert_eq!(msg_json["error"]["type"], "not_found_error");
+        assert_eq!(msg_json["error"]["code"], "model_not_found");
+        assert_eq!(msg_json["error"]["message"], "Unknown model");
+        assert_eq!(msg_json["request_id"], "req_1");
 
         let oai_resp = build_protocol_error_response(
             false,
@@ -5326,6 +5475,18 @@ mod tests {
                 .expect("ASCII retry-after value"),
             "5"
         );
+        let oai_body = oai_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect oai response body")
+            .to_bytes();
+        let oai_json: serde_json::Value =
+            serde_json::from_slice(&oai_body).expect("parse oai error json");
+        assert_eq!(oai_json["error"]["type"], "server_error");
+        assert_eq!(oai_json["error"]["code"], "no_eligible_route");
+        assert_eq!(oai_json["error"]["message"], "No route");
+        assert!(oai_json["error"]["param"].is_null());
 
         assert_eq!(
             failure_charge(llmroller_core::usage::AttemptOutcome::WaitTimeout, 1200),

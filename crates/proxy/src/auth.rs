@@ -12,12 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use arc_swap::ArcSwap;
-use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use ipnet::IpNet;
 use llmroller_core::client_key::{ClientKeyRpmLimiter, GateFailure, evaluate_request_gates};
 use llmroller_core::snapshot::ConfigSnapshot;
@@ -294,19 +293,22 @@ pub async fn client_key_auth_middleware(
         );
 
     let client_ip = extract_client_ip(peer_addr, &headers, &state.trusted_proxies);
+    let path = request.uri().path().to_string();
+    let is_messages_path = path.starts_with("/v1/messages")
+        || path.starts_with("/v1/v1/messages")
+        || path.starts_with("/messages");
 
     // 1. Check IP failure rate limit (SEC-12)
     if state.is_ip_rate_limited(client_ip, now_ms) {
-        return (
+        return crate::orchestrator::build_protocol_error_response(
+            is_messages_path,
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "rate_limit_error",
-                    "message": "too many authentication failures, retry in 60s"
-                }
-            })),
-        )
-            .into_response();
+            "rate_limit_error",
+            "rate_limit_error",
+            "too many authentication failures, retry in 60s",
+            None,
+            Some(60),
+        );
     }
 
     // 2. Extract client bearer key from Authorization or x-api-key per API-2
@@ -321,16 +323,15 @@ pub async fn client_key_auth_middleware(
         api_key.trim()
     } else {
         state.record_failure(client_ip, "unknown_key", now_ms).await;
-        return (
+        return crate::orchestrator::build_protocol_error_response(
+            is_messages_path,
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "authentication_error",
-                    "message": "missing bearer token or x-api-key"
-                }
-            })),
-        )
-            .into_response();
+            "authentication_error",
+            "authentication_error",
+            "missing bearer token or x-api-key",
+            None,
+            None,
+        );
     };
 
     let hash: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
@@ -339,16 +340,12 @@ pub async fn client_key_auth_middleware(
     // 3. Evaluate gates G1 through G6.
     // RPM rate limiting (G5) applies strictly to inference endpoints (CLK-1, API-2);
     // administrative/discovery routes like /v1/models, /v1/usage, /v1/key do not consume RPM.
-    let path = request.uri().path().to_string();
     // `SEC-6`, `USG-9` (`F-011`): gate-rejection events must still carry the
     // sanitized allow-list of diagnostic headers. `Authorization`/`x-api-key`
     // are never allow-listed, so the bearer secret cannot leak here.
     let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
         &headers,
     ));
-    let is_messages_path = path.starts_with("/v1/messages")
-        || path.starts_with("/v1/v1/messages")
-        || path.starts_with("/messages");
     let is_inference = path.starts_with("/v1/chat/completions")
         || is_messages_path
         || path.starts_with("/v1/responses");
