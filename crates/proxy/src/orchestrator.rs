@@ -2842,6 +2842,7 @@ fn attempt_record(
     attempt_no: i64,
     ts: i64,
     key_id: UpstreamKeyId,
+    share_id: Option<String>,
     outcome: llmroller_core::usage::AttemptOutcome,
     http_status: Option<u16>,
     bytes_sent: usize,
@@ -2853,7 +2854,7 @@ fn attempt_record(
         attempt_no,
         ts,
         upstream_key_id: key_id.to_string(),
-        share_id: None,
+        share_id,
         outcome,
         http_status: http_status.map(i64::from),
         bytes_sent: bytes_sent as i64,
@@ -2939,18 +2940,18 @@ impl StreamFinalizer {
         }
         self.cap_guards.commit(effective_cost);
 
-        let mut served_attempt = attempt_record(
+        let served_attempt = attempt_record(
             self.usage.request_id,
             self.attempts.len() as i64 + 1,
             finished_ms,
             self.attempt_key_id,
+            self.usage.share_id.clone(),
             llmroller_core::usage::AttemptOutcome::Served,
             Some(self.http_status),
             0,
             effective_cost,
             "actual",
         );
-        served_attempt.share_id = self.usage.share_id.clone();
         self.attempts.push(served_attempt);
 
         if let Some(writer) = &self.state.writer {
@@ -3784,6 +3785,7 @@ pub async fn handle_inference_request(
             }
         };
         tried.push(candidate.upstream_key_id);
+        let candidate_share_id = candidate.share_id.map(|s| s.to_string());
         attempt_no += 1;
         let origin = OriginKey::from_base_url(&candidate.base_url, candidate.allow_private_network);
         let Some(key) = snapshot
@@ -3803,6 +3805,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::ConnectError,
                     None,
                     body.len(),
@@ -3863,6 +3866,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::Http429,
                     Some(429),
                     body.len(),
@@ -3890,6 +3894,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::Http429,
                     Some(429),
                     body.len(),
@@ -3910,6 +3915,7 @@ pub async fn handle_inference_request(
                 attempt_no as i64,
                 now,
                 candidate.upstream_key_id,
+                candidate_share_id.clone(),
                 llmroller_core::usage::AttemptOutcome::ConnectError,
                 None,
                 body.len(),
@@ -4020,18 +4026,18 @@ pub async fn handle_inference_request(
                 {
                     res.commit(charged_micro_usd, now);
                 }
-                let mut att = attempt_record(
+                let att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     attempt_outcome,
                     Some(502),
                     body.len(),
                     charged_micro_usd,
                     charge_basis,
                 );
-                att.share_id = candidate.share_id.map(|sh| sh.to_string());
                 attempts.push(att);
                 if let Some(replacement) = note_pre_first_byte_failure(
                     &state,
@@ -4067,6 +4073,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::Http429,
                     Some(status.as_u16()),
                     body.len(),
@@ -4112,6 +4119,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
                     Some(status.as_u16()),
                     body.len(),
@@ -4164,18 +4172,18 @@ pub async fn handle_inference_request(
                     ));
                 }
                 try_outcomes.push(TryOutcome::Unavailable);
-                let mut att = attempt_record(
+                let att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
                     Some(status.as_u16()),
                     body.len(),
                     0,
                     "none",
                 );
-                att.share_id = candidate.share_id.map(|sh| sh.to_string());
                 attempts.push(att);
                 failovers += 1;
                 crate::metrics::record_failover();
@@ -4191,18 +4199,18 @@ pub async fn handle_inference_request(
                     // effect; moderation 403s must never quarantine or fail over.
                     let outcome =
                         llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
-                    let mut att = attempt_record(
+                    let att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         outcome,
                         Some(status.as_u16()),
                         body.len(),
                         0,
                         "none",
                     );
-                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
                     attempts.push(att);
 
                     if let Some(writer) = &state.writer {
@@ -4288,6 +4296,7 @@ pub async fn handle_inference_request(
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         llmroller_core::usage::AttemptOutcome::Http403,
                         Some(status.as_u16()),
                         body.len(),
@@ -4313,6 +4322,7 @@ pub async fn handle_inference_request(
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
                         Some(status.as_u16()),
                         body.len(),
@@ -4355,6 +4365,7 @@ pub async fn handle_inference_request(
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         outcome,
                         Some(status.as_u16()),
                         body.len(),
@@ -4384,6 +4395,7 @@ pub async fn handle_inference_request(
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         outcome,
                         Some(status.as_u16()),
                         body.len(),
@@ -4415,35 +4427,35 @@ pub async fn handle_inference_request(
                     {
                         res.commit(charged_micro_usd, now);
                     }
-                    let mut att = attempt_record(
+                    let att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         outcome,
                         Some(status.as_u16()),
                         body.len(),
                         charged_micro_usd,
                         charge_basis,
                     );
-                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
                     attempts.push(att);
                 }
                 ErrorClass::Other(_) => {
                     let outcome =
                         llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16());
-                    let mut att = attempt_record(
+                    let att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         outcome,
                         Some(status.as_u16()),
                         body.len(),
                         0,
                         "none",
                     );
-                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
                     attempts.push(att);
 
                     if let Some(writer) = &state.writer {
@@ -4601,6 +4613,7 @@ pub async fn handle_inference_request(
                                     attempt_no as i64,
                                     now,
                                     candidate.upstream_key_id,
+                                    candidate_share_id.clone(),
                                     llmroller_core::usage::AttemptOutcome::from_http_status(400),
                                     Some(400),
                                     body.len(),
@@ -4729,18 +4742,18 @@ pub async fn handle_inference_request(
                     {
                         res.commit(charged_micro_usd, now);
                     }
-                    let mut att = attempt_record(
+                    let att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
                         candidate.upstream_key_id,
+                        candidate_share_id.clone(),
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
                         Some(status.as_u16()),
                         body.len(),
                         charged_micro_usd,
                         charge_basis,
                     );
-                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
                     attempts.push(att);
                     if let Some(replacement) = note_pre_first_byte_failure(
                         &state,
@@ -5073,18 +5086,18 @@ pub async fn handle_inference_request(
                 {
                     res.commit(charged_micro_usd, now);
                 }
-                let mut att = attempt_record(
+                let att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     attempt_outcome,
                     Some(502),
                     body.len(),
                     charged_micro_usd,
                     charge_basis,
                 );
-                att.share_id = candidate.share_id.map(|sh| sh.to_string());
                 attempts.push(att);
                 failovers += 1;
                 crate::metrics::record_failover();
@@ -5100,6 +5113,7 @@ pub async fn handle_inference_request(
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::ErrorFrame,
                     Some(status_value.as_u16()),
                     body.len(),
@@ -5157,18 +5171,18 @@ pub async fn handle_inference_request(
                         now,
                     );
                 }
-                let mut att = attempt_record(
+                let att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
                     candidate.upstream_key_id,
+                    candidate_share_id.clone(),
                     llmroller_core::usage::AttemptOutcome::ErrorFrame,
                     Some(status_value.as_u16()),
                     body.len(),
                     input_only_estimate,
                     "estimated_input",
                 );
-                att.share_id = candidate.share_id.map(|sh| sh.to_string());
                 attempts.push(att);
                 failovers += 1;
                 crate::metrics::record_failover();
@@ -5246,18 +5260,18 @@ pub async fn handle_inference_request(
         }
         drop(permit.take());
 
-        let mut served_att = attempt_record(
+        let served_att = attempt_record(
             request_id,
             attempt_no as i64,
             now,
             candidate.upstream_key_id,
+            candidate_share_id.clone(),
             llmroller_core::usage::AttemptOutcome::Served,
             Some(status_value.as_u16()),
             body.len(),
             effective_cost,
             "actual",
         );
-        served_att.share_id = candidate.share_id.map(|sh| sh.to_string());
         attempts.push(served_att);
 
         let trace_output = trace_request.take().map(|request_body| {
