@@ -78,6 +78,21 @@ pub fn compute_effective_weight(
     ((base * bps) / 10_000).max(1)
 }
 
+/// Scale base weight by remaining budget headroom in basis points (`RTE-13`).
+#[must_use]
+pub fn scale_weight_by_headroom_bps(
+    base_weight: i64,
+    headroom_bps: i64,
+    headroom_scaling_enabled: bool,
+) -> i64 {
+    let base = base_weight.clamp(1, 1000);
+    if !headroom_scaling_enabled || headroom_bps >= 10_000 {
+        return base;
+    }
+    let bps = headroom_bps.clamp(500, 10_000);
+    ((base * bps) / 10_000).max(1)
+}
+
 /// Filters candidates to minimum strict tier when models.distribution == 'strict' (RTE-6).
 pub fn filter_strict_tier<T: Copy>(candidates: &[(T, Option<i64>)]) -> Vec<T> {
     let min_tier = candidates.iter().filter_map(|(_, t)| *t).min();

@@ -198,4 +198,26 @@ fn test_strict_tier_filtering_and_headroom_scaling() {
     // Minimum weight is 1
     let w_min = compute_effective_weight(1, &windows_2, true);
     assert_eq!(w_min, 1);
+
+    // 3. Direct basis points scaling (RTE-13, F-058)
+    assert_eq!(
+        crate::strategy::scale_weight_by_headroom_bps(100, 10_000, true),
+        100
+    );
+    assert_eq!(
+        crate::strategy::scale_weight_by_headroom_bps(100, 8_000, true),
+        80
+    );
+    assert_eq!(
+        crate::strategy::scale_weight_by_headroom_bps(100, 200, true),
+        5
+    );
+    assert_eq!(
+        crate::strategy::scale_weight_by_headroom_bps(100, 0, true),
+        5
+    );
+    assert_eq!(
+        crate::strategy::scale_weight_by_headroom_bps(100, 200, false),
+        100
+    );
 }

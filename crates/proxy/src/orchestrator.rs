@@ -2117,6 +2117,7 @@ fn eligibility_route(
 #[allow(clippy::too_many_arguments)]
 fn select_next_candidate(
     runtime: &RuntimeState,
+    snapshot: &ConfigSnapshot,
     strategy: RoutingStrategy,
     caller: UserId,
     model_pk: ModelPk,
@@ -2131,7 +2132,24 @@ fn select_next_candidate(
     let candidates: Vec<(RouteId, i64)> = eligible
         .iter()
         .filter(|candidate| !tried.contains(&candidate.upstream_key_id))
-        .map(|candidate| (candidate.route_id(), candidate.priority))
+        .map(|candidate| {
+            let weight = if snapshot.settings.headroom_scaling_enabled {
+                let bps = runtime.headroom_bps_for_route(
+                    snapshot,
+                    candidate.upstream_key_id,
+                    Some(model_pk),
+                    now,
+                );
+                llmroller_core::strategy::scale_weight_by_headroom_bps(
+                    candidate.priority,
+                    bps,
+                    true,
+                )
+            } else {
+                candidate.priority
+            };
+            (candidate.route_id(), weight)
+        })
         .collect();
     if candidates.is_empty() {
         return None;
@@ -2171,6 +2189,7 @@ fn select_next_candidate(
 /// Immutable routing context needed to reselect a pin after a pre-first-byte failure.
 struct PinFailureContext<'a> {
     runtime: &'a RuntimeState,
+    snapshot: &'a ConfigSnapshot,
     strategy: RoutingStrategy,
     caller: UserId,
     model_pk: ModelPk,
@@ -2187,6 +2206,7 @@ impl PinFailureContext<'_> {
     fn select(&self, tried: &[UpstreamKeyId]) -> Option<(UpstreamKeyId, CandidatePoolTier)> {
         select_next_candidate(
             self.runtime,
+            self.snapshot,
             self.strategy,
             self.caller,
             self.model_pk,
@@ -3772,6 +3792,7 @@ pub async fn handle_inference_request(
             |tried| {
                 select_next_candidate(
                     &state.runtime_state,
+                    &snapshot,
                     strategy,
                     caller.owner_user_id,
                     model.id,
@@ -3804,6 +3825,7 @@ pub async fn handle_inference_request(
     // would advance cyclic strategies once per candidate and starve later keys.
     let pin_context = PinFailureContext {
         runtime: state.runtime_state.as_ref(),
+        snapshot: &snapshot,
         strategy,
         caller: caller.owner_user_id,
         model_pk: model.id,
@@ -3838,6 +3860,7 @@ pub async fn handle_inference_request(
         } else {
             match select_next_candidate(
                 &state.runtime_state,
+                &snapshot,
                 strategy,
                 caller.owner_user_id,
                 model.id,
