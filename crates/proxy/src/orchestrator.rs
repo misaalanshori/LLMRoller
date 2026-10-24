@@ -3008,6 +3008,9 @@ impl StreamFinalizer {
                             )
                         });
                 event.trace_dropped = !accepted;
+                if !accepted {
+                    crate::metrics::record_trace_dropped();
+                }
             }
             writer
                 .queues
@@ -3721,6 +3724,9 @@ pub async fn handle_inference_request(
             },
         );
         if let Some(ticket) = ticket {
+            if ticket.outcome == PinOutcome::UnpinnedCapacity {
+                crate::metrics::record_pin_capacity_overflow();
+            }
             if let Some(candidate) = tier_candidates
                 .iter()
                 .find(|candidate| candidate.upstream_key_id == ticket.upstream_key_id)
@@ -3995,6 +4001,9 @@ pub async fn handle_inference_request(
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
                 let is_timeout = send_res.is_err();
+                if is_timeout {
+                    crate::metrics::record_upstream_slow(&candidate.provider_id.to_string());
+                }
                 let attempt_outcome = if is_timeout {
                     llmroller_core::usage::AttemptOutcome::WaitTimeout
                 } else {
@@ -4774,6 +4783,9 @@ pub async fn handle_inference_request(
                 }
 
                 let ttfb_ms = (now_ms() - attempt_started).max(0);
+                if ttfb_ms >= 10_000 {
+                    crate::metrics::record_upstream_slow(&candidate.provider_id.to_string());
+                }
                 crate::metrics::record_upstream_ttfb(
                     endpoint_str,
                     &candidate.provider_kind.to_string(),
@@ -4792,12 +4804,15 @@ pub async fn handle_inference_request(
                     candidate.upstream_key_id,
                     now,
                 );
-                if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket)
-                    && let Some(entry) = state
+                if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket) {
+                    if let Some(entry) = state
                         .pin_store
                         .first_valid_frame(pin_key, ticket, now, pin_ttl_ms)
-                {
-                    enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
+                    {
+                        enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
+                    } else {
+                        crate::metrics::record_pin_stale_confirm();
+                    }
                 }
                 drop(permit.take());
 
@@ -5251,12 +5266,15 @@ pub async fn handle_inference_request(
             candidate.upstream_key_id,
             now,
         );
-        if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket)
-            && let Some(entry) = state
+        if let (Some(pin_key), Some(ticket)) = (&pin_key, &pin_ticket) {
+            if let Some(entry) = state
                 .pin_store
                 .first_valid_frame(pin_key, ticket, now, pin_ttl_ms)
-        {
-            enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
+            {
+                enqueue_pin_upsert(&state, pin_key, candidate.model_pk, &entry);
+            } else {
+                crate::metrics::record_pin_stale_confirm();
+            }
         }
         drop(permit.take());
 
@@ -5350,6 +5368,9 @@ pub async fn handle_inference_request(
                         )
                     });
                 event.trace_dropped = !accepted;
+                if !accepted {
+                    crate::metrics::record_trace_dropped();
+                }
             }
             writer.queues.durable_state.lock().insert(
                 llmroller_store::writer::DurableKey::ClientKeyTouch(caller.id.to_string()),
