@@ -766,6 +766,42 @@ async fn test_budget_window_crud_endpoints_and_validation() {
         .expect("invalid resp");
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
+    // 5b. Alice adds a manual calibration adjustment to the window (F-064, LIM-1)
+    let adj_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/user/budget-windows/{window_id}/adjustments"))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .header("x-csrf-token", &harness.alice_key.csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{
+                "delta_micro_usd": 500000,
+                "note": "calibration delta"
+            }"#,
+        ))
+        .expect("adj req");
+    let resp = app.clone().oneshot(adj_req).await.expect("adj resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let get_adj_req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/user/budget-windows/{window_id}/adjustments"))
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("get adj req");
+    let resp = app
+        .clone()
+        .oneshot(get_adj_req)
+        .await
+        .expect("get adj resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("adj body");
+    let adj_json: serde_json::Value = serde_json::from_slice(&bytes).expect("adj json");
+    assert_eq!(adj_json["adjustments"].as_array().expect("array").len(), 1);
+    assert_eq!(adj_json["adjustments"][0]["delta_micro_usd"], 500000);
+
     // 6. Alice deletes the window -> 204
     let del_req = Request::builder()
         .method("DELETE")

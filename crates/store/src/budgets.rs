@@ -216,3 +216,126 @@ pub async fn load_budget_windows_tx(
     }
     Ok(out)
 }
+
+/// Single budget adjustment record from SQLite `budget_adjustments` table (`LIM-1`, `F-064`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetAdjustmentRow {
+    pub id: String,
+    pub budget_window_id: String,
+    pub actor_user_id: Option<String>,
+    pub delta_micro_usd: i64,
+    pub effective_at: i64,
+    pub window_instance_start: Option<i64>,
+    pub source: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+}
+
+/// Insert a manual calibration budget adjustment into SQLite within an active transaction (`LIM-1`, `F-064`).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_budget_adjustment_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    budget_window_id: &str,
+    actor_user_id: Option<&str>,
+    delta_micro_usd: i64,
+    effective_at: i64,
+    window_instance_start: Option<i64>,
+    note: Option<&str>,
+    created_at: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO budget_adjustments (
+               id, budget_window_id, actor_user_id, delta_micro_usd,
+               effective_at, window_instance_start, source, note, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, 'manual_calibration', ?, ?)"#,
+    )
+    .bind(id)
+    .bind(budget_window_id)
+    .bind(actor_user_id)
+    .bind(delta_micro_usd)
+    .bind(effective_at)
+    .bind(window_instance_start)
+    .bind(note)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+}
+
+/// Insert a manual calibration budget adjustment into SQLite (`LIM-1`, `F-064`).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_budget_adjustment(
+    pool: &SqlitePool,
+    id: &str,
+    budget_window_id: &str,
+    actor_user_id: Option<&str>,
+    delta_micro_usd: i64,
+    effective_at: i64,
+    window_instance_start: Option<i64>,
+    note: Option<&str>,
+    created_at: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO budget_adjustments (
+               id, budget_window_id, actor_user_id, delta_micro_usd,
+               effective_at, window_instance_start, source, note, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, 'manual_calibration', ?, ?)"#,
+    )
+    .bind(id)
+    .bind(budget_window_id)
+    .bind(actor_user_id)
+    .bind(delta_micro_usd)
+    .bind(effective_at)
+    .bind(window_instance_start)
+    .bind(note)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Calculate the sum of all budget adjustments for a window effective on or before `now_ms` (`LIM-1`, `F-064`).
+pub async fn sum_budget_adjustments_for_window(
+    pool: &SqlitePool,
+    budget_window_id: &str,
+    effective_at_or_before: i64,
+) -> Result<i64, sqlx::Error> {
+    let sum: Option<i64> = sqlx::query_scalar(
+        "SELECT SUM(delta_micro_usd) FROM budget_adjustments WHERE budget_window_id = ? AND effective_at <= ?",
+    )
+    .bind(budget_window_id)
+    .bind(effective_at_or_before)
+    .fetch_one(pool)
+    .await?;
+    Ok(sum.unwrap_or(0))
+}
+
+/// List all budget adjustments for a budget window ordered by effective_at descending (`LIM-1`, `F-064`).
+pub async fn list_budget_adjustments_for_window(
+    pool: &SqlitePool,
+    budget_window_id: &str,
+) -> Result<Vec<BudgetAdjustmentRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, budget_window_id, actor_user_id, delta_micro_usd, effective_at, window_instance_start, source, note, created_at
+         FROM budget_adjustments WHERE budget_window_id = ? ORDER BY effective_at DESC",
+    )
+    .bind(budget_window_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(BudgetAdjustmentRow {
+            id: row.try_get("id")?,
+            budget_window_id: row.try_get("budget_window_id")?,
+            actor_user_id: row.try_get("actor_user_id")?,
+            delta_micro_usd: row.try_get("delta_micro_usd")?,
+            effective_at: row.try_get("effective_at")?,
+            window_instance_start: row.try_get("window_instance_start")?,
+            source: row.try_get("source")?,
+            note: row.try_get("note")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+    Ok(out)
+}

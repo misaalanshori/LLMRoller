@@ -354,6 +354,22 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 key_ring
             };
             runtime_state.hydrate_window_counter_from_ring(window, source_ring, clock.now_ms());
+            if let Ok(delta) = llmroller_store::budgets::sum_budget_adjustments_for_window(
+                &pool,
+                &window.id,
+                clock.now_ms(),
+            )
+            .await
+                && delta != 0
+                && let Some(counter) = runtime_state.window_counter(&window.id)
+            {
+                let period = window.period_ms.unwrap_or(2_678_400_000);
+                counter.set_manual_offset(Some(llmroller_core::windows::ManualOffset {
+                    effective_at_ms: clock.now_ms(),
+                    delta_micro_usd: delta,
+                    period_ms: period,
+                }));
+            }
         }
     }
 

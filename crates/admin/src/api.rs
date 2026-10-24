@@ -5450,6 +5450,155 @@ async fn patch_admin_budget_window_handler(
     patch_budget_window_internal(&state, &actor, id, payload).await
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateBudgetAdjustmentRequest {
+    pub delta_micro_usd: i64,
+    pub effective_at: Option<i64>,
+    pub window_instance_start: Option<i64>,
+    pub note: Option<String>,
+}
+
+async fn get_budget_window_adjustments_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    id: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
+
+    let upstream_key_id: String = row.try_get("upstream_key_id").unwrap_or_default();
+    authorize_budget_window_key(state, actor, &upstream_key_id).await?;
+
+    let adjustments =
+        llmroller_store::budgets::list_budget_adjustments_for_window(&state.auth.reader_pool, &id)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let list: Vec<serde_json::Value> = adjustments
+        .into_iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "budget_window_id": a.budget_window_id,
+                "actor_user_id": a.actor_user_id,
+                "delta_micro_usd": a.delta_micro_usd,
+                "effective_at": a.effective_at,
+                "window_instance_start": a.window_instance_start,
+                "source": a.source,
+                "note": a.note,
+                "created_at": a.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "adjustments": list })))
+}
+
+async fn post_budget_window_adjustment_internal(
+    state: &ApiAppState,
+    actor: &llmroller_core::rbac::ActorScope,
+    id: String,
+    payload: CreateBudgetAdjustmentRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.auth.reader_pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
+
+    let upstream_key_id: String = row.try_get("upstream_key_id").unwrap_or_default();
+    authorize_budget_window_key(state, actor, &upstream_key_id).await?;
+
+    let now = state.auth.clock.now_ms();
+    let effective_at = payload.effective_at.unwrap_or(now);
+    let adj_id = llmroller_core::ids::RequestId::generate().to_string();
+    let actor_id = actor.user_id().map(|u| u.to_string());
+
+    let response = serde_json::json!({
+        "id": adj_id.clone(),
+        "budget_window_id": id.clone(),
+        "actor_user_id": actor_id.clone(),
+        "delta_micro_usd": payload.delta_micro_usd,
+        "effective_at": effective_at,
+        "window_instance_start": payload.window_instance_start,
+        "source": "manual_calibration",
+        "note": payload.note.clone(),
+        "created_at": now,
+    });
+
+    let window_id_clone = id.clone();
+    let adj_id_clone = adj_id.clone();
+    let note_clone = payload.note;
+    let delta = payload.delta_micro_usd;
+    let win_inst = payload.window_instance_start;
+
+    execute_atomic_mutation(state, vec![ConfigDomain::BudgetWindows], move |tx| {
+        Box::pin(async move {
+            llmroller_store::budgets::insert_budget_adjustment_tx(
+                tx,
+                &adj_id_clone,
+                &window_id_clone,
+                actor_id.as_deref(),
+                delta,
+                effective_at,
+                win_inst,
+                note_clone.as_deref(),
+                now,
+            )
+            .await
+            .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(Json(response))
+}
+
+async fn get_user_budget_window_adjustments_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, false).await?;
+    get_budget_window_adjustments_internal(&state, &actor, id).await
+}
+
+async fn post_user_budget_window_adjustment_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateBudgetAdjustmentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_actor(&state, &headers, true).await?;
+    post_budget_window_adjustment_internal(&state, &actor, id, payload).await
+}
+
+async fn get_admin_budget_window_adjustments_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, false).await?;
+    get_budget_window_adjustments_internal(&state, &actor, id).await
+}
+
+async fn post_admin_budget_window_adjustment_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<CreateBudgetAdjustmentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let actor = authenticate_admin(&state, &headers, true).await?;
+    post_budget_window_adjustment_internal(&state, &actor, id, payload).await
+}
+
 async fn get_user_usage_summary_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -8789,6 +8938,11 @@ pub fn router(state: ApiAppState) -> Router {
             "/api/user/budget-windows/{id}",
             patch(patch_user_budget_window_handler).delete(delete_user_budget_window_handler),
         )
+        .route(
+            "/api/user/budget-windows/{id}/adjustments",
+            get(get_user_budget_window_adjustments_handler)
+                .post(post_user_budget_window_adjustment_handler),
+        )
         .route("/api/user/routes", get(get_user_routes_handler))
         .route(
             "/api/user/routes/{key_id}/{canonical_id}",
@@ -8944,6 +9098,11 @@ pub fn router(state: ApiAppState) -> Router {
         .route(
             "/admin/api/budget-windows/{id}",
             patch(patch_admin_budget_window_handler).delete(delete_admin_budget_window_handler),
+        )
+        .route(
+            "/admin/api/budget-windows/{id}/adjustments",
+            get(get_admin_budget_window_adjustments_handler)
+                .post(post_admin_budget_window_adjustment_handler),
         )
         .route(
             "/admin/api/client-keys/{id}",
