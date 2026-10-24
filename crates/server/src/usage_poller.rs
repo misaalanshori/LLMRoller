@@ -74,8 +74,12 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                             if !key.enabled || !provider.enabled {
                                 continue;
                             }
-                            let Some(endpoint) =
-                                usage_endpoint(&provider.config_json, provider.kind)
+                            let Some(target) =
+                                llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                                    &provider.base_url,
+                                    provider.kind,
+                                    &provider.config_json,
+                                )
                             else {
                                 continue;
                             };
@@ -125,9 +129,8 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
                                     &key,
                                     provider.kind,
                                     &budget_windows,
-                                    &provider.base_url,
                                     &provider.config_json,
-                                    &endpoint,
+                                    &target,
                                     provider.allow_private_network,
                                 )
                                 .await
@@ -146,27 +149,6 @@ pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> 
     })
 }
 
-fn usage_endpoint(
-    config_json: &str,
-    kind: llmroller_core::provider::ProviderKind,
-) -> Option<String> {
-    if let Ok(config) = serde_json::from_str::<serde_json::Value>(config_json)
-        && let Some(ep) = config
-            .get("usage_endpoint")
-            .or_else(|| config.get("usage_path"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-    {
-        return Some(ep.to_string());
-    }
-    match kind {
-        llmroller_core::provider::ProviderKind::Openrouter => Some("/api/v1/auth/key".to_string()),
-        llmroller_core::provider::ProviderKind::OpencodeGo => Some("/usage".to_string()),
-        llmroller_core::provider::ProviderKind::CommandCode => Some("/credits".to_string()),
-        _ => None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn poll_key(
     writer: &WriterHandle,
@@ -176,9 +158,8 @@ async fn poll_key(
     key: &UpstreamKeyRecord,
     kind: llmroller_core::provider::ProviderKind,
     budget_windows: &[llmroller_core::snapshot::SnapshotBudgetWindow],
-    base_url: &str,
     config_json: &str,
-    endpoint: &str,
+    target: &str,
     allow_private_network: bool,
 ) -> Result<(), String> {
     let secret = sealer
@@ -194,12 +175,7 @@ async fn poll_key(
         .map_err(|_| "cannot unseal upstream key".to_string())?;
     let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
-    let target = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("{}{}", base_url.trim_end_matches('/'), endpoint)
-    };
-    llmroller_core::ssrf::validate_url(&target, allow_private_network)
+    llmroller_core::ssrf::validate_url(target, allow_private_network)
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private_network)
         .map_err(|_| "cannot build guarded HTTP client".to_string())?;
@@ -216,7 +192,7 @@ async fn poll_key(
     let t0_ms = llmroller_core::seams::SystemClock::new().now_ms();
 
     let response = client
-        .get(&target)
+        .get(target)
         .header(&scheme.header, auth_header_val)
         .timeout(Duration::from_secs(10))
         .send()
@@ -299,30 +275,56 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    #[doc = "Spec: USG-4"]
-    fn extracts_usage_endpoint_from_provider_config() {
+    #[doc = "Spec: USG-4, USG-6, USG-7, PRV-1"]
+    fn background_poller_uses_the_shared_non_duplicating_usage_url_resolver() {
+        use llmroller_core::provider::ProviderKind;
+
+        // The on-demand and background paths share one resolver, so an
+        // OpenRouter preset base ending in `/api/v1` must not produce
+        // `/api/v1/api/v1/...` (`F-023`).
         assert_eq!(
-            usage_endpoint(
-                r#"{"usage_endpoint":"/v1/usage"}"#,
-                llmroller_core::provider::ProviderKind::Custom
+            llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                "https://openrouter.ai/api/v1",
+                ProviderKind::Openrouter,
+                "{}"
             )
             .as_deref(),
-            Some("/v1/usage")
+            Some("https://openrouter.ai/api/v1/key")
         );
         assert_eq!(
-            usage_endpoint(
-                r#"{"usage_path":""}"#,
-                llmroller_core::provider::ProviderKind::Custom
+            llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                "https://opencode.ai/zen/go/v1",
+                ProviderKind::OpencodeGo,
+                "{}"
+            )
+            .as_deref(),
+            Some("https://opencode.ai/zen/go/v1/usage")
+        );
+        assert_eq!(
+            llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                "https://api.commandcode.ai/provider/v1",
+                ProviderKind::CommandCode,
+                "{}"
+            )
+            .as_deref(),
+            Some("https://api.commandcode.ai/provider/v1/alpha/billing/credits")
+        );
+        assert_eq!(
+            llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                "https://custom.example.com",
+                ProviderKind::Custom,
+                r#"{"paths":{"usage":"/v1/usage"}}"#
+            )
+            .as_deref(),
+            Some("https://custom.example.com/v1/usage")
+        );
+        assert_eq!(
+            llmroller_proxy::usage_passthrough::resolve_provider_usage_url(
+                "https://custom.example.com",
+                ProviderKind::Custom,
+                "{}"
             ),
             None
-        );
-        assert_eq!(
-            usage_endpoint("{}", llmroller_core::provider::ProviderKind::Custom),
-            None
-        );
-        assert_eq!(
-            usage_endpoint("{}", llmroller_core::provider::ProviderKind::Openrouter).as_deref(),
-            Some("/api/v1/auth/key")
         );
     }
 
