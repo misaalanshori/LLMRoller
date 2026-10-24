@@ -50,6 +50,9 @@ const SSE_OK: &str = concat!(
     "\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},",
     "\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",",
+    "\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,",
+    "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",",
     "\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[],",
     "\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,",
     "\"total_tokens\":1500}}\n\n",
@@ -208,6 +211,15 @@ async fn insert_user(pool: &sqlx::SqlitePool, username: &str) -> UserId {
 }
 
 async fn create_client_key(harness: &Harness, user_id: UserId, label: &str) -> String {
+    create_client_key_with_cidrs(harness, user_id, label, None).await
+}
+
+async fn create_client_key_with_cidrs(
+    harness: &Harness,
+    user_id: UserId,
+    label: &str,
+    allowed_cidrs: Option<Vec<String>>,
+) -> String {
     let mut tx = harness.pool.begin().await.expect("begin");
     let created = create_client_key_tx(
         &mut tx,
@@ -220,7 +232,7 @@ async fn create_client_key(harness: &Harness, user_id: UserId, label: &str) -> S
             routing_scope: None,
             rate_limit_rpm: None,
             budget_micro_usd_month: None,
-            allowed_cidrs: None,
+            allowed_cidrs,
             expires_at: None,
             constant_session_mode: None,
         },
@@ -508,7 +520,7 @@ async fn test_streaming_sse_emits_usage_event_and_attempt_to_sqlite() {
     assert_eq!(mock_state.calls.load(Ordering::SeqCst), 1);
     flush(&harness).await;
 
-    let (stream, termination, incomplete, input, output, cost, status): (
+    let (stream, termination, incomplete, input, output, cost, status, stop_reason): (
         i64,
         String,
         i64,
@@ -516,9 +528,10 @@ async fn test_streaming_sse_emits_usage_event_and_attempt_to_sqlite() {
         i64,
         i64,
         i64,
+        Option<String>,
     ) = sqlx::query_as(
         "SELECT stream, termination, incomplete, input_uncached_tokens, output_tokens, \
-                cost_micro_usd, status FROM usage_events",
+                cost_micro_usd, status, stop_reason FROM usage_events",
     )
     .fetch_one(&harness.pool)
     .await
@@ -530,6 +543,11 @@ async fn test_streaming_sse_emits_usage_event_and_attempt_to_sqlite() {
     assert_eq!(output, 500, "completion tokens from the final SSE frame");
     assert_eq!(cost, 2000, "1000 input + 500 output at the seeded price");
     assert_eq!(status, 200);
+    assert_eq!(
+        stop_reason.as_deref(),
+        Some("stop"),
+        "finish_reason must be persisted to usage_events.stop_reason (USG-9)"
+    );
 
     let (outcome, attempt_no, key, attempt_cost, charge_basis): (String, i64, String, i64, String) =
         sqlx::query_as(
@@ -544,6 +562,116 @@ async fn test_streaming_sse_emits_usage_event_and_attempt_to_sqlite() {
     assert_eq!(key, key_id.to_string());
     assert_eq!(attempt_cost, 2000, "the served attempt carries actual cost");
     assert_eq!(charge_basis, "actual");
+}
+
+#[tokio::test]
+#[doc = "Spec: USG-9, SEC-6"]
+async fn test_usage_event_persists_sanitized_diagnostic_request_headers() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "diag-headers").await;
+    let (mock_addr, _mock_state) = spawn_mock(MockMode::StreamOk).await;
+    let _ = single_key_route(&harness, mock_addr, "diag-headers-a", 100).await;
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "diag-headers-key").await;
+    let app = build_app(&harness).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "opencode/1.2")
+        .header("x-opencode-session", "sess-abc123")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", "sk-should-not-persist-123456")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("request");
+
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect stream");
+    flush(&harness).await;
+
+    let (headers_json, client_user_agent): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT request_headers_json, client_user_agent FROM usage_events")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("usage event");
+
+    let json = headers_json.expect("request_headers_json must be persisted (F-011, USG-9)");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid header JSON");
+    assert_eq!(parsed["user-agent"], "opencode/1.2");
+    assert_eq!(parsed["x-opencode-session"], "sess-abc123");
+    assert_eq!(parsed["anthropic-version"], "2023-06-01");
+    assert_eq!(parsed["content-type"], "application/json");
+    assert!(
+        parsed.get("authorization").is_none(),
+        "Authorization must never be persisted (SEC-6)"
+    );
+    assert!(
+        parsed.get("x-api-key").is_none(),
+        "x-api-key must never be persisted (SEC-6)"
+    );
+    assert!(
+        !json.contains(&token),
+        "bearer secret must not leak into request_headers_json (SEC-6)"
+    );
+    assert_eq!(
+        client_user_agent.as_deref(),
+        Some("opencode/1.2"),
+        "client_user_agent is derived from the sanitized headers"
+    );
+}
+
+#[tokio::test]
+#[doc = "Spec: USG-9, SEC-6"]
+async fn test_gate_rejection_usage_event_persists_sanitized_diagnostic_headers() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "gate-headers").await;
+    // 127.0.0.1 is outside this CIDR, so gate G4 rejects the request.
+    let token = create_client_key_with_cidrs(
+        &harness,
+        user,
+        "gate-headers-key",
+        Some(vec!["192.0.2.0/24".to_string()]),
+    )
+    .await;
+    let app = build_app(&harness).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "gate-agent/9.9")
+        .header("x-opencode-session", "gate-sess")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("request");
+
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    flush(&harness).await;
+
+    let (status, error_code, headers_json): (i64, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT status, error_code, request_headers_json FROM usage_events")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("gate rejection usage event");
+
+    assert_eq!(status, 403);
+    assert_eq!(error_code.as_deref(), Some("permission_error"));
+    let json = headers_json.expect("gate rejection events keep diagnostics (F-011)");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid header JSON");
+    assert_eq!(parsed["user-agent"], "gate-agent/9.9");
+    assert_eq!(parsed["x-opencode-session"], "gate-sess");
+    assert!(parsed.get("authorization").is_none());
+    assert!(!json.contains(&token));
 }
 
 #[tokio::test]

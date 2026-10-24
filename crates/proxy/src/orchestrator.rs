@@ -2486,6 +2486,7 @@ struct UsageContext {
     billing_coverage_mode: String,
     plan_multiplier_bps: i64,
     service_account_id: Option<String>,
+    request_headers_json: Option<String>,
 }
 
 impl UsageContext {
@@ -2500,6 +2501,7 @@ impl UsageContext {
         usage: &llmroller_proto::json_usage::ExtractedUsage,
         cost_micro_usd: i64,
         cost_source: CostSource,
+        stop_reason: Option<String>,
         ttfb_ms: Option<i64>,
         latency_ms: Option<i64>,
     ) -> UsageEventRecord {
@@ -2545,8 +2547,8 @@ impl UsageContext {
             plan_multiplier_bps: self.plan_multiplier_bps,
             billing_coverage_mode: self.billing_coverage_mode.clone(),
             service_account_id: self.service_account_id.clone(),
-            stop_reason: None,
-            request_headers_json: None,
+            stop_reason,
+            request_headers_json: self.request_headers_json.clone(),
             metadata_json: None,
         }
     }
@@ -2688,6 +2690,7 @@ impl StreamFinalizer {
                 &extracted,
                 cost.cost_micro_usd,
                 cost.cost_source,
+                self.tap.stop_reason.clone(),
                 self.ttfb_ms,
                 Some(finished_ms - self.started_ms),
             );
@@ -2947,6 +2950,11 @@ pub async fn handle_inference_request(
         _ => endpoint_str,
     };
     let aux_label = aux_endpoint_label(endpoint);
+    // `SEC-6`, `USG-9` (`F-011`): persist only the closed allow-list of
+    // diagnostic request headers, scrubbed of secrets, for every event path.
+    let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
+        &headers,
+    ));
 
     let encoding = headers
         .get(axum::http::header::CONTENT_ENCODING)
@@ -4275,6 +4283,7 @@ pub async fn handle_inference_request(
                     billing_coverage_mode,
                     plan_multiplier_bps,
                     service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+                    request_headers_json: request_headers_json.clone(),
                 };
                 let trace = trace_request.clone().map(|request_body| {
                     TraceCapture::new(request_body, trace_retention_days, first_chunk.as_ref())
@@ -4695,6 +4704,7 @@ pub async fn handle_inference_request(
                 billing_coverage_mode,
                 plan_multiplier_bps,
                 service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+                request_headers_json: request_headers_json.clone(),
             };
             let mut event = usage.event(
                 now,
@@ -4705,6 +4715,7 @@ pub async fn handle_inference_request(
                 &extracted,
                 cost.cost_micro_usd,
                 cost.cost_source,
+                llmroller_proto::json_usage::extract_json_stop_reason(endpoint, &json_value),
                 None,
                 Some(now_ms() - attempt_started),
             );
@@ -4840,6 +4851,7 @@ pub async fn handle_inference_request(
             billing_coverage_mode: "pay_as_you_go".to_string(),
             plan_multiplier_bps: 10_000,
             service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+            request_headers_json: request_headers_json.clone(),
         };
         let event = usage.event(
             now,
@@ -4850,6 +4862,7 @@ pub async fn handle_inference_request(
             &llmroller_proto::json_usage::ExtractedUsage::default(),
             0,
             CostSource::EstimatedIncomplete,
+            None,
             None,
             Some(now_ms() - now),
         );

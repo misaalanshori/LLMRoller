@@ -340,6 +340,12 @@ pub async fn client_key_auth_middleware(
     // RPM rate limiting (G5) applies strictly to inference endpoints (CLK-1, API-2);
     // administrative/discovery routes like /v1/models, /v1/usage, /v1/key do not consume RPM.
     let path = request.uri().path().to_string();
+    // `SEC-6`, `USG-9` (`F-011`): gate-rejection events must still carry the
+    // sanitized allow-list of diagnostic headers. `Authorization`/`x-api-key`
+    // are never allow-listed, so the bearer secret cannot leak here.
+    let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
+        &headers,
+    ));
     let is_messages_path = path.starts_with("/v1/messages")
         || path.starts_with("/v1/v1/messages")
         || path.starts_with("/messages");
@@ -423,7 +429,7 @@ pub async fn client_key_auth_middleware(
                                 .clone()
                                 .map(|sa| sa.to_string()),
                             stop_reason: None,
-                            request_headers_json: None,
+                            request_headers_json: request_headers_json.clone(),
                             metadata_json: None,
                         },
                         Vec::new(),
