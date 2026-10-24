@@ -3876,7 +3876,7 @@ pub async fn handle_inference_request(
                 continue;
             }
         };
-        let reservation = match state.runtime_state.reserve_key_windows(
+        let mut reservation = match state.runtime_state.reserve_key_windows(
             &snapshot,
             candidate.upstream_key_id,
             Some(candidate.model_pk),
@@ -4013,7 +4013,14 @@ pub async fn handle_inference_request(
                     candidate.upstream_key_id,
                     now,
                 );
-                attempts.push(attempt_record(
+                let (charged_micro_usd, charge_basis) =
+                    failure_charge(attempt_outcome, input_only_estimate);
+                if charged_micro_usd > 0
+                    && let Some(res) = reservation.take()
+                {
+                    res.commit(charged_micro_usd, now);
+                }
+                let mut att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
@@ -4021,9 +4028,11 @@ pub async fn handle_inference_request(
                     attempt_outcome,
                     Some(502),
                     body.len(),
-                    0,
-                    "none",
-                ));
+                    charged_micro_usd,
+                    charge_basis,
+                );
+                att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                attempts.push(att);
                 if let Some(replacement) = note_pre_first_byte_failure(
                     &state,
                     pin_key.as_ref(),
@@ -4401,7 +4410,12 @@ pub async fn handle_inference_request(
                     try_outcomes.push(TryOutcome::HostFailure);
                     let (charged_micro_usd, charge_basis) =
                         failure_charge(outcome, input_only_estimate);
-                    attempts.push(attempt_record(
+                    if charged_micro_usd > 0
+                        && let Some(res) = reservation.take()
+                    {
+                        res.commit(charged_micro_usd, now);
+                    }
+                    let mut att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
@@ -4411,7 +4425,9 @@ pub async fn handle_inference_request(
                         body.len(),
                         charged_micro_usd,
                         charge_basis,
-                    ));
+                    );
+                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                    attempts.push(att);
                 }
                 ErrorClass::Other(_) => {
                     let outcome =
@@ -4708,7 +4724,12 @@ pub async fn handle_inference_request(
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
                         input_only_estimate,
                     );
-                    attempts.push(attempt_record(
+                    if charged_micro_usd > 0
+                        && let Some(res) = reservation.take()
+                    {
+                        res.commit(charged_micro_usd, now);
+                    }
+                    let mut att = attempt_record(
                         request_id,
                         attempt_no as i64,
                         now,
@@ -4718,7 +4739,9 @@ pub async fn handle_inference_request(
                         body.len(),
                         charged_micro_usd,
                         charge_basis,
-                    ));
+                    );
+                    att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                    attempts.push(att);
                     if let Some(replacement) = note_pre_first_byte_failure(
                         &state,
                         pin_key.as_ref(),
@@ -5043,7 +5066,14 @@ pub async fn handle_inference_request(
                 } else {
                     TryOutcome::HostFailure
                 };
-                attempts.push(attempt_record(
+                let (charged_micro_usd, charge_basis) =
+                    failure_charge(attempt_outcome, input_only_estimate);
+                if charged_micro_usd > 0
+                    && let Some(res) = reservation.take()
+                {
+                    res.commit(charged_micro_usd, now);
+                }
+                let mut att = attempt_record(
                     request_id,
                     attempt_no as i64,
                     now,
@@ -5051,9 +5081,11 @@ pub async fn handle_inference_request(
                     attempt_outcome,
                     Some(502),
                     body.len(),
-                    0,
-                    "none",
-                ));
+                    charged_micro_usd,
+                    charge_basis,
+                );
+                att.share_id = candidate.share_id.map(|sh| sh.to_string());
+                attempts.push(att);
                 failovers += 1;
                 crate::metrics::record_failover();
                 try_outcomes.push(try_outcome);
