@@ -4406,6 +4406,7 @@ pub async fn handle_inference_request(
                 let mut tap = SseUsageTap::new(endpoint);
                 let mut first_chunk: Option<Bytes> = None;
                 let mut failure = false;
+                let mut frame_error_payload: Option<String> = None;
 
                 let frame_timeout =
                     Duration::from_millis(candidate.config.first_valid_frame_timeout_ms());
@@ -4420,6 +4421,11 @@ pub async fn handle_inference_request(
                                     break;
                                 }
                                 Ok(None) => {}
+                                Err(crate::forward::ForwardError::UpstreamError(err_msg)) => {
+                                    frame_error_payload = Some(err_msg);
+                                    failure = true;
+                                    break;
+                                }
                                 Err(_) => {
                                     failure = true;
                                     break;
@@ -4444,20 +4450,143 @@ pub async fn handle_inference_request(
                 }
 
                 if failure {
-                    let _ = state.runtime_state.record_upstream_failure(
-                        &origin,
-                        candidate.upstream_key_id,
-                        caller.id,
-                        llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                        None,
-                        now,
-                    );
-                    enqueue_key_health(
-                        state.writer.as_ref(),
-                        &state.runtime_state,
-                        candidate.upstream_key_id,
-                        now,
-                    );
+                    if let Some(ref err_msg) = frame_error_payload {
+                        let frame_class =
+                            llmroller_proto::adapters::classify_error_with_classifiers(
+                                200,
+                                err_msg.as_bytes(),
+                                Some(&candidate.config.error_classifiers),
+                            );
+                        match frame_class {
+                            ErrorClass::RequestRejected => {
+                                let (charged_micro_usd, charge_basis) = failure_charge(
+                                    llmroller_core::usage::AttemptOutcome::from_http_status(400),
+                                    input_only_estimate,
+                                );
+                                attempts.push(attempt_record(
+                                    request_id,
+                                    attempt_no as i64,
+                                    now,
+                                    candidate.upstream_key_id,
+                                    llmroller_core::usage::AttemptOutcome::from_http_status(400),
+                                    Some(400),
+                                    body.len(),
+                                    charged_micro_usd,
+                                    charge_basis,
+                                ));
+                                crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                                let rej_status = if err_msg.contains("flagged")
+                                    || err_msg.contains("moderation")
+                                {
+                                    StatusCode::FORBIDDEN
+                                } else {
+                                    StatusCode::BAD_REQUEST
+                                };
+                                return protocol_error(
+                                    is_messages,
+                                    rej_status,
+                                    "invalid_request_error",
+                                    err_msg.clone(),
+                                    Some(&request_id_str),
+                                    None,
+                                );
+                            }
+                            ErrorClass::PlanRestricted => {
+                                let until = now.saturating_add(PROTOCOL_BLOCK_MS);
+                                state.runtime_state.block_route_protocol(
+                                    candidate.upstream_key_id,
+                                    candidate.model_pk,
+                                    protocol,
+                                    until,
+                                );
+                                enqueue_route_protocol_block(
+                                    &state,
+                                    candidate.upstream_key_id,
+                                    candidate.model_pk,
+                                    protocol,
+                                    "plan_restricted",
+                                    until,
+                                );
+                                try_outcomes.push(TryOutcome::PlanRestricted);
+                            }
+                            ErrorClass::QuotaExhausted => {
+                                state.runtime_state.record_quota_exhausted(
+                                    candidate.upstream_key_id,
+                                    None,
+                                    now,
+                                );
+                                enqueue_key_health(
+                                    state.writer.as_ref(),
+                                    &state.runtime_state,
+                                    candidate.upstream_key_id,
+                                    now,
+                                );
+                                try_outcomes.push(TryOutcome::QuotaExhausted {
+                                    retry_after_secs: None,
+                                });
+                            }
+                            ErrorClass::CredentialInvalid => {
+                                let strike = state.runtime_state.record_upstream_failure(
+                                    &origin,
+                                    candidate.upstream_key_id,
+                                    caller.id,
+                                    llmroller_core::usage::AttemptOutcome::Http401,
+                                    None,
+                                    now,
+                                );
+                                enqueue_key_health(
+                                    state.writer.as_ref(),
+                                    &state.runtime_state,
+                                    candidate.upstream_key_id,
+                                    now,
+                                );
+                                if strike == Some(StrikeResult::ProbeRequired) {
+                                    spawn_credential_probe(
+                                        &state,
+                                        &candidate.base_url,
+                                        candidate.allow_private_network,
+                                        &secret,
+                                        candidate.upstream_key_id,
+                                    );
+                                }
+                                try_outcomes.push(TryOutcome::HostFailure);
+                            }
+                            _ => {
+                                let _ = state.runtime_state.record_upstream_failure(
+                                    &origin,
+                                    candidate.upstream_key_id,
+                                    caller.id,
+                                    llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                                    None,
+                                    now,
+                                );
+                                enqueue_key_health(
+                                    state.writer.as_ref(),
+                                    &state.runtime_state,
+                                    candidate.upstream_key_id,
+                                    now,
+                                );
+                                try_outcomes.push(TryOutcome::HostFailure);
+                            }
+                        }
+                    } else {
+                        let _ = state.runtime_state.record_upstream_failure(
+                            &origin,
+                            candidate.upstream_key_id,
+                            caller.id,
+                            llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                            None,
+                            now,
+                        );
+                        enqueue_key_health(
+                            state.writer.as_ref(),
+                            &state.runtime_state,
+                            candidate.upstream_key_id,
+                            now,
+                        );
+                        try_outcomes.push(TryOutcome::HostFailure);
+                    }
+
                     let (charged_micro_usd, charge_basis) = failure_charge(
                         llmroller_core::usage::AttemptOutcome::ErrorFrame,
                         input_only_estimate,
@@ -4488,7 +4617,6 @@ pub async fn handle_inference_request(
                     }
                     failovers += 1;
                     crate::metrics::record_failover();
-                    try_outcomes.push(TryOutcome::HostFailure);
                     continue;
                 }
 
