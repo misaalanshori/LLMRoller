@@ -522,6 +522,40 @@ impl PinStore {
         self.entries.insert(pin_key, Arc::new(Mutex::new(entry)));
     }
 
+    /// Upsert or touch a confirmed pin for HardKey / state-bound operations (RTE-12).
+    pub fn upsert_confirmed(
+        &self,
+        pin_key: PinKey,
+        upstream_key_id: UpstreamKeyId,
+        pool_tier: CandidatePoolTier,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) {
+        if let Some(entry_arc) = self.entries.get(&pin_key) {
+            let mut entry = entry_arc.lock();
+            entry.upstream_key_id = upstream_key_id;
+            entry.state = PinState::Confirmed;
+            entry.pool_tier = pool_tier;
+            entry.last_used_ms = now_ms;
+            entry.expires_ms = now_ms.saturating_add(ttl_ms);
+        } else {
+            self.insert_hydrated(
+                pin_key,
+                PinEntry {
+                    state: PinState::Confirmed,
+                    upstream_key_id,
+                    generation: 1,
+                    pool_tier,
+                    created_ms: now_ms,
+                    last_used_ms: now_ms,
+                    expires_ms: now_ms.saturating_add(ttl_ms),
+                    repin_count: 0,
+                    tried_this_generation: Vec::new(),
+                },
+            );
+        }
+    }
+
     /// Sweeper removes expired pins every 60s (RTE-10).
     pub fn sweep(&self, now_ms: i64) {
         self.entries.retain(|_, arc| {

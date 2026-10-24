@@ -7,6 +7,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#27-sub-phase-27-v1-orchestrator-v1-pre-flight-body-memory-budget-graceful-sigterm-drain-and-early-load-harness
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -32,7 +33,7 @@ use llmroller_core::eligibility::{
 };
 use llmroller_core::health::StrikeResult;
 use llmroller_core::ids::{
-    ClientKeyId, ModelPk, ProviderId, RequestId, ShareId, UpstreamKeyId, UserId,
+    ClientKeyId, ModelPk, ProviderId, RequestId, ShareId, UpstreamKeyId, UsageEventId, UserId,
 };
 use llmroller_core::pins::{PinEntry, PinKey, PinOutcome, PinTicket};
 use llmroller_core::pricing::{
@@ -960,11 +961,20 @@ async fn forward_state_bound_response_op(
             "the linked upstream origin is not permitted",
         );
     }
+    let auth_scheme = provider
+        .config
+        .auth
+        .for_endpoint(ProviderEndpoint::Responses);
+    let (auth_header, auth_prefix) = auth_scheme
+        .as_ref()
+        .map_or(("authorization", "Bearer "), |scheme| {
+            (scheme.header.as_str(), scheme.prefix.as_str())
+        });
     let client = state.select_http_client(provider.allow_private_network);
     let request_id = RequestId::generate().to_string();
     let upstream = match client
         .request(method.clone(), &url)
-        .header(header::AUTHORIZATION.as_str(), format!("Bearer {secret}"))
+        .header(auth_header, format!("{auth_prefix}{secret}"))
         .header("x-request-id", &request_id)
         .send()
         .await
@@ -981,7 +991,26 @@ async fn forward_state_bound_response_op(
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
+    let candidate_tier = if provider.owner_user_id.is_none() {
+        CandidatePoolTier::Global
+    } else if provider.owner_user_id == Some(caller.owner_user_id) {
+        CandidatePoolTier::Own
+    } else {
+        CandidatePoolTier::Shared
+    };
+    let pool_tier = candidate_tier_as_pool(candidate_tier);
+    let is_admin = snapshot
+        .users
+        .get(&caller.owner_user_id)
+        .is_some_and(|user| user.role == Role::Admin);
+
+    let filtered_headers = llmroller_proto::headers::apply_response_header_pipeline(
+        upstream.headers(),
+        pool_tier,
+        is_admin,
+        &request_id,
+        &provider.config.response_header_allow,
+    );
     let body = match upstream.bytes().await {
         Ok(body) => body,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
@@ -1026,9 +1055,90 @@ async fn forward_state_bound_response_op(
         }
     }
 
+    let canonical_id = snapshot
+        .models
+        .get(&link.model_pk)
+        .map_or_else(|| "gpt-4o".to_string(), |m| m.canonical_id.clone());
+
+    if !link.session_hash.is_empty() {
+        let pin_key = PinKey {
+            client_key_id: caller.id,
+            canonical_id: canonical_id.clone(),
+            session_hash: link.session_hash.clone(),
+        };
+        let pin_ttl_ms = snapshot.settings.pin_ttl_secs.saturating_mul(1000);
+        state.pin_store.upsert_confirmed(
+            pin_key,
+            link.upstream_key_id,
+            candidate_tier,
+            now,
+            pin_ttl_ms,
+        );
+    }
+
+    if let Some(writer) = &state.writer {
+        let tier_str = match pool_tier {
+            PoolTier::Own => "own",
+            PoolTier::Shared => "shared",
+            PoolTier::Global | PoolTier::Blended => "global",
+        };
+        let rid = RequestId::from_str(&request_id).unwrap_or_else(|_| RequestId::generate());
+        writer.queues.usage_writer.enqueue(
+            UsageEventRecord {
+                id: UsageEventId::generate().to_string(),
+                ts: now,
+                request_id: rid,
+                client_key_id: caller.id,
+                owner_user_id: caller.owner_user_id,
+                upstream_key_id: Some(link.upstream_key_id.to_string()),
+                provider_id: Some(key.provider_id.to_string()),
+                provider_scope: Some(tier_str.to_string()),
+                share_id: None,
+                canonical_id: Some(canonical_id),
+                upstream_model_id: None,
+                endpoint: "responses".to_string(),
+                protocol: Some("responses".to_string()),
+                session_hash: if link.session_hash.is_empty() {
+                    None
+                } else {
+                    Some(link.session_hash.clone())
+                },
+                status: i64::from(status.as_u16()),
+                stream: false,
+                incomplete: false,
+                termination: "completed".to_string(),
+                trace_dropped: false,
+                input_uncached_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cost_micro_usd: 0,
+                cost_source: CostSource::PriceBook,
+                latency_ms: Some((now_ms() - now).max(0)),
+                ttfb_ms: None,
+                pin_outcome: None,
+                failovers: 0,
+                error_code: if status.is_success() {
+                    None
+                } else {
+                    Some("upstream_error".to_string())
+                },
+                list_cost_micro_usd: 0,
+                plan_multiplier_bps: 10_000,
+                billing_coverage_mode: "pay_as_you_go".to_string(),
+                service_account_id: caller.service_account_id.clone().map(|sa| sa.to_string()),
+                stop_reason: None,
+                request_headers_json: None,
+                metadata_json: None,
+            },
+            Vec::new(),
+        );
+    }
+
     let mut builder = Response::builder().status(status);
-    if let Some(content_type) = content_type {
-        builder = builder.header(CONTENT_TYPE, content_type);
+    for (name, value) in &filtered_headers {
+        builder = builder.header(name, value);
     }
     builder
         .body(Body::from(body))

@@ -75,7 +75,10 @@ impl MockState {
 
 async fn record(state: &MockState, request: &mut Request<Body>) -> String {
     let method = request.method().as_str().to_string();
-    let path = request.uri().path().to_string();
+    let path = request.uri().path_and_query().map_or_else(
+        || request.uri().path().to_string(),
+        |pq| pq.as_str().to_string(),
+    );
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -429,25 +432,49 @@ async fn test_state_bound_get_forwards_to_bound_upstream_key_verbatim() {
     let app = build_app(&harness).await;
 
     let response = app
-        .oneshot(request("GET", "/v1/responses/resp_up_1", &token, None))
+        .oneshot(request(
+            "GET",
+            "/v1/responses/resp_up_1?include=step_details",
+            &token,
+            None,
+        ))
         .await
         .expect("get response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().contains_key("x-llmroller-request-id"),
+        "response header pipeline must insert x-llmroller-request-id"
+    );
     let json = response_json(response).await;
     assert_eq!(
         json["output"][0]["content"][0]["text"], "Real upstream output",
         "the upstream payload must be returned verbatim"
     );
 
-    let calls = mock.calls.lock().expect("calls");
-    let get_call = calls
-        .iter()
-        .find(|call| call.method == "GET" && call.path == "/responses/resp_up_1")
-        .expect("upstream GET");
-    assert_eq!(
-        get_call.authorization.as_deref(),
-        Some("Bearer sk-bound"),
-        "the state-bound call must use the exact bound upstream key"
+    {
+        let calls = mock.calls.lock().expect("calls");
+        let get_call = calls
+            .iter()
+            .find(|call| {
+                call.method == "GET" && call.path == "/responses/resp_up_1?include=step_details"
+            })
+            .expect("upstream GET with query string");
+        assert_eq!(
+            get_call.authorization.as_deref(),
+            Some("Bearer sk-bound"),
+            "the state-bound call must use the exact bound upstream key"
+        );
+    }
+
+    flush(&harness).await;
+    let events_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE endpoint = 'responses'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("count usage events");
+    assert!(
+        events_count >= 1,
+        "state-bound response operation must emit a usage_events row"
     );
 }
 
