@@ -60,6 +60,7 @@ fn test_timeline_reconstruction_with_lcp_and_decryption_cap() {
         assistant_reasoning: None,
         assistant_tool_calls: vec![],
         has_load_more_placeholder: false,
+        context_compacted_or_branched: false,
     };
 
     let turn2_refs = [b1.clone(), b2.clone(), b3.clone()];
@@ -92,21 +93,56 @@ fn test_timeline_reconstruction_with_lcp_and_decryption_cap() {
         assistant_reasoning: None,
         assistant_tool_calls: vec![],
         has_load_more_placeholder: false,
+        context_compacted_or_branched: false,
     };
 
-    let input = [(&turn1_refs[..], turn1), (&turn2_refs[..], turn2)];
+    let input = [
+        (&turn1_refs[..], turn1.clone()),
+        (&turn2_refs[..], turn2.clone()),
+    ];
 
     let timeline = reconstruct_timeline(&input, 10_000);
     assert_eq!(timeline.len(), 2);
 
-    // Turn 1: both messages are new
+    // Turn 1: both messages are new, not compacted or branched
     assert!(timeline[0].messages[0].is_new);
     assert!(timeline[0].messages[1].is_new);
+    assert!(!timeline[0].context_compacted_or_branched);
 
     // Turn 2: LCP is 2! Messages 0 and 1 are repeated prefix, message 2 is new!
     assert!(!timeline[1].messages[0].is_new);
     assert!(!timeline[1].messages[1].is_new);
     assert!(timeline[1].messages[2].is_new);
+    assert!(!timeline[1].context_compacted_or_branched);
+
+    // Turn 3: Compacted/branched context (e.g. prefix shrinks or branches)
+    let b_comp = "hash_b_comp".to_string();
+    let turn3_refs = [b_comp.clone()];
+    let turn3 = PreviewTurn {
+        request_id: "req-3".to_string(),
+        ts: 3000,
+        canonical_model: "gpt-4o".to_string(),
+        protocol: "chat".to_string(),
+        messages: vec![PreviewMessage {
+            role: "user".to_string(),
+            content: "compacted question".to_string(),
+            block_hash: b_comp,
+            is_new: false,
+        }],
+        assistant_text: "assistant reply 3".to_string(),
+        assistant_reasoning: None,
+        assistant_tool_calls: vec![],
+        has_load_more_placeholder: false,
+        context_compacted_or_branched: false,
+    };
+    let input3 = [
+        (&turn1_refs[..], turn1.clone()),
+        (&turn2_refs[..], turn2.clone()),
+        (&turn3_refs[..], turn3),
+    ];
+    let timeline3 = reconstruct_timeline(&input3, 10_000);
+    assert_eq!(timeline3.len(), 3);
+    assert!(timeline3[2].context_compacted_or_branched);
 
     // Decryption cap: if max_decrypt_bytes is small, sets has_load_more_placeholder
     let capped_timeline = reconstruct_timeline(&input, 10);

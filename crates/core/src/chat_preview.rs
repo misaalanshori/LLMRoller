@@ -104,10 +104,13 @@ pub fn sanitize_assistant_markdown(text: &str) -> String {
 }
 
 /// Returns whether a turn's block reference sequence indicates context compaction or branching
-/// relative to the previous turn (`lcp < prev_refs.len()`, excluding empty `prev_refs`; `F-062`, `TRC-5`).
+/// relative to the previous turn (`lcp < prev_refs.len()`, excluding empty `prev_refs` and identical retries; `F-062`, `TRC-5`).
 #[must_use]
 pub fn is_compacted_or_branched(prev_refs: &[String], curr_refs: &[String]) -> bool {
-    !prev_refs.is_empty() && compute_lcp(prev_refs, curr_refs) < prev_refs.len()
+    if prev_refs.is_empty() || prev_refs == curr_refs {
+        return false;
+    }
+    compute_lcp(prev_refs, curr_refs) < prev_refs.len()
 }
 
 /// Single reconstructed message in the session preview timeline.
@@ -131,6 +134,7 @@ pub struct PreviewTurn {
     pub assistant_reasoning: Option<String>,
     pub assistant_tool_calls: Vec<serde_json::Value>,
     pub has_load_more_placeholder: bool,
+    pub context_compacted_or_branched: bool,
 }
 
 /// Reconstructs a sequence of turns into a deduplicated preview timeline (TRC-5).
@@ -145,6 +149,7 @@ pub fn reconstruct_timeline(
     for (block_refs, turn) in turns {
         let lcp = compute_lcp(prev_refs, block_refs);
         let mut new_turn = turn.clone();
+        new_turn.context_compacted_or_branched = is_compacted_or_branched(prev_refs, block_refs);
 
         // Mark only new blocks beyond LCP as is_new
         for (i, msg) in new_turn.messages.iter_mut().enumerate() {

@@ -2778,6 +2778,11 @@ async fn get_session_preview_internal(
         } else {
             0
         };
+        let is_compacted_or_branched = thread_id == prev_thread_id
+            && llmroller_core::chat_preview::is_compacted_or_branched(
+                &prev_block_refs,
+                &turn_trace.block_refs,
+            );
         prev_block_refs = turn_trace.block_refs.clone();
         prev_thread_id = thread_id.clone();
 
@@ -2882,6 +2887,7 @@ async fn get_session_preview_internal(
             "canonical_model": escape_html(&canonical_model),
             "protocol": escape_html(&protocol),
             "truncated_content": truncated_content,
+            "context_compacted_or_branched": is_compacted_or_branched,
             "new_input_messages": new_input_messages,
             "assistant_text": sanitized_assistant,
             "assistant_reasoning": assistant_reasoning,
