@@ -2508,17 +2508,24 @@ fn resolve_session(
 
     let use_step8 = raw_session.is_empty()
         || (step.is_generic() && client_key.constant_session_mode == "fingerprint_generic_ids");
-    let session_hash = if use_step8 {
+    let (session_hash, fallback_id_opt) = if use_step8 {
         let (sys, usr) = canonical.as_ref()?;
-        llmroller_core::session::compute_step8_fingerprint(
+        let fallback_id = llmroller_core::session::compute_step8_fingerprint(
             &client_key.id,
             canonical_id,
             llmroller_core::session::protocol_code(protocol),
             sys,
             usr,
-        )
+        );
+        let hash = session_hash(
+            session_hmac_secret,
+            &client_key.owner_user_id,
+            client_key.id,
+            &fallback_id,
+        );
+        (hash, Some(fallback_id))
     } else {
-        raw_hash?
+        (raw_hash?, None)
     };
 
     // Step 8 has no client-supplied seed, so the canonical fingerprint is the
@@ -2526,8 +2533,8 @@ fn resolve_session(
     // fingerprinted via `constant_session_mode == "fingerprint_generic_ids"`.
     // The instance secret is always present in production; an empty key keeps
     // unit-level fixtures deterministic.
-    let affinity_seed = if use_step8 {
-        session_hash.as_str()
+    let affinity_seed = if let Some(ref fallback_id) = fallback_id_opt {
+        fallback_id.as_str()
     } else {
         raw_session.as_str()
     };
@@ -5891,9 +5898,14 @@ mod tests {
         )
         .expect("generic session must resolve");
 
+        assert_eq!(
+            resolved.pin_key.session_hash.len(),
+            32,
+            "session_hash must be a 32-character tenant-scoped HMAC"
+        );
         assert!(
-            resolved.pin_key.session_hash.starts_with("fp:"),
-            "fingerprint_generic_ids must switch the pin to Step 8"
+            !resolved.pin_key.session_hash.starts_with("fp:"),
+            "Step 8 session_hash must not start with raw 'fp:' prefix"
         );
         assert!(
             resolved.raw_session.is_empty(),
@@ -5954,7 +5966,7 @@ mod tests {
             4_000,
         )
         .expect("Step 8 must produce a fingerprint pin");
-        assert!(step8_first.session_hash.starts_with("fp:"));
+        assert!(!step8_first.session_hash.starts_with("fp:"));
         assert_eq!(step8_first.session_hash, step8_second.session_hash);
         assert_ne!(step8_first.session_hash, first.session_hash);
 
@@ -5968,6 +5980,29 @@ mod tests {
         .expect("HMAC session hash must produce a pin");
         assert_eq!(hmac_pin.session_hash.len(), 32);
         assert_ne!(hmac_pin.session_hash, first.session_hash);
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-1, SEC-9 - F-046 Step 8 fallback session ID is HMAC hashed into 32 hex chars"]
+    fn step_8_fallback_session_id_is_hmac_hashed_into_32_hex_chars() {
+        let runtime = RuntimeState::new();
+        let key = session_test_key("flag");
+        let pin = test_session_pin(
+            &key,
+            &session_body(None, "opening question"),
+            Some(b"instance-session-secret-32-bytes"),
+            &runtime,
+            1_000,
+        )
+        .expect("Step 8 must produce a pin");
+
+        assert_eq!(pin.session_hash.len(), 32);
+        assert!(!pin.session_hash.starts_with("fp:"));
+        assert!(
+            pin.session_hash
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        );
     }
 
     #[test]
