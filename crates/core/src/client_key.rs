@@ -44,6 +44,8 @@ pub struct ClientKeyRecord {
     pub routing_scope: String,
     pub allowed_models: Option<Vec<String>>,
     pub rate_limit_rpm: Option<i64>,
+    #[serde(default)]
+    pub rate_limit_tpm: Option<i64>,
     pub budget_micro_usd_month: Option<i64>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub constant_session_mode: String,

@@ -34,13 +34,35 @@ use llmroller_store::providers::{
 };
 use llmroller_store::settings::seed_defaults;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MockUpstreamState {
     calls: Arc<AtomicUsize>,
+    status: Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl Default for MockUpstreamState {
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            status: Arc::new(std::sync::atomic::AtomicU16::new(200)),
+        }
+    }
 }
 
 async fn mock_chat(State(state): State<MockUpstreamState>, _body: axum::body::Bytes) -> Response {
     state.calls.fetch_add(1, Ordering::SeqCst);
+    let code = state.status.load(Ordering::SeqCst);
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+    if !status.is_success() {
+        return (
+            status,
+            [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "error": { "message": "mock error", "code": "upstream_error" }
+            })),
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -62,6 +84,24 @@ async fn mock_chat(State(state): State<MockUpstreamState>, _body: axum::body::By
 
 async fn spawn_mock_upstream() -> (SocketAddr, MockUpstreamState) {
     let state = MockUpstreamState::default();
+    let app = Router::new()
+        .route("/chat/completions", post(mock_chat))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, state)
+}
+
+async fn spawn_mock_upstream_status(status: StatusCode) -> (SocketAddr, MockUpstreamState) {
+    let state = MockUpstreamState {
+        calls: Arc::new(AtomicUsize::new(0)),
+        status: Arc::new(std::sync::atomic::AtomicU16::new(status.as_u16())),
+    };
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
         .with_state(state.clone());
@@ -183,6 +223,16 @@ async fn create_upstream_key(
     label: &str,
     priority: i64,
 ) -> UpstreamKeyId {
+    create_upstream_key_with_tier(harness, provider_id, label, priority, 1).await
+}
+
+async fn create_upstream_key_with_tier(
+    harness: &Harness,
+    provider_id: llmroller_core::ids::ProviderId,
+    label: &str,
+    priority: i64,
+    strict_tier: i64,
+) -> UpstreamKeyId {
     let mut tx = harness.pool.begin().await.expect("begin");
     let key = create_upstream_key_tx(
         &mut tx,
@@ -195,7 +245,7 @@ async fn create_upstream_key(
             label: label.to_string(),
             secret: secret_string(format!("sk-{label}")),
             priority: Some(priority),
-            strict_tier: Some(1),
+            strict_tier: Some(strict_tier),
             enabled: Some(true),
         },
         1000,
@@ -584,5 +634,69 @@ async fn test_client_monthly_cap_rejects_before_upstream_dispatch() {
         mock_state.calls.load(Ordering::SeqCst),
         0,
         "no upstream request may be made after the cap is exceeded"
+    );
+}
+
+#[doc = "Spec: RTE-6, F031 - Strict tier prevents failover from Tier 1 to Tier 2 when Tier 1 key fails"]
+#[tokio::test]
+async fn regression_test_f031_strict_tier_blocks_fallback_to_lower_tiers() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "f031-user").await;
+    let (mock_a, state_a) = spawn_mock_upstream_status(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (mock_b, state_b) = spawn_mock_upstream().await;
+
+    let provider_a = create_provider(
+        &harness,
+        "Provider Tier 1",
+        format!("http://{mock_a}"),
+        OwnershipScope::Global,
+        None,
+    )
+    .await;
+    let key_a = create_upstream_key_with_tier(&harness, provider_a, "key-tier-1", 100, 1).await;
+
+    let provider_b = create_provider(
+        &harness,
+        "Provider Tier 2",
+        format!("http://{mock_b}"),
+        OwnershipScope::Global,
+        None,
+    )
+    .await;
+    let key_b = create_upstream_key_with_tier(&harness, provider_b, "key-tier-2", 100, 2).await;
+
+    let model_pk = ModelPk::generate();
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed, routing_strategy, distribution) VALUES (?, 'gpt-4o-strict', 1, 'smooth_weighted_rr', 'strict')",
+    )
+    .bind(model_pk.to_string())
+    .execute(&harness.pool)
+    .await
+    .expect("insert strict model");
+
+    insert_route(&harness, key_a, model_pk, "gpt-4o-strict", true).await;
+    insert_route(&harness, key_b, model_pk, "gpt-4o-strict", true).await;
+
+    let token = create_client_key(&harness, user, "f031-client-key", None, None).await;
+    let (app, _runtime) = build_app(&harness, harness.master_key.clone()).await;
+
+    let response = app
+        .oneshot(chat_request(&token, "gpt-4o-strict"))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "when Tier 1 fails and strict tier is active, request must not fall back to Tier 2"
+    );
+    assert_eq!(
+        state_a.calls.load(Ordering::SeqCst),
+        1,
+        "Tier 1 key was attempted"
+    );
+    assert_eq!(
+        state_b.calls.load(Ordering::SeqCst),
+        0,
+        "Tier 2 key must NEVER be queried because strict tier forbids cross-tier fallback"
     );
 }

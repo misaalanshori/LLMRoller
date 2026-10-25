@@ -665,3 +665,44 @@ async fn version_one_database_upgrades_to_version_two_without_losing_rows() {
     migrate(&pool).await.expect("upgrade must be idempotent");
     pool.close().await;
 }
+
+#[tokio::test]
+#[doc = "Spec: MNT-1, F065 - Migration checksum verification detects tampered migration scripts"]
+async fn regression_test_f065_migration_checksum_mismatch_fails_fast() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("tampered.db");
+    let pool = open_pool(&path, Role::Writer)
+        .await
+        .expect("writer pool must open");
+
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&pool)
+        .await
+        .expect("incremental auto-vacuum");
+    sqlx::query("VACUUM").execute(&pool).await.expect("vacuum");
+    sqlx::raw_sql(INITIAL_SCHEMA_SQL)
+        .execute(&pool)
+        .await
+        .expect("version 1 schema");
+
+    // Insert an invalid / tampered checksum for version 1
+    sqlx::query("INSERT INTO _llmroller_schema (version, checksum) VALUES (1, 'tampered-sha256-digest-value')")
+        .execute(&pool)
+        .await
+        .expect("tampered version 1 row");
+
+    let error = migrate(&pool)
+        .await
+        .expect_err("migration runner must reject tampered migration checksum");
+    assert!(matches!(
+        error,
+        MigrationError::ChecksumMismatch {
+            version: 1,
+            ref actual,
+            ..
+        } if actual == "tampered-sha256-digest-value"
+    ));
+    assert_eq!(error.exit_code(), 14);
+
+    pool.close().await;
+}

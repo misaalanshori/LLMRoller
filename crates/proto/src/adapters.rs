@@ -82,6 +82,101 @@ const EMBEDDED_REQUEST_REJECTED_SUBSTRINGS: [&str; 6] = [
     "bad_request",
 ];
 
+/// Extract embedded error status, code, type, and message from a JSON body or SSE error frame (F001, F002).
+#[must_use]
+pub fn extract_embedded_status_and_error_fields(
+    body: &[u8],
+) -> Option<(Option<u16>, String, String, String)> {
+    let extracted = extract_sse_data_or_raw(body);
+    let val: serde_json::Value = serde_json::from_str(&extracted).ok()?;
+
+    let err_obj = val.get("error").or_else(|| val.pointer("/response/error"));
+    let is_error_type = val.get("type").and_then(|t| t.as_str()) == Some("error");
+    let is_failed_status = val.get("status").and_then(|s| s.as_str()) == Some("failed");
+
+    if err_obj.is_none() && !is_error_type && !is_failed_status {
+        return None;
+    }
+
+    let mut status: Option<u16> = None;
+    let mut code = String::new();
+    let mut err_type = String::new();
+    let mut message = String::new();
+
+    let parse_status = |v: &serde_json::Value| -> Option<u16> {
+        if let Some(n) = v.as_u64() {
+            u16::try_from(n).ok()
+        } else if let Some(s) = v.as_str() {
+            s.parse::<u16>().ok()
+        } else {
+            None
+        }
+    };
+
+    if let Some(err) = err_obj {
+        if let Some(obj) = err.as_object() {
+            if let Some(s) = obj.get("status").and_then(parse_status) {
+                status = Some(s);
+            } else if let Some(c) = obj.get("code").and_then(parse_status) {
+                status = Some(c);
+            }
+            if let Some(c) = obj.get("code").and_then(|v| v.as_str()) {
+                code = c.to_string();
+            } else if let Some(c) = obj.get("code").and_then(|v| v.as_u64()) {
+                code = c.to_string();
+            }
+            if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
+                err_type = t.to_string();
+            }
+            if let Some(m) = obj.get("message").and_then(|v| v.as_str()) {
+                message = m.to_string();
+            }
+        } else if let Some(s) = err.as_str() {
+            message = s.to_string();
+        }
+    }
+
+    if status.is_none() {
+        if let Some(s) = val.get("status").and_then(parse_status) {
+            status = Some(s);
+        } else if let Some(c) = val.get("code").and_then(parse_status) {
+            status = Some(c);
+        }
+    }
+    if code.is_empty() {
+        if let Some(c) = val.get("code").and_then(|v| v.as_str()) {
+            code = c.to_string();
+        } else if let Some(c) = val.get("code").and_then(|v| v.as_u64()) {
+            code = c.to_string();
+        }
+    }
+    if err_type.is_empty()
+        && let Some(t) = val.get("type").and_then(|v| v.as_str())
+    {
+        err_type = t.to_string();
+    }
+    if message.is_empty()
+        && let Some(m) = val.get("message").and_then(|v| v.as_str())
+    {
+        message = m.to_string();
+    }
+
+    if is_failed_status && let Some(last_err) = val.get("last_error") {
+        if let Some(c) = last_err.get("code").and_then(|v| v.as_str())
+            && code.is_empty()
+        {
+            code = c.to_string();
+        }
+        if let Some(m) = last_err.get("message").and_then(|v| v.as_str())
+            && message.is_empty()
+        {
+            message = m.to_string();
+        }
+    }
+
+    Some((status, code, err_type, message))
+}
+
 /// Extract the JSON payload from a multi-line SSE error frame (`event: error\ndata: {...}`),
 /// or return the raw UTF-8 string when the input is not SSE-framed (`F017`).
 #[must_use]
@@ -187,6 +282,70 @@ pub fn classify_error_with_classifiers(
             && ErrorClassifiers::matches(&custom.credential_invalid_substrings, &body_str)
         {
             return ErrorClass::CredentialInvalid;
+        }
+        if matches!(status, 200 | 404)
+            && ErrorClassifiers::matches(&custom.model_not_found_substrings, &body_str)
+        {
+            return ErrorClass::Other(404);
+        }
+    }
+
+    // F001 & F002: Check embedded status and error fields when status == 200
+    if status == 200 {
+        if let Some((emb_status, code, err_type, _msg)) =
+            extract_embedded_status_and_error_fields(body_8k)
+        {
+            let code_lower = code.to_ascii_lowercase();
+            let type_lower = err_type.to_ascii_lowercase();
+
+            if emb_status == Some(404)
+                || code_lower == "model_not_found"
+                || type_lower == "model_not_found"
+                || is_model_not_found_error(200, body_8k, classifiers)
+            {
+                return ErrorClass::Other(404);
+            }
+            if emb_status == Some(429)
+                || code_lower.contains("rate_limit")
+                || type_lower.contains("rate_limit")
+            {
+                return ErrorClass::Other(429);
+            }
+            if emb_status == Some(402)
+                || code_lower.contains("quota")
+                || code_lower.contains("balance")
+                || code_lower.contains("credit")
+                || type_lower.contains("quota")
+            {
+                return ErrorClass::QuotaExhausted;
+            }
+            if emb_status == Some(401)
+                || code_lower.contains("auth")
+                || type_lower.contains("auth")
+                || code_lower.contains("invalid_api_key")
+                || type_lower.contains("invalid_api_key")
+            {
+                return ErrorClass::CredentialInvalid;
+            }
+            if emb_status == Some(400)
+                || type_lower == "invalid_request_error"
+                || code_lower.contains("bad_request")
+            {
+                return ErrorClass::RequestRejected;
+            }
+            if emb_status == Some(529) || type_lower == "overloaded_error" {
+                return ErrorClass::Other(529);
+            }
+            if let Some(s) = emb_status {
+                if s == 403 {
+                    return ErrorClass::PlanRestricted;
+                }
+                return ErrorClass::Other(s);
+            }
+        }
+
+        if is_model_not_found_error(200, body_8k, classifiers) {
+            return ErrorClass::Other(404);
         }
     }
 

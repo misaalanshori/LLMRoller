@@ -994,6 +994,7 @@ mod tests {
             routing_scope: "inherit".to_string(),
             allowed_models: None,
             rate_limit_rpm: None,
+            rate_limit_tpm: None,
             budget_micro_usd_month: None,
             allowed_cidrs: None,
             constant_session_mode: "off".to_string(),

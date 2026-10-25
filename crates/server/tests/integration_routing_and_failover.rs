@@ -535,6 +535,16 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
                     r#"{"input_tokens": 10}"#,
                 )
             }),
+        )
+        .route(
+            "/embeddings",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0023,0.0456,-0.0123]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":4,"total_tokens":4}}"#,
+                )
+            }),
         );
     let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -603,6 +613,15 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     .await
     .expect("insert model claude");
 
+    let model_pk3 = ModelPk::generate();
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'text-embedding-3-small', 1)",
+    )
+    .bind(model_pk3.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model text-embedding-3-small");
+
     for model_pk in [model_pk1, model_pk2] {
         sqlx::query(
             "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
@@ -614,6 +633,16 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         .await
         .expect("insert model route");
     }
+
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+         VALUES (?, ?, 'text-embedding-3-small', '[\"embeddings\"]', 'active', 1000)",
+    )
+    .bind(upstream_key.id.to_string())
+    .bind(model_pk3.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model route embeddings");
 
     let created_key = create_client_key_tx(
         &mut tx,
@@ -739,6 +768,37 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
     assert_eq!(responses_calls.load(Ordering::SeqCst), 1);
     assert_eq!(compact_calls.load(Ordering::SeqCst), 1);
 
+    // 6. POST /v1/embeddings (F028)
+    let req_emb = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"text-embedding-3-small","input":"test prompt"}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_emb).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["object"], "list");
+    assert_eq!(json["data"][0]["embedding"][0], 0.0023);
+    assert_eq!(json["usage"]["prompt_tokens"], 4);
+
+    // POST /v1/embeddings with stream: true must return 400 Bad Request
+    let req_emb_stream = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"text-embedding-3-small","input":"test prompt","stream":true}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_emb_stream).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // A 404 from the compact endpoint is cached without failing the key, and a
     // second request short-circuits without another upstream probe (API-8).
     reject_compact.store(true, Ordering::SeqCst);
@@ -843,4 +903,167 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         .expect("req");
     let resp = app.oneshot(req_del).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[doc = "Spec: API-1, F028 - POST /v1/embeddings route integration test verifying forwarding and rejection of streaming"]
+#[tokio::test]
+async fn regression_test_f028_embeddings_endpoint_route_and_usage_accounting() {
+    use arc_swap::ArcSwap;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use http_body_util::BodyExt as _;
+    use llmroller_core::provider::ProviderKind;
+    use llmroller_core::rbac::OwnershipScope;
+    use llmroller_core::seams::secret_string;
+    use llmroller_proxy::auth::ProxyAuthState;
+    use llmroller_proxy::listeners::data_plane_router;
+    use llmroller_server::reloader::load_initial_snapshot;
+    use llmroller_store::client_keys::{NewClientKey, create_client_key_tx};
+    use llmroller_store::providers::{
+        NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
+    };
+    use tower::ServiceExt as _;
+
+    let mock_app = axum::Router::new().route(
+        "/embeddings",
+        axum::routing::post(|| async {
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#,
+            )
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
+    let (_dir, pool, master_key, user_id) = setup_failover_test_db().await;
+    let actor = ActorScope::user(user_id, Role::User);
+    let mut tx = pool.begin().await.expect("begin");
+
+    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
+    let provider = create_provider_tx(
+        &mut tx,
+        &system_actor,
+        NewProvider {
+            name: "Mock Embeddings Provider".to_string(),
+            kind: ProviderKind::Custom,
+            base_url: format!("http://{}", mock_addr),
+            config_json: "{}".to_string(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            usage_url_cross_origin_ack: false,
+            allow_private_network: true,
+            enabled: true,
+        },
+        1000,
+    )
+    .await
+    .expect("create provider");
+
+    let upstream_key = create_upstream_key_tx(
+        &mut tx,
+        &system_actor,
+        &master_key,
+        "key-emb",
+        Arc::new(OsEntropy),
+        NewUpstreamKey {
+            provider_id: provider.id,
+            label: "Mock Upstream Key Embeddings".to_string(),
+            secret: secret_string("sk-mock-emb-key"),
+            priority: Some(100),
+            strict_tier: Some(1),
+            enabled: Some(true),
+        },
+        1000,
+    )
+    .await
+    .expect("create upstream key");
+
+    let model_pk = ModelPk::generate();
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'text-embedding-3-small', 1)",
+    )
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model text-embedding-3-small");
+
+    sqlx::query(
+        "INSERT INTO model_routes (upstream_key_id, model_pk, upstream_model_id, protocols, status, discovered_at) \
+         VALUES (?, ?, 'text-embedding-3-small', '[\"embeddings\"]', 'active', 1000)",
+    )
+    .bind(upstream_key.id.to_string())
+    .bind(model_pk.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert model route embeddings");
+
+    let created_key = create_client_key_tx(
+        &mut tx,
+        &actor,
+        user_id,
+        NewClientKey {
+            label: "test-emb-client-key".to_string(),
+            service_account_id: None,
+            allowed_models: None,
+            routing_scope: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            expires_at: None,
+            constant_session_mode: None,
+        },
+        &OsEntropy,
+        1000,
+    )
+    .await
+    .expect("create client key");
+
+    tx.commit().await.expect("commit");
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let client_key_token = created_key.raw_token.expose_secret().to_string();
+    let initial_snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+
+    let state = ProxyAuthState::new(shared_snapshot, pool.clone(), vec![])
+        .with_master_key(master_key.clone());
+    state.is_ready.store(true, Ordering::SeqCst);
+    let app = data_plane_router(state);
+
+    let req_emb = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"text-embedding-3-small","input":"test prompt"}"#,
+        ))
+        .expect("req");
+    let resp = app.clone().oneshot(req_emb).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["object"], "list");
+    assert_eq!(json["model"], "text-embedding-3-small");
+    assert_eq!(json["usage"]["prompt_tokens"], 5);
+
+    // Stream on /v1/embeddings must return 400 Bad Request
+    let req_stream = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"text-embedding-3-small","input":"test prompt","stream":true}"#,
+        ))
+        .expect("req");
+    let resp = app.oneshot(req_stream).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

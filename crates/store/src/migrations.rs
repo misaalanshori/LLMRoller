@@ -34,6 +34,16 @@ pub enum MigrationError {
         /// Highest version this build understands.
         supported: i64,
     },
+    /// A previously applied migration's stored checksum does not match the embedded SQL script.
+    #[error("migration {version} checksum mismatch: expected {expected}, found {actual}")]
+    ChecksumMismatch {
+        /// Migration version with mismatch.
+        version: i64,
+        /// Expected SHA-256 hex digest.
+        expected: String,
+        /// Actual stored SHA-256 hex digest.
+        actual: String,
+    },
     /// The database does not use incremental auto-vacuum.
     #[error("database auto_vacuum mode is {actual}, expected 2 (INCREMENTAL)")]
     AutoVacuumNotIncremental {
@@ -53,7 +63,9 @@ impl MigrationError {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::SchemaTooNew { .. } | Self::UnrecognizedDatabase => 14,
+            Self::SchemaTooNew { .. }
+            | Self::UnrecognizedDatabase
+            | Self::ChecksumMismatch { .. } => 14,
             Self::AutoVacuumNotIncremental { .. } => 13,
             Self::Sqlx(_) => 1,
         }
@@ -107,6 +119,58 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), MigrationError> {
         if version < 1 {
             return Err(MigrationError::UnrecognizedDatabase);
         }
+
+        // Ensure checksum column exists in _llmroller_schema
+        let has_checksum: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('_llmroller_schema') WHERE name = 'checksum'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .map(|count: i64| count > 0)
+        .unwrap_or(false);
+
+        if !has_checksum {
+            sqlx::query("ALTER TABLE _llmroller_schema ADD COLUMN checksum TEXT")
+                .execute(&mut *connection)
+                .await?;
+        }
+
+        // Verify SHA-256 checksum of all already-applied migrations
+        let applied_rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT version, checksum FROM _llmroller_schema ORDER BY version ASC")
+                .fetch_all(&mut *connection)
+                .await?;
+
+        for (applied_version, stored_checksum) in applied_rows {
+            let expected_checksum = match applied_version {
+                1 => crate::crypto::sha256_hex(INITIAL_SCHEMA_SQL.as_bytes()),
+                v => {
+                    if let Some((_, sql)) = INCREMENTAL_MIGRATIONS.iter().find(|(ver, _)| *ver == v)
+                    {
+                        crate::crypto::sha256_hex(sql.as_bytes())
+                    } else {
+                        continue;
+                    }
+                }
+            };
+
+            if let Some(actual) = stored_checksum {
+                if actual != expected_checksum {
+                    return Err(MigrationError::ChecksumMismatch {
+                        version: applied_version,
+                        expected: expected_checksum,
+                        actual,
+                    });
+                }
+            } else {
+                sqlx::query("UPDATE _llmroller_schema SET checksum = ? WHERE version = ?")
+                    .bind(&expected_checksum)
+                    .bind(applied_version)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+        }
+
         if version < SCHEMA_VERSION {
             apply_incremental_migrations(&mut connection, version).await?;
         }
@@ -127,7 +191,9 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), MigrationError> {
     sqlx::raw_sql(INITIAL_SCHEMA_SQL)
         .execute(&mut *transaction)
         .await?;
-    sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (1)")
+    let initial_checksum = crate::crypto::sha256_hex(INITIAL_SCHEMA_SQL.as_bytes());
+    sqlx::query("INSERT INTO _llmroller_schema (version, checksum) VALUES (1, ?)")
+        .bind(initial_checksum)
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
@@ -149,10 +215,12 @@ async fn apply_incremental_migrations(
         if *target <= from_version {
             continue;
         }
+        let checksum = crate::crypto::sha256_hex(sql.as_bytes());
         let mut transaction = connection.begin().await?;
         sqlx::raw_sql(*sql).execute(&mut *transaction).await?;
-        sqlx::query("INSERT INTO _llmroller_schema (version) VALUES (?)")
+        sqlx::query("INSERT INTO _llmroller_schema (version, checksum) VALUES (?, ?)")
             .bind(*target)
+            .bind(checksum)
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;

@@ -303,4 +303,55 @@ fn test_embedded_http_200_and_sse_error_frame_classification() {
     assert!(is_origin_timeout_status(504));
     assert!(is_origin_timeout_status(524));
     assert!(!is_origin_timeout_status(502));
+
+    // F001: Initial SSE error frame with model_not_found under HTTP 200 maps to Other(404)
+    let sse_model_not_found = b"event: error\ndata: {\"error\":{\"type\":\"model_not_found\",\"message\":\"The model does not exist\",\"code\":\"model_not_found\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_model_not_found, None),
+        ErrorClass::Other(404)
+    );
+}
+
+#[doc = "Spec: RTE-8, API-6, F001 - regression test for initial SSE error frame classification under HTTP 200"]
+#[test]
+fn regression_test_f001_sse_initial_error_frame_status_200_misclassification() {
+    use crate::adapters::extract_embedded_status_and_error_fields;
+
+    // 1. extract_embedded_status_and_error_fields parses OpenAI format
+    let openai_body = br#"{"error":{"message":"The model gpt-5 does not exist","type":"invalid_request_error","code":"model_not_found"}}"#;
+    let extracted = extract_embedded_status_and_error_fields(openai_body).expect("should extract");
+    assert_eq!(extracted.0, None);
+    assert_eq!(extracted.1, "model_not_found");
+    assert_eq!(extracted.2, "invalid_request_error");
+    assert_eq!(extracted.3, "The model gpt-5 does not exist");
+
+    // 2. extract_embedded_status_and_error_fields parses Google format
+    let google_body =
+        br#"{"error":{"code":404,"message":"models/xyz is not found","status":"NOT_FOUND"}}"#;
+    let extracted_g =
+        extract_embedded_status_and_error_fields(google_body).expect("should extract");
+    assert_eq!(extracted_g.0, Some(404));
+    assert_eq!(extracted_g.1, "404");
+    assert_eq!(extracted_g.3, "models/xyz is not found");
+
+    // 3. extract_embedded_status_and_error_fields parses SSE frame
+    let sse_frame = b"event: error\ndata: {\"error\":{\"code\":\"rate_limit_exceeded\",\"type\":\"rate_limit_error\",\"message\":\"Slow down\"}}\n\n";
+    let extracted_sse =
+        extract_embedded_status_and_error_fields(sse_frame).expect("should extract");
+    assert_eq!(extracted_sse.1, "rate_limit_exceeded");
+    assert_eq!(extracted_sse.2, "rate_limit_error");
+    assert_eq!(extracted_sse.3, "Slow down");
+
+    // 4. classify_error_with_classifiers on SSE model_not_found maps to Other(404)
+    let sse_not_found = b"event: error\ndata: {\"error\":{\"message\":\"unknown model: gpt-9\",\"code\":\"model_not_found\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_not_found, None),
+        ErrorClass::Other(404)
+    );
+
+    // 5. classify_error_with_classifiers on SSE rate_limit maps to Other(429)
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_frame, None),
+        ErrorClass::Other(429)
+    );
 }

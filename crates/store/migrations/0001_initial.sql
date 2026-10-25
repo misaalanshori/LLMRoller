@@ -2,7 +2,8 @@
 
 -- 0. Schema Version, Instance Metadata, and Sealed Instance Secrets
 CREATE TABLE _llmroller_schema (
-  version INTEGER PRIMARY KEY
+  version INTEGER PRIMARY KEY,
+  checksum TEXT
 );
 
 CREATE TABLE instance_meta (

@@ -947,3 +947,202 @@ async fn test_provider_usage_endpoint_cross_origin_validation() {
     let resp = app.oneshot(ack_req).await.expect("resp");
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
+
+#[doc = "Spec: RTE-10, F039 - Expired pins are filtered out by WHERE expires_at > now_ms in /api/user/pins and /app/partials/pins"]
+#[tokio::test]
+async fn regression_test_f039_expired_pins_excluded_from_api_and_ui() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    let model_pk: String =
+        sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = 'gpt-4o'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("model_pk");
+
+    // Insert an expired pin
+    sqlx::query(
+        "INSERT INTO pins (client_key_id, session_hash, model_pk, upstream_key_id, pool_tier, created_at, last_used_at, expires_at)
+         VALUES (?, 'expired-sess-hash', ?, ?, 1, ?, ?, ?)",
+    )
+    .bind(harness.alice_key.client_key_id.to_string())
+    .bind(&model_pk)
+    .bind(harness.alice_key.upstream_key_id.to_string())
+    .bind(now_ms - 200_000)
+    .bind(now_ms - 200_000)
+    .bind(now_ms - 100_000) // expired!
+    .execute(&harness.pool)
+    .await
+    .expect("insert expired pin");
+
+    // Alice queries /api/user/pins (JSON)
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/user/pins")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("req");
+    let resp = app.clone().oneshot(req).await.expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let list: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("json");
+    // Only the unexpired pin ("shared-session-hash") should be present, NOT "expired-sess-hash"
+    assert!(
+        list.iter()
+            .any(|p| p["session_hash"] == "shared-session-hash")
+    );
+    assert!(
+        !list
+            .iter()
+            .any(|p| p["session_hash"] == "expired-sess-hash"),
+        "expired pin must be excluded"
+    );
+
+    // Alice queries /app/partials/pins (HTML partial)
+    let partial_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/pins")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("req");
+    let partial_resp = app.oneshot(partial_req).await.expect("resp");
+    assert_eq!(partial_resp.status(), StatusCode::OK);
+    let p_bytes = axum::body::to_bytes(partial_resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let p_html = String::from_utf8(p_bytes.to_vec()).expect("html");
+    assert!(
+        !p_html.contains("expired-sess-hash"),
+        "expired pin must not appear in HTML partial"
+    );
+}
+
+#[doc = "Spec: USR-4, SEC-17, F082 - /api/user/pins and /app/partials/pins mask global upstream key labels to 'global pool' for standard users"]
+#[tokio::test]
+async fn regression_test_f082_user_portal_session_pins_endpoint_masks_global_upstream_key_labels() {
+    let harness = harness().await;
+    let app = build_app(&harness, Arc::new(PinStore::new(1_000)));
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    let global_prov_id = ProviderId::generate();
+    let global_key_id = UpstreamKeyId::generate();
+    let model_pk: String =
+        sqlx::query_scalar("SELECT model_pk FROM models WHERE canonical_id = 'gpt-4o'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("model_pk");
+
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, created_at)
+         VALUES (?, 'global-provider-f082', 'custom', 'https://global.test', '{}', 'global', ?)",
+    )
+    .bind(global_prov_id.to_string())
+    .bind(now_ms)
+    .execute(&harness.pool)
+    .await
+    .expect("insert global provider");
+
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, label, secret_enc, master_key_id, secret_last4, created_at)
+         VALUES (?, ?, 'admin-confidential-global-key-label', X'00', 'key-0', '9876', ?)",
+    )
+    .bind(global_key_id.to_string())
+    .bind(global_prov_id.to_string())
+    .bind(now_ms)
+    .execute(&harness.pool)
+    .await
+    .expect("insert global key with sensitive label");
+
+    // Pin a session to this global key for Alice (pool_tier = 3)
+    sqlx::query(
+        "INSERT INTO pins (client_key_id, session_hash, model_pk, upstream_key_id, pool_tier, created_at, last_used_at, expires_at)
+         VALUES (?, 'global-pin-session-hash-1234', ?, ?, 3, ?, ?, ?)",
+    )
+    .bind(harness.alice_key.client_key_id.to_string())
+    .bind(&model_pk)
+    .bind(global_key_id.to_string())
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(now_ms + 3_600_000)
+    .execute(&harness.pool)
+    .await
+    .expect("insert pin to global key");
+
+    // Standard user Alice calls /api/user/pins (JSON)
+    let user_req = Request::builder()
+        .method("GET")
+        .uri("/api/user/pins")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("req");
+    let user_resp = app.clone().oneshot(user_req).await.expect("resp");
+    assert_eq!(user_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(user_resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let list: Vec<serde_json::Value> = serde_json::from_slice(&bytes).expect("json");
+    let pin_item = list
+        .iter()
+        .find(|p| p["session_hash"] == "global-pin-session-hash-1234")
+        .expect("pin must be present");
+    assert_eq!(
+        pin_item["key_label"], "global pool",
+        "global key label must be masked to 'global pool' for standard users"
+    );
+    assert!(
+        !pin_item["key_label"]
+            .as_str()
+            .expect("key_label string")
+            .contains("admin-confidential"),
+        "must never leak admin upstream key label"
+    );
+
+    // Standard user Alice calls /app/partials/pins (HTML)
+    let partial_req = Request::builder()
+        .method("GET")
+        .uri("/app/partials/pins")
+        .header(header::COOKIE, &harness.alice_key.cookie)
+        .body(Body::empty())
+        .expect("req");
+    let partial_resp = app.clone().oneshot(partial_req).await.expect("resp");
+    assert_eq!(partial_resp.status(), StatusCode::OK);
+    let p_bytes = axum::body::to_bytes(partial_resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let p_html = String::from_utf8(p_bytes.to_vec()).expect("html");
+    assert!(
+        p_html.contains("global pool"),
+        "HTML partial must display 'global pool'"
+    );
+    assert!(
+        !p_html.contains("admin-confidential"),
+        "HTML partial must never leak admin upstream key label"
+    );
+
+    // Admin user calls /admin/api/pins (JSON): receives real label
+    let (admin_cookie, _admin_csrf) =
+        insert_session(&harness.pool, harness.admin, "admin_pins_token_f082").await;
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/pins")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let admin_resp = app.oneshot(admin_req).await.expect("resp");
+    assert_eq!(admin_resp.status(), StatusCode::OK);
+    let a_bytes = axum::body::to_bytes(admin_resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let a_list: Vec<serde_json::Value> = serde_json::from_slice(&a_bytes).expect("json");
+    let admin_pin = a_list
+        .iter()
+        .find(|p| p["session_hash"] == "global-pin-session-hash-1234")
+        .expect("admin pin present");
+    assert_eq!(
+        admin_pin["key_label"], "admin-confidential-global-key-label",
+        "admin receives real label"
+    );
+}

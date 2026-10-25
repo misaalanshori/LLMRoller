@@ -2284,11 +2284,7 @@ fn select_next_candidate(
         .get(&model_pk)
         .is_some_and(|m| m.distribution.eq_ignore_ascii_case("strict"));
     let min_strict_tier = if is_strict {
-        eligible
-            .iter()
-            .filter(|candidate| !tried.contains(&candidate.upstream_key_id))
-            .map(|candidate| candidate.strict_tier)
-            .min()
+        eligible.iter().map(|candidate| candidate.strict_tier).min()
     } else {
         None
     };
@@ -2435,7 +2431,8 @@ fn estimate_cost_micro_usd(
         .get(&candidate.provider_id)
         .map(|p| (p.billing_coverage_mode.as_str(), p.plan_multiplier_bps))
         .unwrap_or(("pay_as_you_go", 10_000));
-    llmroller_core::pricing::apply_plan_multiplier(raw_est, bps, mode)
+    let is_free_tier = candidate.upstream_model_id.ends_with(":free") || mode == "free_tier";
+    llmroller_core::pricing::apply_effective_upstream_cost(raw_est, bps, mode, is_free_tier)
 }
 
 /// Extract the caller's requested output-token ceiling for the pre-flight
@@ -3188,10 +3185,14 @@ impl UsageContext {
         latency_ms: Option<i64>,
     ) -> UsageEventRecord {
         let list_cost_micro_usd = cost_micro_usd;
-        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+        let is_free_tier = self.upstream_model_id.ends_with(":free")
+            || self.canonical_model.ends_with(":free")
+            || self.billing_coverage_mode == "free_tier";
+        let effective_cost = llmroller_core::pricing::apply_effective_upstream_cost(
             list_cost_micro_usd,
             self.plan_multiplier_bps,
             &self.billing_coverage_mode,
+            is_free_tier,
         );
         UsageEventRecord {
             id: llmroller_core::ids::UsageEventId::generate().to_string(),
@@ -3332,10 +3333,14 @@ impl StreamFinalizer {
         {
             cost.cost_source = CostSource::EstimatedIncomplete;
         }
-        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+        let is_free_tier = self.usage.upstream_model_id.ends_with(":free")
+            || self.usage.canonical_model.ends_with(":free")
+            || self.usage.billing_coverage_mode == "free_tier";
+        let effective_cost = llmroller_core::pricing::apply_effective_upstream_cost(
             cost.cost_micro_usd,
             self.usage.plan_multiplier_bps,
             &self.usage.billing_coverage_mode,
+            is_free_tier,
         );
 
         if let Some(reservation) = self.reservation.take() {
@@ -3680,7 +3685,7 @@ pub async fn handle_inference_request(
     let protocol = match endpoint {
         // The compact endpoint speaks the Responses wire protocol but has its own upstream path.
         EndpointKind::ResponsesCompact => "responses",
-        EndpointKind::Embeddings => "chat",
+        EndpointKind::Embeddings => "embeddings",
         _ => endpoint_str,
     };
     let aux_label = aux_endpoint_label(endpoint);
@@ -3869,6 +3874,25 @@ pub async fn handle_inference_request(
             format!("model {} not permitted on this key", model.canonical_id),
             Some(&request_id_str),
             None,
+        );
+    }
+
+    // F040: Client key TPM sliding-window rate limit enforcement at proxy ingress
+    let input_tokens_est = estimate_input_tokens(&body);
+    if let Err(retry_secs) = state.runtime_state.try_consume_client_key_tpm(
+        caller.id,
+        input_tokens_est,
+        caller.rate_limit_tpm,
+        now,
+    ) {
+        crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+        return protocol_error(
+            is_messages,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "client key token rate limit exceeded",
+            Some(&request_id_str),
+            Some(retry_secs),
         );
     }
 
@@ -4113,11 +4137,11 @@ pub async fn handle_inference_request(
         &snapshot,
         &state.runtime_state,
         &tier_candidates[0],
-        estimate_input_tokens(&body),
+        input_tokens_est,
         requested_output,
     )
     .max(estimate_reservation_cost_micro_usd(
-        estimate_input_tokens(&body),
+        input_tokens_est,
         first_cache_ratio,
         &Rates::from(&snapshot.settings.unpriced_fallback_rates),
         requested_output,
@@ -4372,7 +4396,10 @@ pub async fn handle_inference_request(
             .map(|p| (p.billing_coverage_mode.as_str(), p.plan_multiplier_bps))
             .unwrap_or(("pay_as_you_go", 10_000));
         let cand_cache_ratio = state.runtime_state.route_cache_ratio(candidate.route_id());
-        let attempt_estimate = llmroller_core::pricing::apply_plan_multiplier(
+        let is_free_tier = candidate.upstream_model_id.ends_with(":free")
+            || model.canonical_id.ends_with(":free")
+            || cand_cov_mode == "free_tier";
+        let attempt_estimate = llmroller_core::pricing::apply_effective_upstream_cost(
             estimate_reservation_cost_micro_usd(
                 input_tokens_est,
                 cand_cache_ratio,
@@ -4382,14 +4409,16 @@ pub async fn handle_inference_request(
             ),
             cand_mult_bps,
             cand_cov_mode,
+            is_free_tier,
         );
-        let input_only_estimate = llmroller_core::pricing::apply_plan_multiplier(
+        let input_only_estimate = llmroller_core::pricing::apply_effective_upstream_cost(
             (i128::from(input_tokens_est.max(0))
                 * i128::from(candidate_rates.input_per_mtok_micro_usd.max(0))
                 + 999_999)
                 .div_euclid(1_000_000) as i64,
             cand_mult_bps,
             cand_cov_mode,
+            is_free_tier,
         );
         let mut cap_guards = match reserve_candidate_caps(
             &state.runtime_state.accumulators,
@@ -4687,12 +4716,29 @@ pub async fn handle_inference_request(
                     candidate.upstream_key_id,
                     candidate_share_id.clone(),
                     attempt_outcome,
-                    Some(502),
+                    Some(if is_timeout { 504 } else { 502 }),
                     body.len(),
                     charged_micro_usd,
                     charge_basis,
                 );
                 attempts.push(att);
+                // F003: If pre-response send() timed out after body dispatch, check timeout_failover
+                // to prevent duplicate billing when upstream accepted request.
+                if is_timeout && !candidate.config.timeout_failover() {
+                    if let Some(guard) = client_guard.take() {
+                        guard.commit(charged_micro_usd);
+                    }
+                    cap_guards.commit(charged_micro_usd);
+                    crate::metrics::record_request_metric(endpoint_str, "5xx", "timeout");
+                    return protocol_error(
+                        is_messages,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout_error",
+                        "upstream timed out waiting for response",
+                        Some(&request_id_str),
+                        None,
+                    );
+                }
                 if let Some(replacement) = note_pre_first_byte_failure(
                     &state,
                     pin_key.as_ref(),
@@ -5260,6 +5306,7 @@ pub async fn handle_inference_request(
                 let mut tap = SseUsageTap::new(endpoint);
                 let mut first_chunk: Option<Bytes> = None;
                 let mut failure = false;
+                let mut is_stream_timeout = false;
                 let mut frame_error_payload: Option<String> = None;
 
                 let frame_timeout =
@@ -5286,8 +5333,13 @@ pub async fn handle_inference_request(
                                 }
                             }
                         }
-                        Ok(Some(Err(_))) | Err(_) => {
+                        Ok(Some(Err(_))) => {
                             failure = true;
+                            break;
+                        }
+                        Err(_) => {
+                            failure = true;
+                            is_stream_timeout = true;
                             break;
                         }
                         Ok(None) => match buffer.flush_remaining() {
@@ -5345,6 +5397,66 @@ pub async fn handle_inference_request(
                                     Some(&request_id_str),
                                     None,
                                 );
+                            }
+                            ErrorClass::Other(404) => {
+                                let until = now.saturating_add(600_000);
+                                state.runtime_state.block_route_protocol(
+                                    candidate.upstream_key_id,
+                                    candidate.model_pk,
+                                    protocol,
+                                    until,
+                                );
+                                enqueue_route_protocol_block(
+                                    &state,
+                                    candidate.upstream_key_id,
+                                    candidate.model_pk,
+                                    protocol,
+                                    "model_not_found",
+                                    until,
+                                );
+                                enqueue_route_health_update(
+                                    &state,
+                                    candidate.upstream_key_id,
+                                    candidate.model_pk,
+                                    "unavailable",
+                                    Some(until),
+                                    Some("model_not_found_404".to_string()),
+                                );
+                                if let Some(ref tx) = state.discovery_tx {
+                                    let _ =
+                                        tx.send(llmroller_proto::discovery::DiscoveryTarget::Key(
+                                            candidate.upstream_key_id,
+                                        ));
+                                }
+                                try_outcomes.push(TryOutcome::Unavailable);
+                                let att = attempt_record(
+                                    request_id,
+                                    attempt_no as i64,
+                                    now,
+                                    candidate.upstream_key_id,
+                                    candidate_share_id.clone(),
+                                    llmroller_core::usage::AttemptOutcome::from_http_status(404),
+                                    Some(404),
+                                    body.len(),
+                                    0,
+                                    "none",
+                                );
+                                attempts.push(att);
+                                if let Some(replacement) = note_pre_first_byte_failure(
+                                    &state,
+                                    pin_key.as_ref(),
+                                    pin_ticket.as_ref(),
+                                    candidate.upstream_key_id,
+                                    &pin_context,
+                                ) && let Some(next) = tier_candidates.iter().find(|entry| {
+                                    entry.upstream_key_id == replacement.upstream_key_id
+                                }) {
+                                    pinned_order.push(next.clone());
+                                    pin_ticket = Some(replacement);
+                                }
+                                failovers += 1;
+                                crate::metrics::record_failover();
+                                continue;
                             }
                             ErrorClass::PlanRestricted => {
                                 let until = now.saturating_add(PROTOCOL_BLOCK_MS);
@@ -5444,11 +5556,16 @@ pub async fn handle_inference_request(
                             }
                         }
                     } else {
+                        let stream_outcome = if is_stream_timeout {
+                            llmroller_core::usage::AttemptOutcome::WaitTimeout
+                        } else {
+                            llmroller_core::usage::AttemptOutcome::ErrorFrame
+                        };
                         let _ = state.runtime_state.record_upstream_failure(
                             &origin,
                             candidate.upstream_key_id,
                             caller.id,
-                            llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                            stream_outcome,
                             None,
                             now,
                         );
@@ -5458,13 +5575,20 @@ pub async fn handle_inference_request(
                             candidate.upstream_key_id,
                             now,
                         );
-                        try_outcomes.push(TryOutcome::HostFailure);
+                        try_outcomes.push(if is_stream_timeout {
+                            TryOutcome::WaitTimeout
+                        } else {
+                            TryOutcome::HostFailure
+                        });
                     }
 
-                    let (charged_micro_usd, charge_basis) = failure_charge(
-                        llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                        input_only_estimate,
-                    );
+                    let stream_outcome = if is_stream_timeout {
+                        llmroller_core::usage::AttemptOutcome::WaitTimeout
+                    } else {
+                        llmroller_core::usage::AttemptOutcome::ErrorFrame
+                    };
+                    let (charged_micro_usd, charge_basis) =
+                        failure_charge(stream_outcome, input_only_estimate);
                     if charged_micro_usd > 0
                         && let Some(res) = reservation.take()
                     {
@@ -5476,13 +5600,33 @@ pub async fn handle_inference_request(
                         now,
                         candidate.upstream_key_id,
                         candidate_share_id.clone(),
-                        llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                        Some(status.as_u16()),
+                        stream_outcome,
+                        Some(if is_stream_timeout {
+                            504
+                        } else {
+                            status.as_u16()
+                        }),
                         body.len(),
                         charged_micro_usd,
                         charge_basis,
                     );
                     attempts.push(att);
+                    // F003: If streaming first frame timed out, check timeout_failover to prevent duplicate billing
+                    if is_stream_timeout && !candidate.config.timeout_failover() {
+                        if let Some(guard) = client_guard.take() {
+                            guard.commit(charged_micro_usd);
+                        }
+                        cap_guards.commit(charged_micro_usd);
+                        crate::metrics::record_request_metric(endpoint_str, "5xx", "timeout");
+                        return protocol_error(
+                            is_messages,
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "timeout_error",
+                            "upstream timed out waiting for first valid SSE frame",
+                            Some(&request_id_str),
+                            None,
+                        );
+                    }
                     if let Some(replacement) = note_pre_first_byte_failure(
                         &state,
                         pin_key.as_ref(),
@@ -5957,7 +6101,8 @@ pub async fn handle_inference_request(
             .get("error")
             .or_else(|| json_value.pointer("/response/error"))
             .is_some_and(|e| e.is_object() || e.as_str().is_some_and(|s| !s.trim().is_empty()))
-            || json_value.get("type").and_then(|t| t.as_str()) == Some("error");
+            || json_value.get("type").and_then(|t| t.as_str()) == Some("error")
+            || json_value.get("status").and_then(|s| s.as_str()) == Some("failed");
         if is_embedded_error {
             let classify_prefix = &body_bytes[..body_bytes.len().min(ERROR_CLASSIFY_BYTES)];
             let class = classify_error_with_classifiers(
@@ -5990,6 +6135,37 @@ pub async fn handle_inference_request(
                         &request_id.to_string(),
                         is_admin,
                     );
+                }
+                ErrorClass::Other(404) => {
+                    let until = now.saturating_add(600_000);
+                    state.runtime_state.block_route_protocol(
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        until,
+                    );
+                    enqueue_route_protocol_block(
+                        &state,
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        "model_not_found",
+                        until,
+                    );
+                    enqueue_route_health_update(
+                        &state,
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        "unavailable",
+                        Some(until),
+                        Some("model_not_found_404".to_string()),
+                    );
+                    if let Some(ref tx) = state.discovery_tx {
+                        let _ = tx.send(llmroller_proto::discovery::DiscoveryTarget::Key(
+                            candidate.upstream_key_id,
+                        ));
+                    }
+                    try_outcomes.push(TryOutcome::Unavailable);
                 }
                 ErrorClass::QuotaExhausted => {
                     state.runtime_state.record_quota_exhausted(
@@ -6166,10 +6342,14 @@ pub async fn handle_inference_request(
             Rates::from(&snapshot.settings.unpriced_fallback_rates),
             attempt_started,
         );
-        let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
+        let is_free_tier = candidate.upstream_model_id.ends_with(":free")
+            || model.canonical_id.ends_with(":free")
+            || cand_cov_mode == "free_tier";
+        let effective_cost = llmroller_core::pricing::apply_effective_upstream_cost(
             cost.cost_micro_usd,
             cand_mult_bps,
             cand_cov_mode,
+            is_free_tier,
         );
 
         if let Some(reservation) = reservation {
@@ -6670,6 +6850,7 @@ mod tests {
             routing_scope: "inherit".to_string(),
             allowed_models: None,
             rate_limit_rpm: None,
+            rate_limit_tpm: None,
             budget_micro_usd_month: None,
             allowed_cidrs: None,
             constant_session_mode: mode.to_string(),

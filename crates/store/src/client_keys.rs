@@ -540,6 +540,7 @@ pub async fn load_client_key_records_tx(
             routing_scope: k.routing_scope,
             allowed_models: k.allowed_models,
             rate_limit_rpm: k.rate_limit_rpm,
+            rate_limit_tpm: None,
             budget_micro_usd_month: k.budget_micro_usd_month,
             allowed_cidrs: k.allowed_cidrs,
             constant_session_mode: k.constant_session_mode,

@@ -467,3 +467,90 @@ async fn test_non_inference_endpoints_do_not_consume_rpm() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
+
+#[doc = "Spec: LIM-1, F040 - Client key TPM limit throttles requests exceeding TPM with HTTP 429 and Retry-After"]
+#[tokio::test]
+async fn regression_test_f040_client_key_tpm_rate_limiting() {
+    let (_dir, pool, user_id) = setup_test_context().await;
+    let user_actor = ActorScope::user(user_id, Role::User);
+    let entropy = OsEntropy;
+    use llmroller_core::seams::Clock as _;
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+
+    let res = create_client_key(
+        &pool,
+        &user_actor,
+        user_id,
+        NewClientKey {
+            label: "tpm-test-key".to_string(),
+            service_account_id: None,
+            routing_scope: None,
+            allowed_models: None,
+            rate_limit_rpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: None,
+            expires_at: None,
+        },
+        &entropy,
+        now_ms,
+    )
+    .await
+    .expect("create client key");
+
+    use llmroller_core::seams::ExposeSecret as _;
+    let raw_token = res.raw_token.expose_secret().to_string();
+
+    let model_pk = llmroller_core::ids::ModelPk::generate();
+    sqlx::query("INSERT INTO models (model_pk, canonical_id, exposed) VALUES (?, 'gpt-4o', 1)")
+        .bind(model_pk.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert model");
+
+    let mut snapshot = load_initial_snapshot(&pool).await.expect("load snapshot");
+    // Configure rate_limit_tpm = 30 on the client key record in the snapshot
+    let mut keys_map = (*snapshot.client_keys_by_hash).clone();
+    for (rec, _) in keys_map.values_mut() {
+        rec.rate_limit_tpm = Some(30);
+    }
+    snapshot.client_keys_by_hash = Arc::new(keys_map);
+
+    let shared_snapshot = Arc::new(ArcSwap::new(Arc::new(snapshot)));
+    let auth_state = ProxyAuthState::new(shared_snapshot.clone(), pool.clone(), vec![]);
+    auth_state
+        .is_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = data_plane_router(auth_state.clone());
+
+    let body_text = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"The quick brown fox jumps over the lazy dog near the river bank on a sunny day in spring"}]}"#;
+
+    // 1. First request consumes tokens: ~25 tokens (<= 30 TPM)
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", &raw_token)
+        .header("content-type", "application/json")
+        .body(Body::from(body_text))
+        .expect("req1");
+    let resp1 = app.clone().oneshot(req1).await.expect("resp1");
+    assert_ne!(resp1.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 2. Second request in the same minute consumes more tokens: 25 + 25 = 50 > 30 TPM limit
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", &raw_token)
+        .header("content-type", "application/json")
+        .body(Body::from(body_text))
+        .expect("req2");
+    let resp2 = app.oneshot(req2).await.expect("resp2");
+    let status2 = resp2.status();
+    let has_retry_after = resp2.headers().contains_key(header::RETRY_AFTER);
+    assert_eq!(
+        status2,
+        StatusCode::TOO_MANY_REQUESTS,
+        "second request exceeding 30 TPM must return 429"
+    );
+    assert!(has_retry_after, "429 must include Retry-After header");
+}

@@ -64,6 +64,11 @@ const SSE_OVERLOADED: &str = concat!(
     "data: {\"error\":{\"message\":\"overloaded\",\"code\":529}}\n\n",
 );
 
+const SSE_MODEL_NOT_FOUND: &str = concat!(
+    ": keep-alive\n\n",
+    "data: {\"error\":{\"message\":\"The model does not exist\",\"code\":\"model_not_found\"}}\n\n",
+);
+
 /// One complete frame, then the upstream never sends another byte or closes.
 const SSE_STALL_AFTER_FIRST_FRAME: &str = concat!(
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",",
@@ -76,9 +81,12 @@ const SSE_STALL_AFTER_FIRST_FRAME: &str = concat!(
 enum MockMode {
     StreamOk,
     StreamOverloaded,
+    StreamModelNotFound,
     StreamStall,
     ChatJson,
     Chat429,
+    ResponsesFailed,
+    SleepDelay(u64),
 }
 
 #[derive(Clone)]
@@ -101,6 +109,7 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
     match state.mode {
         MockMode::StreamOk => sse_response(SSE_OK),
         MockMode::StreamOverloaded => sse_response(SSE_OVERLOADED),
+        MockMode::StreamModelNotFound => sse_response(SSE_MODEL_NOT_FOUND),
         MockMode::StreamStall => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -138,6 +147,20 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
             })),
         )
             .into_response(),
+        MockMode::ResponsesFailed => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "id": "resp_failed_1",
+                "status": "failed",
+                "last_error": { "code": "server_error", "message": "Model execution failed" }
+            })),
+        )
+            .into_response(),
+        MockMode::SleepDelay(ms) => {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            sse_response(SSE_OK)
+        }
     }
 }
 
@@ -419,6 +442,22 @@ fn stream_request(token: &str, session: Option<&str>) -> Request<Body> {
     builder
         .body(Body::from(
             r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .expect("request")
+}
+
+fn non_stream_request(token: &str, session: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session) = session {
+        builder = builder.header("x-llmroller-session-id", session);
+    }
+    builder
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":false,"messages":[{"role":"user","content":"hello"}]}"#,
         ))
         .expect("request")
 }
@@ -930,6 +969,49 @@ async fn test_non_streaming_served_attempt_records_actual_charge_basis() {
     assert_eq!(cost, 2000);
 }
 
+#[doc = "Spec: USG-10, F035 - Provider with free_tier billing coverage records 0 effective micro-USD while preserving token counts"]
+#[tokio::test]
+async fn regression_test_f035_free_tier_provider_records_zero_cost_preserving_tokens() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "f035-user").await;
+    let (mock_addr, _mock_state) = spawn_mock(MockMode::ChatJson).await;
+    let provider_id = create_provider(&harness, "free-prov", format!("http://{mock_addr}")).await;
+
+    // Set provider to free_tier billing coverage mode
+    sqlx::query("UPDATE providers SET billing_coverage_mode = 'free_tier' WHERE id = ?")
+        .bind(provider_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .expect("update billing coverage mode to free_tier");
+
+    let key_id = create_upstream_key(&harness, provider_id, "free-key", 100).await;
+    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    insert_route(&harness, key_id, model_pk, "gpt-4o").await;
+
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "f035-client-key").await;
+    let app = build_app(&harness).await;
+
+    let response = app
+        .oneshot(non_stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    flush(&harness).await;
+
+    let (uncached, completion, cost): (i64, i64, i64) =
+        sqlx::query_as("SELECT input_uncached_tokens, output_tokens, cost_micro_usd FROM usage_events WHERE client_key_id = (SELECT id FROM client_keys WHERE label = 'f035-client-key')")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("usage event");
+    assert_eq!(uncached, 1000, "uncached prompt tokens must be preserved");
+    assert_eq!(completion, 500, "completion tokens must be preserved");
+    assert_eq!(cost, 0, "effective cost must be 0 for free_tier provider");
+}
+
 #[tokio::test]
 async fn test_non_streaming_429_then_served_persists_both_attempts_and_real_cost() {
     let harness = harness().await;
@@ -1119,6 +1201,140 @@ async fn test_shutdown_cut_terminates_live_stream_and_records_shutdown_cut() {
             .expect("usage event");
     assert_eq!(termination, "shutdown_cut");
     assert_eq!(incomplete, 1);
+}
+
+#[doc = "Spec: RTE-8, F001 - Initial SSE model_not_found frame fails over to backup key without tripping origin breaker"]
+#[tokio::test]
+async fn regression_test_f001_sse_model_not_found_fails_over_without_tripping_origin_breaker() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "f001-user").await;
+    let (primary_addr, primary_state) = spawn_mock(MockMode::StreamModelNotFound).await;
+    let (backup_addr, backup_state) = spawn_mock(MockMode::StreamOk).await;
+
+    let provider_a = create_provider(&harness, "p-primary", format!("http://{primary_addr}")).await;
+    let key_a = create_upstream_key(&harness, provider_a, "primary-key", 100).await;
+    let provider_b = create_provider(&harness, "p-backup", format!("http://{backup_addr}")).await;
+    let key_b = create_upstream_key(&harness, provider_b, "backup-key", 1).await;
+    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    insert_route(&harness, key_a, model_pk, "gpt-4o").await;
+    insert_route(&harness, key_b, model_pk, "gpt-4o").await;
+
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "f001-client-key").await;
+    let app = build_app(&harness).await;
+
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect stream");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(
+        text.contains("\"content\":\"hello\""),
+        "backup key frames must reach client"
+    );
+    assert_eq!(primary_state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_state.calls.load(Ordering::SeqCst), 1);
+
+    flush(&harness).await;
+    let (termination, failovers, key): (String, i64, String) =
+        sqlx::query_as("SELECT termination, failovers, upstream_key_id FROM usage_events")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("usage event");
+    assert_eq!(termination, "completed");
+    assert_eq!(failovers, 1);
+    assert_eq!(key, key_b.to_string(), "backup key served the request");
+}
+
+#[doc = "Spec: RTE-8, F002 - Non-streaming HTTP 200 embedded error (status: failed) fails over and does not promote provisional pin"]
+#[tokio::test]
+async fn regression_test_f002_nonstreaming_http_200_embedded_error_does_not_promote_pin() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "f002-user").await;
+    let (primary_addr, primary_state) = spawn_mock(MockMode::ResponsesFailed).await;
+    let (backup_addr, backup_state) = spawn_mock(MockMode::ChatJson).await;
+
+    let provider_a = create_provider(&harness, "p-failed", format!("http://{primary_addr}")).await;
+    let key_a = create_upstream_key(&harness, provider_a, "failed-key", 100).await;
+    let provider_b = create_provider(&harness, "p-backup2", format!("http://{backup_addr}")).await;
+    let key_b = create_upstream_key(&harness, provider_b, "backup-key2", 1).await;
+    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    insert_route(&harness, key_a, model_pk, "gpt-4o").await;
+    insert_route(&harness, key_b, model_pk, "gpt-4o").await;
+
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "f002-client-key").await;
+    let app = build_app(&harness).await;
+
+    let response = app
+        .oneshot(non_stream_request(&token, Some("sess-f002-test")))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(primary_state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_state.calls.load(Ordering::SeqCst), 1);
+
+    flush(&harness).await;
+    // Verify that the pin table records the backup key, NOT the primary key that returned status: failed
+    let pinned_key: Option<String> = sqlx::query_scalar("SELECT upstream_key_id FROM pins LIMIT 1")
+        .fetch_optional(&harness.pool)
+        .await
+        .expect("fetch pin");
+    if let Some(pk) = pinned_key {
+        assert_eq!(
+            pk,
+            key_b.to_string(),
+            "provisional pin must NOT be promoted to failed key A"
+        );
+    }
+}
+
+#[doc = "Spec: RTE-9, F003 - Post-dispatch send timeout does not fail over when timeout_failover is false, preventing duplicate billing"]
+#[tokio::test]
+async fn regression_test_f003_timeout_failover_disabled_prevents_duplicate_billing() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "f003-user").await;
+    let (primary_addr, primary_state) = spawn_mock(MockMode::SleepDelay(2000)).await;
+    let (backup_addr, backup_state) = spawn_mock(MockMode::StreamOk).await;
+
+    // Configure primary with 100ms timeout and timeout_failover = false
+    let provider_a = create_provider_with_config(
+        &harness,
+        "p-timeout-a",
+        format!("http://{primary_addr}"),
+        r#"{"timeouts":{"first_activity_timeout_ms":100,"timeout_failover":false}}"#,
+    )
+    .await;
+    let key_a = create_upstream_key(&harness, provider_a, "timeout-key", 100).await;
+    let provider_b = create_provider(&harness, "p-backup3", format!("http://{backup_addr}")).await;
+    let key_b = create_upstream_key(&harness, provider_b, "backup-key3", 1).await;
+    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    insert_route(&harness, key_a, model_pk, "gpt-4o").await;
+    insert_route(&harness, key_b, model_pk, "gpt-4o").await;
+
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "f003-client-key").await;
+    let app = build_app(&harness).await;
+
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "must abort with 504 Gateway Timeout when timeout_failover is false"
+    );
+    assert_eq!(primary_state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backup_state.calls.load(Ordering::SeqCst),
+        0,
+        "backup key must NEVER be called, preventing duplicate billing"
+    );
 }
 
 // Keep the writer handle reachable for the duration of each test.
