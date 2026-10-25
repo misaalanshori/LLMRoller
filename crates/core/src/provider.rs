@@ -19,6 +19,15 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// All recognized built-in provider kinds.
+    pub const ALL: [Self; 5] = [
+        Self::OpencodeGo,
+        Self::CommandCode,
+        Self::OpenDesignAmr,
+        Self::Openrouter,
+        Self::Custom,
+    ];
+
     /// Lowercase string representation matching the database enum.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -259,7 +268,10 @@ impl ProtocolAuthConfig {
                 prefix: String::new(),
             },
             Self::Shorthand(AuthShorthand::XApiKeyOrBearer) => {
-                if matches!(endpoint, ProviderEndpoint::Messages | ProviderEndpoint::CountTokens) {
+                if matches!(
+                    endpoint,
+                    ProviderEndpoint::Messages | ProviderEndpoint::CountTokens
+                ) {
                     ProviderAuthScheme {
                         header: "x-api-key".to_string(),
                         prefix: String::new(),

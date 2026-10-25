@@ -302,14 +302,9 @@ pub fn resolve_provider_usage_url(
     }
     // F019 & F095: CommandCode base_url ends with `/provider/v1`, whereas billing endpoints
     // (`/alpha/billing/credits`, `/internal/billing/credits`) live at the origin root.
-    if base.ends_with("/provider/v1")
-        && (rel.starts_with("alpha/") || rel.starts_with("internal/"))
+    if base.ends_with("/provider/v1") && (rel.starts_with("alpha/") || rel.starts_with("internal/"))
     {
-        return Some(format!(
-            "{}/{}",
-            base.trim_end_matches("/provider/v1"),
-            rel
-        ));
+        return Some(format!("{}/{}", base.trim_end_matches("/provider/v1"), rel));
     }
     Some(format!("{base}/{rel}"))
 }

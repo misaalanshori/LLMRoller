@@ -417,9 +417,14 @@ fn test_responses_failover_sanitization_openai_compat_and_wildcard_body_edits() 
     assert!(chat_val.get("store").is_none());
     assert!(chat_val.get("reasoning_effort").is_none());
     assert_eq!(chat_val["messages"][0]["role"], "system");
-    let norm_id = chat_val["messages"][1]["tool_calls"][0]["id"].as_str().expect("id");
+    let norm_id = chat_val["messages"][1]["tool_calls"][0]["id"]
+        .as_str()
+        .expect("id");
     assert_eq!(norm_id.len(), 9);
-    assert_eq!(chat_val["messages"][2]["tool_call_id"].as_str(), Some(norm_id));
+    assert_eq!(
+        chat_val["messages"][2]["tool_call_id"].as_str(),
+        Some(norm_id)
+    );
 
     // F024: apply_body_edit_rules promotes intermediate Null to Object and supports * array wildcards
     let mut body_val = serde_json::json!({
@@ -445,6 +450,12 @@ fn test_responses_failover_sanitization_openai_compat_and_wildcard_body_edits() 
     ];
     assert!(apply_body_edit_rules(&mut body_val, &rules));
     assert_eq!(body_val["reasoning"]["effort"], "high");
-    assert_eq!(body_val["messages"][0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(body_val["messages"][1]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body_val["messages"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        body_val["messages"][1]["cache_control"]["type"],
+        "ephemeral"
+    );
 }

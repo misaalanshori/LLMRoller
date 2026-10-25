@@ -158,66 +158,66 @@ pub async fn verify_audit_log(
         }
         for row in &rows {
             total_verified += 1;
-        let seq: i64 = row.try_get("seq")?;
-        if seq != expected_seq {
-            return Err(AuditVerificationError::SequenceGap {
-                seq,
-                expected_seq,
-                found_seq: seq,
-            });
-        }
-
-        let id: String = row.try_get("id")?;
-        let ts: i64 = row.try_get("ts")?;
-        let actor_user_id: Option<String> = row.try_get("actor_user_id")?;
-        let ip_addr: Option<String> = row.try_get("ip_addr")?;
-        let action: String = row.try_get("action")?;
-        let target_type: String = row.try_get("target_type")?;
-        let target_id: Option<String> = row.try_get("target_id")?;
-        let detail_json: Option<String> = row.try_get("detail_json")?;
-        let prev_hash: String = row.try_get("prev_hash")?;
-        let stored_hash: String = row.try_get("hash")?;
-
-        if prev_hash != expected_prev_hash {
-            return Err(AuditVerificationError::ChainBroken {
-                seq,
-                prev_hash,
-                expected_prev_hash,
-            });
-        }
-
-        let entry = AuditEntry {
-            id: &id,
-            ts,
-            actor_user_id: actor_user_id.as_deref(),
-            ip_addr: ip_addr.as_deref(),
-            action: &action,
-            target_type: &target_type,
-            target_id: target_id.as_deref(),
-            detail_json: detail_json.as_deref(),
-        };
-
-        let computed_hash = entry_hash(audit_hmac_key, &entry, seq, &prev_hash);
-        if computed_hash != stored_hash {
-            return Err(AuditVerificationError::HashMismatch {
-                seq,
-                stored_hash,
-                computed_hash,
-            });
-        }
-
-        if let (Some(a_seq), Some(a_hash)) = (anchor_seq, anchor_hash)
-            && seq == a_seq
-        {
-            if stored_hash != a_hash {
-                return Err(AuditVerificationError::AnchorHashMismatch {
-                    anchor_seq: a_seq,
-                    expected_hash: a_hash.to_owned(),
-                    found_hash: stored_hash,
+            let seq: i64 = row.try_get("seq")?;
+            if seq != expected_seq {
+                return Err(AuditVerificationError::SequenceGap {
+                    seq,
+                    expected_seq,
+                    found_seq: seq,
                 });
             }
-            anchor_found = true;
-        }
+
+            let id: String = row.try_get("id")?;
+            let ts: i64 = row.try_get("ts")?;
+            let actor_user_id: Option<String> = row.try_get("actor_user_id")?;
+            let ip_addr: Option<String> = row.try_get("ip_addr")?;
+            let action: String = row.try_get("action")?;
+            let target_type: String = row.try_get("target_type")?;
+            let target_id: Option<String> = row.try_get("target_id")?;
+            let detail_json: Option<String> = row.try_get("detail_json")?;
+            let prev_hash: String = row.try_get("prev_hash")?;
+            let stored_hash: String = row.try_get("hash")?;
+
+            if prev_hash != expected_prev_hash {
+                return Err(AuditVerificationError::ChainBroken {
+                    seq,
+                    prev_hash,
+                    expected_prev_hash,
+                });
+            }
+
+            let entry = AuditEntry {
+                id: &id,
+                ts,
+                actor_user_id: actor_user_id.as_deref(),
+                ip_addr: ip_addr.as_deref(),
+                action: &action,
+                target_type: &target_type,
+                target_id: target_id.as_deref(),
+                detail_json: detail_json.as_deref(),
+            };
+
+            let computed_hash = entry_hash(audit_hmac_key, &entry, seq, &prev_hash);
+            if computed_hash != stored_hash {
+                return Err(AuditVerificationError::HashMismatch {
+                    seq,
+                    stored_hash,
+                    computed_hash,
+                });
+            }
+
+            if let (Some(a_seq), Some(a_hash)) = (anchor_seq, anchor_hash)
+                && seq == a_seq
+            {
+                if stored_hash != a_hash {
+                    return Err(AuditVerificationError::AnchorHashMismatch {
+                        anchor_seq: a_seq,
+                        expected_hash: a_hash.to_owned(),
+                        found_hash: stored_hash,
+                    });
+                }
+                anchor_found = true;
+            }
 
             last_seq = seq;
             expected_prev_hash = stored_hash.clone();

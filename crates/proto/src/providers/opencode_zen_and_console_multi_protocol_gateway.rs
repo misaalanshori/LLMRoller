@@ -31,10 +31,21 @@ pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/v1";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `opencode_zen_and_console_multi_protocol_gateway`.
-pub const DEFAULT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "gpt-5.4", "gpt-5.3-codex", "gemini-3.1-pro", "big-pickle", "glm-5", "kimi-k2.5", "minimax-m2.5"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gemini-3.1-pro",
+    "big-pickle",
+    "glm-5",
+    "kimi-k2.5",
+    "minimax-m2.5",
+];
 
 /// Compile-time embedded `presets/opencode_zen_and_console_multi_protocol_gateway.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/opencode_zen_and_console_multi_protocol_gateway.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/opencode_zen_and_console_multi_protocol_gateway.toml");
 
 /// Build the full upstream endpoint URL for `opencode_zen_and_console_multi_protocol_gateway` (`F111`).
 #[must_use]
@@ -123,7 +134,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -147,7 +161,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

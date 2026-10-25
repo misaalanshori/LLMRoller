@@ -254,10 +254,7 @@ impl ConfigSnapshot {
         let trimmed = raw_model.trim();
         let normalized = crate::catalog::normalize_model_id(trimmed)
             .map_err(|_| SnapshotResolveError::NotFound)?;
-        let stripped_vendor = trimmed
-            .rsplit_once('/')
-            .map(|(_, s)| s)
-            .unwrap_or(trimmed);
+        let stripped_vendor = trimmed.rsplit_once('/').map(|(_, s)| s).unwrap_or(trimmed);
         let stripped_norm = crate::catalog::normalize_model_id(stripped_vendor)
             .unwrap_or_else(|_| normalized.clone());
 
@@ -309,12 +306,12 @@ impl ConfigSnapshot {
                 for pk in self.models.keys() {
                     if self.routes_by_model.get(pk).is_some_and(|routes| {
                         routes.iter().any(|r| {
-                            r.upstream_model_id.rsplit_once('/').is_some_and(
-                                |(_, suffix)| {
+                            r.upstream_model_id
+                                .rsplit_once('/')
+                                .is_some_and(|(_, suffix)| {
                                     suffix.eq_ignore_ascii_case(stripped_vendor)
                                         || suffix.eq_ignore_ascii_case(&stripped_norm)
-                                },
-                            )
+                                })
                         })
                     }) {
                         if let Some(existing) = found
@@ -627,8 +624,20 @@ mod tests {
         Arc::make_mut(&mut snapshot.models_by_canonical).insert("gpt-5.4-legacy".to_string(), pk_b);
         Arc::make_mut(&mut snapshot.aliases).insert("GPT5-Fast".to_string(), pk_a);
 
-        assert_eq!(snapshot.resolve_model("gpt5-fast").expect("case-insensitive alias").id, pk_a);
-        assert_eq!(snapshot.resolve_model("openai/gpt-5.4").expect("vendor-prefixed canonical").id, pk_a);
+        assert_eq!(
+            snapshot
+                .resolve_model("gpt5-fast")
+                .expect("case-insensitive alias")
+                .id,
+            pk_a
+        );
+        assert_eq!(
+            snapshot
+                .resolve_model("openai/gpt-5.4")
+                .expect("vendor-prefixed canonical")
+                .id,
+            pk_a
+        );
 
         // Two-hop redirect cycle pk_a <-> pk_b must return RedirectLoop
         Arc::make_mut(&mut snapshot.redirects).insert("gpt-5.4".to_string(), pk_b);

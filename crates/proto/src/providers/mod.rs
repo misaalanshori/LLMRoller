@@ -10,89 +10,89 @@ use llmroller_core::provider::ProviderConfig;
 
 use crate::adapters::EndpointKind;
 
-pub mod command_code;
-pub mod antigravity_google_cloud_code_assist;
-pub mod google_gemini_cli_cloud_code_assist;
-pub mod openai_codex_chatgpt_backend_oauth_and_websocket;
-pub mod anthropic_claude_code_stealth_oauth;
-pub mod github_copilot_dual_surface_and_token_exchange;
-pub mod cursor_ide_connect_protobuf_and_cursor_agent_cli;
-pub mod aws_kiro_codewhisperer_eventstream;
-pub mod kimi_coding_cli_oauth_and_msh_fingerprint;
-pub mod grok_cli_and_grok_web_sso_cookie_executor;
-pub mod typesafe_system_one_and_agent_gateway;
-pub mod opencode_zen_and_console_multi_protocol_gateway;
-pub mod vercel_ai_gateway_and_oidc_headers;
+pub mod abacus_ai_route_llm_and_aihubmix;
 pub mod alibaba_qwen_oauth_portal_and_dashscope_coding_plan;
-pub mod zai_zhipu_glm_coding_plan_multi_region;
-pub mod minimax_and_minimax_coding_plan_dual_region;
-pub mod google_generative_ai_studio_and_vertex_ai;
 pub mod amazon_bedrock_sigv4_and_bearer_converse_stream;
+pub mod anthropic_claude_code_stealth_oauth;
+pub mod anthropic_official_direct_api_preset;
+pub mod antigravity_google_cloud_code_assist;
+pub mod automatic_prompt_cache_breakpoint_injector;
+pub mod aws_kiro_codewhisperer_eventstream;
 pub mod azure_openai_and_azure_cognitive_services_v1_and_deployments;
-pub mod cloudflare_workers_ai_and_ai_gateway_unified;
-pub mod gitlab_duo_agent_platform_and_direct_access;
-pub mod deepseek_api_and_interleaved_reasoning_content;
-pub mod mistral_and_codestral_api_compat;
-pub mod groq_cloud_lpu_inference;
-pub mod cerebras_wafer_scale_inference;
-pub mod huggingface_inference_router;
-pub mod together_ai_cloud;
-pub mod fireworks_ai_inference;
-pub mod deepinfra_inference_api;
-pub mod perplexity_sonar_api;
-pub mod cohere_v2_compatibility_api;
-pub mod nvidia_nim_integrate_api;
-pub mod sambanova_cloud_api;
-pub mod nebius_ai_studio_token_factory;
-pub mod novita_ai_openai_api;
-pub mod hyperbolic_ai_inference;
+pub mod baidu_qianfan_ernie_and_modelscope;
 pub mod baseten_model_apis;
+pub mod cerebras_wafer_scale_inference;
 pub mod chutes_ai_decentralized_inference;
-pub mod siliconflow_global_and_cn;
-pub mod moonshot_ai_global_and_cn;
-pub mod xiaomi_mimo_openai_and_anthropic;
-pub mod volcengine_ark_and_byteplus_coding_plan;
-pub mod venice_ai_privacy_inference;
-pub mod synthetic_new_glhf_openai_and_anthropic;
-pub mod inference_net_and_nano_gpt;
-pub mod poe_api_and_requesty_router;
-pub mod ovhcloud_ai_endpoints_and_scaleway;
-pub mod sap_ai_core_orchestration_and_berget_ai;
-pub mod vultr_serverless_inference_and_digitalocean;
+pub mod cloudferro_sherlock_and_evroc_sovereign;
+pub mod cloudflare_workers_ai_and_ai_gateway_unified;
+pub mod cohere_v2_compatibility_api;
+pub mod command_code;
+pub mod cross_provider_json_schema_tool_sanitizer;
+pub mod cross_provider_thinking_and_signature_preservation_bridge;
+pub mod cursor_ide_connect_protobuf_and_cursor_agent_cli;
+pub mod deepinfra_inference_api;
+pub mod deepseek_api_and_interleaved_reasoning_content;
+pub mod fireworks_ai_inference;
 #[allow(non_snake_case)]
 pub mod friendli_ai_and_Inception_mercury_diffusion;
-pub mod upstage_solar_and_302ai_gateway;
-pub mod abacus_ai_route_llm_and_aihubmix;
+pub mod github_copilot_dual_surface_and_token_exchange;
 pub mod github_models_inference_azure_ai;
+pub mod gitlab_duo_agent_platform_and_direct_access;
+pub mod google_gemini_cli_cloud_code_assist;
+pub mod google_generative_ai_studio_and_vertex_ai;
+pub mod grok_cli_and_grok_web_sso_cookie_executor;
+pub mod groq_cloud_lpu_inference;
+pub mod helicone_ai_gateway_and_portkey;
+pub mod huggingface_inference_router;
+pub mod hyperbolic_ai_inference;
+pub mod iflow_cn_and_longcat_meituan;
+pub mod inference_net_and_nano_gpt;
+pub mod kilo_code_and_cline_gateway;
+pub mod kimi_coding_cli_oauth_and_msh_fingerprint;
+pub mod kuae_cloud_and_stackit_rag;
 #[allow(non_snake_case)]
 pub mod llama_meta_api_and_Clarifai;
-pub mod wandb_inference_coreweave_and_weights_and_biases;
-pub mod morph_fast_apply_and_relace_instant_apply;
-pub mod ollama_cloud_and_local_ollama_v1;
 pub mod lmstudio_vllm_and_llamacpp_local_servers;
-pub mod kilo_code_and_cline_gateway;
-pub mod roocode_cloud_and_kilocode_openrouter_compatible;
-pub mod windsurf_codeium_and_qoder_coding_agents;
-pub mod baidu_qianfan_ernie_and_modelscope;
-pub mod iflow_cn_and_longcat_meituan;
-pub mod stepfun_and_yi_lingyiwanwu;
-pub mod pollinations_ai_and_puters_free_gateways;
-pub mod helicone_ai_gateway_and_portkey;
-pub mod privatemode_ai_confidential_and_io_net;
-pub mod nova_amazon_direct_api;
-pub mod submodel_instagen_and_moark_gitee;
-pub mod vivgrid_and_fastrouter;
-pub mod cloudferro_sherlock_and_evroc_sovereign;
-pub mod kuae_cloud_and_stackit_rag;
-pub mod openai_official_direct_platform_preset;
-pub mod anthropic_official_direct_api_preset;
-pub mod openai_websocket_responses_transport_v2;
-pub mod cross_provider_thinking_and_signature_preservation_bridge;
-pub mod cross_provider_json_schema_tool_sanitizer;
-pub mod automatic_prompt_cache_breakpoint_injector;
+pub mod minimax_and_minimax_coding_plan_dual_region;
+pub mod mistral_and_codestral_api_compat;
+pub mod moonshot_ai_global_and_cn;
+pub mod morph_fast_apply_and_relace_instant_apply;
 pub mod multi_provider_oauth_device_and_pkce_flow_manager;
 pub mod multi_provider_quota_and_rate_limit_adapter_expansion;
+pub mod nebius_ai_studio_token_factory;
+pub mod nova_amazon_direct_api;
+pub mod novita_ai_openai_api;
+pub mod nvidia_nim_integrate_api;
+pub mod ollama_cloud_and_local_ollama_v1;
+pub mod openai_codex_chatgpt_backend_oauth_and_websocket;
+pub mod openai_official_direct_platform_preset;
+pub mod openai_websocket_responses_transport_v2;
+pub mod opencode_zen_and_console_multi_protocol_gateway;
+pub mod ovhcloud_ai_endpoints_and_scaleway;
+pub mod perplexity_sonar_api;
+pub mod poe_api_and_requesty_router;
+pub mod pollinations_ai_and_puters_free_gateways;
 pub mod preset_catalog_and_models_dev_bundled_registry;
+pub mod privatemode_ai_confidential_and_io_net;
+pub mod roocode_cloud_and_kilocode_openrouter_compatible;
+pub mod sambanova_cloud_api;
+pub mod sap_ai_core_orchestration_and_berget_ai;
+pub mod siliconflow_global_and_cn;
+pub mod stepfun_and_yi_lingyiwanwu;
+pub mod submodel_instagen_and_moark_gitee;
+pub mod synthetic_new_glhf_openai_and_anthropic;
+pub mod together_ai_cloud;
+pub mod typesafe_system_one_and_agent_gateway;
+pub mod upstage_solar_and_302ai_gateway;
+pub mod venice_ai_privacy_inference;
+pub mod vercel_ai_gateway_and_oidc_headers;
+pub mod vivgrid_and_fastrouter;
+pub mod volcengine_ark_and_byteplus_coding_plan;
+pub mod vultr_serverless_inference_and_digitalocean;
+pub mod wandb_inference_coreweave_and_weights_and_biases;
+pub mod windsurf_codeium_and_qoder_coding_agents;
+pub mod xiaomi_mimo_openai_and_anthropic;
+pub mod zai_zhipu_glm_coding_plan_multi_region;
 
 /// Static descriptor for a compiled-in provider preset (`F101`–`F180`).
 #[derive(Debug, Clone, Copy)]
@@ -148,8 +148,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: openai_codex_chatgpt_backend_oauth_and_websocket::PRESET_TOML,
         build_endpoint_url: openai_codex_chatgpt_backend_oauth_and_websocket::build_endpoint_url,
         synthesize_headers: openai_codex_chatgpt_backend_oauth_and_websocket::synthesize_headers,
-        normalize_request_body: openai_codex_chatgpt_backend_oauth_and_websocket::normalize_request_body,
-        default_provider_config: openai_codex_chatgpt_backend_oauth_and_websocket::default_provider_config,
+        normalize_request_body:
+            openai_codex_chatgpt_backend_oauth_and_websocket::normalize_request_body,
+        default_provider_config:
+            openai_codex_chatgpt_backend_oauth_and_websocket::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: anthropic_claude_code_stealth_oauth::FINDING_ID,
@@ -174,8 +176,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: github_copilot_dual_surface_and_token_exchange::PRESET_TOML,
         build_endpoint_url: github_copilot_dual_surface_and_token_exchange::build_endpoint_url,
         synthesize_headers: github_copilot_dual_surface_and_token_exchange::synthesize_headers,
-        normalize_request_body: github_copilot_dual_surface_and_token_exchange::normalize_request_body,
-        default_provider_config: github_copilot_dual_surface_and_token_exchange::default_provider_config,
+        normalize_request_body:
+            github_copilot_dual_surface_and_token_exchange::normalize_request_body,
+        default_provider_config:
+            github_copilot_dual_surface_and_token_exchange::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: cursor_ide_connect_protobuf_and_cursor_agent_cli::FINDING_ID,
@@ -187,8 +191,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: cursor_ide_connect_protobuf_and_cursor_agent_cli::PRESET_TOML,
         build_endpoint_url: cursor_ide_connect_protobuf_and_cursor_agent_cli::build_endpoint_url,
         synthesize_headers: cursor_ide_connect_protobuf_and_cursor_agent_cli::synthesize_headers,
-        normalize_request_body: cursor_ide_connect_protobuf_and_cursor_agent_cli::normalize_request_body,
-        default_provider_config: cursor_ide_connect_protobuf_and_cursor_agent_cli::default_provider_config,
+        normalize_request_body:
+            cursor_ide_connect_protobuf_and_cursor_agent_cli::normalize_request_body,
+        default_provider_config:
+            cursor_ide_connect_protobuf_and_cursor_agent_cli::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: aws_kiro_codewhisperer_eventstream::FINDING_ID,
@@ -252,8 +258,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: opencode_zen_and_console_multi_protocol_gateway::PRESET_TOML,
         build_endpoint_url: opencode_zen_and_console_multi_protocol_gateway::build_endpoint_url,
         synthesize_headers: opencode_zen_and_console_multi_protocol_gateway::synthesize_headers,
-        normalize_request_body: opencode_zen_and_console_multi_protocol_gateway::normalize_request_body,
-        default_provider_config: opencode_zen_and_console_multi_protocol_gateway::default_provider_config,
+        normalize_request_body:
+            opencode_zen_and_console_multi_protocol_gateway::normalize_request_body,
+        default_provider_config:
+            opencode_zen_and_console_multi_protocol_gateway::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: vercel_ai_gateway_and_oidc_headers::FINDING_ID,
@@ -273,13 +281,16 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_id: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::PRESET_ID,
         display_name: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::DISPLAY_NAME,
         default_base_url: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::DEFAULT_BASE_URL,
-        supported_protocols: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::SUPPORTED_PROTOCOLS,
+        supported_protocols:
+            alibaba_qwen_oauth_portal_and_dashscope_coding_plan::SUPPORTED_PROTOCOLS,
         default_models: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::DEFAULT_MODELS,
         preset_toml: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::PRESET_TOML,
         build_endpoint_url: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::build_endpoint_url,
         synthesize_headers: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::synthesize_headers,
-        normalize_request_body: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::normalize_request_body,
-        default_provider_config: alibaba_qwen_oauth_portal_and_dashscope_coding_plan::default_provider_config,
+        normalize_request_body:
+            alibaba_qwen_oauth_portal_and_dashscope_coding_plan::normalize_request_body,
+        default_provider_config:
+            alibaba_qwen_oauth_portal_and_dashscope_coding_plan::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: zai_zhipu_glm_coding_plan_multi_region::FINDING_ID,
@@ -305,7 +316,8 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         build_endpoint_url: minimax_and_minimax_coding_plan_dual_region::build_endpoint_url,
         synthesize_headers: minimax_and_minimax_coding_plan_dual_region::synthesize_headers,
         normalize_request_body: minimax_and_minimax_coding_plan_dual_region::normalize_request_body,
-        default_provider_config: minimax_and_minimax_coding_plan_dual_region::default_provider_config,
+        default_provider_config:
+            minimax_and_minimax_coding_plan_dual_region::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: google_generative_ai_studio_and_vertex_ai::FINDING_ID,
@@ -330,21 +342,30 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: amazon_bedrock_sigv4_and_bearer_converse_stream::PRESET_TOML,
         build_endpoint_url: amazon_bedrock_sigv4_and_bearer_converse_stream::build_endpoint_url,
         synthesize_headers: amazon_bedrock_sigv4_and_bearer_converse_stream::synthesize_headers,
-        normalize_request_body: amazon_bedrock_sigv4_and_bearer_converse_stream::normalize_request_body,
-        default_provider_config: amazon_bedrock_sigv4_and_bearer_converse_stream::default_provider_config,
+        normalize_request_body:
+            amazon_bedrock_sigv4_and_bearer_converse_stream::normalize_request_body,
+        default_provider_config:
+            amazon_bedrock_sigv4_and_bearer_converse_stream::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: azure_openai_and_azure_cognitive_services_v1_and_deployments::FINDING_ID,
         preset_id: azure_openai_and_azure_cognitive_services_v1_and_deployments::PRESET_ID,
         display_name: azure_openai_and_azure_cognitive_services_v1_and_deployments::DISPLAY_NAME,
-        default_base_url: azure_openai_and_azure_cognitive_services_v1_and_deployments::DEFAULT_BASE_URL,
-        supported_protocols: azure_openai_and_azure_cognitive_services_v1_and_deployments::SUPPORTED_PROTOCOLS,
-        default_models: azure_openai_and_azure_cognitive_services_v1_and_deployments::DEFAULT_MODELS,
+        default_base_url:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::DEFAULT_BASE_URL,
+        supported_protocols:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::SUPPORTED_PROTOCOLS,
+        default_models:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::DEFAULT_MODELS,
         preset_toml: azure_openai_and_azure_cognitive_services_v1_and_deployments::PRESET_TOML,
-        build_endpoint_url: azure_openai_and_azure_cognitive_services_v1_and_deployments::build_endpoint_url,
-        synthesize_headers: azure_openai_and_azure_cognitive_services_v1_and_deployments::synthesize_headers,
-        normalize_request_body: azure_openai_and_azure_cognitive_services_v1_and_deployments::normalize_request_body,
-        default_provider_config: azure_openai_and_azure_cognitive_services_v1_and_deployments::default_provider_config,
+        build_endpoint_url:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::build_endpoint_url,
+        synthesize_headers:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::synthesize_headers,
+        normalize_request_body:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::normalize_request_body,
+        default_provider_config:
+            azure_openai_and_azure_cognitive_services_v1_and_deployments::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: cloudflare_workers_ai_and_ai_gateway_unified::FINDING_ID,
@@ -356,8 +377,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: cloudflare_workers_ai_and_ai_gateway_unified::PRESET_TOML,
         build_endpoint_url: cloudflare_workers_ai_and_ai_gateway_unified::build_endpoint_url,
         synthesize_headers: cloudflare_workers_ai_and_ai_gateway_unified::synthesize_headers,
-        normalize_request_body: cloudflare_workers_ai_and_ai_gateway_unified::normalize_request_body,
-        default_provider_config: cloudflare_workers_ai_and_ai_gateway_unified::default_provider_config,
+        normalize_request_body:
+            cloudflare_workers_ai_and_ai_gateway_unified::normalize_request_body,
+        default_provider_config:
+            cloudflare_workers_ai_and_ai_gateway_unified::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: gitlab_duo_agent_platform_and_direct_access::FINDING_ID,
@@ -370,7 +393,8 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         build_endpoint_url: gitlab_duo_agent_platform_and_direct_access::build_endpoint_url,
         synthesize_headers: gitlab_duo_agent_platform_and_direct_access::synthesize_headers,
         normalize_request_body: gitlab_duo_agent_platform_and_direct_access::normalize_request_body,
-        default_provider_config: gitlab_duo_agent_platform_and_direct_access::default_provider_config,
+        default_provider_config:
+            gitlab_duo_agent_platform_and_direct_access::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: deepseek_api_and_interleaved_reasoning_content::FINDING_ID,
@@ -382,8 +406,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: deepseek_api_and_interleaved_reasoning_content::PRESET_TOML,
         build_endpoint_url: deepseek_api_and_interleaved_reasoning_content::build_endpoint_url,
         synthesize_headers: deepseek_api_and_interleaved_reasoning_content::synthesize_headers,
-        normalize_request_body: deepseek_api_and_interleaved_reasoning_content::normalize_request_body,
-        default_provider_config: deepseek_api_and_interleaved_reasoning_content::default_provider_config,
+        normalize_request_body:
+            deepseek_api_and_interleaved_reasoning_content::normalize_request_body,
+        default_provider_config:
+            deepseek_api_and_interleaved_reasoning_content::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: mistral_and_codestral_api_compat::FINDING_ID,
@@ -734,7 +760,8 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         build_endpoint_url: vultr_serverless_inference_and_digitalocean::build_endpoint_url,
         synthesize_headers: vultr_serverless_inference_and_digitalocean::synthesize_headers,
         normalize_request_body: vultr_serverless_inference_and_digitalocean::normalize_request_body,
-        default_provider_config: vultr_serverless_inference_and_digitalocean::default_provider_config,
+        default_provider_config:
+            vultr_serverless_inference_and_digitalocean::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: friendli_ai_and_Inception_mercury_diffusion::FINDING_ID,
@@ -747,7 +774,8 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         build_endpoint_url: friendli_ai_and_Inception_mercury_diffusion::build_endpoint_url,
         synthesize_headers: friendli_ai_and_Inception_mercury_diffusion::synthesize_headers,
         normalize_request_body: friendli_ai_and_Inception_mercury_diffusion::normalize_request_body,
-        default_provider_config: friendli_ai_and_Inception_mercury_diffusion::default_provider_config,
+        default_provider_config:
+            friendli_ai_and_Inception_mercury_diffusion::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: upstage_solar_and_302ai_gateway::FINDING_ID,
@@ -811,8 +839,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: wandb_inference_coreweave_and_weights_and_biases::PRESET_TOML,
         build_endpoint_url: wandb_inference_coreweave_and_weights_and_biases::build_endpoint_url,
         synthesize_headers: wandb_inference_coreweave_and_weights_and_biases::synthesize_headers,
-        normalize_request_body: wandb_inference_coreweave_and_weights_and_biases::normalize_request_body,
-        default_provider_config: wandb_inference_coreweave_and_weights_and_biases::default_provider_config,
+        normalize_request_body:
+            wandb_inference_coreweave_and_weights_and_biases::normalize_request_body,
+        default_provider_config:
+            wandb_inference_coreweave_and_weights_and_biases::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: morph_fast_apply_and_relace_instant_apply::FINDING_ID,
@@ -876,8 +906,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: roocode_cloud_and_kilocode_openrouter_compatible::PRESET_TOML,
         build_endpoint_url: roocode_cloud_and_kilocode_openrouter_compatible::build_endpoint_url,
         synthesize_headers: roocode_cloud_and_kilocode_openrouter_compatible::synthesize_headers,
-        normalize_request_body: roocode_cloud_and_kilocode_openrouter_compatible::normalize_request_body,
-        default_provider_config: roocode_cloud_and_kilocode_openrouter_compatible::default_provider_config,
+        normalize_request_body:
+            roocode_cloud_and_kilocode_openrouter_compatible::normalize_request_body,
+        default_provider_config:
+            roocode_cloud_and_kilocode_openrouter_compatible::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: windsurf_codeium_and_qoder_coding_agents::FINDING_ID,
@@ -1078,14 +1110,20 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         finding_id: cross_provider_thinking_and_signature_preservation_bridge::FINDING_ID,
         preset_id: cross_provider_thinking_and_signature_preservation_bridge::PRESET_ID,
         display_name: cross_provider_thinking_and_signature_preservation_bridge::DISPLAY_NAME,
-        default_base_url: cross_provider_thinking_and_signature_preservation_bridge::DEFAULT_BASE_URL,
-        supported_protocols: cross_provider_thinking_and_signature_preservation_bridge::SUPPORTED_PROTOCOLS,
+        default_base_url:
+            cross_provider_thinking_and_signature_preservation_bridge::DEFAULT_BASE_URL,
+        supported_protocols:
+            cross_provider_thinking_and_signature_preservation_bridge::SUPPORTED_PROTOCOLS,
         default_models: cross_provider_thinking_and_signature_preservation_bridge::DEFAULT_MODELS,
         preset_toml: cross_provider_thinking_and_signature_preservation_bridge::PRESET_TOML,
-        build_endpoint_url: cross_provider_thinking_and_signature_preservation_bridge::build_endpoint_url,
-        synthesize_headers: cross_provider_thinking_and_signature_preservation_bridge::synthesize_headers,
-        normalize_request_body: cross_provider_thinking_and_signature_preservation_bridge::normalize_request_body,
-        default_provider_config: cross_provider_thinking_and_signature_preservation_bridge::default_provider_config,
+        build_endpoint_url:
+            cross_provider_thinking_and_signature_preservation_bridge::build_endpoint_url,
+        synthesize_headers:
+            cross_provider_thinking_and_signature_preservation_bridge::synthesize_headers,
+        normalize_request_body:
+            cross_provider_thinking_and_signature_preservation_bridge::normalize_request_body,
+        default_provider_config:
+            cross_provider_thinking_and_signature_preservation_bridge::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: cross_provider_json_schema_tool_sanitizer::FINDING_ID,
@@ -1111,7 +1149,8 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         build_endpoint_url: automatic_prompt_cache_breakpoint_injector::build_endpoint_url,
         synthesize_headers: automatic_prompt_cache_breakpoint_injector::synthesize_headers,
         normalize_request_body: automatic_prompt_cache_breakpoint_injector::normalize_request_body,
-        default_provider_config: automatic_prompt_cache_breakpoint_injector::default_provider_config,
+        default_provider_config:
+            automatic_prompt_cache_breakpoint_injector::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: multi_provider_oauth_device_and_pkce_flow_manager::FINDING_ID,
@@ -1123,21 +1162,28 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: multi_provider_oauth_device_and_pkce_flow_manager::PRESET_TOML,
         build_endpoint_url: multi_provider_oauth_device_and_pkce_flow_manager::build_endpoint_url,
         synthesize_headers: multi_provider_oauth_device_and_pkce_flow_manager::synthesize_headers,
-        normalize_request_body: multi_provider_oauth_device_and_pkce_flow_manager::normalize_request_body,
-        default_provider_config: multi_provider_oauth_device_and_pkce_flow_manager::default_provider_config,
+        normalize_request_body:
+            multi_provider_oauth_device_and_pkce_flow_manager::normalize_request_body,
+        default_provider_config:
+            multi_provider_oauth_device_and_pkce_flow_manager::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: multi_provider_quota_and_rate_limit_adapter_expansion::FINDING_ID,
         preset_id: multi_provider_quota_and_rate_limit_adapter_expansion::PRESET_ID,
         display_name: multi_provider_quota_and_rate_limit_adapter_expansion::DISPLAY_NAME,
         default_base_url: multi_provider_quota_and_rate_limit_adapter_expansion::DEFAULT_BASE_URL,
-        supported_protocols: multi_provider_quota_and_rate_limit_adapter_expansion::SUPPORTED_PROTOCOLS,
+        supported_protocols:
+            multi_provider_quota_and_rate_limit_adapter_expansion::SUPPORTED_PROTOCOLS,
         default_models: multi_provider_quota_and_rate_limit_adapter_expansion::DEFAULT_MODELS,
         preset_toml: multi_provider_quota_and_rate_limit_adapter_expansion::PRESET_TOML,
-        build_endpoint_url: multi_provider_quota_and_rate_limit_adapter_expansion::build_endpoint_url,
-        synthesize_headers: multi_provider_quota_and_rate_limit_adapter_expansion::synthesize_headers,
-        normalize_request_body: multi_provider_quota_and_rate_limit_adapter_expansion::normalize_request_body,
-        default_provider_config: multi_provider_quota_and_rate_limit_adapter_expansion::default_provider_config,
+        build_endpoint_url:
+            multi_provider_quota_and_rate_limit_adapter_expansion::build_endpoint_url,
+        synthesize_headers:
+            multi_provider_quota_and_rate_limit_adapter_expansion::synthesize_headers,
+        normalize_request_body:
+            multi_provider_quota_and_rate_limit_adapter_expansion::normalize_request_body,
+        default_provider_config:
+            multi_provider_quota_and_rate_limit_adapter_expansion::default_provider_config,
     },
     ProviderPresetSpec {
         finding_id: preset_catalog_and_models_dev_bundled_registry::FINDING_ID,
@@ -1149,8 +1195,10 @@ pub static ALL_PROVIDER_PRESET_SPECS: &[ProviderPresetSpec] = &[
         preset_toml: preset_catalog_and_models_dev_bundled_registry::PRESET_TOML,
         build_endpoint_url: preset_catalog_and_models_dev_bundled_registry::build_endpoint_url,
         synthesize_headers: preset_catalog_and_models_dev_bundled_registry::synthesize_headers,
-        normalize_request_body: preset_catalog_and_models_dev_bundled_registry::normalize_request_body,
-        default_provider_config: preset_catalog_and_models_dev_bundled_registry::default_provider_config,
+        normalize_request_body:
+            preset_catalog_and_models_dev_bundled_registry::normalize_request_body,
+        default_provider_config:
+            preset_catalog_and_models_dev_bundled_registry::default_provider_config,
     },
 ];
 

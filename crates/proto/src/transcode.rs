@@ -1271,18 +1271,16 @@ pub fn transcode_sse_payload(
                 .get("textDelta")
                 .or_else(|| val.get("delta"))
                 .and_then(Value::as_str)
+            && !d.is_empty()
         {
-            if !d.is_empty() {
-                deltas.push(d.to_string());
-            }
+            deltas.push(d.to_string());
         } else if let Some(d) = val
             .pointer("/candidates/0/content/parts/0/text")
             .or_else(|| val.pointer("/response/candidates/0/content/parts/0/text"))
             .and_then(Value::as_str)
+            && !d.is_empty()
         {
-            if !d.is_empty() {
-                deltas.push(d.to_string());
-            }
+            deltas.push(d.to_string());
         }
 
         // Extract token usage from any upstream streaming event format
@@ -1380,9 +1378,7 @@ pub fn transcode_sse_payload(
                     }
                 }
             });
-            out.push_str(&format!(
-                "event: response.completed\ndata: {completed}\n\n"
-            ));
+            out.push_str(&format!("event: response.completed\ndata: {completed}\n\n"));
         }
         WireProtocol::Messages
         | WireProtocol::GoogleGemini

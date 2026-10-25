@@ -332,6 +332,7 @@ pub struct MonthReservationGuard {
 
 impl MonthReservationGuard {
     /// Posts actual spend to the reservation month's accumulator and releases reservation.
+    #[allow(deprecated)]
     pub fn commit(mut self, actual_cost_micro_usd: i64) {
         self.accumulator
             .used_micro_usd
@@ -346,6 +347,7 @@ impl MonthReservationGuard {
 }
 
 impl Drop for MonthReservationGuard {
+    #[allow(deprecated)]
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.accumulator.reserved_in_flight.fetch_update(

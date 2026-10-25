@@ -31,14 +31,8 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             "/v1/chat/completions",
             post(crate::orchestrator::post_chat_completions),
         )
-        .route(
-            "/v1/embeddings",
-            post(crate::orchestrator::post_embeddings),
-        )
-        .route(
-            "/embeddings",
-            post(crate::orchestrator::post_embeddings),
-        )
+        .route("/v1/embeddings", post(crate::orchestrator::post_embeddings))
+        .route("/embeddings", post(crate::orchestrator::post_embeddings))
         .route("/v1/responses", post(crate::orchestrator::post_responses))
         .route(
             "/v1/responses/compact",

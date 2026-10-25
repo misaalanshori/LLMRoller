@@ -25,16 +25,24 @@ pub const PRESET_ID: &str = "amazon_bedrock_sigv4_and_bearer_converse_stream";
 pub const DISPLAY_NAME: &str = "Amazon Bedrock (`bedrock-runtime.{region}.amazonaws.com` ConverseStream & InvokeModelWithResponseStream with SigV4 & Bearer API Key)";
 
 /// Default upstream base URL for `amazon_bedrock_sigv4_and_bearer_converse_stream`.
-pub const DEFAULT_BASE_URL: &str = "https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream";
+pub const DEFAULT_BASE_URL: &str =
+    "https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream";
 
 /// Supported wire protocols for `amazon_bedrock_sigv4_and_bearer_converse_stream`.
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `amazon_bedrock_sigv4_and_bearer_converse_stream`.
-pub const DEFAULT_MODELS: &[&str] = &["us.anthropic.claude-opus-4-6-v1", "us.anthropic.claude-sonnet-4-6", "us.anthropic.claude-haiku-4-5-20251001-v1:0", "amazon.nova-pro-v1:0", "deepseek.r1-v1:0"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "us.anthropic.claude-opus-4-6-v1",
+    "us.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "amazon.nova-pro-v1:0",
+    "deepseek.r1-v1:0",
+];
 
 /// Compile-time embedded `presets/amazon_bedrock_sigv4_and_bearer_converse_stream.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/amazon_bedrock_sigv4_and_bearer_converse_stream.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/amazon_bedrock_sigv4_and_bearer_converse_stream.toml");
 
 /// Build the full upstream endpoint URL for `amazon_bedrock_sigv4_and_bearer_converse_stream` (`F117`).
 #[must_use]
@@ -82,7 +90,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-llmroller-preset".to_string(), "amazon_bedrock_sigv4_and_bearer_converse_stream".to_string());
+    map.insert(
+        "x-llmroller-preset".to_string(),
+        "amazon_bedrock_sigv4_and_bearer_converse_stream".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -122,7 +133,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -146,7 +160,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

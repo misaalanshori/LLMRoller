@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F103";
 pub const PRESET_ID: &str = "openai_codex_chatgpt_backend_oauth_and_websocket";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE & WebSocket v2 with Zstd)";
+pub const DISPLAY_NAME: &str =
+    "OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE & WebSocket v2 with Zstd)";
 
 /// Default upstream base URL for `openai_codex_chatgpt_backend_oauth_and_websocket`.
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -31,10 +32,18 @@ pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/respon
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["responses"];
 
 /// Reference models bundled with `openai_codex_chatgpt_backend_oauth_and_websocket`.
-pub const DEFAULT_MODELS: &[&str] = &["gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+];
 
 /// Compile-time embedded `presets/openai_codex_chatgpt_backend_oauth_and_websocket.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/openai_codex_chatgpt_backend_oauth_and_websocket.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/openai_codex_chatgpt_backend_oauth_and_websocket.toml");
 
 /// Build the full upstream endpoint URL for `openai_codex_chatgpt_backend_oauth_and_websocket` (`F103`).
 #[must_use]
@@ -82,9 +91,15 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("openai-beta".to_string(), "responses=experimental".to_string());
+    map.insert(
+        "openai-beta".to_string(),
+        "responses=experimental".to_string(),
+    );
     map.insert("originator".to_string(), "codex_cli_rs".to_string());
-    map.insert("user-agent".to_string(), "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464".to_string());
+    map.insert(
+        "user-agent".to_string(),
+        "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -123,7 +138,10 @@ pub fn normalize_request_body(body: Bytes, target_model: &str) -> Bytes {
                 }
             });
             if !sys_parts.is_empty() {
-                obj.insert("instructions".to_string(), Value::String(sys_parts.join("\n\n")));
+                obj.insert(
+                    "instructions".to_string(),
+                    Value::String(sys_parts.join("\n\n")),
+                );
             }
         }
         if let Ok(vec) = serde_json::to_vec(&val) {
@@ -152,7 +170,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -176,7 +197,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

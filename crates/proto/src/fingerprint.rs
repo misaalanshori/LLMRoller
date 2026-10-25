@@ -105,7 +105,9 @@ impl DeviceProfile {
     pub fn claude_billing_header(&self, seed: &str) -> String {
         let build_hash = &self.machine_id_sha256[..7];
         let cch = self.claude_cch(seed);
-        format!("x-anthropic-billing-header: cc_version=2.1.63.{build_hash}; cc_entrypoint=cli; cch={cch};")
+        format!(
+            "x-anthropic-billing-header: cc_version=2.1.63.{build_hash}; cc_entrypoint=cli; cch={cch};"
+        )
     }
 
     /// Synthesize the complete provider-specific hardware/CLI fingerprint header map (`F100`).
@@ -217,10 +219,7 @@ impl DeviceProfile {
                     "openai-intent".to_string(),
                     "conversation-edits".to_string(),
                 );
-                map.insert(
-                    "x-github-api-version".to_string(),
-                    "2025-04-01".to_string(),
-                );
+                map.insert("x-github-api-version".to_string(), "2025-04-01".to_string());
                 map.insert("x-request-id".to_string(), eff_req.to_string());
             }
             HardwareFingerprintPreset::KimiCoding => {
@@ -228,10 +227,7 @@ impl DeviceProfile {
                 map.insert("x-msh-platform".to_string(), "kimi_cli".to_string());
                 map.insert("x-msh-version".to_string(), "1.3.0".to_string());
                 map.insert("x-msh-device-name".to_string(), self.hostname.clone());
-                map.insert(
-                    "x-msh-device-model".to_string(),
-                    self.device_model.clone(),
-                );
+                map.insert("x-msh-device-model".to_string(), self.device_model.clone());
                 map.insert("x-msh-os-version".to_string(), self.os_version.clone());
                 map.insert("x-msh-device-id".to_string(), self.device_id.clone());
             }
@@ -240,19 +236,13 @@ impl DeviceProfile {
                     "x-cursor-checksum".to_string(),
                     self.cursor_checksum(timestamp_secs),
                 );
-                map.insert(
-                    "x-cursor-client-version".to_string(),
-                    "2.3.41".to_string(),
-                );
+                map.insert("x-cursor-client-version".to_string(), "2.3.41".to_string());
                 map.insert("x-cursor-client-type".to_string(), "ide".to_string());
             }
             HardwareFingerprintPreset::AwsKiro => {
                 map.insert(
                     "user-agent".to_string(),
-                    format!(
-                        "aws-sdk-js/1.0.0 KiroIDE-0.2.13-{}",
-                        self.machine_id_sha256
-                    ),
+                    format!("aws-sdk-js/1.0.0 KiroIDE-0.2.13-{}", self.machine_id_sha256),
                 );
                 map.insert("x-amzn-kiro-agent-mode".to_string(), "vibe".to_string());
                 map.insert("amz-sdk-invocation-id".to_string(), eff_req.to_string());
@@ -341,7 +331,7 @@ fn format_deterministic_uuid(hex64: &str) -> String {
     let variant_nibble = match bytes[16] {
         b'0'..=b'3' => '8',
         b'4'..=b'7' => '9',
-        b'8'..=b'b' | b'B' => 'a',
+        b'8'..=b'9' | b'a'..=b'b' | b'A'..=b'B' => 'a',
         _ => 'b',
     };
     let p4 = &hex64[17..20];
@@ -390,8 +380,14 @@ mod tests {
         let p2 = DeviceProfile::from_key_id("01JABCDEF1234567890ABCDEFG");
         let p3 = DeviceProfile::from_key_id("01JDIFFERENTKEY00000000000");
 
-        assert_eq!(p1, p2, "same upstream key ID must yield identical hardware identity");
-        assert_ne!(p1.device_id, p3.device_id, "different keys must have distinct device IDs");
+        assert_eq!(
+            p1, p2,
+            "same upstream key ID must yield identical hardware identity"
+        );
+        assert_ne!(
+            p1.device_id, p3.device_id,
+            "different keys must have distinct device IDs"
+        );
         assert_eq!(p1.device_id.len(), 36);
         assert_eq!(p1.machine_id_sha256.len(), 64);
 
@@ -419,8 +415,14 @@ mod tests {
             claude.get("user-agent").map(String::as_str),
             Some("claude-cli/2.1.63 (external, cli)")
         );
-        assert_eq!(claude.get("x-stainless-lang").map(String::as_str), Some("js"));
-        assert!(p1.claude_billing_header("seed").contains("cc_version=2.1.63."));
+        assert_eq!(
+            claude.get("x-stainless-lang").map(String::as_str),
+            Some("js")
+        );
+        assert!(
+            p1.claude_billing_header("seed")
+                .contains("cc_version=2.1.63.")
+        );
 
         let kimi = p1.headers_for_preset(
             HardwareFingerprintPreset::KimiCoding,
@@ -443,7 +445,10 @@ mod tests {
             copilot.get("copilot-integration-id").map(String::as_str),
             Some("vscode-chat")
         );
-        assert_eq!(copilot.get("x-request-id").map(String::as_str), Some("req-99"));
+        assert_eq!(
+            copilot.get("x-request-id").map(String::as_str),
+            Some("req-99")
+        );
 
         let cursor = p1.headers_for_preset(
             HardwareFingerprintPreset::CursorIde,
@@ -451,9 +456,11 @@ mod tests {
             "sess-1",
             1_776_000_000,
         );
-        assert!(cursor
-            .get("x-cursor-checksum")
-            .is_some_and(|v| v.contains(&p1.machine_id_sha256)));
+        assert!(
+            cursor
+                .get("x-cursor-checksum")
+                .is_some_and(|v| v.contains(&p1.machine_id_sha256))
+        );
 
         let kiro = p1.headers_for_preset(
             HardwareFingerprintPreset::AwsKiro,
@@ -472,8 +479,9 @@ mod tests {
             "sess-1",
             1_776_000_000,
         );
-        assert!(ag
-            .get("client-metadata")
-            .is_some_and(|v| v.contains("ANTIGRAVITY")));
+        assert!(
+            ag.get("client-metadata")
+                .is_some_and(|v| v.contains("ANTIGRAVITY"))
+        );
     }
 }

@@ -721,9 +721,9 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
 pub fn is_sqlite_disk_full_error(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
-            let code_match = db_err
-                .code()
-                .is_some_and(|c| c == "13" || c == "10" || c.starts_with("13") || c.starts_with("10"));
+            let code_match = db_err.code().is_some_and(|c| {
+                c == "13" || c == "10" || c.starts_with("13") || c.starts_with("10")
+            });
             let msg = db_err.message().to_ascii_lowercase();
             code_match
                 || msg.contains("database or disk is full")

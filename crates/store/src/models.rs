@@ -950,7 +950,13 @@ mod tests {
                 vec!["responses".to_string()]
             );
         }
-        for m in ["glm-5", "glm-5.1", "kimi-k2.5", "qwen3.5-plus", "qwen3.6-plus"] {
+        for m in [
+            "glm-5",
+            "glm-5.1",
+            "kimi-k2.5",
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+        ] {
             assert_eq!(
                 infer_discovered_model_protocols(Some("opencode_go"), m, None, None),
                 vec!["chat".to_string()]

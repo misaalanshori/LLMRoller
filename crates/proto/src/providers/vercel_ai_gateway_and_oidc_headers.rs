@@ -31,10 +31,16 @@ pub const DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `vercel_ai_gateway_and_oidc_headers`.
-pub const DEFAULT_MODELS: &[&str] = &["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3.1-pro-preview"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4",
+    "google/gemini-3.1-pro-preview",
+];
 
 /// Compile-time embedded `presets/vercel_ai_gateway_and_oidc_headers.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/vercel_ai_gateway_and_oidc_headers.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/vercel_ai_gateway_and_oidc_headers.toml");
 
 /// Build the full upstream endpoint URL for `vercel_ai_gateway_and_oidc_headers` (`F112`).
 #[must_use]
@@ -123,7 +129,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -147,7 +156,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

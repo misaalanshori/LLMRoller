@@ -789,7 +789,6 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
-
 /// Sanitize a `/v1/responses` JSON payload when failing over across upstream keys or accounts (`F005`).
 ///
 /// Strips `previous_response_id` when `strip_previous_response_id` is true, and removes
@@ -797,10 +796,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// from `input[]` so the failover upstream does not reject Account A's organization-encrypted
 /// items with `400 invalid_encrypted_content`.
 #[must_use]
-pub fn sanitize_responses_failover_body(
-    body: Bytes,
-    strip_previous_response_id: bool,
-) -> Bytes {
+pub fn sanitize_responses_failover_body(body: Bytes, strip_previous_response_id: bool) -> Bytes {
     let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
@@ -817,17 +813,17 @@ pub fn sanitize_responses_failover_body(
             let Some(item_obj) = item.as_object_mut() else {
                 return true;
             };
-            let item_type = item_obj
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if item_type == "item_reference" {
+            let is_item_reference =
+                item_obj.get("type").and_then(serde_json::Value::as_str) == Some("item_reference");
+            if is_item_reference {
                 return false;
             }
+            let is_reasoning =
+                item_obj.get("type").and_then(serde_json::Value::as_str) == Some("reasoning");
             if item_obj.remove("encrypted_content").is_some() {
                 changed = true;
             }
-            if item_type == "reasoning" {
+            if is_reasoning {
                 let has_summary = item_obj
                     .get("summary")
                     .and_then(serde_json::Value::as_array)
@@ -923,10 +919,7 @@ pub fn apply_openai_completions_compat(
                 {
                     let norm = normalize_mistral_tool_call_id(&tc_id);
                     if norm != tc_id {
-                        msg_obj.insert(
-                            "tool_call_id".to_string(),
-                            serde_json::Value::String(norm),
-                        );
+                        msg_obj.insert("tool_call_id".to_string(), serde_json::Value::String(norm));
                         changed = true;
                     }
                 }
@@ -973,17 +966,17 @@ pub fn apply_body_edit_rules(
         }
         match rule.op {
             BodyEditOp::Set => {
-                if let Some(ref v) = rule.value {
-                    if apply_path_set_or_default(value, &segments, v, false) {
-                        changed = true;
-                    }
+                if let Some(ref v) = rule.value
+                    && apply_path_set_or_default(value, &segments, v, false)
+                {
+                    changed = true;
                 }
             }
             BodyEditOp::Default => {
-                if let Some(ref v) = rule.value {
-                    if apply_path_set_or_default(value, &segments, v, true) {
-                        changed = true;
-                    }
+                if let Some(ref v) = rule.value
+                    && apply_path_set_or_default(value, &segments, v, true)
+                {
+                    changed = true;
                 }
             }
             BodyEditOp::Delete => {
@@ -1096,7 +1089,10 @@ fn apply_path_delete(current: &mut serde_json::Value, segments: &[&str]) -> bool
     }
 }
 
-fn take_path_value(current: &mut serde_json::Value, segments: &[&str]) -> Option<serde_json::Value> {
+fn take_path_value(
+    current: &mut serde_json::Value,
+    segments: &[&str],
+) -> Option<serde_json::Value> {
     let (&first, rest) = segments.split_first()?;
     let map = current.as_object_mut()?;
     if rest.is_empty() {
@@ -1105,7 +1101,6 @@ fn take_path_value(current: &mut serde_json::Value, segments: &[&str]) -> Option
         take_path_value(map.get_mut(first)?, rest)
     }
 }
-
 
 /// Force `store: false` and strip prior `reasoning` items from `input[]` when dispatching
 /// to OpenCode Go `/v1/responses` (`F096`).
@@ -1136,7 +1131,10 @@ pub fn inject_openrouter_anthropic_cache_control(
     if !lower.starts_with("anthropic/") && !lower.contains("claude-") {
         return false;
     }
-    let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return false;
     };
     for msg in messages.iter_mut().rev() {
@@ -1170,4 +1168,3 @@ pub fn inject_openrouter_anthropic_cache_control(
 
 #[cfg(test)]
 mod proptests;
-

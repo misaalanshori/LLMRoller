@@ -47,7 +47,10 @@ pub fn is_comment_frame(frame: &[u8]) -> bool {
             continue;
         }
         if trimmed.starts_with("data:") {
-            let compact: String = trimmed.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            let compact: String = trimmed
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
             if compact.contains("\"type\":\"ping\"") {
                 continue;
             }

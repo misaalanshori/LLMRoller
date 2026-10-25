@@ -362,7 +362,8 @@ fn test_phase_2b_pricing_free_tier_ceil_date_suffix_and_inline_base64() {
 
     // F045: Large (> 16 KiB) inline base64 string under non-standard key is counted as 1 binary block (1,600 tokens)
     let b64_blob = "A".repeat(24_000);
-    let payload = format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","source":"{b64_blob}"}}]}}"#);
+    let payload =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","source":"{b64_blob}"}}]}}"#);
     let est = estimate_input_tokens(payload.as_bytes());
     assert!(
         est < 2_000,

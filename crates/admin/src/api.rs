@@ -9369,7 +9369,7 @@ mod catalog_sync_tests {
         assert!(!setup_html.contains("<style"));
         assert!(!setup_html.contains("<script>"));
         // F079: admin.html must include #modal-new-upstream-key
-        assert!(admin_html.contains("id="modal-new-upstream-key""));
+        assert!(admin_html.contains("id=\"modal-new-upstream-key\""));
         // F080 & F094: render_logs_table_html emits exactly one <thead> and escapes XSS payloads
         let logs_json = serde_json::json!({
             "rows": [{

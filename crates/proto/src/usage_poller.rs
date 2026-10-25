@@ -309,7 +309,10 @@ pub fn parse_raw_usage_to_sanitized(
                 }
             }
             // F179: Codex /wham/usage rate_limit.primary_window & secondary_window
-            if let Some(rl) = raw_json.get("rate_limit").and_then(serde_json::Value::as_object) {
+            if let Some(rl) = raw_json
+                .get("rate_limit")
+                .and_then(serde_json::Value::as_object)
+            {
                 for (field, label) in [("primary_window", "5h"), ("secondary_window", "7d")] {
                     if let Some(w) = rl.get(field) {
                         windows.push(parse_window_obj(label, w, now_ms));
@@ -319,19 +322,28 @@ pub fn parse_raw_usage_to_sanitized(
             // F179: Claude OAuth /api/oauth/usage five_hour & seven_day
             for (field, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
                 if let Some(w) = raw_json.get(field) {
-                    let pct = w.get("utilization").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                    let pct = w
+                        .get("utilization")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
                     let mut obj = w.clone();
                     if let Some(map) = obj.as_object_mut() {
-                        map.entry("used_percent".to_string()).or_insert_with(|| serde_json::json!(pct));
+                        map.entry("used_percent".to_string())
+                            .or_insert_with(|| serde_json::json!(pct));
                     }
                     windows.push(parse_window_obj(label, &obj, now_ms));
                 }
             }
             // F179: Antigravity / Gemini CLI retrieveUserQuota buckets
-            if let Some(buckets) = raw_json.get("buckets").and_then(serde_json::Value::as_array)
+            if let Some(buckets) = raw_json
+                .get("buckets")
+                .and_then(serde_json::Value::as_array)
                 && let Some(first) = buckets.first()
             {
-                let rem_frac = first.get("remainingFraction").and_then(serde_json::Value::as_f64).unwrap_or(1.0);
+                let rem_frac = first
+                    .get("remainingFraction")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0);
                 let used_pct = ((1.0 - rem_frac) * 100.0).clamp(0.0, 100.0);
                 windows.push(parse_window_obj(
                     "5h",
@@ -348,7 +360,11 @@ pub fn parse_raw_usage_to_sanitized(
                 .and_then(serde_json::Value::as_array)
                 .and_then(|arr| arr.first())
                 .and_then(|b| b.get("total_balance"))
-                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| v.as_f64())
+                })
                 .map(usd_to_micro);
             if windows.is_empty()
                 && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())
@@ -365,7 +381,7 @@ pub fn parse_raw_usage_to_sanitized(
                 status: "ok".to_string(),
                 plan_name: plan,
                 windows,
-                balance_micro_usd: None,
+                balance_micro_usd: ds_balance,
             })
         }
         ProviderKind::CommandCode => {
@@ -473,14 +489,25 @@ pub fn parse_raw_usage_to_sanitized(
             }
         }
         ProviderKind::OpenDesignAmr | ProviderKind::Custom => {
-            if raw_json.get("data").and_then(|d| d.get("totalBalance")).is_some() {
+            if raw_json
+                .get("data")
+                .and_then(|d| d.get("totalBalance"))
+                .is_some()
+            {
                 let bal = raw_json
                     .pointer("/data/totalBalance")
-                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                    .and_then(|v| {
+                        v.as_str()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .or_else(|| v.as_f64())
+                    })
                     .map(usd_to_micro);
                 return Some(SanitizedUsageSnapshot {
                     status: "ok".to_string(),
-                    plan_name: raw_json.pointer("/data/role").and_then(serde_json::Value::as_str).map(str::to_string),
+                    plan_name: raw_json
+                        .pointer("/data/role")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     windows: Vec::new(),
                     balance_micro_usd: bal,
                 });
@@ -531,29 +558,42 @@ pub fn parse_raw_usage_to_sanitized(
                     windows.push(parse_window_obj(label, item, now_ms));
                 }
             }
-            let balance_micro_usd = ds_balance.or_else(|| raw_json
-                .get("balance_micro_usd")
-                .and_then(serde_json::Value::as_i64)
-                .or_else(|| {
-                    raw_json
-                        .get("balance_usd")
-                        .or_else(|| raw_json.get("balanceUsd"))
-                        .and_then(serde_json::Value::as_f64)
-                        .map(usd_to_micro)
+            let ds_balance = raw_json
+                .get("balance_infos")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|b| b.get("total_balance"))
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| v.as_f64())
                 })
-                .or_else(|| {
-                    raw_json.get("credits").and_then(|credits| {
-                        credits
-                            .get("balance_micro_usd")
-                            .and_then(serde_json::Value::as_i64)
-                            .or_else(|| {
-                                credits
-                                    .get("balanceUsd")
-                                    .and_then(serde_json::Value::as_f64)
-                                    .map(usd_to_micro)
-                            })
+                .map(usd_to_micro);
+            let balance_micro_usd = ds_balance.or_else(|| {
+                raw_json
+                    .get("balance_micro_usd")
+                    .and_then(serde_json::Value::as_i64)
+                    .or_else(|| {
+                        raw_json
+                            .get("balance_usd")
+                            .or_else(|| raw_json.get("balanceUsd"))
+                            .and_then(serde_json::Value::as_f64)
+                            .map(usd_to_micro)
                     })
-                }));
+                    .or_else(|| {
+                        raw_json.get("credits").and_then(|credits| {
+                            credits
+                                .get("balance_micro_usd")
+                                .and_then(serde_json::Value::as_i64)
+                                .or_else(|| {
+                                    credits
+                                        .get("balanceUsd")
+                                        .and_then(serde_json::Value::as_f64)
+                                        .map(usd_to_micro)
+                                })
+                        })
+                    })
+            });
             if plan.is_none() && windows.is_empty() && balance_micro_usd.is_none() {
                 None
             } else {
@@ -725,7 +765,8 @@ mod tests {
         assert_eq!(detailed.limit_remaining_usd, Some(45.75));
         assert!(!detailed.is_free_tier);
 
-        let sanitized = parse_raw_usage_to_sanitized(ProviderKind::Openrouter, &raw).expect("sanitized");
+        let sanitized =
+            parse_raw_usage_to_sanitized(ProviderKind::Openrouter, &raw).expect("sanitized");
         assert_eq!(sanitized.balance_micro_usd, Some(45_750_000));
     }
 }

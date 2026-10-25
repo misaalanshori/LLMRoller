@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F108";
 pub const PRESET_ID: &str = "kimi_coding_cli_oauth_and_msh_fingerprint";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers)";
+pub const DISPLAY_NAME: &str =
+    "Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers)";
 
 /// Default upstream base URL for `kimi_coding_cli_oauth_and_msh_fingerprint`.
 pub const DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1/messages";
@@ -34,7 +35,8 @@ pub const SUPPORTED_PROTOCOLS: &[&str] = &["messages"];
 pub const DEFAULT_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.5", "kimi-k2-thinking"];
 
 /// Compile-time embedded `presets/kimi_coding_cli_oauth_and_msh_fingerprint.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/kimi_coding_cli_oauth_and_msh_fingerprint.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/kimi_coding_cli_oauth_and_msh_fingerprint.toml");
 
 /// Build the full upstream endpoint URL for `kimi_coding_cli_oauth_and_msh_fingerprint` (`F108`).
 #[must_use]
@@ -125,7 +127,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -149,7 +154,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

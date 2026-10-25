@@ -292,7 +292,6 @@ impl SseUsageTap {
     }
 }
 
-
 fn merge_responses_usage(
     previous: Option<ExtractedUsage>,
     current: ExtractedUsage,

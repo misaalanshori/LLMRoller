@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F139";
 pub const PRESET_ID: &str = "moonshot_ai_global_and_cn";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Moonshot AI (`api.moonshot.ai/v1` Global & `api.moonshot.cn/v1` CN)";
+pub const DISPLAY_NAME: &str =
+    "Moonshot AI (`api.moonshot.ai/v1` Global & `api.moonshot.cn/v1` CN)";
 
 /// Default upstream base URL for `moonshot_ai_global_and_cn`.
 pub const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -31,7 +32,12 @@ pub const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `moonshot_ai_global_and_cn`.
-pub const DEFAULT_MODELS: &[&str] = &["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-thinking-turbo", "kimi-k2-0905-preview"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "kimi-k2.5",
+    "kimi-k2-thinking",
+    "kimi-k2-thinking-turbo",
+    "kimi-k2-0905-preview",
+];
 
 /// Compile-time embedded `presets/moonshot_ai_global_and_cn.toml` document.
 pub const PRESET_TOML: &str = include_str!("../../../../presets/moonshot_ai_global_and_cn.toml");
@@ -82,7 +88,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-llmroller-preset".to_string(), "moonshot_ai_global_and_cn".to_string());
+    map.insert(
+        "x-llmroller-preset".to_string(),
+        "moonshot_ai_global_and_cn".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -122,7 +131,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -146,7 +158,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

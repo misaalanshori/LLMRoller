@@ -365,7 +365,11 @@ pub fn apply_effective_upstream_cost(
     if is_free_tier_key || billing_coverage_mode == "free_tier" {
         return 0;
     }
-    apply_plan_multiplier(list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode)
+    apply_plan_multiplier(
+        list_cost_micro_usd,
+        plan_multiplier_bps,
+        billing_coverage_mode,
+    )
 }
 
 /// Streaming binary-aware JSON string tokenizer counting text vs binary blocks.
@@ -429,7 +433,9 @@ pub fn estimate_input_tokens(body: &[u8]) -> i64 {
                     let is_data_uri = raw_str.starts_with(b"data:");
                     let is_large_inline_base64 =
                         raw_str.len() > 16_384 && is_mostly_base64(raw_str);
-                    if ((is_url_data || is_data_uri || (is_binary_key && is_mostly_base64(raw_str)))
+                    if ((is_url_data
+                        || is_data_uri
+                        || (is_binary_key && is_mostly_base64(raw_str)))
                         && raw_str.len() > 1024)
                         || is_large_inline_base64
                     {

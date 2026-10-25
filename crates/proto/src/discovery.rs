@@ -94,7 +94,10 @@ fn parse_discovered_model(value: &Value) -> Option<DiscoveredModel> {
         .or_else(|| obj.get("max_context_length"))
         .or_else(|| obj.get("metadata").and_then(|m| m.get("context_limit")))
         .or_else(|| obj.get("metadata").and_then(|m| m.get("context_length")))
-        .or_else(|| obj.get("top_provider").and_then(|tp| tp.get("context_length")))
+        .or_else(|| {
+            obj.get("top_provider")
+                .and_then(|tp| tp.get("context_length"))
+        })
         .and_then(Value::as_i64)
         .filter(|&n| n > 0);
     let supported_protocols = obj

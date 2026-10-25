@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F143";
 pub const PRESET_ID: &str = "synthetic_new_glhf_openai_and_anthropic";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Synthetic (`api.synthetic.new/openai/v1` & `api.synthetic.new/anthropic`)";
+pub const DISPLAY_NAME: &str =
+    "Synthetic (`api.synthetic.new/openai/v1` & `api.synthetic.new/anthropic`)";
 
 /// Default upstream base URL for `synthetic_new_glhf_openai_and_anthropic`.
 pub const DEFAULT_BASE_URL: &str = "https://api.synthetic.new/openai/v1";
@@ -31,10 +32,17 @@ pub const DEFAULT_BASE_URL: &str = "https://api.synthetic.new/openai/v1";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `synthetic_new_glhf_openai_and_anthropic`.
-pub const DEFAULT_MODELS: &[&str] = &["hf:deepseek-ai/DeepSeek-V3.2", "hf:deepseek-ai/DeepSeek-R1-0528", "hf:moonshotai/Kimi-K2.5", "hf:zai-org/GLM-4.7", "hf:MiniMaxAI/MiniMax-M2.5"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "hf:deepseek-ai/DeepSeek-V3.2",
+    "hf:deepseek-ai/DeepSeek-R1-0528",
+    "hf:moonshotai/Kimi-K2.5",
+    "hf:zai-org/GLM-4.7",
+    "hf:MiniMaxAI/MiniMax-M2.5",
+];
 
 /// Compile-time embedded `presets/synthetic_new_glhf_openai_and_anthropic.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/synthetic_new_glhf_openai_and_anthropic.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/synthetic_new_glhf_openai_and_anthropic.toml");
 
 /// Build the full upstream endpoint URL for `synthetic_new_glhf_openai_and_anthropic` (`F143`).
 #[must_use]
@@ -122,7 +130,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -146,7 +157,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

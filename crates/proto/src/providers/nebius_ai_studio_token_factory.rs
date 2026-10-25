@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F133";
 pub const PRESET_ID: &str = "nebius_ai_studio_token_factory";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Nebius AI Studio (`api.studio.nebius.ai/v1` / `api.tokenfactory.nebius.com/v1`)";
+pub const DISPLAY_NAME: &str =
+    "Nebius AI Studio (`api.studio.nebius.ai/v1` / `api.tokenfactory.nebius.com/v1`)";
 
 /// Default upstream base URL for `nebius_ai_studio_token_factory`.
 pub const DEFAULT_BASE_URL: &str = "https://api.tokenfactory.nebius.com/v1";
@@ -31,10 +32,16 @@ pub const DEFAULT_BASE_URL: &str = "https://api.tokenfactory.nebius.com/v1";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `nebius_ai_studio_token_factory`.
-pub const DEFAULT_MODELS: &[&str] = &["deepseek-ai/DeepSeek-R1-0528", "deepseek-ai/DeepSeek-V3-0324", "Qwen/Qwen3-235B-A22B-Instruct-2507", "moonshotai/Kimi-K2.5"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "deepseek-ai/DeepSeek-R1-0528",
+    "deepseek-ai/DeepSeek-V3-0324",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "moonshotai/Kimi-K2.5",
+];
 
 /// Compile-time embedded `presets/nebius_ai_studio_token_factory.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/nebius_ai_studio_token_factory.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/nebius_ai_studio_token_factory.toml");
 
 /// Build the full upstream endpoint URL for `nebius_ai_studio_token_factory` (`F133`).
 #[must_use]
@@ -82,7 +89,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-llmroller-preset".to_string(), "nebius_ai_studio_token_factory".to_string());
+    map.insert(
+        "x-llmroller-preset".to_string(),
+        "nebius_ai_studio_token_factory".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -122,7 +132,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -146,7 +159,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

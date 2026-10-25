@@ -262,7 +262,7 @@ fn test_is_model_not_found_error_matching() {
 #[doc = "Spec: RTE-8, API-6, F001, F017, F018 - initial SSE and embedded HTTP 200 error classification"]
 #[test]
 fn test_embedded_http_200_and_sse_error_frame_classification() {
-    use crate::adapters::{is_overloaded_error, is_origin_timeout_status};
+    use crate::adapters::{is_origin_timeout_status, is_overloaded_error};
 
     // F001: Initial SSE frame with HTTP 200 carrying quota_exceeded or invalid_api_key
     let sse_quota = b"event: error\ndata: {\"error\":{\"code\":\"insufficient_quota\",\"message\":\"Out of credits\"}}\n\n";

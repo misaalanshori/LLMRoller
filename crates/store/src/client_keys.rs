@@ -518,21 +518,13 @@ pub async fn load_client_key_records_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
     now_ms: i64,
 ) -> Result<HashMap<[u8; 32], (ClientKeyRecord, HashRole)>, ClientKeyError> {
-    let rows = sqlx::query(
-        r#"SELECT ck.*, COALESCE(u.disabled, 1) AS owner_disabled
-           FROM client_keys ck
-           LEFT JOIN users u ON ck.owner_user_id = u.id"#,
-    )
-    .fetch_all(&mut **tx)
-    .await?;
+    let rows = sqlx::query("SELECT * FROM client_keys")
+        .fetch_all(&mut **tx)
+        .await?;
 
     let mut map = HashMap::with_capacity(rows.len() * 2);
     for row in rows {
-        let mut k = client_key_from_row(&row)?;
-        let owner_disabled: i64 = row.try_get("owner_disabled").unwrap_or(0);
-        if owner_disabled != 0 {
-            k.disabled = true;
-        }
+        let k = client_key_from_row(&row)?;
         let key_hash_bytes = hex_to_32bytes(&k.key_hash);
         let prev_hash_bytes = k.prev_key_hash.as_ref().map(|h| hex_to_32bytes(h));
 

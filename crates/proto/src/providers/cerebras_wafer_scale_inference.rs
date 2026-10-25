@@ -31,10 +31,17 @@ pub const DEFAULT_BASE_URL: &str = "https://api.cerebras.ai/v1";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `cerebras_wafer_scale_inference`.
-pub const DEFAULT_MODELS: &[&str] = &["zai-glm-4.7", "gpt-oss-120b", "qwen-3-235b-a22b-instruct-2507", "qwen-3-32b", "llama-3.3-70b"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "zai-glm-4.7",
+    "gpt-oss-120b",
+    "qwen-3-235b-a22b-instruct-2507",
+    "qwen-3-32b",
+    "llama-3.3-70b",
+];
 
 /// Compile-time embedded `presets/cerebras_wafer_scale_inference.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/cerebras_wafer_scale_inference.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/cerebras_wafer_scale_inference.toml");
 
 /// Build the full upstream endpoint URL for `cerebras_wafer_scale_inference` (`F124`).
 #[must_use]
@@ -82,7 +89,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-llmroller-preset".to_string(), "cerebras_wafer_scale_inference".to_string());
+    map.insert(
+        "x-llmroller-preset".to_string(),
+        "cerebras_wafer_scale_inference".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -128,7 +138,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -152,7 +165,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

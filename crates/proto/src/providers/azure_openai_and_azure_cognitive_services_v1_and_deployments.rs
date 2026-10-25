@@ -31,10 +31,21 @@ pub const DEFAULT_BASE_URL: &str = "https://{resource}.openai.azure.com/openai/v
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `azure_openai_and_azure_cognitive_services_v1_and_deployments`.
-pub const DEFAULT_MODELS: &[&str] = &["gpt-5.4", "gpt-5.3-codex", "gpt-4.1", "gpt-4o", "o3", "o4-mini", "DeepSeek-R1", "claude-sonnet-4-5"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-4.1",
+    "gpt-4o",
+    "o3",
+    "o4-mini",
+    "DeepSeek-R1",
+    "claude-sonnet-4-5",
+];
 
 /// Compile-time embedded `presets/azure_openai_and_azure_cognitive_services_v1_and_deployments.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/azure_openai_and_azure_cognitive_services_v1_and_deployments.toml");
+pub const PRESET_TOML: &str = include_str!(
+    "../../../../presets/azure_openai_and_azure_cognitive_services_v1_and_deployments.toml"
+);
 
 /// Build the full upstream endpoint URL for `azure_openai_and_azure_cognitive_services_v1_and_deployments` (`F118`).
 #[must_use]
@@ -82,7 +93,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-llmroller-preset".to_string(), "azure_openai_and_azure_cognitive_services_v1_and_deployments".to_string());
+    map.insert(
+        "x-llmroller-preset".to_string(),
+        "azure_openai_and_azure_cognitive_services_v1_and_deployments".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -122,7 +136,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -146,7 +163,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

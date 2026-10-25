@@ -450,10 +450,19 @@ fn test_request_header_pipeline_strips_proxy_forwarding_org_and_accept_encoding(
     inbound.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     inbound.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.7"));
     inbound.insert("true-client-ip", HeaderValue::from_static("198.51.100.7"));
-    inbound.insert("openai-organization", HeaderValue::from_static("org-client123"));
-    inbound.insert("anthropic-organization-id", HeaderValue::from_static("org-anth123"));
+    inbound.insert(
+        "openai-organization",
+        HeaderValue::from_static("org-client123"),
+    );
+    inbound.insert(
+        "anthropic-organization-id",
+        HeaderValue::from_static("org-anth123"),
+    );
     inbound.insert("x-goog-api-key", HeaderValue::from_static("AIzaClientKey"));
-    inbound.insert("accept-encoding", HeaderValue::from_static("gzip, br, zstd"));
+    inbound.insert(
+        "accept-encoding",
+        HeaderValue::from_static("gzip, br, zstd"),
+    );
 
     let out = apply_request_header_pipeline(
         &inbound,

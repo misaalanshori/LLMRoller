@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F106";
 pub const PRESET_ID: &str = "cursor_ide_connect_protobuf_and_cursor_agent_cli";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat & cursor-agent CLI Bridge)";
+pub const DISPLAY_NAME: &str =
+    "Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat & cursor-agent CLI Bridge)";
 
 /// Default upstream base URL for `cursor_ide_connect_protobuf_and_cursor_agent_cli`.
 pub const DEFAULT_BASE_URL: &str = "https://api2.cursor.sh/aiserver.v1.ChatService/StreamChat";
@@ -31,10 +32,19 @@ pub const DEFAULT_BASE_URL: &str = "https://api2.cursor.sh/aiserver.v1.ChatServi
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `cursor_ide_connect_protobuf_and_cursor_agent_cli`.
-pub const DEFAULT_MODELS: &[&str] = &["default", "claude-4.5-opus-high-thinking", "claude-4.5-opus-high", "claude-4.5-sonnet-thinking", "claude-4.5-sonnet", "claude-4.6-opus-max", "gpt-5.2-codex"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "default",
+    "claude-4.5-opus-high-thinking",
+    "claude-4.5-opus-high",
+    "claude-4.5-sonnet-thinking",
+    "claude-4.5-sonnet",
+    "claude-4.6-opus-max",
+    "gpt-5.2-codex",
+];
 
 /// Compile-time embedded `presets/cursor_ide_connect_protobuf_and_cursor_agent_cli.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/cursor_ide_connect_protobuf_and_cursor_agent_cli.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/cursor_ide_connect_protobuf_and_cursor_agent_cli.toml");
 
 /// Build the full upstream endpoint URL for `cursor_ide_connect_protobuf_and_cursor_agent_cli` (`F106`).
 #[must_use]
@@ -84,7 +94,10 @@ pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, St
     let mut map = BTreeMap::new();
     map.insert("x-cursor-client-version".to_string(), "2.3.41".to_string());
     map.insert("x-cursor-client-type".to_string(), "ide".to_string());
-    map.insert("x-cursor-checksum".to_string(), "{{cursor_checksum}}".to_string());
+    map.insert(
+        "x-cursor-checksum".to_string(),
+        "{{cursor_checksum}}".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -124,7 +137,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -148,7 +164,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

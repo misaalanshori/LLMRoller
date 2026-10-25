@@ -282,9 +282,11 @@ mod tests {
     fn pre_first_frame_buffer_handles_keepalive_comments_before_error_and_eof() {
         let mut buf = PreFirstFrameBuffer::new(StatusCode::OK, HeaderMap::new());
         assert!(
-            buf.push_chunk(b": OPENROUTER PROCESSING\n\nevent: ping\ndata: {\"type\": \"ping\"}\n\n")
-                .expect("keepalive ok")
-                .is_none()
+            buf.push_chunk(
+                b": OPENROUTER PROCESSING\n\nevent: ping\ndata: {\"type\": \"ping\"}\n\n"
+            )
+            .expect("keepalive ok")
+            .is_none()
         );
         // Premature EOF after only keepalives must return None so orchestrator fails over
         assert!(buf.flush_remaining().is_none());

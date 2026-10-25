@@ -258,8 +258,11 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         ));
     }
     let has_tls_proxy = !trusted_proxies.trim().is_empty();
-    match llmroller_proxy::metrics::check_data_plane_bind_security(&args.listen, has_tls_proxy, require_tls)
-    {
+    match llmroller_proxy::metrics::check_data_plane_bind_security(
+        &args.listen,
+        has_tls_proxy,
+        require_tls,
+    ) {
         Ok(true) => {
             tracing::warn!(
                 "Binding plaintext data-plane on non-loopback address {}; setting llmroller_plaintext_data_plane=1 (SEC-10)",
@@ -1067,7 +1070,10 @@ async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> ExitCode {
     let serialized = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
     if let Some(out) = args.out {
         if let Err(e) = fs::write(&out, &serialized) {
-            eprintln!("error: failed to write diagnostics to {}: {e}", out.display());
+            eprintln!(
+                "error: failed to write diagnostics to {}: {e}",
+                out.display()
+            );
             return ExitCode::from(6);
         }
     } else {

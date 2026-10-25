@@ -22,7 +22,8 @@ pub const FINDING_ID: &str = "F104";
 pub const PRESET_ID: &str = "anthropic_claude_code_stealth_oauth";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header & Tool Prefixing)";
+pub const DISPLAY_NAME: &str =
+    "Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header & Tool Prefixing)";
 
 /// Default upstream base URL for `anthropic_claude_code_stealth_oauth`.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
@@ -31,10 +32,17 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1/messages?beta=t
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["messages"];
 
 /// Reference models bundled with `anthropic_claude_code_stealth_oauth`.
-pub const DEFAULT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+];
 
 /// Compile-time embedded `presets/anthropic_claude_code_stealth_oauth.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/anthropic_claude_code_stealth_oauth.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/anthropic_claude_code_stealth_oauth.toml");
 
 /// Build the full upstream endpoint URL for `anthropic_claude_code_stealth_oauth` (`F104`).
 #[must_use]
@@ -82,16 +90,28 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("user-agent".to_string(), "claude-cli/2.1.63 (external, cli)".to_string());
+    map.insert(
+        "user-agent".to_string(),
+        "claude-cli/2.1.63 (external, cli)".to_string(),
+    );
     map.insert("x-app".to_string(), "cli".to_string());
-    map.insert("anthropic-dangerous-direct-browser-access".to_string(), "true".to_string());
+    map.insert(
+        "anthropic-dangerous-direct-browser-access".to_string(),
+        "true".to_string(),
+    );
     map.insert("anthropic-beta".to_string(), "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05".to_string());
     map.insert("x-stainless-lang".to_string(), "js".to_string());
-    map.insert("x-stainless-package-version".to_string(), "0.74.0".to_string());
+    map.insert(
+        "x-stainless-package-version".to_string(),
+        "0.74.0".to_string(),
+    );
     map.insert("x-stainless-os".to_string(), "MacOS".to_string());
     map.insert("x-stainless-arch".to_string(), "arm64".to_string());
     map.insert("x-stainless-runtime".to_string(), "node".to_string());
-    map.insert("x-stainless-runtime-version".to_string(), "v24.3.0".to_string());
+    map.insert(
+        "x-stainless-runtime-version".to_string(),
+        "v24.3.0".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -143,7 +163,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -167,7 +190,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

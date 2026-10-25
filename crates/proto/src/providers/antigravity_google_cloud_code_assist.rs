@@ -22,19 +22,29 @@ pub const FINDING_ID: &str = "F101";
 pub const PRESET_ID: &str = "antigravity_google_cloud_code_assist";
 
 /// Human-readable provider display name.
-pub const DISPLAY_NAME: &str = "Google Antigravity (Cloud Code Assist v1internal Sandbox & Prod Dual-Endpoint)";
+pub const DISPLAY_NAME: &str =
+    "Google Antigravity (Cloud Code Assist v1internal Sandbox & Prod Dual-Endpoint)";
 
 /// Default upstream base URL for `antigravity_google_cloud_code_assist`.
-pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+pub const DEFAULT_BASE_URL: &str =
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 
 /// Supported wire protocols for `antigravity_google_cloud_code_assist`.
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "messages", "responses"];
 
 /// Reference models bundled with `antigravity_google_cloud_code_assist`.
-pub const DEFAULT_MODELS: &[&str] = &["gemini-3.1-pro-high", "gemini-3.1-pro-low", "gemini-3-flash", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "gemini-3.1-pro-high",
+    "gemini-3.1-pro-low",
+    "gemini-3-flash",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6-thinking",
+    "gpt-oss-120b-medium",
+];
 
 /// Compile-time embedded `presets/antigravity_google_cloud_code_assist.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/antigravity_google_cloud_code_assist.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/antigravity_google_cloud_code_assist.toml");
 
 /// Build the full upstream endpoint URL for `antigravity_google_cloud_code_assist` (`F101`).
 #[must_use]
@@ -82,9 +92,19 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("user-agent".to_string(), "antigravity/1.107.0 darwin/arm64".to_string());
-    map.insert("x-goog-api-client".to_string(), "google-cloud-sdk vscode_cloudshelleditor/0.1".to_string());
-    map.insert("client-metadata".to_string(), "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"MACOS\",\"pluginType\":\"GEMINI\"}".to_string());
+    map.insert(
+        "user-agent".to_string(),
+        "antigravity/1.107.0 darwin/arm64".to_string(),
+    );
+    map.insert(
+        "x-goog-api-client".to_string(),
+        "google-cloud-sdk vscode_cloudshelleditor/0.1".to_string(),
+    );
+    map.insert(
+        "client-metadata".to_string(),
+        "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"MACOS\",\"pluginType\":\"GEMINI\"}"
+            .to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(
@@ -140,7 +160,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -164,7 +187,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

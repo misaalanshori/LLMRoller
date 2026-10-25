@@ -31,10 +31,24 @@ pub const DEFAULT_BASE_URL: &str = "https://api.githubcopilot.com";
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `github_copilot_dual_surface_and_token_exchange`.
-pub const DEFAULT_MODELS: &[&str] = &["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-5.1-codex", "gpt-5.2-codex", "claude-sonnet-4", "claude-sonnet-4.5", "claude-opus-4.5", "gemini-2.5-pro", "o3-mini", "o4-mini"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.1-codex",
+    "gpt-5.2-codex",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "claude-opus-4.5",
+    "gemini-2.5-pro",
+    "o3-mini",
+    "o4-mini",
+];
 
 /// Compile-time embedded `presets/github_copilot_dual_surface_and_token_exchange.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/github_copilot_dual_surface_and_token_exchange.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/github_copilot_dual_surface_and_token_exchange.toml");
 
 /// Build the full upstream endpoint URL for `github_copilot_dual_surface_and_token_exchange` (`F105`).
 #[must_use]
@@ -83,9 +97,18 @@ pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, St
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
     map.insert("editor-version".to_string(), "vscode/1.110.0".to_string());
-    map.insert("editor-plugin-version".to_string(), "copilot-chat/0.38.0".to_string());
-    map.insert("copilot-integration-id".to_string(), "vscode-chat".to_string());
-    map.insert("openai-intent".to_string(), "conversation-edits".to_string());
+    map.insert(
+        "editor-plugin-version".to_string(),
+        "copilot-chat/0.38.0".to_string(),
+    );
+    map.insert(
+        "copilot-integration-id".to_string(),
+        "vscode-chat".to_string(),
+    );
+    map.insert(
+        "openai-intent".to_string(),
+        "conversation-edits".to_string(),
+    );
     map.insert("x-github-api-version".to_string(), "2025-04-01".to_string());
     for val in map.values_mut() {
         if val.contains("{{") {
@@ -126,7 +149,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -150,7 +176,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

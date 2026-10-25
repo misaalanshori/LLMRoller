@@ -807,6 +807,7 @@ impl Reservation {
     }
 
     /// Commits actual spend to counters and releases reservation.
+    #[allow(deprecated)]
     pub fn commit(mut self, actual_micro_usd: i64, now_ms: i64) {
         for counter in &self.counters {
             // Post actual cost first
@@ -823,6 +824,7 @@ impl Reservation {
 }
 
 impl Drop for Reservation {
+    #[allow(deprecated)]
     fn drop(&mut self) {
         if !self.committed {
             for counter in &self.counters {

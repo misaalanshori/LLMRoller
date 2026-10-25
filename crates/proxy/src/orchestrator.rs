@@ -1406,7 +1406,8 @@ pub async fn post_messages_count_tokens(
             Ok(Ok(bytes)) => bytes,
             _ => return StatusCode::BAD_GATEWAY.into_response(),
         };
-        let bytes = decode_upstream_body(content_encoding.as_deref(), raw_bytes).unwrap_or_default();
+        let bytes =
+            decode_upstream_body(content_encoding.as_deref(), raw_bytes).unwrap_or_default();
         let mut builder = Response::builder().status(status);
         for (name, value) in filtered_headers {
             if let Some(name) = name {
@@ -2867,16 +2868,11 @@ pub fn parse_rate_limit_backoff_ms(headers: &HeaderMap, body: &[u8], now_ms: i64
         if let Some(ms) = parse_go_duration_ms(ra_str) {
             return Some(ms);
         }
-        if let Ok(dt) =
-            time::OffsetDateTime::parse(ra_str, &time::format_description::well_known::Rfc2822)
-                .or_else(|_| {
-                    time::OffsetDateTime::parse(
-                        ra_str,
-                        &time::format_description::well_known::Rfc3339,
-                    )
-                })
-        {
-            let target_ms = i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(now_ms);
+        if let Ok(st) = httpdate::parse_http_date(ra_str) {
+            let target_ms = match st.duration_since(std::time::UNIX_EPOCH) {
+                Ok(dur) => i64::try_from(dur.as_millis()).unwrap_or(now_ms),
+                Err(_) => now_ms,
+            };
             return Some((target_ms - now_ms).max(0));
         }
     }
@@ -3422,11 +3418,7 @@ impl StreamFinalizer {
                             ts: finished_ms,
                             owner_user_id: self.usage.owner_user_id,
                             client_key_id: self.usage.client_key_id,
-                            session_hash: self
-                                .usage
-                                .session_hash
-                                .as_deref()
-                                .unwrap_or_default(),
+                            session_hash: self.usage.session_hash.as_deref().unwrap_or_default(),
                             thread_id: &self.thread_id,
                             canonical_id: &self.usage.canonical_model,
                             protocol: &self.usage.endpoint_str,
@@ -3776,8 +3768,10 @@ pub async fn handle_inference_request(
     };
 
     // F004 & API-1: POST /v1/responses/compact is strictly non-streaming; reject stream: true with HTTP 400.
-    if matches!(endpoint, EndpointKind::ResponsesCompact | EndpointKind::Embeddings)
-        && scan.stream.as_ref().is_some_and(|(stream, _)| *stream)
+    if matches!(
+        endpoint,
+        EndpointKind::ResponsesCompact | EndpointKind::Embeddings
+    ) && scan.stream.as_ref().is_some_and(|(stream, _)| *stream)
     {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
         return protocol_error(
@@ -4455,10 +4449,8 @@ pub async fn handle_inference_request(
         };
 
         // F096 & F099: Determine whether this candidate natively supports `protocol` or requires cross-protocol transcoding.
-        let route_protos: Option<Vec<String>> = snapshot
-            .routes_by_model
-            .get(&model.id)
-            .and_then(|routes| {
+        let route_protos: Option<Vec<String>> =
+            snapshot.routes_by_model.get(&model.id).and_then(|routes| {
                 routes
                     .iter()
                     .find(|r| r.upstream_key_id == candidate.upstream_key_id)
@@ -4550,7 +4542,12 @@ pub async fn handle_inference_request(
         };
         // F005: On failover across keys for /v1/responses, strip unpinned previous_response_id
         // and cross-account encrypted reasoning items so the backup key does not return 400.
-        if attempt_no > 1 && matches!(endpoint, EndpointKind::Responses | EndpointKind::ResponsesCompact) {
+        if attempt_no > 1
+            && matches!(
+                endpoint,
+                EndpointKind::Responses | EndpointKind::ResponsesCompact
+            )
+        {
             edited_body = llmroller_proto::body_edit::sanitize_responses_failover_body(
                 edited_body,
                 hard_link.is_none(),
@@ -4593,7 +4590,10 @@ pub async fn handle_inference_request(
             let mut doc_changed = false;
             if let Some(ref compat) = candidate.config.openai_compat
                 && attempt_endpoint == EndpointKind::Chat
-                && llmroller_proto::body_edit::apply_openai_completions_compat(&mut json_doc, compat)
+                && llmroller_proto::body_edit::apply_openai_completions_compat(
+                    &mut json_doc,
+                    compat,
+                )
             {
                 doc_changed = true;
             }
@@ -4757,8 +4757,7 @@ pub async fn handle_inference_request(
             let error_body = decode_upstream_body(err_encoding.as_deref(), raw_error_body.clone())
                 .unwrap_or(raw_error_body);
             // F029: Parse rate-limit backoff across Retry-After, retry-after-ms, Go durations, and JSON body.
-            last_retry_after_ms =
-                parse_rate_limit_backoff_ms(&upstream_headers, &error_body, now);
+            last_retry_after_ms = parse_rate_limit_backoff_ms(&upstream_headers, &error_body, now);
             // Auxiliary endpoints have independent support. A 404/405/501 means this
             // key does not implement the endpoint; cache that fact without treating it
             // as a credential or host failure (API-8).
@@ -5872,8 +5871,10 @@ pub async fn handle_inference_request(
                             service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
                             request_headers_json: request_headers_json.clone(),
                         };
-                        let mut est_usage = llmroller_proto::json_usage::ExtractedUsage::default();
-                        est_usage.input_uncached_tokens = input_tokens_est;
+                        let est_usage = llmroller_proto::json_usage::ExtractedUsage {
+                            input_uncached_tokens: input_tokens_est,
+                            ..Default::default()
+                        };
                         let event = usage.event(
                             now,
                             StatusCode::GATEWAY_TIMEOUT.as_u16(),
@@ -5955,9 +5956,7 @@ pub async fn handle_inference_request(
         let is_embedded_error = json_value
             .get("error")
             .or_else(|| json_value.pointer("/response/error"))
-            .is_some_and(|e| {
-                e.is_object() || e.as_str().is_some_and(|s| !s.trim().is_empty())
-            })
+            .is_some_and(|e| e.is_object() || e.as_str().is_some_and(|s| !s.trim().is_empty()))
             || json_value.get("type").and_then(|t| t.as_str()) == Some("error");
         if is_embedded_error {
             let classify_prefix = &body_bytes[..body_bytes.len().min(ERROR_CLASSIFY_BYTES)];
@@ -7025,12 +7024,24 @@ mod tests {
         assert_eq!(parse_rate_limit_backoff_ms(&h, b"", 1_000_000), Some(1500));
 
         let mut h2 = HeaderMap::new();
-        h2.insert("x-ratelimit-reset-requests", HeaderValue::from_static("6m0s"));
-        assert_eq!(parse_rate_limit_backoff_ms(&h2, b"", 1_000_000), Some(360_000));
+        h2.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("6m0s"),
+        );
+        assert_eq!(
+            parse_rate_limit_backoff_ms(&h2, b"", 1_000_000),
+            Some(360_000)
+        );
 
         let mut h3 = HeaderMap::new();
-        h3.insert("x-codex-primary-reset-after-seconds", HeaderValue::from_static("45"));
-        assert_eq!(parse_rate_limit_backoff_ms(&h3, b"", 1_000_000), Some(45_000));
+        h3.insert(
+            "x-codex-primary-reset-after-seconds",
+            HeaderValue::from_static("45"),
+        );
+        assert_eq!(
+            parse_rate_limit_backoff_ms(&h3, b"", 1_000_000),
+            Some(45_000)
+        );
 
         let mut h4 = HeaderMap::new();
         h4.insert("x-ratelimit-reset", HeaderValue::from_static("1775000010"));

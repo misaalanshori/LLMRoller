@@ -746,7 +746,8 @@ async fn post_login(
         Ok(Some(record)) => record,
         Ok(None) => {
             let pwd = payload.password.clone();
-            let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_ARGON2_PHC)).await;
+            let _ =
+                tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_ARGON2_PHC)).await;
             state
                 .limiter
                 .record_failure(&payload.username, client_ip, now_ms);

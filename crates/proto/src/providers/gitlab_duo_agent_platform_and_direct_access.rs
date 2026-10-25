@@ -31,10 +31,18 @@ pub const DEFAULT_BASE_URL: &str = "https://cloud.gitlab.com/ai/v1/proxy/anthrop
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["chat", "responses", "messages"];
 
 /// Reference models bundled with `gitlab_duo_agent_platform_and_direct_access`.
-pub const DEFAULT_MODELS: &[&str] = &["duo-chat-haiku-4-5", "duo-chat-sonnet-4-5", "duo-chat-sonnet-4-6", "duo-chat-opus-4-6", "duo-chat-gpt-5-2-codex", "duo-chat-gpt-5-codex"];
+pub const DEFAULT_MODELS: &[&str] = &[
+    "duo-chat-haiku-4-5",
+    "duo-chat-sonnet-4-5",
+    "duo-chat-sonnet-4-6",
+    "duo-chat-opus-4-6",
+    "duo-chat-gpt-5-2-codex",
+    "duo-chat-gpt-5-codex",
+];
 
 /// Compile-time embedded `presets/gitlab_duo_agent_platform_and_direct_access.toml` document.
-pub const PRESET_TOML: &str = include_str!("../../../../presets/gitlab_duo_agent_platform_and_direct_access.toml");
+pub const PRESET_TOML: &str =
+    include_str!("../../../../presets/gitlab_duo_agent_platform_and_direct_access.toml");
 
 /// Build the full upstream endpoint URL for `gitlab_duo_agent_platform_and_direct_access` (`F120`).
 #[must_use]
@@ -82,7 +90,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let mut map = BTreeMap::new();
-    map.insert("x-gitlab-instance-url".to_string(), "https://gitlab.com".to_string());
+    map.insert(
+        "x-gitlab-instance-url".to_string(),
+        "https://gitlab.com".to_string(),
+    );
     map.insert("anthropic-version".to_string(), "2023-06-01".to_string());
     for val in map.values_mut() {
         if val.contains("{{") {
@@ -123,7 +134,10 @@ pub const fn default_openai_compat() -> Option<OpenAiCompatConfig> {
 pub fn default_provider_config() -> ProviderConfig {
     ProviderConfig {
         preset_id: Some(PRESET_ID.to_string()),
-        supported_protocols: SUPPORTED_PROTOCOLS.iter().map(|s| (*s).to_string()).collect(),
+        supported_protocols: SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
@@ -147,7 +161,10 @@ mod tests {
         let headers = synthesize_headers("01JKEYTEST0000000000000000", "sess_test_1");
         assert!(!headers.is_empty());
         for val in headers.values() {
-            assert!(!val.contains("{{uuid}}"), "template placeholders must be expanded");
+            assert!(
+                !val.contains("{{uuid}}"),
+                "template placeholders must be expanded"
+            );
         }
 
         let sample = Bytes::from_static(

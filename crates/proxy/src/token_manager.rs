@@ -178,9 +178,17 @@ impl TokenManager {
             form.push(("scope", scope.as_str()));
         }
 
+        let form_body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form)
+            .finish();
+
         let response = client
             .post(token_url)
-            .form(&form)
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form_body)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -231,7 +239,8 @@ mod tests {
         assert_eq!(plain, "sk-static-key-123");
 
         // 2. Dynamic OAuth2 spec with fresh inline access_token is cached and returned
-        let oauth_json = r#"{"type":"oauth2","access_token":"ya29.fresh-token","expires_at_ms":900000}"#;
+        let oauth_json =
+            r#"{"type":"oauth2","access_token":"ya29.fresh-token","expires_at_ms":900000}"#;
         let resolved = mgr
             .resolve_secret(key_id, oauth_json, &client, false, 100_000)
             .await
