@@ -9349,6 +9349,24 @@ mod catalog_sync_tests {
         assert!(!app_html.contains("http://127.0.0.1:8082"));
     }
 
+    #[test]
+    #[doc = "Spec: PRV-2, CLK-7, UI-2"]
+    fn web_ui_preset_urls_and_proxy_port_match_presets_and_cli_defaults() {
+        let app_html = include_str!("../templates/app.html");
+        let app_js = include_str!("../static/app.js");
+
+        // Verify Quick Connect snippets in app.html use default data-plane port 8080 and zero 8082
+        assert!(app_html.contains("export ANTHROPIC_BASE_URL=\"http://127.0.0.1:8080\""));
+        assert!(app_html.contains("export OPENAI_BASE_URL=\"http://127.0.0.1:8080/v1\""));
+        assert!(!app_html.contains("8082"));
+
+        // Verify onProviderKindChange in app.js synchronizes with authoritative presets/*.toml base URLs
+        assert!(app_js.contains("https://openrouter.ai/api/v1"));
+        assert!(app_js.contains("https://opencode.ai/zen/go/v1"));
+        assert!(app_js.contains("https://api.commandcode.ai/provider/v1"));
+        assert!(app_js.contains("https://amr-link.open-design.ai/v1"));
+    }
+
     /// Models without a `cost` block are not priced, and the catalogue shape is
     /// tolerated defensively (no `models` key, non-object roots).
     #[test]
