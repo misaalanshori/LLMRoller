@@ -196,6 +196,12 @@ fn collect_rust_files(directory: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries {
         let path = entry.expect("directory entry").path();
         if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "target" || name == ".git")
+            {
+                continue;
+            }
             collect_rust_files(&path, out);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             out.push(path);
@@ -440,4 +446,33 @@ fn lockfile_is_committed_despite_generic_lock_ignore() {
         ),
         Err(error) => panic!("git must be available: {error}"),
     }
+}
+
+#[test]
+#[doc = "Spec: MNT-3"]
+fn all_rust_files_are_under_1600_lines() {
+    let mut files = Vec::new();
+    for sub in ["crates", "tests", "benches", "xtask", "fuzz"] {
+        let dir = workspace_root().join(sub);
+        if dir.is_dir() {
+            collect_rust_files(&dir, &mut files);
+        }
+    }
+    let mut violations = Vec::new();
+    for file in files {
+        let content = fs::read_to_string(&file).expect("source must be UTF-8");
+        let line_count = content.lines().count();
+        if line_count > 1600 {
+            violations.push(format!(
+                "{}: {} lines (exceeds 1600 ceiling)",
+                file.display(),
+                line_count
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Files exceed 1600 LOC ceiling (MNT-3):\n{}",
+        violations.join("\n")
+    );
 }

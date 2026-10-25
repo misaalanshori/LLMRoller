@@ -722,6 +722,12 @@ delivering_subphase = "1.1"
 partial_subphases = ["2.6"]
 tests = ["crates/server/tests/workspace_boundaries.rs"]
 
+[requirements.MNT-3]
+priority = "P0"
+milestone = "M0"
+delivering_subphase = "1.1"
+tests = ["crates/server/tests/workspace_boundaries.rs"]
+
 [requirements.OBS-1]
 priority = "P0"
 milestone = "M1"

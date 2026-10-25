@@ -1,0 +1,205 @@
+use super::*;
+
+#[tokio::test]
+#[doc = "Spec: API-4, TRN-2 — F03 only Chat streaming may inject stream_options"]
+async fn test_non_chat_streaming_does_not_inject_chat_stream_options() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_body.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE1; 32]);
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, "{}").await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let messages = streaming_request(
+        "/v1/messages",
+        &token,
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    );
+    let messages_response = app
+        .clone()
+        .oneshot(messages)
+        .await
+        .expect("messages response");
+    assert_eq!(messages_response.status(), StatusCode::OK);
+    let messages_body = latest_request(&mock_state, "/messages").body;
+    assert!(
+        !messages_body.contains("stream_options"),
+        "Anthropic /v1/messages must not receive stream_options: {messages_body}"
+    );
+
+    let responses = streaming_request(
+        "/v1/responses",
+        &token,
+        r#"{"model":"gpt-4o","input":"hi","stream":true}"#,
+    );
+    let responses_response = app.oneshot(responses).await.expect("responses response");
+    assert_eq!(responses_response.status(), StatusCode::OK);
+    let responses_body = latest_request(&mock_state, "/responses").body;
+    assert!(
+        !responses_body.contains("stream_options"),
+        "OpenAI /v1/responses must not receive chat stream_options: {responses_body}"
+    );
+}
+
+
+#[tokio::test]
+#[doc = "Spec: API-4 — F03 provider-native chat_stream mode suppresses injection"]
+async fn test_provider_native_chat_stream_mode_preserves_body() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_native.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE2; 32]);
+    let config = r#"{"usage_reporting":{"chat_stream":"native"}}"#;
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, config).await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = streaming_request(
+        "/v1/chat/completions",
+        &token,
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    );
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = latest_request(&mock_state, "/chat/completions").body;
+    assert!(
+        !body.contains("stream_options"),
+        "provider-native usage reporting must not be mutated: {body}"
+    );
+
+    let _ = mock_state;
+}
+
+
+#[tokio::test]
+#[doc = "Spec: API-2, API-3, PRV-3 — F03 honors provider header, UA, auth and response profiles"]
+async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_profile.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE3; 32]);
+    let config = r#"{
+        "add_headers": {"x-custom-provider": "1"},
+        "strip_headers": ["x-client-secret"],
+        "strip_header_tokens": ["beta-drop"],
+        "ua_policy": "label",
+        "response_header_allow": ["x-upstream-custom"],
+        "auth": {"chat": {"header": "authorization", "prefix": "Bearer "}}
+    }"#;
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, config).await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-client-secret", "must-not-leak")
+        .header("anthropic-beta", "keep, beta-drop")
+        .header(header::USER_AGENT, "curl/8.5.0")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-custom")
+            .map(|v| v.as_bytes()),
+        Some(&b"yes"[..]),
+        "response_header_allow must forward the configured upstream header"
+    );
+
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-custom-provider")
+            .map(|v| v.as_bytes()),
+        Some(&b"1"[..]),
+        "add_headers must be applied to the upstream request"
+    );
+    assert!(
+        !recorded.headers.contains_key("x-client-secret"),
+        "strip_headers must remove configured deny-listed headers"
+    );
+    assert_eq!(
+        recorded.headers.get("anthropic-beta").map(|v| v.as_bytes()),
+        Some(&b"keep"[..]),
+        "strip_header_tokens must remove only the configured tokens"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get(header::USER_AGENT)
+            .map(|v| v.as_bytes()),
+        Some(&b"llmroller/1.0"[..]),
+        "ua_policy=label must replace generic library User-Agent values"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get(header::AUTHORIZATION)
+            .map(|v| v.as_bytes()),
+        Some(&b"Bearer sk-mock-key"[..]),
+        "the configured auth scheme must receive the decrypted upstream secret"
+    );
+}
+
+
+#[tokio::test]
+#[doc = "Spec: API-2, PRV-3 — F03 supports per-protocol x-api-key authentication"]
+async fn test_messages_auth_scheme_uses_configured_x_api_key() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("f03_messages_auth.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE4; 32]);
+    let config = r#"{"auth":{"messages":{"header":"x-api-key","prefix":""}}}"#;
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, config).await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = latest_request(&mock_state, "/messages");
+    assert_eq!(
+        recorded.headers.get("x-api-key").map(|v| v.as_bytes()),
+        Some(&b"sk-mock-key"[..]),
+        "the Messages protocol must use its configured auth header"
+    );
+    assert!(
+        !recorded.headers.contains_key(header::AUTHORIZATION),
+        "client credentials must not leak through the Authorization header"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get("anthropic-version")
+            .map(|v| v.as_bytes()),
+        Some(&b"2023-06-01"[..]),
+        "native Anthropic Messages requests require anthropic-version"
+    );
+}
+
