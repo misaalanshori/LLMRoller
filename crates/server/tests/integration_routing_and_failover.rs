@@ -786,6 +786,27 @@ async fn test_v1_endpoints_and_auxiliary_routes() {
         "the cached negative probe must short-circuit before dispatch"
     );
 
+    // F004 & API-1: POST /v1/responses/compact with stream: true returns HTTP 400 Bad Request
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses/compact")
+                .header(header::AUTHORIZATION, format!("Bearer {client_key_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4o","input":"compact me","stream":true}"#,
+                ))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+
     // 6. State-bound endpoints: GET/DELETE /v1/responses/{id}, /input_items, /cancel
     let req_get = Request::builder()
         .method("GET")
