@@ -525,12 +525,13 @@ fn start_reloader_inner(
 
     let rx_arc = Arc::new(tokio::sync::Mutex::new(reloader_rx));
     let supervisor = crate::shutdown::JobSupervisor::new("reloader");
-    let (_stop_tx, stop_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     let join_handle =
         tokio::spawn(async move {
+            let _keep_alive = stop_tx;
             supervisor
-            .run_supervised(stop_rx, move |_stop_rx| {
+            .run_supervised(stop_rx, move |mut job_stop| {
                 let rx_arc = rx_arc.clone();
                 let pool = pool.clone();
                 let shared_snapshot = shared_snapshot.clone();
@@ -539,7 +540,14 @@ fn start_reloader_inner(
                 let published_version_tx = published_version_tx.clone();
                 async move {
                     let mut rx_guard = rx_arc.lock().await;
-                    while let Some(first_notif) = rx_guard.recv().await {
+                    loop {
+                        let first_notif = tokio::select! {
+                            _ = job_stop.changed() => break,
+                            maybe = rx_guard.recv() => match maybe {
+                                Some(n) => n,
+                                None => break,
+                            },
+                        };
                         // 1. Drain and coalesce all pending ReloadNotification messages
                         let mut _min_version = first_notif.min_version;
                         let mut changed_domains = first_notif.changed_domains;

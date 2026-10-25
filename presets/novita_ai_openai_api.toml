@@ -1,0 +1,35 @@
+# Novita AI (`api.novita.ai/openai`) provider preset (F134).
+# Spec: apiclientreferences/opencode/novita-ai.md, apiclientreferences/9router/novita.md
+
+kind = "custom"
+preset_id = "novita_ai_openai_api"
+name = "Novita AI (`api.novita.ai/openai`)"
+base_url = "https://api.novita.ai/openai"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "novita_ai_openai_api"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek/deepseek-v3-2" = "deepseek/deepseek-v3.2"
+"deepseek/deepseek-r1-0528" = "deepseek/deepseek-r1-0528"
+"moonshotai/kimi-k2-5" = "moonshotai/kimi-k2.5"
+"zai-org/glm-5" = "zai-org/glm-5"
+"minimax/minimax-m2-5" = "minimax/minimax-m2.5"

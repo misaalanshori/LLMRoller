@@ -1,0 +1,34 @@
+# Vultr Serverless Inference (`api.vultrinference.com/v1`) & Firmware AI (`app.firmware.ai/api/v1`) provider preset (F148).
+# Spec: apiclientreferences/opencode/vultr.md, apiclientreferences/opencode/firmware.md
+
+kind = "custom"
+preset_id = "vultr_serverless_inference_and_digitalocean"
+name = "Vultr Serverless Inference (`api.vultrinference.com/v1`) & Firmware AI (`app.firmware.ai/api/v1`)"
+base_url = "https://api.vultrinference.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "vultr_serverless_inference_and_digitalocean"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-r1-distill-qwen-32b" = "deepseek-r1-distill-qwen-32b"
+"qwen2-5-coder-32b-instruct" = "qwen2.5-coder-32b-instruct"
+"gpt-oss-120b" = "gpt-oss-120b"
+"kimi-k2-instruct" = "kimi-k2-instruct"

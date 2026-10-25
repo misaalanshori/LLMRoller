@@ -1,0 +1,32 @@
+# DeepSeek Official API (`api.deepseek.com` with Interleaved `reasoning_content` Tool-Call Preservation) provider preset (F121).
+# Spec: apiclientreferences/opencode/deepseek.md, apiclientreferences/9router/deepseek.md
+
+kind = "custom"
+preset_id = "deepseek_api_and_interleaved_reasoning_content"
+name = "DeepSeek Official API (`api.deepseek.com` with Interleaved `reasoning_content` Tool-Call Preservation)"
+base_url = "https://api.deepseek.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "deepseek_api_and_interleaved_reasoning_content"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-chat" = "deepseek-chat"
+"deepseek-reasoner" = "deepseek-reasoner"

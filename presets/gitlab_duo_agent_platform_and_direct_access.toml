@@ -1,0 +1,37 @@
+# GitLab Duo Agent Platform (`cloud.gitlab.com/ai/v1/proxy/anthropic` & `/ai/v1/proxy/openai` with Direct Access Token Exchange) provider preset (F120).
+# Spec: apiclientreferences/opencode/gitlab.md
+
+kind = "custom"
+preset_id = "gitlab_duo_agent_platform_and_direct_access"
+name = "GitLab Duo Agent Platform (`cloud.gitlab.com/ai/v1/proxy/anthropic` & `/ai/v1/proxy/openai` with Direct Access Token Exchange)"
+base_url = "https://cloud.gitlab.com/ai/v1/proxy/anthropic/v1/messages"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-gitlab-instance-url" = "https://gitlab.com"
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"duo-chat-haiku-4-5" = "duo-chat-haiku-4-5"
+"duo-chat-sonnet-4-5" = "duo-chat-sonnet-4-5"
+"duo-chat-sonnet-4-6" = "duo-chat-sonnet-4-6"
+"duo-chat-opus-4-6" = "duo-chat-opus-4-6"
+"duo-chat-gpt-5-2-codex" = "duo-chat-gpt-5-2-codex"
+"duo-chat-gpt-5-codex" = "duo-chat-gpt-5-codex"

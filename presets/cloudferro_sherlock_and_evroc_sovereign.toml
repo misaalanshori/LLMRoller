@@ -1,0 +1,33 @@
+# CloudFerro Sherlock (`api-sherlock.cloudferro.com/openai/v1`) & Evroc Think (`models.think.evroc.com/v1`) provider preset (F170).
+# Spec: apiclientreferences/opencode/cloudferro-sherlock.md, apiclientreferences/opencode/evroc.md
+
+kind = "custom"
+preset_id = "cloudferro_sherlock_and_evroc_sovereign"
+name = "CloudFerro Sherlock (`api-sherlock.cloudferro.com/openai/v1`) & Evroc Think (`models.think.evroc.com/v1`)"
+base_url = "https://api-sherlock.cloudferro.com/openai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "cloudferro_sherlock_and_evroc_sovereign"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-r1-0528" = "deepseek-ai/DeepSeek-R1-0528"
+"qwen/qwen3-coder-480b-a35b-instruct" = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+"moonshotai/kimi-k2-5" = "moonshotai/Kimi-K2.5"

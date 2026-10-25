@@ -141,7 +141,14 @@ pub async fn get_price_tx(
     }
 
     let norm_model = llmroller_core::catalog::normalize_model_id(upstream_model_id).ok();
-    for candidate in std::iter::once(upstream_model_id).chain(norm_model.as_deref()) {
+    let date_stripped = norm_model
+        .as_deref()
+        .and_then(llmroller_core::snapshot::strip_model_date_suffix)
+        .or_else(|| llmroller_core::snapshot::strip_model_date_suffix(upstream_model_id));
+    for candidate in std::iter::once(upstream_model_id)
+        .chain(norm_model.as_deref())
+        .chain(date_stripped.as_deref())
+    {
         let row_bundled = sqlx::query(
             r#"SELECT input_per_mtok_micro_usd, output_per_mtok_micro_usd,
                       cache_read_per_mtok_micro_usd, cache_write_per_mtok_micro_usd

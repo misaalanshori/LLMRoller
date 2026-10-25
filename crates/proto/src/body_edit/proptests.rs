@@ -364,3 +364,87 @@ fn test_stream_options_sibling_fields_and_session_override_edge_cases() {
     assert_eq!(parsed_own["session_id"], "header-override");
     assert!(scan_top_level(&out_own).is_ok());
 }
+
+#[doc = "Spec: F005, F007, F024 - responses failover sanitization, OpenAI completions compat, and wildcard/null-promoting body edits"]
+#[test]
+fn test_responses_failover_sanitization_openai_compat_and_wildcard_body_edits() {
+    use crate::body_edit::{
+        apply_body_edit_rules, apply_openai_completions_compat, sanitize_responses_failover_body,
+    };
+    use llmroller_core::provider::{BodyEditOp, BodyEditRule, MaxTokensField, OpenAiCompatConfig};
+
+    // F005: sanitize_responses_failover_body strips previous_response_id, encrypted_content, and item_reference
+    let raw_resp = Bytes::from_static(br#"{
+        "model": "gpt-5.4",
+        "previous_response_id": "resp_acc_a_123",
+        "input": [
+            {"type": "item_reference", "id": "rs_secret_1"},
+            {"type": "reasoning", "encrypted_content": "gAAAAAB...", "summary": []},
+            {"type": "reasoning", "encrypted_content": "gAAAAAB...", "summary": [{"type": "summary_text", "text": "thought"}]},
+            {"role": "user", "content": "hello"}
+        ]
+    }"#);
+    let sanitized = sanitize_responses_failover_body(raw_resp, true);
+    let val: serde_json::Value = serde_json::from_slice(&sanitized).expect("valid json");
+    assert!(val.get("previous_response_id").is_none());
+    let items = val["input"].as_array().expect("input array");
+    assert_eq!(items.len(), 2);
+    assert!(items[0].get("encrypted_content").is_none());
+    assert_eq!(items[1]["role"], "user");
+
+    // F007: OpenAiCompatConfig rewrites developer->system, max_completion_tokens->max_tokens, and 9-char Mistral tool IDs
+    let mut chat_val = serde_json::json!({
+        "model": "mistral-large-latest",
+        "max_completion_tokens": 512,
+        "store": true,
+        "reasoning_effort": "high",
+        "messages": [
+            {"role": "developer", "content": "Be concise"},
+            {"role": "assistant", "tool_calls": [{"id": "call_very_long_openai_id_12345", "type": "function", "function": {"name": "fn1", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_very_long_openai_id_12345", "content": "ok"}
+        ]
+    });
+    let compat = OpenAiCompatConfig {
+        rewrite_developer_role_to_system: true,
+        max_tokens_field: Some(MaxTokensField::MaxTokens),
+        strip_store: true,
+        strip_reasoning_effort: true,
+        normalize_mistral_tool_ids: true,
+    };
+    assert!(apply_openai_completions_compat(&mut chat_val, &compat));
+    assert_eq!(chat_val["max_tokens"], 512);
+    assert!(chat_val.get("max_completion_tokens").is_none());
+    assert!(chat_val.get("store").is_none());
+    assert!(chat_val.get("reasoning_effort").is_none());
+    assert_eq!(chat_val["messages"][0]["role"], "system");
+    let norm_id = chat_val["messages"][1]["tool_calls"][0]["id"].as_str().expect("id");
+    assert_eq!(norm_id.len(), 9);
+    assert_eq!(chat_val["messages"][2]["tool_call_id"].as_str(), Some(norm_id));
+
+    // F024: apply_body_edit_rules promotes intermediate Null to Object and supports * array wildcards
+    let mut body_val = serde_json::json!({
+        "reasoning": null,
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "user", "content": "b"}
+        ]
+    });
+    let rules = vec![
+        BodyEditRule {
+            op: BodyEditOp::Set,
+            path: "reasoning.effort".to_string(),
+            value: Some(serde_json::json!("high")),
+            from: None,
+        },
+        BodyEditRule {
+            op: BodyEditOp::Default,
+            path: "messages.*.cache_control".to_string(),
+            value: Some(serde_json::json!({"type": "ephemeral"})),
+            from: None,
+        },
+    ];
+    assert!(apply_body_edit_rules(&mut body_val, &rules));
+    assert_eq!(body_val["reasoning"]["effort"], "high");
+    assert_eq!(body_val["messages"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body_val["messages"][1]["cache_control"]["type"], "ephemeral");
+}

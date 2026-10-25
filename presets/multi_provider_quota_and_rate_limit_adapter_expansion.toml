@@ -1,0 +1,33 @@
+# Expanded Upstream Quota Poller Supporting Codex (`/wham/usage`), Claude OAuth (`/api/oauth/usage`), Copilot (`/copilot_internal/user`), Antigravity (`retrieveUserQuota`), GLM, MiniMax, Kimi, and DeepSeek provider preset (F179).
+# Spec: apiclientreferences/9router/{codex,claude,github,antigravity,glm,minimax,kimi-coding,deepseek}.md
+
+kind = "custom"
+preset_id = "multi_provider_quota_and_rate_limit_adapter_expansion"
+name = "Expanded Upstream Quota Poller Supporting Codex (`/wham/usage`), Claude OAuth (`/api/oauth/usage`), Copilot (`/copilot_internal/user`), Antigravity (`retrieveUserQuota`), GLM, MiniMax, Kimi, and DeepSeek"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "multi_provider_quota_and_rate_limit_adapter_expansion"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gemini-3-1-pro" = "gemini-3.1-pro"

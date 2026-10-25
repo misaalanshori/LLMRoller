@@ -629,3 +629,46 @@ fn test_expired_provisional_excludes_tried_keys_and_confirmed_pin_coalesces_pers
         "must emit coalesced persist after 60s"
     );
 }
+
+#[doc = "Spec: RTE-10, CLK-1 — F039 active pin filtering and F043 wildcard model allowlist"]
+#[test]
+fn test_phase_2b_pin_active_filtering_and_wildcard_models() {
+    let store = PinStore::new(100);
+    let ck = ClientKeyId::generate();
+    let k1 = UpstreamKeyId::generate();
+    let pk1 = PinKey {
+        client_key_id: ck,
+        canonical_id: "gpt-4o".to_string(),
+        session_hash: "s1".to_string(),
+    };
+    let pk2 = PinKey {
+        client_key_id: ck,
+        canonical_id: "gpt-4o".to_string(),
+        session_hash: "s2".to_string(),
+    };
+    store.upsert_confirmed(pk1, k1, CandidatePoolTier::Own, 1_000, 5_000);
+    store.upsert_confirmed(pk2, k1, CandidatePoolTier::Own, 1_000, 50_000);
+
+    assert_eq!(store.active_len(10_000), 1);
+    assert_eq!(store.list_active(10_000).len(), 1);
+    store.sweep(10_000);
+    assert_eq!(store.len(), 1);
+
+    // F043: Wildcard and canonical model matching
+    let allowed = vec!["gpt-4o*".to_string(), "anthropic/claude-*".to_string()];
+    assert!(crate::client_key::is_model_allowed_by_patterns(
+        &allowed,
+        "openai/gpt-4o-mini",
+        "gpt-4o-mini"
+    ));
+    assert!(crate::client_key::is_model_allowed_by_patterns(
+        &allowed,
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.6"
+    ));
+    assert!(!crate::client_key::is_model_allowed_by_patterns(
+        &allowed,
+        "deepseek-r1",
+        "deepseek-r1"
+    ));
+}

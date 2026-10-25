@@ -82,7 +82,7 @@ pub fn select_terminal_error(
     // status or body can be forwarded; surface an operator-visible 503.
     if outcomes
         .iter()
-        .any(|o| matches!(o, TryOutcome::Unavailable))
+        .all(|o| matches!(o, TryOutcome::Unavailable))
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

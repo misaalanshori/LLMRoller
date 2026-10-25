@@ -52,6 +52,66 @@ pub async fn upsert_discovered_models_tx(
     .await
 }
 
+/// Infer the supported inference protocols for a discovered model (`F020`, `MDL-1`, `RTE-3`).
+#[must_use]
+pub fn infer_discovered_model_protocols(
+    provider_kind: Option<&str>,
+    raw_model_id: &str,
+    advertised_protocols: Option<&[String]>,
+    provider_supported: Option<&[String]>,
+) -> Vec<String> {
+    let mut base: Vec<String> = if let Some(adv) = advertised_protocols
+        && !adv.is_empty()
+    {
+        adv.to_vec()
+    } else if provider_kind == Some("opencode_go") {
+        let slug = raw_model_id
+            .rsplit_once('/')
+            .map(|(_, s)| s)
+            .unwrap_or(raw_model_id)
+            .to_ascii_lowercase();
+        if slug.starts_with("minimax-") {
+            vec!["messages".to_string()]
+        } else if matches!(slug.as_str(), "gpt-5.4" | "gpt-6-luna" | "grok-4.7")
+            || slug.starts_with("muse-spark")
+        {
+            vec!["responses".to_string()]
+        } else if slug.starts_with("glm-")
+            || slug.starts_with("kimi-")
+            || slug.starts_with("qwen")
+            || slug.starts_with("mimo-")
+        {
+            vec!["chat".to_string()]
+        } else {
+            vec![
+                "chat".to_string(),
+                "responses".to_string(),
+                "messages".to_string(),
+            ]
+        }
+    } else {
+        vec![
+            "chat".to_string(),
+            "responses".to_string(),
+            "messages".to_string(),
+        ]
+    };
+
+    if let Some(prov) = provider_supported
+        && !prov.is_empty()
+    {
+        let intersected: Vec<String> = base
+            .iter()
+            .filter(|p| prov.iter().any(|allowed| allowed == *p))
+            .cloned()
+            .collect();
+        if !intersected.is_empty() {
+            base = intersected;
+        }
+    }
+    base
+}
+
 /// Upserts discovered models while persisting optional advertised `context_window`
 /// values keyed by upstream model id (`MDL-1`, `F-031`).
 #[allow(clippy::too_many_arguments)]
@@ -63,6 +123,34 @@ pub async fn upsert_discovered_models_with_context_tx(
     now_ms: i64,
     discovered_raw_models: &[String],
     context_windows: &HashMap<String, i64>,
+    response_bytes_len: usize,
+) -> Result<DiscoveryResult, sqlx::Error> {
+    upsert_discovered_models_with_metadata_tx(
+        tx,
+        upstream_key_id,
+        is_global,
+        owner_user_id,
+        now_ms,
+        discovered_raw_models,
+        context_windows,
+        &HashMap::new(),
+        response_bytes_len,
+    )
+    .await
+}
+
+/// Upserts discovered models while persisting optional `context_window` and per-model
+/// `supported_protocols` metadata (`F020`, `MDL-1`, `RTE-3`).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_discovered_models_with_metadata_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    upstream_key_id: &UpstreamKeyId,
+    is_global: bool,
+    owner_user_id: Option<&UserId>,
+    now_ms: i64,
+    discovered_raw_models: &[String],
+    context_windows: &HashMap<String, i64>,
+    model_protocols: &HashMap<String, Vec<String>>,
     response_bytes_len: usize,
 ) -> Result<DiscoveryResult, sqlx::Error> {
     // Check 2 MiB (2_097_152 bytes) or > 1,000 models partial guard (MDL-1)
@@ -228,30 +316,39 @@ pub async fn upsert_discovered_models_with_context_tx(
         let pk_str = model_pk.to_string();
         let key_str = upstream_key_id.to_string();
         let raw_str = raw.as_str();
-        let provider_cfg_opt: Option<String> = sqlx::query_scalar(
-            "SELECT p.config_json FROM upstream_keys k JOIN providers p ON p.id = k.provider_id WHERE k.id = ?",
+        let provider_row = sqlx::query(
+            "SELECT p.kind, p.config_json FROM upstream_keys k JOIN providers p ON p.id = k.provider_id WHERE k.id = ?",
         )
         .bind(&key_str)
         .fetch_optional(&mut **tx)
         .await?;
 
-        let protocols_json = if let Some(ref cfg_str) = provider_cfg_opt
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(cfg_str)
-            && let Some(arr) = val.get("supported_protocols").and_then(|v| v.as_array())
-        {
-            let filtered: Vec<&str> = ["chat", "responses", "messages"]
-                .into_iter()
-                .filter(|p| arr.iter().any(|item| item.as_str() == Some(*p)))
-                .collect();
-            if filtered.is_empty() {
-                r#"["chat","responses","messages"]"#.to_string()
-            } else {
-                serde_json::to_string(&filtered)
-                    .unwrap_or_else(|_| r#"["chat","responses","messages"]"#.to_string())
-            }
-        } else {
-            r#"["chat","responses","messages"]"#.to_string()
-        };
+        let provider_kind_str: Option<String> = provider_row
+            .as_ref()
+            .and_then(|r| r.try_get::<String, _>("kind").ok());
+        let provider_supported: Option<Vec<String>> = provider_row
+            .as_ref()
+            .and_then(|r| r.try_get::<String, _>("config_json").ok())
+            .and_then(|cfg_str| serde_json::from_str::<serde_json::Value>(&cfg_str).ok())
+            .and_then(|val| {
+                val.get("supported_protocols")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<String>>()
+                    })
+            })
+            .filter(|v| !v.is_empty());
+
+        let inferred_protocols = infer_discovered_model_protocols(
+            provider_kind_str.as_deref(),
+            raw_str,
+            model_protocols.get(raw_str).map(Vec::as_slice),
+            provider_supported.as_deref(),
+        );
+        let protocols_json = serde_json::to_string(&inferred_protocols)
+            .unwrap_or_else(|_| r#"["chat","responses","messages"]"#.to_string());
 
         sqlx::query(
             r#"INSERT INTO model_routes (
@@ -830,5 +927,37 @@ mod tests {
             snap.resolve_model("model-c").expect("resolve model-c").id,
             pk_c
         );
+    }
+
+    #[test]
+    #[doc = "Spec: MDL-1, RTE-3, PRV-2, F096 - opencode_go per-model protocol dispatch mapping"]
+    fn regression_test_f096_opencode_go_preset_and_protocol_routing_() {
+        for m in ["minimax-m2.5", "minimax-m2.7"] {
+            assert_eq!(
+                infer_discovered_model_protocols(Some("opencode_go"), m, None, None),
+                vec!["messages".to_string()]
+            );
+        }
+        for m in [
+            "gpt-5.4",
+            "gpt-6-luna",
+            "muse-spark-20260408",
+            "muse-spark-thinking-20260408",
+            "grok-4.7",
+        ] {
+            assert_eq!(
+                infer_discovered_model_protocols(Some("opencode_go"), m, None, None),
+                vec!["responses".to_string()]
+            );
+        }
+        for m in ["glm-5", "glm-5.1", "kimi-k2.5", "qwen3.5-plus", "qwen3.6-plus"] {
+            assert_eq!(
+                infer_discovered_model_protocols(Some("opencode_go"), m, None, None),
+                vec!["chat".to_string()]
+            );
+        }
+        let preset_toml = llmroller_core::provider::ProviderKind::OpencodeGo.preset_toml();
+        assert!(preset_toml.contains("x-opencode-client"));
+        assert!(preset_toml.contains("x-opencode-session"));
     }
 }

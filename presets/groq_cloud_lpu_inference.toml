@@ -1,0 +1,35 @@
+# Groq Cloud (`api.groq.com/openai/v1` LPU Inference) provider preset (F123).
+# Spec: apiclientreferences/pi/groq.md, apiclientreferences/opencode/groq.md, apiclientreferences/9router/groq.md
+
+kind = "custom"
+preset_id = "groq_cloud_lpu_inference"
+name = "Groq Cloud (`api.groq.com/openai/v1` LPU Inference)"
+base_url = "https://api.groq.com/openai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "groq_cloud_lpu_inference"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"openai/gpt-oss-120b" = "openai/gpt-oss-120b"
+"openai/gpt-oss-20b" = "openai/gpt-oss-20b"
+"qwen/qwen3-32b" = "qwen/qwen3-32b"
+"moonshotai/kimi-k2-instruct-0905" = "moonshotai/kimi-k2-instruct-0905"
+"llama-3-3-70b-versatile" = "llama-3.3-70b-versatile"

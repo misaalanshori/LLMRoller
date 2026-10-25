@@ -151,7 +151,7 @@ impl ThreeQueueUsageWriter {
     ///
     /// Preserves 100% of tokens and costs in rollups even if raw events are evicted (REL-3).
     pub fn enqueue(&self, event: UsageEventRecord, attempts: Vec<UsageAttemptRecord>) {
-        let is_error = event.status >= 400;
+        let is_error = event.status >= 400 && event.termination != "client_gone";
 
         // 1. Fold into non-dropping 5-minute rollups
         let bucket_5min = (event.ts / 300_000) * 300_000;

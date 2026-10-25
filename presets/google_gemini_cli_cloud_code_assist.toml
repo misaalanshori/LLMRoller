@@ -1,0 +1,37 @@
+# Google Gemini CLI (Cloud Code Assist OAuth Provider) provider preset (F102).
+# Spec: apiclientreferences/pi/google-gemini-cli.md, apiclientreferences/9router/gemini-cli.md
+
+kind = "custom"
+preset_id = "google_gemini_cli_cloud_code_assist"
+name = "Google Gemini CLI (Cloud Code Assist OAuth Provider)"
+base_url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+ua_policy = "pass"
+supported_protocols = ["chat", "messages", "responses"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"user-agent" = "google-cloud-sdk vscode_cloudshelleditor/0.1"
+"x-goog-api-client" = "gl-node/22.17.0"
+"client-metadata" = "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gemini-2-5-pro" = "gemini-2.5-pro"
+"gemini-2-5-flash" = "gemini-2.5-flash"
+"gemini-3-pro-preview" = "gemini-3-pro-preview"
+"gemini-3-flash-preview" = "gemini-3-flash-preview"
+"gemini-3-1-pro-preview" = "gemini-3.1-pro-preview"

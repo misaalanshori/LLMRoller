@@ -70,6 +70,12 @@ pub(crate) enum Command {
     Healthcheck(HealthcheckArgs),
     /// Create a crash-safe atomic backup of the database (REL-6).
     Backup(BackupArgs),
+    /// Restore a verified SQLite backup into the data directory (`REL-6`, `F083`).
+    Restore(RestoreArgs),
+    /// Verify database integrity, schema, master key, and audit chain (`F083`).
+    Doctor(DoctorArgs),
+    /// Export a redacted support diagnostics JSON bundle (`F086`).
+    ExportDiagnostics(ExportDiagnosticsArgs),
     /// Generate a 32-byte cryptographically secure master key (SEC-2).
     GenerateMasterKey,
 }
@@ -111,6 +117,36 @@ pub(crate) struct BackupArgs {
     /// Overwrite destination if it already exists.
     #[arg(long, default_value_t = false)]
     pub(crate) overwrite: bool,
+    /// Data directory containing `llmroller.db`.
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+}
+
+/// Arguments for `llmroller restore` (`F083`, `REL-6`).
+#[derive(Debug, Args)]
+pub(crate) struct RestoreArgs {
+    /// Source backup file path to restore from.
+    #[arg(long)]
+    pub(crate) from: PathBuf,
+    /// Data directory containing `llmroller.db`.
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+}
+
+/// Arguments for `llmroller doctor` (`F083`).
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Data directory containing `llmroller.db`.
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+}
+
+/// Arguments for `llmroller export-diagnostics` (`F086`).
+#[derive(Debug, Args)]
+pub(crate) struct ExportDiagnosticsArgs {
+    /// Optional output JSON file path (writes to stdout when omitted).
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
     /// Data directory containing `llmroller.db`.
     #[arg(long)]
     pub(crate) data_dir: Option<PathBuf>,
@@ -182,6 +218,9 @@ pub(crate) async fn main() -> ExitCode {
         Command::VerifyAuditLog(args) => run_verify_audit_log(args).await,
         Command::Healthcheck(args) => run_healthcheck(args).await,
         Command::Backup(args) => run_backup_cmd(args).await,
+        Command::Restore(args) => run_restore_cmd(args).await,
+        Command::Doctor(args) => run_doctor_cmd(args).await,
+        Command::ExportDiagnostics(args) => run_export_diagnostics_cmd(args).await,
         Command::GenerateMasterKey => run_generate_master_key(),
     }
 }
@@ -218,7 +257,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             "admin listener rejects non-loopback without TLS or trusted proxies".to_string(),
         ));
     }
-    match llmroller_proxy::metrics::check_data_plane_bind_security(&args.listen, false, require_tls)
+    let has_tls_proxy = !trusted_proxies.trim().is_empty();
+    match llmroller_proxy::metrics::check_data_plane_bind_security(&args.listen, has_tls_proxy, require_tls)
     {
         Ok(true) => {
             tracing::warn!(
@@ -539,8 +579,9 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     proxy_auth_state.master_key_id = Some(master_key_id.clone());
     proxy_auth_state.instance_id = Some(instance_state.instance_id);
     proxy_auth_state.sealer_pool = Some(sealer_pool.clone());
+    let (stop_tx, stop_rx_init) = tokio::sync::watch::channel(false);
     let (discovery_tx, _discovery_task) =
-        llmroller_server::discovery_poller::start_discovery_poller(
+        llmroller_server::discovery_poller::start_discovery_poller_with_stop(
             llmroller_server::discovery_poller::DiscoveryPollerDeps {
                 pool: pool.clone(),
                 writer: writer_handle.clone(),
@@ -548,6 +589,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 master_key: master_key.clone(),
                 instance_id: instance_state.instance_id,
             },
+            stop_rx_init.clone(),
+            None,
         );
     proxy_auth_state.discovery_tx = Some(discovery_tx.clone());
     let data_router = llmroller_proxy::listeners::data_plane_router(proxy_auth_state);
@@ -597,7 +640,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         })
         .expect("spawn trace enqueue thread");
 
-    let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller(
+    let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller_with_stop(
         llmroller_server::usage_poller::UsagePollerDeps {
             snapshot: shared_snapshot.clone(),
             runtime_state: runtime_state.clone(),
@@ -606,6 +649,8 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             master_key_id: master_key_id.clone(),
             instance_id: instance_state.instance_id,
         },
+        stop_tx.subscribe(),
+        None,
     );
     let admin_router =
         llmroller_admin::control_plane_router_full(setup_state, auth_state, api_state);
@@ -637,7 +682,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     is_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     eprintln!("LLMRoller server ready on {}", args.listen);
 
-    let (stop_tx, mut stop_rx1) = tokio::sync::watch::channel(false);
+    let mut stop_rx1 = stop_rx_init;
     let mut stop_rx2 = stop_tx.subscribe();
     let mut stop_rx3 = stop_tx.subscribe();
 
@@ -839,6 +884,195 @@ fn run_generate_master_key() -> ExitCode {
     let encoded = BASE64.encode(key);
     key.zeroize();
     println!("{encoded}");
+    ExitCode::SUCCESS
+}
+
+async fn run_restore_cmd(args: RestoreArgs) -> ExitCode {
+    let data_dir = resolve_data_dir(args.data_dir);
+    if let Err(e) = fs::create_dir_all(&data_dir) {
+        eprintln!("error: cannot create data directory: {e}");
+        return ExitCode::from(13);
+    }
+    let _lock = match acquire_lock(&data_dir) {
+        Ok(lock) => lock,
+        Err(failure) => {
+            eprintln!("error: {}", failure.message);
+            return ExitCode::from(failure.code);
+        }
+    };
+    let target_db = data_dir.join("llmroller.db");
+    let master_key = load_master_key_from_env().ok();
+    let master_key_id = load_master_key_id_from_env().ok();
+    match llmroller_server::backup::restore_backup(
+        &args.from,
+        &target_db,
+        master_key.as_ref(),
+        master_key_id.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "restored",
+                    "from": args.from.to_string_lossy(),
+                    "target_db": target_db.to_string_lossy(),
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: restore failed: {e}");
+            ExitCode::from(13)
+        }
+    }
+}
+
+async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
+    let data_dir = resolve_data_dir(args.data_dir);
+    let database = data_dir.join("llmroller.db");
+    if !database.is_file() {
+        eprintln!("error: database {} does not exist", database.display());
+        return ExitCode::from(10);
+    }
+    let pool = match open_pool(&database, Role::cli_read_only()).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", database.display());
+            return ExitCode::from(13);
+        }
+    };
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|_| "error".to_string());
+    if integrity != "ok" {
+        eprintln!("error: sqlite integrity_check failed: {integrity}");
+        return ExitCode::from(13);
+    }
+    for kind in llmroller_core::provider::ProviderKind::ALL {
+        let _ = kind.preset_toml();
+    }
+    if let (Ok(mk), Ok(mk_id)) = (load_master_key_from_env(), load_master_key_id_from_env()) {
+        let entropy = Arc::new(OsEntropy::new());
+        let clock = SystemClock::new();
+        let state = match load_or_initialize(&pool, &mk_id, &mk, entropy, clock.now_ms()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: master key check failed: {e}");
+                return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+            }
+        };
+        if let Err(e) = llmroller_store::audit::verify_audit_log(
+            &pool,
+            state.audit_hmac_key.expose_secret(),
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!("error: audit chain verification failed: {e}");
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(8));
+        }
+    }
+    pool.close().await;
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "ok",
+            "database": database.to_string_lossy(),
+            "integrity": "ok",
+            "schema_version": llmroller_store::migrations::SCHEMA_VERSION,
+        })
+    );
+    ExitCode::SUCCESS
+}
+
+/// Redacts sensitive header values (`authorization`, `*key*`, `*token*`, `*secret*`, `cookie`)
+/// inside a provider `config_json` object before exporting diagnostics (`F086`, `SEC-6`).
+#[must_use]
+pub(crate) fn redact_provider_config_json(raw: &str) -> serde_json::Value {
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return serde_json::json!({});
+    };
+    let is_sensitive = |name: &str| {
+        let l = name.to_ascii_lowercase();
+        l == "authorization"
+            || l == "cookie"
+            || l.contains("key")
+            || l.contains("token")
+            || l.contains("secret")
+    };
+    if let Some(obj) = val.as_object_mut() {
+        if let Some(add_headers) = obj.get_mut("add_headers").and_then(|v| v.as_object_mut()) {
+            for (k, v) in add_headers.iter_mut() {
+                if is_sensitive(k) {
+                    *v = serde_json::Value::String("[REDACTED]".to_string());
+                }
+            }
+        }
+        if let Some(edits) = obj.get_mut("header_edits").and_then(|v| v.as_array_mut()) {
+            for edit in edits.iter_mut() {
+                if let Some(eobj) = edit.as_object_mut() {
+                    let name_sens = eobj
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(is_sensitive);
+                    if name_sens && eobj.contains_key("value") {
+                        eobj.insert(
+                            "value".to_string(),
+                            serde_json::Value::String("[REDACTED]".to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    val
+}
+
+async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> ExitCode {
+    use sqlx::Row as _;
+    let data_dir = resolve_data_dir(args.data_dir);
+    let database = data_dir.join("llmroller.db");
+    let Ok(pool) = open_pool(&database, Role::cli_read_only()).await else {
+        eprintln!("error: cannot open {}", database.display());
+        return ExitCode::from(13);
+    };
+    let rows = sqlx::query("SELECT id, kind, name, base_url, config_json, enabled FROM providers")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+    let providers: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            let cfg: String = r.try_get("config_json").unwrap_or_default();
+            serde_json::json!({
+                "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                "base_url": r.try_get::<String, _>("base_url").unwrap_or_default(),
+                "enabled": r.try_get::<i64, _>("enabled").unwrap_or(0) != 0,
+                "config": redact_provider_config_json(&cfg),
+            })
+        })
+        .collect();
+    pool.close().await;
+    let payload = serde_json::json!({
+        "version": version_string(),
+        "schema_version": llmroller_store::migrations::SCHEMA_VERSION,
+        "providers": providers,
+    });
+    let serialized = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+    if let Some(out) = args.out {
+        if let Err(e) = fs::write(&out, &serialized) {
+            eprintln!("error: failed to write diagnostics to {}: {e}", out.display());
+            return ExitCode::from(6);
+        }
+    } else {
+        println!("{serialized}");
+    }
     ExitCode::SUCCESS
 }
 

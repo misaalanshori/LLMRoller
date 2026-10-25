@@ -1,0 +1,37 @@
+# Z.AI / Zhipu GLM Coding Plan (`api.z.ai/api/coding/paas/v4` & Anthropic-Compatible `/api/anthropic/v1/messages`) provider preset (F114).
+# Spec: apiclientreferences/pi/zai.md, apiclientreferences/opencode/zai-zhipu.md, apiclientreferences/9router/glm.md
+
+kind = "custom"
+preset_id = "zai_zhipu_glm_coding_plan_multi_region"
+name = "Z.AI / Zhipu GLM Coding Plan (`api.z.ai/api/coding/paas/v4` & Anthropic-Compatible `/api/anthropic/v1/messages`)"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"glm-5" = "glm-5"
+"glm-5-1" = "glm-5.1"
+"glm-4-7" = "glm-4.7"
+"glm-4-7-flash" = "glm-4.7-flash"
+"glm-4-6" = "glm-4.6"
+"glm-4-6v" = "glm-4.6v"
+"glm-4-5-air" = "glm-4.5-air"

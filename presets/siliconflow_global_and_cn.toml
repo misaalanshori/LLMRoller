@@ -1,0 +1,35 @@
+# SiliconFlow (`api.siliconflow.com/v1` & `api.siliconflow.cn/v1`) provider preset (F138).
+# Spec: apiclientreferences/opencode/siliconflow.md, apiclientreferences/9router/siliconflow.md
+
+kind = "custom"
+preset_id = "siliconflow_global_and_cn"
+name = "SiliconFlow (`api.siliconflow.com/v1` & `api.siliconflow.cn/v1`)"
+base_url = "https://api.siliconflow.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "siliconflow_global_and_cn"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"pro/deepseek-ai/deepseek-v3-2" = "Pro/deepseek-ai/DeepSeek-V3.2"
+"pro/deepseek-ai/deepseek-r1" = "Pro/deepseek-ai/DeepSeek-R1"
+"pro/moonshotai/kimi-k2-5" = "Pro/moonshotai/Kimi-K2.5"
+"pro/zai-org/glm-5" = "Pro/zai-org/GLM-5"
+"pro/minimaxai/minimax-m2-5" = "Pro/MiniMaxAI/MiniMax-M2.5"

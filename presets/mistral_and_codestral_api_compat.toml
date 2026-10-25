@@ -1,0 +1,35 @@
+# Mistral AI (`api.mistral.ai/v1`) & Codestral (`codestral.mistral.ai/v1`) with Strict 9-Char Tool IDs provider preset (F122).
+# Spec: apiclientreferences/pi/mistral.md, apiclientreferences/opencode/mistral.md
+
+kind = "custom"
+preset_id = "mistral_and_codestral_api_compat"
+name = "Mistral AI (`api.mistral.ai/v1`) & Codestral (`codestral.mistral.ai/v1`) with Strict 9-Char Tool IDs"
+base_url = "https://api.mistral.ai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "mistral_and_codestral_api_compat"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"devstral-medium-latest" = "devstral-medium-latest"
+"devstral-2512" = "devstral-2512"
+"codestral-latest" = "codestral-latest"
+"mistral-large-latest" = "mistral-large-latest"
+"magistral-medium-latest" = "magistral-medium-latest"

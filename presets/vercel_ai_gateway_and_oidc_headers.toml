@@ -1,0 +1,35 @@
+# Vercel AI Gateway (`ai-gateway.vercel.sh` Anthropic Messages & OpenAI Dual Surface with OIDC/Bearer Auth) provider preset (F112).
+# Spec: apiclientreferences/pi/vercel-ai-gateway.md, apiclientreferences/opencode/vercel.md
+
+kind = "custom"
+preset_id = "vercel_ai_gateway_and_oidc_headers"
+name = "Vercel AI Gateway (`ai-gateway.vercel.sh` Anthropic Messages & OpenAI Dual Surface with OIDC/Bearer Auth)"
+base_url = "https://ai-gateway.vercel.sh"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"http-referer" = "https://vercel.com"
+"x-title" = "LLMRoller"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"anthropic/claude-opus-4-6" = "anthropic/claude-opus-4.6"
+"anthropic/claude-sonnet-4-6" = "anthropic/claude-sonnet-4.6"
+"openai/gpt-5-4" = "openai/gpt-5.4"
+"google/gemini-3-1-pro-preview" = "google/gemini-3.1-pro-preview"

@@ -1,0 +1,37 @@
+# xAI Grok CLI (api.x.ai OpenAI/Anthropic Dual Surface) & Grok Web (grok.com SSO Cookie NDJSON Executor) provider preset (F109).
+# Spec: apiclientreferences/fx/grok-cli.md, apiclientreferences/9router/grok-web.md, apiclientreferences/opencode/xai.md, apiclientreferences/pi/xai.md
+
+kind = "custom"
+preset_id = "grok_cli_and_grok_web_sso_cookie_executor"
+name = "xAI Grok CLI (api.x.ai OpenAI/Anthropic Dual Surface) & Grok Web (grok.com SSO Cookie NDJSON Executor)"
+base_url = "https://api.x.ai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "grok_cli_and_grok_web_sso_cookie_executor"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"grok-4" = "grok-4"
+"grok-4-20-beta" = "grok-4.20-beta"
+"grok-4-fast" = "grok-4-fast"
+"grok-4-1-fast-reasoning" = "grok-4-1-fast-reasoning"
+"grok-code-fast-1" = "grok-code-fast-1"
+"grok-3" = "grok-3"
+"grok-3-mini" = "grok-3-mini"

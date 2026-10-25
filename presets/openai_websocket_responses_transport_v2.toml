@@ -1,0 +1,33 @@
+# OpenAI & Codex WebSocket `/v1/responses` Transport (`wss://` Connection Pooling, `response.create`, and Incremental Turn Continuation) provider preset (F174).
+# Spec: apiclientreferences/pi/openai-codex.md, apiclientreferences/fx/openai-codex.md
+
+kind = "custom"
+preset_id = "openai_websocket_responses_transport_v2"
+name = "OpenAI & Codex WebSocket `/v1/responses` Transport (`wss://` Connection Pooling, `response.create`, and Incremental Turn Continuation)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["responses"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"openai-beta" = "responses_websockets=2026-02-06"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gpt-5-2-codex" = "gpt-5.2-codex"

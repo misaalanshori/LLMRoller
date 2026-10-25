@@ -1,0 +1,34 @@
+# OVHcloud AI Endpoints (`oai.endpoints.kepler.ai.cloud.ovh.net/v1`) & Scaleway Generative APIs (`api.scaleway.ai/v1`) provider preset (F146).
+# Spec: apiclientreferences/opencode/ovhcloud.md, apiclientreferences/opencode/scaleway.md, apiclientreferences/9router/scaleway.md
+
+kind = "custom"
+preset_id = "ovhcloud_ai_endpoints_and_scaleway"
+name = "OVHcloud AI Endpoints (`oai.endpoints.kepler.ai.cloud.ovh.net/v1`) & Scaleway Generative APIs (`api.scaleway.ai/v1`)"
+base_url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "ovhcloud_ai_endpoints_and_scaleway"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"qwen3-coder-30b-a3b-instruct" = "Qwen3-Coder-30B-A3B-Instruct"
+"deepseek-r1-distill-llama-70b" = "DeepSeek-R1-Distill-Llama-70B"
+"llama-3-3-70b-instruct" = "Llama-3.3-70B-Instruct"
+"devstral-2-123b-instruct-2512" = "devstral-2-123b-instruct-2512"

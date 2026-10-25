@@ -1,0 +1,33 @@
+# Windsurf / Codeium & Qoder Coding Agent Gateways provider preset (F160).
+# Spec: apiclientreferences/9router/windsurf.md, apiclientreferences/9router/qoder.md
+
+kind = "custom"
+preset_id = "windsurf_codeium_and_qoder_coding_agents"
+name = "Windsurf / Codeium & Qoder Coding Agent Gateways"
+base_url = "https://server.codeium.com"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "windsurf_codeium_and_qoder_coding_agents"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-sonnet-4-5" = "claude-sonnet-4-5"
+"gpt-5" = "gpt-5"
+"deepseek-v3" = "deepseek-v3"

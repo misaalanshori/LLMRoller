@@ -1,0 +1,33 @@
+# Meta Llama API (`api.llama.com/compat/v1`) & Clarifai (`api.clarifai.com/v2/ext/openai/v1`) provider preset (F153).
+# Spec: apiclientreferences/opencode/llama.md, apiclientreferences/9router/clarifai.md
+
+kind = "custom"
+preset_id = "llama_meta_api_and_Clarifai"
+name = "Meta Llama API (`api.llama.com/compat/v1`) & Clarifai (`api.clarifai.com/v2/ext/openai/v1`)"
+base_url = "https://api.llama.com/compat/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "llama_meta_api_and_Clarifai"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"llama-4-maverick-17b-128e-instruct-fp8" = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+"llama-4-scout-17b-16e-instruct-fp8" = "Llama-4-Scout-17B-16E-Instruct-FP8"
+"llama-3-3-70b-instruct" = "Llama-3.3-70B-Instruct"

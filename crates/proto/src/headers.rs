@@ -45,18 +45,29 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "upgrade",
 ];
 
-/// Internal and forwarding headers stripped from outbound requests.
-const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 10] = [
+/// Internal and forwarding headers stripped from outbound requests (SEC-15, F011, F023).
+const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 21] = [
     "host",
     "content-length",
+    "accept-encoding",
     "cookie",
     "set-cookie",
+    "referer",
     "openai-organization",
     "openai-project",
+    "anthropic-organization-id",
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-original-forwarded-for",
+    "cf-connecting-ip",
+    "cf-ipcountry",
+    "true-client-ip",
 ];
 
 /// Session-affinity headers stripped when routing to Shared or Global tiers per SEC-16.
@@ -146,12 +157,13 @@ pub fn apply_request_header_pipeline(
     for (name, val) in inbound {
         let name_lower = name.as_str().to_ascii_lowercase();
 
-        // Rule 1: Strip hop-by-hop, org, proxy internal, and x-llmroller-*
+        // Rule 1: Strip hop-by-hop, org, proxy internal, x-forwarded-*, cf-*, and x-llmroller-* (F011)
         if HOP_BY_HOP_HEADERS.contains(&name_lower.as_str())
             || INTERNAL_STRIP_REQUEST_HEADERS.contains(&name_lower.as_str())
             || connection_named_headers.contains(&name_lower)
             || name_lower.starts_with("x-llmroller-")
-            || name_lower == "x-real-ip"
+            || name_lower.starts_with("x-forwarded-")
+            || name_lower.starts_with("cf-")
         {
             continue;
         }
@@ -169,8 +181,11 @@ pub fn apply_request_header_pipeline(
             continue;
         }
 
-        // Rule 3: Strip client authentication headers (will be replaced below)
-        if name_lower == "authorization" || name_lower == "x-api-key" {
+        // Rule 3: Strip client authentication headers (will be replaced below; F011)
+        if matches!(
+            name_lower.as_str(),
+            "authorization" | "x-api-key" | "x-goog-api-key" | "api-key"
+        ) {
             continue;
         }
 

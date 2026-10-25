@@ -335,10 +335,12 @@ impl MonthReservationGuard {
     pub fn commit(mut self, actual_cost_micro_usd: i64) {
         self.accumulator
             .used_micro_usd
-            .fetch_add(actual_cost_micro_usd, Ordering::AcqRel);
-        self.accumulator
-            .reserved_in_flight
-            .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+            .fetch_add(actual_cost_micro_usd.max(0), Ordering::AcqRel);
+        let _ = self.accumulator.reserved_in_flight.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |curr| Some((curr - self.estimate_micro_usd).max(0)),
+        );
         self.committed = true;
     }
 }
@@ -346,9 +348,11 @@ impl MonthReservationGuard {
 impl Drop for MonthReservationGuard {
     fn drop(&mut self) {
         if !self.committed {
-            self.accumulator
-                .reserved_in_flight
-                .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+            let _ = self.accumulator.reserved_in_flight.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |curr| Some((curr - self.estimate_micro_usd).max(0)),
+            );
         }
     }
 }

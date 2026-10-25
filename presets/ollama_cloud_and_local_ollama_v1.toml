@@ -1,0 +1,36 @@
+# Ollama Cloud (`ollama.com/v1`) & Local Ollama (`localhost:11434/v1`) provider preset (F156).
+# Spec: apiclientreferences/opencode/ollama-cloud.md, apiclientreferences/9router/ollama.md
+
+kind = "custom"
+preset_id = "ollama_cloud_and_local_ollama_v1"
+name = "Ollama Cloud (`ollama.com/v1`) & Local Ollama (`localhost:11434/v1`)"
+base_url = "https://ollama.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "ollama_cloud_and_local_ollama_v1"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-v3-2" = "deepseek-v3.2"
+"glm-5" = "glm-5"
+"kimi-k2-5" = "kimi-k2.5"
+"minimax-m2-5" = "minimax-m2.5"
+"qwen3-coder-next" = "qwen3-coder-next"
+"gpt-oss-120b" = "gpt-oss:120b"

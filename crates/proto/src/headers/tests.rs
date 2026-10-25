@@ -441,3 +441,38 @@ fn test_scrub_secret_prefixes_oc_sk_and_safe_diagnostic_headers() {
     );
     assert_eq!(out.get("x-custom-upstream").expect("allowed header"), "ok");
 }
+
+#[doc = "Spec: SEC-15, F011, F023 - strips x-forwarded-*, cf-*, org headers, custom auth headers, and replaces accept-encoding with identity"]
+#[test]
+fn test_request_header_pipeline_strips_proxy_forwarding_org_and_accept_encoding() {
+    let mut inbound = HeaderMap::new();
+    inbound.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+    inbound.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    inbound.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.7"));
+    inbound.insert("true-client-ip", HeaderValue::from_static("198.51.100.7"));
+    inbound.insert("openai-organization", HeaderValue::from_static("org-client123"));
+    inbound.insert("anthropic-organization-id", HeaderValue::from_static("org-anth123"));
+    inbound.insert("x-goog-api-key", HeaderValue::from_static("AIzaClientKey"));
+    inbound.insert("accept-encoding", HeaderValue::from_static("gzip, br, zstd"));
+
+    let out = apply_request_header_pipeline(
+        &inbound,
+        PoolTier::Global,
+        Some(("authorization", "Bearer sk-upstream")),
+        &[],
+        &StripHeaderTokens::default(),
+    )
+    .expect("pipeline");
+
+    assert!(!out.contains_key("x-forwarded-for"));
+    assert!(!out.contains_key("x-forwarded-proto"));
+    assert!(!out.contains_key("cf-connecting-ip"));
+    assert!(!out.contains_key("true-client-ip"));
+    assert!(!out.contains_key("openai-organization"));
+    assert!(!out.contains_key("anthropic-organization-id"));
+    assert!(!out.contains_key("x-goog-api-key"));
+    assert_eq!(
+        out.get("accept-encoding").and_then(|v| v.to_str().ok()),
+        Some("identity")
+    );
+}

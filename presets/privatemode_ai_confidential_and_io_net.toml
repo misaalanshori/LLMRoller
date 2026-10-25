@@ -1,0 +1,33 @@
+# Privatemode AI (`localhost:8080/v1` Confidential Computing) & IO.NET (`api.intelligence.io.solutions/api/v1`) provider preset (F166).
+# Spec: apiclientreferences/opencode/privatemode-ai.md, apiclientreferences/opencode/io-net.md
+
+kind = "custom"
+preset_id = "privatemode_ai_confidential_and_io_net"
+name = "Privatemode AI (`localhost:8080/v1` Confidential Computing) & IO.NET (`api.intelligence.io.solutions/api/v1`)"
+base_url = "https://api.intelligence.io.solutions/api/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "privatemode_ai_confidential_and_io_net"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-r1-0528" = "deepseek-ai/DeepSeek-R1-0528"
+"qwen/qwen3-235b-a22b-thinking-2507" = "Qwen/Qwen3-235B-A22B-Thinking-2507"
+"zai-org/glm-4-7" = "zai-org/GLM-4.7"

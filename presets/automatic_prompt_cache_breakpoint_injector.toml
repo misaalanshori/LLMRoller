@@ -1,0 +1,32 @@
+# Automatic Prompt Cache Key & Cache Control Breakpoint Injector Across OpenAI (`prompt_cache_key`), Anthropic (`cache_control`), and Bedrock (`cachePoint`) provider preset (F177).
+# Spec: apiclientreferences/pi/anthropic.md, apiclientreferences/pi/openai-responses.md, apiclientreferences/pi/openrouter.md, apiclientreferences/pi/amazon-bedrock.md
+
+kind = "custom"
+preset_id = "automatic_prompt_cache_breakpoint_injector"
+name = "Automatic Prompt Cache Key & Cache Control Breakpoint Injector Across OpenAI (`prompt_cache_key`), Anthropic (`cache_control`), and Bedrock (`cachePoint`)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "automatic_prompt_cache_breakpoint_injector"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"anthropic" = "Anthropic"
+"openrouter" = "OpenRouter"

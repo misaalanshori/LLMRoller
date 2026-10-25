@@ -137,6 +137,12 @@ Because LLMRoller's embedded control plane serves both human operators (`admin` 
 4. **Telemetry, Dual-Stream Logs & Cost Attribution (`14.l`–`14.o`)**: The `Logs` explorer with `Inference` (7-column) vs. `API` (5-column) segmented streams, the 460px right-docked Request Detail Inspection Drawer, the `Usage` ledger with 5-metric Token Summary Strip and pill filters, and the interactive `Credit usage breakdown` popover (`Plan contribution multiplier`).
 5. **Providers, Quotas, Sharing, Routing & Traceability (`14.p`–`14.z`)**: Provider & key cards, `Plan & balance` dual window gauges, consented personal sharing, the `Routing Matrix` with 6 pluggable strategies, `Active Sessions` & per-key `Recently Active Sessions` drawers, `Session Chat Preview`, `Model Catalog & Price Book`, `Settings`, `Audit Log`, WCAG 2.1 AA accessibility, and the master `ui-spec` component inventory.
 
+
+---
+### v3.1 Post-Audit Specification Extensions
+- **Section 23**: `23. SRDD - Multi-Provider Access Layer, OAuth Token Exchange, and Hardware Fingerprinting.md`
+- **Section 24**: `24. SRDD - Cross-Protocol Transcoding and OpenAI Client Normalization.md`
+
 ## 1. Summary
 
 LLMRoller is a self-hosted LLM proxy and API key router written in Rust. It sits between coding agents and multiple paid upstream subscriptions or aggregator accounts. Each user authenticates to LLMRoller with a single client key, and LLMRoller distributes conversations across a pool of upstream keys.
@@ -2674,6 +2680,22 @@ To populate the 7-section slide-over Request Detail Inspection Drawer (`Section 
 4. **Sanitized `request_headers_json`**: Built by `extract_safe_diagnostic_headers(req.headers())`, storing a sorted JSON object of safe diagnostic headers (`content-length`, `content-type`, `user-agent`, `x-opencode-session`, `anthropic-version`, `openai-beta`) capped at `4 KiB`.
 5. **Top-level `metadata_json`**: When the inbound JSON request contains a top-level `"metadata"` object, its string key-value pairs (up to `16` keys, `2 KiB` total, scrubbed of any secret patterns per `SEC-6`) are serialized into `usage_events.metadata_json`; otherwise the drawer renders `None recorded.`.
 
+
+---
+### v3.1 Audit Alignment Amendments: OpenAI Client Behavior & Error Classification
+1. **HTTP 200 Initial SSE Error Frame & Embedded Error Classification (`F001`, `F002`, `F017`)**:
+   - When an upstream responds with `HTTP 200 OK` and emits an initial SSE error frame (`event: error` or JSON `{"error": ...}`) or returns a non-streaming JSON body containing a top-level `error` object, `classify_embedded_error_payload` MUST inspect `error.status`, `error.code`, and `error.type` without gating on HTTP status `!= 200`.
+   - SSE `event:` / `data:` prefixes must be stripped before JSON parsing.
+   - Embedded errors on non-streaming HTTP 200 responses MUST NOT promote provisional pins (`RTE-8`) or record upstream success, and MUST trigger failover when eligible.
+2. **Keepalive Frames During Pre-Commit Window (`F030`)**:
+   - Both SSE comment lines (`: keepalive`) and `event: ping` (`data: {"type":"ping"}`) frames reset `first_activity_timeout_ms` (60s) but MUST NOT satisfy `first_valid_frame_timeout_ms` (180s) or commit the downstream HTTP 200 response headers.
+3. **Streaming `/v1/responses` Response ID Pinning (`F049`, `F050`)**:
+   - Streaming `/v1/responses` calls must extract `response.id` from `response.created` / `response.completed` events, register the confirmed pin in `PinTable`, and persist `response_pins` asynchronously through `WriterActor` (`DurableStateUpdate::UpsertResponsePin`).
+4. **Reject `stream: true` on `POST /v1/responses/compact` (`F004`)**:
+   - Requests to `/v1/responses/compact` with `"stream": true` must be rejected at ingress with `HTTP 400 Bad Request`.
+5. **Automatic `stream_options.include_usage: true` Injection (`F006`)**:
+   - Outbound streaming `/v1/chat/completions` requests must inject `"stream_options": {"include_usage": true}` when supported by the provider so post-flight token accounting is never starved of usage chunks.
+
 ## 13. Pricing, limits, and source provider usage engine
 
 LLMRoller combines local micro-USD pricing and window budgets with single-flight `/usage` polling, time-bounded observation projections, and sanitized `/usage` pass-through.
@@ -2888,6 +2910,24 @@ When a user hovers or clicks the `(i)` info icon in the `Credits used` column of
   "footer_note": "This call uses Design Plan credits and does not deduct from your pay-as-you-go balance."
 }
 ```
+
+
+---
+### v3.1 Audit Alignment Amendments: Provider Presets, Usage Endpoints, & Cost Accounting
+1. **Command Code (`command_code`) Endpoint & Adapter Corrections (`F019`, `F095`)**:
+   - **Billing Credits URL**: Must resolve against the origin root `GET https://api.commandcode.ai/alpha/billing/credits` (stripping `/provider/v1` from `base_url`).
+   - **Required CLI Headers**: `x-command-code-version: 0.25.7`, `x-cli-environment: cli`, `x-session-id: <session_uuid>`.
+   - **Native CLI Endpoint (`POST https://api.commandcode.ai/alpha/generate`)**: Supports `{ threadId, memory, config, params }` request envelope and AI SDK v5 NDJSON streaming.
+2. **OpenCode Go (`opencode_go`) Per-Model Protocol Dispatch (`F020`, `F096`)**:
+   - `/v1/responses`: `gpt-5.4`, `gpt-6-luna`, `muse-spark-20260408`, `muse-spark-thinking-20260408`, `grok-4.7` (with `store: false` and prior `reasoning` items stripped on cross-account failover).
+   - `/v1/messages`: `minimax-m2.5`, `minimax-m2.7` (with `anthropic-version: 2023-06-01`).
+   - `/v1/chat/completions`: `glm-5`, `glm-5.1`, `kimi-k2.5`, `qwen3.5-plus`, `qwen3.6-plus`.
+   - Outbound headers: `x-opencode-session: ses_<32hex>`, `x-opencode-request: req_<32hex>`, `x-opencode-client: app`, `User-Agent: opencode/1.2.15`.
+3. **OpenDesign AMR (`open_design_amr`) Discovery & Headers (`F020`, `F097`)**:
+   - Discovery (`GET https://amr.opendesign.cloud/api/v1/models`) must skip models where `"enabled": false` and extract `"metadata": { "context_limit": ..., "output_limit": ... }`.
+   - Outbound requests must default `anthropic-version: 2023-06-01`.
+4. **Anthropic Cached Input Token Normalization (`F022`)**:
+   - Normalize Anthropic `/v1/messages` `input_tokens` so `cost.rs` does not underflow when subtracting `cache_read_input_tokens` from uncached `input_tokens`.
 
 ## 14. API and web UI specification
 
@@ -3701,6 +3741,15 @@ Stateless background jobs (`Discovery`, `UsagePoller`, `RetentionSweeper`, `WalC
 
 The **SQLite writer actor is never restarted** after a panic because an interrupted batch could desynchronize in-memory queues. Instead, a writer panic sets `/readyz` to HTTP `503` and triggers controlled shutdown with exit code `12`.
 
+
+---
+### v3.1 Audit Alignment Amendments: Supervision, Single-Writer Enforcement, & Timeouts
+1. **Background Poller `watch::Sender` Lifetime (`F051`, `F052`, `F055`)**:
+   - `start_usage_poller`, `start_discovery_poller`, and `start_reloader_loop` MUST receive a live `watch::Receiver<bool>` whose `watch::Sender<bool>` is owned by `ShutdownSupervisor` and triggered at Shutdown Step 5. Never drop `_stop_tx` inside the starter function.
+2. **Strict Single-Writer Actor Enforcement (`F050`, `F053`, `F054`)**:
+   - All control-plane mutations (`crates/admin`), model discovery writes, usage snapshot writes, and response pin writes must execute through `WriterHandle` (`control_tx` or `data_tx`), never directly on `SqlitePool`.
+   - `WriterActor` must set `sqlite_full = true` on `SQLITE_FULL (13)` / `SQLITE_IOERR (10)` and restore `pending_durable_state` items if a batch transaction fails to commit.
+
 ## 22. Deployment and containerization specification
 
 This section defines the containerization architecture, orchestration topologies, volume and network boundaries, and environment contracts for LLMRoller (`POR-1`, `SEC-9`, `SEC-11`, `REL-1`). Every port, path, timeout, and environment variable matches Sections 5, 7, 8, 9, 10, and 21 with zero drift.
@@ -4217,3 +4266,49 @@ Database migrations run automatically inside Startup Step 3 (`Section 5.5.2`) wh
 All logs write to `stdout` and `stderr` as single-line JSON objects (`ts`, `level`, `target`, `request_id`, `msg`, `fields`). Secrets are scrubbed per `SEC-6`, and `audit_anchor` lines emit per `AUD-1`. Container log rotation is bounded by Docker's `json-file` driver (`max-size: "50m"`, `max-file: "5"`).
 
 Prometheus scrapes `http://172.28.2.20:9090/metrics` over `internal_obs_net`. Every routing selection increments `llmroller_routing_selections_total{provider_kind,provider_id,protocol,outcome,strategy,model_bucket}` where `strategy` identifies the active `RoutingStrategy` (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, or `power_of_two_choices`).
+
+
+---
+### v3.1 Audit Alignment Amendments: Container Bind Check & CLI Completeness
+1. **Trusted Proxy TLS Bind Security Check (`F076`)**:
+   - In `crates/server/src/cli.rs`, `check_data_plane_bind_security(&args.listen, has_tls, require_tls)` MUST pass `has_tls = !args.trusted_proxies.trim().is_empty()` rather than hardcoding `false`, allowing `docker-compose.yml` (`LLMROLLER_LISTEN=0.0.0.0:8080`, `LLMROLLER_TRUSTED_PROXIES=172.28.1.10/32`, `LLMROLLER_REQUIRE_TLS=true`) to start cleanly behind Caddy.
+2. **CLI `restore` and `doctor` Subcommands (`F083`)**:
+   - Expose `llmroller restore --from <backup_path>` (wired to `backup::restore_backup`) and `llmroller doctor` in `crates/server/src/cli.rs`.
+
+## 23. Multi-Provider Access Layer, OAuth Token Exchange, and Hardware Fingerprinting
+
+### 23.1 Overview
+To eliminate external compatibility proxies and manual provider configuration, LLMRoller implements a native **Multi-Provider Access Layer** in `crates/proto/src/providers/` and `crates/proxy/src/token_manager.rs`, backed by 60+ built-in presets in `./presets/` derived from `apiclientreferences.zip` (`pi`, `pi-antigravity`, `pi-opendesigncloud`, `fx`, `opencode`, and `9router`).
+
+### 23.2 Provider Authentication & Token Exchange Topologies
+1. **Static Bearer / Custom Header**: OpenAI, Anthropic (`x-api-key`), OpenRouter, OpenCode Go/Zen, OpenDesign AMR, Command Code, DeepSeek, Groq, Cerebras, Mistral, xAI, Together, Fireworks, DeepInfra, Perplexity, Cohere, NVIDIA, SambaNova, Nebius, Novita, Baseten, Chutes, SiliconFlow, Moonshot, Xiaomi MiMo, Z.AI GLM, MiniMax, Volcengine, BytePlus, Venice, HuggingFace.
+2. **OAuth2 Refresh Token (`TokenManager`)**: Antigravity (`cloudcode-pa`), Gemini CLI, OpenAI Codex (`auth.openai.com`), Claude Code OAuth (`platform.claude.com`), Kimi Coding (`auth.kimi.com`), Qwen Portal (`chat.qwen.ai`), Cline, Kiro Social. Cached in memory, refreshed 5 minutes prior to expiry, and persisted via `WriterActor`.
+3. **Two-Stage Session Token Exchange**: GitHub Copilot (`api.github.com/copilot_internal/v2/token`), GitLab Duo (`api/v4/ai/third_party_agents/direct_access`), SAP AI Core (XSUAA Client Credentials).
+4. **Cloud IAM / Cryptographic Signing**: Google Vertex AI (RS256 Service Account JWT -> `oauth2.googleapis.com/token`), AWS Bedrock (AWS SigV4 `AWS4-HMAC-SHA256` or Bearer token).
+
+### 23.3 Deterministic Per-Key Hardware & CLI Fingerprinting (`crates/proto/src/fingerprint.rs`)
+- **Anthropic Claude Code (`claude_code`)**: `?beta=true`, `User-Agent: claude-cli/2.1.63 (external, cli)`, `x-app: cli`, `anthropic-dangerous-direct-browser-access: true`, `anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05`, `x-Stainless-*` headers, and `x-anthropic-billing-header: cc_version=2.1.63.<hash>; cc_entrypoint=cli; cch=<5hex>;` system block.
+- **OpenAI Codex (`openai_codex`)**: `OpenAI-Beta: responses=experimental`, `originator: codex_cli_rs`, `chatgpt-account-id: <jwt_account_id>`, `session_id: <session_uuid>`, `User-Agent: codex_cli_rs/0.116.0`.
+- **Google Antigravity & Gemini CLI (`antigravity`, `gemini_cli`)**: `User-Agent: antigravity/1.107.0 darwin/arm64`, `X-Goog-Api-Client: google-cloud-sdk vscode_cloudshelleditor/0.1`, `Client-Metadata: {"ideType":"ANTIGRAVITY","platform":"MACOS","pluginType":"GEMINI"}`.
+- **GitHub Copilot (`github_copilot`)**: `Editor-Version: vscode/1.110.0`, `Editor-Plugin-Version: copilot-chat/0.38.0`, `Copilot-Integration-Id: vscode-chat`, `Openai-Intent: conversation-edits`, `X-GitHub-Api-Version: 2025-04-01`, `X-Initiator: user|agent`, `Copilot-Vision-Request: true`.
+- **Kimi Coding (`kimi_coding`)**: `User-Agent: KimiCLI/1.3`, `X-Msh-Platform: kimi_cli`, `X-Msh-Version: 1.3.0`, `X-Msh-Device-Name`, `X-Msh-Device-Model`, `X-Msh-Os-Version`, `X-Msh-Device-Id: <deterministic_uuid>`.
+- **Cursor (`cursor`) & Kiro (`kiro`)**: `x-cursor-Checksum` (6-byte Jyh-XOR timestamp prefix + `<machineId>/<macMachineId>`), `x-amzn-kiro-agent-mode: vibe`, `Amz-Sdk-Invocation-Id: <request_uuid>`.
+
+## 24. Cross-Protocol Transcoding and OpenAI Client Normalization
+
+### 24.1 Bidirectional Protocol Transcoding Bridge (`crates/proto/src/transcode/`)
+LLMRoller exposes three downstream ingress protocols (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`) plus `/v1/embeddings` and routes to six upstream wire formats:
+1. `UpstreamFormat::OpenAiChat` (`POST /v1/chat/completions`)
+2. `UpstreamFormat::OpenAiResponses` (`POST /v1/responses` & `wss://.../responses`)
+3. `UpstreamFormat::AnthropicMessages` (`POST /v1/messages`)
+4. `UpstreamFormat::GoogleGemini` (`POST .../models/{model}:streamGenerateContent?alt=sse` & Cloud Code Assist `v1internal:streamGenerateContent?alt=sse`)
+5. `UpstreamFormat::BedrockConverseStream` (`POST /model/{modelId}/converse-stream` with `application/vnd.amazon.eventstream`)
+6. `UpstreamFormat::CommandCodeGenerate` (`POST /alpha/generate` with AI SDK v5 NDJSON streaming)
+
+### 24.2 OpenAI Completions Client Compatibility Matrix (`OpenAICompletionsCompat`)
+- `supports_store`: Strips `"store"` when `false` (Groq, Cerebras, Mistral, DeepSeek, Chutes, Local vLLM).
+- `supports_developer_role`: Rewrites `role: "developer"` -> `"system"` when `false` (Mistral, Cerebras, DeepSeek, Chutes, Qwen, HuggingFace).
+- `max_tokens_field`: Translates between `max_tokens` and `max_completion_tokens`.
+- `supports_usage_in_streaming`: Injects `"stream_options": {"include_usage": true}` when `stream == true`.
+- `requires_mistral_tool_ids`: Hashes `tool_calls[].id` and `tool_call_id` to deterministic 9-char `[a-zA-Z0-9]{9}` on Mistral & Codestral.
+- `preserve_reasoning_content`: Preserves `reasoning_content` on assistant tool-call turns within the active tool loop on DeepSeek, Moonshot Kimi, Z.AI GLM, and Fireworks.

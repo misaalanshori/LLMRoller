@@ -1,0 +1,35 @@
+# Helicone AI Gateway (`ai-gateway.helicone.ai/v1`) & ZenMux (`zenmux.ai/api/v1`) provider preset (F165).
+# Spec: apiclientreferences/opencode/helicone.md, apiclientreferences/opencode/zenmux.md
+
+kind = "custom"
+preset_id = "helicone_ai_gateway_and_portkey"
+name = "Helicone AI Gateway (`ai-gateway.helicone.ai/v1`) & ZenMux (`zenmux.ai/api/v1`)"
+base_url = "https://ai-gateway.helicone.ai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "helicone_ai_gateway_and_portkey"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gemini-3-1-pro" = "gemini-3.1-pro"

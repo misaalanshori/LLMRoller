@@ -89,6 +89,9 @@ pub enum ProviderEndpoint {
     Messages,
     Models,
     Usage,
+    Embeddings,
+    CountTokens,
+    ResponsesCompact,
 }
 
 /// Protocol paths configured in `providers.config_json` (`PRV-3`).
@@ -104,6 +107,12 @@ pub struct ProviderPaths {
     pub models: Option<String>,
     #[serde(default)]
     pub usage: Option<String>,
+    #[serde(default)]
+    pub embeddings: Option<String>,
+    #[serde(default)]
+    pub count_tokens: Option<String>,
+    #[serde(default)]
+    pub responses_compact: Option<String>,
 }
 
 impl ProviderPaths {
@@ -115,6 +124,9 @@ impl ProviderPaths {
             ProviderEndpoint::Messages => self.messages.as_deref(),
             ProviderEndpoint::Models => self.models.as_deref(),
             ProviderEndpoint::Usage => self.usage.as_deref(),
+            ProviderEndpoint::Embeddings => self.embeddings.as_deref(),
+            ProviderEndpoint::CountTokens => self.count_tokens.as_deref(),
+            ProviderEndpoint::ResponsesCompact => self.responses_compact.as_deref(),
         }
     }
 }
@@ -247,7 +259,7 @@ impl ProtocolAuthConfig {
                 prefix: String::new(),
             },
             Self::Shorthand(AuthShorthand::XApiKeyOrBearer) => {
-                if endpoint == ProviderEndpoint::Messages {
+                if matches!(endpoint, ProviderEndpoint::Messages | ProviderEndpoint::CountTokens) {
                     ProviderAuthScheme {
                         header: "x-api-key".to_string(),
                         prefix: String::new(),
@@ -278,6 +290,8 @@ pub struct ProviderAuth {
     pub models: Option<ProtocolAuthConfig>,
     #[serde(default)]
     pub usage: Option<ProtocolAuthConfig>,
+    #[serde(default)]
+    pub embeddings: Option<ProtocolAuthConfig>,
 }
 
 impl ProviderAuth {
@@ -286,10 +300,13 @@ impl ProviderAuth {
     pub fn for_endpoint(&self, endpoint: ProviderEndpoint) -> Option<ProviderAuthScheme> {
         let specific = match endpoint {
             ProviderEndpoint::Chat => self.chat.as_ref(),
-            ProviderEndpoint::Responses => self.responses.as_ref(),
-            ProviderEndpoint::Messages => self.messages.as_ref(),
+            ProviderEndpoint::Responses | ProviderEndpoint::ResponsesCompact => {
+                self.responses.as_ref()
+            }
+            ProviderEndpoint::Messages | ProviderEndpoint::CountTokens => self.messages.as_ref(),
             ProviderEndpoint::Models => self.models.as_ref(),
             ProviderEndpoint::Usage => self.usage.as_ref(),
+            ProviderEndpoint::Embeddings => self.embeddings.as_ref().or(self.chat.as_ref()),
         };
         specific
             .or(self.default.as_ref())
@@ -467,12 +484,60 @@ const fn default_inherit_preset_defaults() -> bool {
 /// Unknown keys are preserved by the database but ignored here so older or newer
 /// control-plane versions can coexist. Missing values fall back to the adapter
 /// preset default at the call site.
+/// Declarative JSON body edit operation (`F024`, `PRV-3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyEditOp {
+    Set,
+    Default,
+    Delete,
+    Move,
+}
+
+/// Declarative JSON body edit rule supporting dot paths, null-to-object promotion, and `*` wildcards (`F024`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyEditRule {
+    pub op: BodyEditOp,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+/// Preferred max output tokens field name for OpenAI Chat Completions compatibility (`F007`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+/// Provider-level OpenAI Chat Completions compatibility normalizations (`F007`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiCompatConfig {
+    #[serde(default)]
+    pub rewrite_developer_role_to_system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+    #[serde(default)]
+    pub strip_store: bool,
+    #[serde(default)]
+    pub strip_reasoning_effort: bool,
+    #[serde(default)]
+    pub normalize_mistral_tool_ids: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default = "default_inherit_preset_defaults")]
     pub inherit_preset_defaults: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_protocols: Vec<String>,
     #[serde(default)]
     pub paths: ProviderPaths,
     #[serde(default)]
@@ -499,6 +564,10 @@ pub struct ProviderConfig {
     pub error_classifiers: ErrorClassifiers,
     #[serde(default)]
     pub timeouts: ProviderTimeouts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_edits: Vec<BodyEditRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_compat: Option<OpenAiCompatConfig>,
 }
 
 impl Default for ProviderConfig {
@@ -506,6 +575,8 @@ impl Default for ProviderConfig {
         Self {
             schema_version: PROVIDER_CONFIG_SCHEMA_VERSION,
             inherit_preset_defaults: true,
+            preset_id: None,
+            supported_protocols: Vec::new(),
             paths: ProviderPaths::default(),
             aux_endpoints: ProviderAuxEndpoints::default(),
             auth: ProviderAuth::default(),
@@ -519,6 +590,8 @@ impl Default for ProviderConfig {
             usage_profile: None,
             error_classifiers: ErrorClassifiers::default(),
             timeouts: ProviderTimeouts::default(),
+            body_edits: Vec::new(),
+            openai_compat: None,
         }
     }
 }
@@ -573,6 +646,12 @@ impl ProviderConfig {
             .nonstream_response_timeout_ms
             .filter(|ms| *ms > 0)
             .map_or(600_000, |ms| ms as u64)
+    }
+
+    /// Whether post-send timeouts are permitted to fail over to another key (`F003`, SRDD Section 10.5.2).
+    #[must_use]
+    pub const fn timeout_failover(&self) -> bool {
+        self.timeouts.timeout_failover
     }
 }
 

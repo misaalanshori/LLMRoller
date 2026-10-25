@@ -43,6 +43,7 @@ pub struct PreFirstFrameBuffer {
     pub headers: HeaderMap,
     pub buffer: Vec<u8>,
     pub committed: bool,
+    scan_offset: usize,
 }
 
 impl PreFirstFrameBuffer {
@@ -53,14 +54,15 @@ impl PreFirstFrameBuffer {
             headers,
             buffer: Vec::with_capacity(8192),
             committed: false,
+            scan_offset: 0,
         }
     }
 
-    /// Feed an initial chunk into the pre-first-frame holding buffer.
+    /// Feed an initial chunk into the pre-first-frame holding buffer (`RTE-8`, `F001`, `F017`, `F030`).
     ///
-    /// If an error object is encountered before commit, returns `Err(ForwardError::UpstreamError)`.
-    /// When the first valid non-comment frame is received or the buffer reaches 64 KiB,
-    /// marks `committed = true` and flushes all held bytes.
+    /// Inspects complete SSE frames one by one so keepalive comments (`: ...`) and
+    /// `event: ping` frames never mask a subsequent error frame or prematurely commit
+    /// the downstream HTTP 200 stream.
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Option<Bytes>, ForwardError> {
         if self.committed {
             return Ok(Some(Bytes::copy_from_slice(chunk)));
@@ -68,26 +70,41 @@ impl PreFirstFrameBuffer {
 
         self.buffer.extend_from_slice(chunk);
 
-        // Check for error object before commit
-        if let Some(err_msg) = extract_frame_error(&self.buffer) {
-            return Err(ForwardError::UpstreamError(err_msg));
+        while let Some(rel_idx) = find_frame_delimiter(&self.buffer[self.scan_offset..]) {
+            let frame_end = self.scan_offset + rel_idx;
+            let frame = &self.buffer[self.scan_offset..frame_end];
+            self.scan_offset = frame_end;
+
+            if is_comment_frame(frame) {
+                if self.buffer.len() >= HOLD_BUFFER_MAX_BYTES {
+                    self.committed = true;
+                    self.scan_offset = 0;
+                    let flushed = std::mem::take(&mut self.buffer);
+                    return Ok(Some(Bytes::from(flushed)));
+                }
+                continue;
+            }
+
+            if let Some(err_msg) = extract_frame_error(frame) {
+                return Err(ForwardError::UpstreamError(err_msg));
+            }
+
+            // Commit condition 1: A complete valid non-comment, non-error frame has arrived
+            self.committed = true;
+            self.scan_offset = 0;
+            let flushed = std::mem::take(&mut self.buffer);
+            return Ok(Some(Bytes::from(flushed)));
         }
 
-        // Commit condition 1: A complete non-comment frame has arrived
-        let mut offset = 0;
-        while let Some(idx) = find_frame_delimiter(&self.buffer[offset..]) {
-            let frame = &self.buffer[offset..offset + idx];
-            if !is_comment_frame(frame) {
-                self.committed = true;
-                let flushed = std::mem::take(&mut self.buffer);
-                return Ok(Some(Bytes::from(flushed)));
-            }
-            offset += idx;
+        // Check if an un-delimited error object arrived in the current partial frame
+        if let Some(err_msg) = extract_frame_error(&self.buffer[self.scan_offset..]) {
+            return Err(ForwardError::UpstreamError(err_msg));
         }
 
         // Commit condition 2: Buffer reached 64 KiB without an error object
         if self.buffer.len() >= HOLD_BUFFER_MAX_BYTES {
             self.committed = true;
+            self.scan_offset = 0;
             let flushed = std::mem::take(&mut self.buffer);
             return Ok(Some(Bytes::from(flushed)));
         }
@@ -95,15 +112,25 @@ impl PreFirstFrameBuffer {
         Ok(None)
     }
 
-    /// Flush any remaining buffered bytes at stream end.
+    /// Flush any remaining buffered bytes at stream end (`F009`, `F030`).
+    ///
+    /// If the stream ended before any non-comment content frame arrived (e.g. only
+    /// keepalive comments were sent before EOF), returns `None` so the caller fails over.
     pub fn flush_remaining(&mut self) -> Option<Bytes> {
-        if !self.buffer.is_empty() {
-            self.committed = true;
-            let flushed = std::mem::take(&mut self.buffer);
-            Some(Bytes::from(flushed))
-        } else {
-            None
+        if self.buffer.is_empty() {
+            return None;
         }
+        let tail = &self.buffer[self.scan_offset..];
+        if tail.iter().all(|b| b.is_ascii_whitespace()) || is_comment_frame(tail) {
+            return None;
+        }
+        if extract_frame_error(tail).is_some() {
+            return None;
+        }
+        self.committed = true;
+        self.scan_offset = 0;
+        let flushed = std::mem::take(&mut self.buffer);
+        Some(Bytes::from(flushed))
     }
 }
 
@@ -248,5 +275,25 @@ mod tests {
             decompress_chunk("identity", payload).expect("identity decode"),
             payload
         );
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-8, API-6, F001, F017, F030 - PreFirstFrameBuffer ignores keepalive comments and pings before initial error or EOF"]
+    fn pre_first_frame_buffer_handles_keepalive_comments_before_error_and_eof() {
+        let mut buf = PreFirstFrameBuffer::new(StatusCode::OK, HeaderMap::new());
+        assert!(
+            buf.push_chunk(b": OPENROUTER PROCESSING\n\nevent: ping\ndata: {\"type\": \"ping\"}\n\n")
+                .expect("keepalive ok")
+                .is_none()
+        );
+        // Premature EOF after only keepalives must return None so orchestrator fails over
+        assert!(buf.flush_remaining().is_none());
+
+        let mut buf2 = PreFirstFrameBuffer::new(StatusCode::OK, HeaderMap::new());
+        assert!(buf2.push_chunk(b": keepalive\n\n").expect("ok").is_none());
+        let err = buf2
+            .push_chunk(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n")
+            .expect_err("must detect initial error frame after keepalive");
+        assert!(matches!(err, ForwardError::UpstreamError(_)));
     }
 }

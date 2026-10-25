@@ -138,19 +138,26 @@ pub async fn verify_audit_log(
     anchor_seq: Option<i64>,
     anchor_hash: Option<&str>,
 ) -> Result<AuditVerificationReport, AuditVerificationError> {
-    let rows = sqlx::query(
-        "SELECT seq, id, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json, prev_hash, hash
-         FROM audit_log ORDER BY seq ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-
     let mut expected_seq = 1_i64;
     let mut expected_prev_hash = GENESIS_HASH.to_owned();
     let mut tail_hash = GENESIS_HASH.to_owned();
     let mut anchor_found = false;
+    let mut last_seq = 0_i64;
+    let mut total_verified = 0_usize;
 
-    for row in &rows {
+    loop {
+        let rows = sqlx::query(
+            "SELECT seq, id, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json, prev_hash, hash
+             FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT 1000",
+        )
+        .bind(last_seq)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            total_verified += 1;
         let seq: i64 = row.try_get("seq")?;
         if seq != expected_seq {
             return Err(AuditVerificationError::SequenceGap {
@@ -212,9 +219,11 @@ pub async fn verify_audit_log(
             anchor_found = true;
         }
 
-        expected_prev_hash = stored_hash.clone();
-        tail_hash = stored_hash;
-        expected_seq += 1;
+            last_seq = seq;
+            expected_prev_hash = stored_hash.clone();
+            tail_hash = stored_hash;
+            expected_seq += 1;
+        }
     }
 
     let max_seq = expected_seq - 1;
@@ -229,7 +238,7 @@ pub async fn verify_audit_log(
     }
 
     Ok(AuditVerificationReport {
-        rows_verified: rows.len(),
+        rows_verified: total_verified,
         max_seq,
         tail_hash,
     })

@@ -344,3 +344,28 @@ fn test_aborted_messages_and_responses_streams_preserve_input_and_estimate_outpu
     assert_eq!(resp_tap.stop_reason.as_deref(), Some("length"));
     assert_eq!(resp_tap.finalize_usage().output_tokens, 32);
 }
+
+#[doc = "Spec: USG-1, USG-2, F009, F021, F022 - unterminated EOF SSE frame flush and nested responses/messages usage"]
+#[test]
+fn test_unterminated_eof_sse_frame_and_nested_responses_messages_usage() {
+    // F009: Final usage chunk at EOF without trailing \n\n is flushed by finalize_usage() / finish()
+    let mut chat_tap = SseUsageTap::new(EndpointKind::Chat);
+    chat_tap.feed_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7}}",
+    );
+    assert!(chat_tap.is_complete_at_eof());
+    let u_chat = chat_tap.finalize_usage();
+    assert_eq!(u_chat.input_uncached_tokens, 42);
+    assert_eq!(u_chat.output_tokens, 7);
+
+    // F021: response.completed with nested input_tokens_details.cached_tokens and output_tokens_details.reasoning_tokens
+    let mut resp_tap = SseUsageTap::new(EndpointKind::Responses);
+    resp_tap.feed_chunk(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":200,\"input_tokens_details\":{\"cached_tokens\":150},\"output_tokens\":90,\"output_tokens_details\":{\"reasoning_tokens\":30}}}}\n\n",
+    );
+    let u_resp = resp_tap.finalize_usage();
+    assert_eq!(u_resp.input_uncached_tokens, 50);
+    assert_eq!(u_resp.cache_read_tokens, 150);
+    assert_eq!(u_resp.output_tokens, 90);
+    assert_eq!(u_resp.reasoning_tokens, 30);
+}

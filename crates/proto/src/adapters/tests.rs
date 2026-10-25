@@ -56,7 +56,7 @@ fn test_provider_adapter_contracts() {
 
         let stream_mode = adapter.default_chat_stream_mode();
         match kind {
-            ProviderKind::Custom | ProviderKind::OpenDesignAmr => {
+            ProviderKind::Custom | ProviderKind::OpenDesignAmr | ProviderKind::OpencodeGo => {
                 assert_eq!(stream_mode, ChatStreamMode::Inject)
             }
             _ => assert_eq!(stream_mode, ChatStreamMode::Native),
@@ -257,4 +257,50 @@ fn test_is_model_not_found_error_matching() {
         b"custom_model_missing",
         Some(&custom)
     ));
+}
+
+#[doc = "Spec: RTE-8, API-6, F001, F017, F018 - initial SSE and embedded HTTP 200 error classification"]
+#[test]
+fn test_embedded_http_200_and_sse_error_frame_classification() {
+    use crate::adapters::{is_overloaded_error, is_origin_timeout_status};
+
+    // F001: Initial SSE frame with HTTP 200 carrying quota_exceeded or invalid_api_key
+    let sse_quota = b"event: error\ndata: {\"error\":{\"code\":\"insufficient_quota\",\"message\":\"Out of credits\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_quota, None),
+        ErrorClass::QuotaExhausted
+    );
+
+    let sse_auth = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_auth, None),
+        ErrorClass::CredentialInvalid
+    );
+
+    let sse_bad_req = b"event: error\ndata: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_bad_req, None),
+        ErrorClass::RequestRejected
+    );
+
+    // F017: Anthropic two-line SSE overloaded_error and rate_limit_error frames
+    let sse_overloaded = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_overloaded, None),
+        ErrorClass::Other(529)
+    );
+    assert!(is_overloaded_error(200, sse_overloaded));
+    assert!(is_overloaded_error(529, b"Site is overloaded"));
+
+    let sse_ratelimit = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Rate limited\"}}\n\n";
+    assert_eq!(
+        classify_error_with_classifiers(200, sse_ratelimit, None),
+        ErrorClass::Other(429)
+    );
+
+    // F018: Origin timeout status detection (408, 504, 524)
+    assert!(is_origin_timeout_status(408));
+    assert!(is_origin_timeout_status(504));
+    assert!(is_origin_timeout_status(524));
+    assert!(!is_origin_timeout_status(502));
 }

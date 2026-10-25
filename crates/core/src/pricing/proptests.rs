@@ -331,3 +331,41 @@ fn cjk_text_without_spaces_is_not_misclassified_as_base64_media() {
         "expected >= 12000 tokens for 48KB CJK text across content and data, got {est}"
     );
 }
+
+#[test]
+#[doc = "Spec: USG-3, USG-10, LIM-1; F035, F036, F044, F045"]
+fn test_phase_2b_pricing_free_tier_ceil_date_suffix_and_inline_base64() {
+    // F035 & F036: apply_effective_upstream_cost zeroes free_tier while apply_plan_multiplier uses div_ceil
+    assert_eq!(
+        crate::pricing::apply_effective_upstream_cost(100_000, 10_000, "pay_as_you_go", true),
+        0
+    );
+    assert_eq!(
+        crate::pricing::apply_effective_upstream_cost(100_000, 10_000, "free_tier", false),
+        0
+    );
+    assert_eq!(
+        apply_plan_multiplier(1, 2_500, "subscription_plan"),
+        1,
+        "non-zero subscription plan cost must ceiling-round to at least 1 micro-USD"
+    );
+
+    // F044: strip_model_date_suffix resolves release-dated model slugs
+    assert_eq!(
+        crate::snapshot::strip_model_date_suffix("gpt-4o-2024-11-20").as_deref(),
+        Some("gpt-4o")
+    );
+    assert_eq!(
+        crate::snapshot::strip_model_date_suffix("claude-3-5-sonnet-20241022").as_deref(),
+        Some("claude-3-5-sonnet")
+    );
+
+    // F045: Large (> 16 KiB) inline base64 string under non-standard key is counted as 1 binary block (1,600 tokens)
+    let b64_blob = "A".repeat(24_000);
+    let payload = format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","source":"{b64_blob}"}}]}}"#);
+    let est = estimate_input_tokens(payload.as_bytes());
+    assert!(
+        est < 2_000,
+        "24 KiB inline base64 blob should be treated as a 1600-token binary block, got {est}"
+    );
+}

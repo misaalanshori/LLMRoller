@@ -1,0 +1,35 @@
+# FriendliAI (`api.friendli.ai/serverless/v1`) & Inception Labs Mercury Diffusion (`api.inceptionlabs.ai/v1`) provider preset (F149).
+# Spec: apiclientreferences/opencode/friendli.md, apiclientreferences/opencode/inception.md
+
+kind = "custom"
+preset_id = "friendli_ai_and_Inception_mercury_diffusion"
+name = "FriendliAI (`api.friendli.ai/serverless/v1`) & Inception Labs Mercury Diffusion (`api.inceptionlabs.ai/v1`)"
+base_url = "https://api.friendli.ai/serverless/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "friendli_ai_and_Inception_mercury_diffusion"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"mercury" = "mercury"
+"mercury-coder" = "mercury-coder"
+"minimaxai/minimax-m2-5" = "MiniMaxAI/MiniMax-M2.5"
+"qwen/qwen3-235b-a22b-instruct-2507" = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+"zai-org/glm-5" = "zai-org/GLM-5"

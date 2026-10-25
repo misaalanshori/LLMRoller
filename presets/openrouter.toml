@@ -20,6 +20,10 @@ responses_compact = false
 [usage_reporting]
 chat_stream = "native"
 
+[add_headers]
+"HTTP-Referer" = "https://github.com/llmroller/llmroller"
+"X-Title" = "LLMRoller"
+
 [session_profile]
 headers = ["x-session-id"]
 body_field = "session_id"

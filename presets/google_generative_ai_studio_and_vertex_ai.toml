@@ -1,0 +1,36 @@
+# Google Generative AI Studio (`generativelanguage.googleapis.com`) & Google Cloud Vertex AI (`aiplatform.googleapis.com`) provider preset (F116).
+# Spec: apiclientreferences/pi/google.md, apiclientreferences/pi/google-vertex.md, apiclientreferences/fx/google.md, apiclientreferences/opencode/google-vertex.md, apiclientreferences/9router/gemini.md
+
+kind = "custom"
+preset_id = "google_generative_ai_studio_and_vertex_ai"
+name = "Google Generative AI Studio (`generativelanguage.googleapis.com`) & Google Cloud Vertex AI (`aiplatform.googleapis.com`)"
+base_url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
+ua_policy = "pass"
+supported_protocols = ["chat", "messages", "responses"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "google_generative_ai_studio_and_vertex_ai"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gemini-3-1-pro-preview" = "gemini-3.1-pro-preview"
+"gemini-3-pro-preview" = "gemini-3-pro-preview"
+"gemini-3-flash-preview" = "gemini-3-flash-preview"
+"gemini-2-5-pro" = "gemini-2.5-pro"
+"gemini-2-5-flash" = "gemini-2.5-flash"
+"gemini-2-5-flash-lite" = "gemini-2.5-flash-lite"

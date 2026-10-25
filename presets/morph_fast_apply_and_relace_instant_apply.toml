@@ -1,0 +1,33 @@
+# Morph Fast Apply (`api.morphllm.com/v1`) & Cortecs (`api.cortecs.ai/v1`) provider preset (F155).
+# Spec: apiclientreferences/opencode/morph.md, apiclientreferences/opencode/cortecs.md
+
+kind = "custom"
+preset_id = "morph_fast_apply_and_relace_instant_apply"
+name = "Morph Fast Apply (`api.morphllm.com/v1`) & Cortecs (`api.cortecs.ai/v1`)"
+base_url = "https://api.morphllm.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "morph_fast_apply_and_relace_instant_apply"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"morph-v3-large" = "morph-v3-large"
+"morph-v3-fast" = "morph-v3-fast"
+"auto" = "auto"

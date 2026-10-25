@@ -1,0 +1,35 @@
+# Cerebras Inference (`api.cerebras.ai/v1`) provider preset (F124).
+# Spec: apiclientreferences/pi/cerebras.md, apiclientreferences/opencode/cerebras.md
+
+kind = "custom"
+preset_id = "cerebras_wafer_scale_inference"
+name = "Cerebras Inference (`api.cerebras.ai/v1`)"
+base_url = "https://api.cerebras.ai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "cerebras_wafer_scale_inference"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"zai-glm-4-7" = "zai-glm-4.7"
+"gpt-oss-120b" = "gpt-oss-120b"
+"qwen-3-235b-a22b-instruct-2507" = "qwen-3-235b-a22b-instruct-2507"
+"qwen-3-32b" = "qwen-3-32b"
+"llama-3-3-70b" = "llama-3.3-70b"

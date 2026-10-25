@@ -789,5 +789,385 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
+
+/// Sanitize a `/v1/responses` JSON payload when failing over across upstream keys or accounts (`F005`).
+///
+/// Strips `previous_response_id` when `strip_previous_response_id` is true, and removes
+/// cross-account `encrypted_content` and orphan `item_reference` / empty `reasoning` items
+/// from `input[]` so the failover upstream does not reject Account A's organization-encrypted
+/// items with `400 invalid_encrypted_content`.
+#[must_use]
+pub fn sanitize_responses_failover_body(
+    body: Bytes,
+    strip_previous_response_id: bool,
+) -> Bytes {
+    let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return body;
+    };
+    let mut changed = false;
+    if strip_previous_response_id && obj.remove("previous_response_id").is_some() {
+        changed = true;
+    }
+    if let Some(serde_json::Value::Array(items)) = obj.get_mut("input") {
+        let orig_len = items.len();
+        items.retain_mut(|item| {
+            let Some(item_obj) = item.as_object_mut() else {
+                return true;
+            };
+            let item_type = item_obj
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if item_type == "item_reference" {
+                return false;
+            }
+            if item_obj.remove("encrypted_content").is_some() {
+                changed = true;
+            }
+            if item_type == "reasoning" {
+                let has_summary = item_obj
+                    .get("summary")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty());
+                let has_content = item_obj
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty());
+                return has_summary || has_content;
+            }
+            true
+        });
+        if items.len() != orig_len {
+            changed = true;
+        }
+    }
+    if !changed {
+        return body;
+    }
+    serde_json::to_vec(&val).map_or(body, Bytes::from)
+}
+
+/// Deterministically normalize a tool call ID into a 9-character ASCII alphanumeric string
+/// (`^[a-zA-Z0-9]{9}$`) required by Mistral-family Chat Completions endpoints (`F007`).
+#[must_use]
+pub fn normalize_mistral_tool_call_id(raw_id: &str) -> String {
+    if raw_id.len() == 9 && raw_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return raw_id.to_string();
+    }
+    let hex = crate::trace_tap::hex_sha256(raw_id.as_bytes());
+    hex.chars().take(9).collect()
+}
+
+/// Apply provider-configured OpenAI Chat Completions compatibility normalizations (`F007`).
+pub fn apply_openai_completions_compat(
+    value: &mut serde_json::Value,
+    compat: &llmroller_core::provider::OpenAiCompatConfig,
+) -> bool {
+    use llmroller_core::provider::MaxTokensField;
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+
+    if compat.strip_store && obj.remove("store").is_some() {
+        changed = true;
+    }
+    if compat.strip_reasoning_effort {
+        if obj.remove("reasoning_effort").is_some() {
+            changed = true;
+        }
+        if obj.remove("reasoning").is_some() {
+            changed = true;
+        }
+    }
+    match compat.max_tokens_field {
+        Some(MaxTokensField::MaxTokens) => {
+            if let Some(v) = obj.remove("max_completion_tokens") {
+                obj.entry("max_tokens".to_string()).or_insert(v);
+                changed = true;
+            }
+        }
+        Some(MaxTokensField::MaxCompletionTokens) => {
+            if let Some(v) = obj.remove("max_tokens") {
+                obj.entry("max_completion_tokens".to_string()).or_insert(v);
+                changed = true;
+            }
+        }
+        None => {}
+    }
+
+    if (compat.rewrite_developer_role_to_system || compat.normalize_mistral_tool_ids)
+        && let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages")
+    {
+        for msg in messages {
+            let Some(msg_obj) = msg.as_object_mut() else {
+                continue;
+            };
+            if compat.rewrite_developer_role_to_system
+                && msg_obj.get("role").and_then(serde_json::Value::as_str) == Some("developer")
+            {
+                msg_obj.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+                changed = true;
+            }
+            if compat.normalize_mistral_tool_ids {
+                if let Some(tc_id) = msg_obj
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                {
+                    let norm = normalize_mistral_tool_call_id(&tc_id);
+                    if norm != tc_id {
+                        msg_obj.insert(
+                            "tool_call_id".to_string(),
+                            serde_json::Value::String(norm),
+                        );
+                        changed = true;
+                    }
+                }
+                if let Some(serde_json::Value::Array(tool_calls)) = msg_obj.get_mut("tool_calls") {
+                    for tc in tool_calls {
+                        if let Some(tc_obj) = tc.as_object_mut()
+                            && let Some(id_str) = tc_obj
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        {
+                            let norm = normalize_mistral_tool_call_id(&id_str);
+                            if norm != id_str {
+                                tc_obj.insert("id".to_string(), serde_json::Value::String(norm));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Apply declarative JSON body edit rules supporting dot-separated paths, `Value::Null` intermediate
+/// object promotion, and `*` array wildcards (`F024`).
+pub fn apply_body_edit_rules(
+    value: &mut serde_json::Value,
+    rules: &[llmroller_core::provider::BodyEditRule],
+) -> bool {
+    use llmroller_core::provider::BodyEditOp;
+    let mut changed = false;
+    for rule in rules {
+        let segments: Vec<&str> = rule
+            .path
+            .split('.')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.is_empty() {
+            continue;
+        }
+        match rule.op {
+            BodyEditOp::Set => {
+                if let Some(ref v) = rule.value {
+                    if apply_path_set_or_default(value, &segments, v, false) {
+                        changed = true;
+                    }
+                }
+            }
+            BodyEditOp::Default => {
+                if let Some(ref v) = rule.value {
+                    if apply_path_set_or_default(value, &segments, v, true) {
+                        changed = true;
+                    }
+                }
+            }
+            BodyEditOp::Delete => {
+                if apply_path_delete(value, &segments) {
+                    changed = true;
+                }
+            }
+            BodyEditOp::Move => {
+                if let Some(ref from_path) = rule.from {
+                    let from_segments: Vec<&str> = from_path
+                        .split('.')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if let Some(extracted) = take_path_value(value, &from_segments) {
+                        let _ = apply_path_set_or_default(value, &segments, &extracted, false);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn apply_path_set_or_default(
+    current: &mut serde_json::Value,
+    segments: &[&str],
+    val: &serde_json::Value,
+    only_if_absent_or_null: bool,
+) -> bool {
+    let Some((&first, rest)) = segments.split_first() else {
+        return false;
+    };
+    if first == "*" {
+        if let serde_json::Value::Array(items) = current {
+            let mut any = false;
+            for item in items.iter_mut() {
+                if rest.is_empty() {
+                    if !only_if_absent_or_null || item.is_null() {
+                        *item = val.clone();
+                        any = true;
+                    }
+                } else if apply_path_set_or_default(item, rest, val, only_if_absent_or_null) {
+                    any = true;
+                }
+            }
+            return any;
+        }
+        return false;
+    }
+
+    // Promote intermediate Null to Object (`F024`)
+    if current.is_null() {
+        *current = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(map) = current.as_object_mut() else {
+        return false;
+    };
+
+    if rest.is_empty() {
+        if only_if_absent_or_null {
+            match map.get(first) {
+                None | Some(serde_json::Value::Null) => {
+                    map.insert(first.to_string(), val.clone());
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            map.insert(first.to_string(), val.clone());
+            true
+        }
+    } else {
+        let entry = map
+            .entry(first.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if entry.is_null() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+        apply_path_set_or_default(entry, rest, val, only_if_absent_or_null)
+    }
+}
+
+fn apply_path_delete(current: &mut serde_json::Value, segments: &[&str]) -> bool {
+    let Some((&first, rest)) = segments.split_first() else {
+        return false;
+    };
+    if first == "*" {
+        if let serde_json::Value::Array(items) = current {
+            let mut any = false;
+            for item in items.iter_mut() {
+                if apply_path_delete(item, rest) {
+                    any = true;
+                }
+            }
+            return any;
+        }
+        return false;
+    }
+    let Some(map) = current.as_object_mut() else {
+        return false;
+    };
+    if rest.is_empty() {
+        map.remove(first).is_some()
+    } else if let Some(child) = map.get_mut(first) {
+        apply_path_delete(child, rest)
+    } else {
+        false
+    }
+}
+
+fn take_path_value(current: &mut serde_json::Value, segments: &[&str]) -> Option<serde_json::Value> {
+    let (&first, rest) = segments.split_first()?;
+    let map = current.as_object_mut()?;
+    if rest.is_empty() {
+        map.remove(first)
+    } else {
+        take_path_value(map.get_mut(first)?, rest)
+    }
+}
+
+
+/// Force `store: false` and strip prior `reasoning` items from `input[]` when dispatching
+/// to OpenCode Go `/v1/responses` (`F096`).
+#[must_use]
+pub fn sanitize_opencode_go_responses_body(body: Bytes) -> Bytes {
+    let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return body;
+    };
+    obj.insert("store".to_string(), serde_json::Value::Bool(false));
+    if let Some(serde_json::Value::Array(items)) = obj.get_mut("input") {
+        items.retain(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning")
+        });
+    }
+    serde_json::to_vec(&val).map_or(body, Bytes::from)
+}
+
+/// Inject `cache_control: {"type": "ephemeral"}` onto the last multipart text block
+/// when routing an `anthropic/*` or `claude-*` model on OpenRouter (`F098`, `F177`).
+pub fn inject_openrouter_anthropic_cache_control(
+    value: &mut serde_json::Value,
+    upstream_model_id: &str,
+) -> bool {
+    let lower = upstream_model_id.trim().to_ascii_lowercase();
+    if !lower.starts_with("anthropic/") && !lower.contains("claude-") {
+        return false;
+    }
+    let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return false;
+    };
+    for msg in messages.iter_mut().rev() {
+        let role = msg
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !matches!(role, "system" | "user") {
+            continue;
+        }
+        if let Some(serde_json::Value::Array(parts)) = msg.get_mut("content") {
+            if parts.iter().any(|p| p.get("cache_control").is_some()) {
+                return false;
+            }
+            if let Some(last_part) = parts
+                .iter_mut()
+                .rev()
+                .find(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                && let Some(part_obj) = last_part.as_object_mut()
+            {
+                part_obj.insert(
+                    "cache_control".to_string(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod proptests;
+

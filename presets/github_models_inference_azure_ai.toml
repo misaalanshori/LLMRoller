@@ -1,0 +1,36 @@
+# GitHub Models (`models.github.ai/inference`) provider preset (F152).
+# Spec: apiclientreferences/opencode/github-models.md
+
+kind = "custom"
+preset_id = "github_models_inference_azure_ai"
+name = "GitHub Models (`models.github.ai/inference`)"
+base_url = "https://models.github.ai/inference"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "github_models_inference_azure_ai"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"openai/gpt-5" = "openai/gpt-5"
+"openai/gpt-4-1" = "openai/gpt-4.1"
+"openai/o3" = "openai/o3"
+"deepseek/deepseek-r1" = "deepseek/DeepSeek-R1"
+"xai/grok-3" = "xai/grok-3"
+"meta/llama-4-maverick-17b-128e-instruct-fp8" = "meta/Llama-4-Maverick-17B-128E-Instruct-FP8"

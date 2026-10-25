@@ -1,0 +1,33 @@
+# Xiaomi MiMo (`api.xiaomimimo.com/v1` OpenAI & `api.xiaomimimo.com/anthropic/v1/messages`) provider preset (F140).
+# Spec: apiclientreferences/opencode/xiaomi.md, apiclientreferences/9router/xiaomi-mimo.md
+
+kind = "custom"
+preset_id = "xiaomi_mimo_openai_and_anthropic"
+name = "Xiaomi MiMo (`api.xiaomimimo.com/v1` OpenAI & `api.xiaomimimo.com/anthropic/v1/messages`)"
+base_url = "https://api.xiaomimimo.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"mimo-v2-pro" = "mimo-v2-pro"
+"mimo-v2-flash" = "mimo-v2-flash"
+"mimo-v2-omni" = "mimo-v2-omni"

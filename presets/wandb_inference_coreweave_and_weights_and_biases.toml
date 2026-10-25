@@ -1,0 +1,34 @@
+# Weights & Biases Inference (`api.inference.wandb.ai/v1` with `OpenAI-Project` team/project header) provider preset (F154).
+# Spec: apiclientreferences/opencode/wandb.md
+
+kind = "custom"
+preset_id = "wandb_inference_coreweave_and_weights_and_biases"
+name = "Weights & Biases Inference (`api.inference.wandb.ai/v1` with `OpenAI-Project` team/project header)"
+base_url = "https://api.inference.wandb.ai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "wandb_inference_coreweave_and_weights_and_biases"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-r1-0528" = "deepseek-ai/DeepSeek-R1-0528"
+"qwen/qwen3-coder-480b-a35b-instruct" = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+"moonshotai/kimi-k2-instruct" = "moonshotai/Kimi-K2-Instruct"
+"openai/gpt-oss-120b" = "openai/gpt-oss-120b"

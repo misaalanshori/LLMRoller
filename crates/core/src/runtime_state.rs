@@ -305,6 +305,10 @@ pub struct RuntimeState {
     pub last_fresh_poll_ts: DashMap<UpstreamKeyId, i64>,
     /// Last data-plane traffic timestamp per upstream key for active (300s) vs idle (3600s) `/usage` polling (`USG-6`, `F-071`).
     pub last_key_used_ms: DashMap<UpstreamKeyId, i64>,
+    /// Per-route EWMA cache read ratio (`f64::to_bits`, `alpha = 0.1`) for preflight reservation cost estimation (`F032`, SRDD §13.2.2).
+    pub route_cache_ratios: DashMap<RouteId, AtomicU64>,
+    /// Per-client-key sliding minute token usage `(minute_epoch, tokens_used)` for TPM rate limiting (`F040`).
+    pub client_key_tpm: DashMap<ClientKeyId, (i64, i64)>,
     pub accumulators: Arc<MonthlyAccumulatorRegistry>,
     pub constant_session_detector: Arc<ConstantSessionDetector>,
 }
@@ -345,6 +349,8 @@ impl RuntimeState {
             upstream_snapshots: DashMap::new(),
             last_fresh_poll_ts: DashMap::new(),
             last_key_used_ms: DashMap::new(),
+            route_cache_ratios: DashMap::new(),
+            client_key_tpm: DashMap::new(),
             accumulators: Arc::new(MonthlyAccumulatorRegistry::new()),
             constant_session_detector: Arc::new(ConstantSessionDetector::new()),
         }
@@ -498,12 +504,106 @@ impl RuntimeState {
         self.health.bump_version();
     }
 
-    /// Whether a key is currently routable (C6).
+    /// Whether a key is currently routable (C6, F047).
     #[must_use]
     pub fn is_key_routable(&self, key_id: UpstreamKeyId, now_ms: i64) -> bool {
-        self.key_health
+        let health_ok = self
+            .key_health
             .get(&key_id)
-            .is_none_or(|entry| entry.is_routable(now_ms))
+            .is_none_or(|entry| entry.is_routable(now_ms));
+        if !health_ok {
+            return false;
+        }
+        // F047: If a fresh upstream /usage snapshot explicitly reports zero remaining balance
+        // or exhausted status across all reported windows, treat the key as unroutable until reset.
+        if let Some(snap) = self.upstream_snapshots.get(&key_id) {
+            if snap.get("status").and_then(|s| s.as_str()) == Some("exhausted") {
+                let resets_at = snap.get("resets_at").and_then(|r| r.as_i64());
+                if resets_at.is_none_or(|until| now_ms < until) {
+                    return false;
+                }
+            }
+            if snap
+                .get("balance_micro_usd")
+                .and_then(|b| b.as_i64())
+                .is_some_and(|bal| bal <= 0)
+                && snap.get("is_unlimited").and_then(|u| u.as_bool()) != Some(true)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Reads the EWMA cache read ratio `[0.0, 1.0]` for `route` (`F032`, SRDD §13.2.2).
+    #[must_use]
+    pub fn route_cache_ratio(&self, route: RouteId) -> f64 {
+        self.route_cache_ratios.get(&route).map_or(0.0, |bits| {
+            f64::from_bits(bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+        })
+    }
+
+    /// Updates the EWMA cache read ratio (`alpha = 0.1`) for `route` from observed token usage (`F032`, SRDD §13.2.2).
+    pub fn record_route_cache_ratio(
+        &self,
+        route: RouteId,
+        input_uncached: i64,
+        cache_read: i64,
+        cache_write: i64,
+    ) {
+        let total = input_uncached.max(0) + cache_read.max(0) + cache_write.max(0);
+        if total <= 0 {
+            return;
+        }
+        let sample = (cache_read.max(0) as f64 / total as f64).clamp(0.0, 1.0);
+        let entry = self
+            .route_cache_ratios
+            .entry(route)
+            .or_insert_with(|| AtomicU64::new(0.0_f64.to_bits()));
+        let mut current = entry.load(Ordering::Relaxed);
+        loop {
+            let prev = f64::from_bits(current).clamp(0.0, 1.0);
+            let next = if prev == 0.0 && current == 0.0_f64.to_bits() {
+                sample * 0.1
+            } else {
+                prev * 0.9 + sample * 0.1
+            };
+            match entry.compare_exchange_weak(
+                current,
+                next.to_bits(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Checks and records sliding-minute token usage against an optional per-client-key TPM limit (`F040`).
+    pub fn try_consume_client_key_tpm(
+        &self,
+        client_key_id: ClientKeyId,
+        tokens: i64,
+        tpm_limit: Option<i64>,
+        now_ms: i64,
+    ) -> Result<(), u64> {
+        let Some(limit) = tpm_limit.filter(|&l| l > 0) else {
+            return Ok(());
+        };
+        let minute = now_ms.div_euclid(60_000);
+        let add = tokens.max(0);
+        let mut entry = self.client_key_tpm.entry(client_key_id).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        if entry.1 > 0 && entry.1.saturating_add(add) > limit {
+            let elapsed_in_min_ms = now_ms.rem_euclid(60_000);
+            let retry_secs = ((60_000 - elapsed_in_min_ms).max(1000) as u64).div_ceil(1000);
+            return Err(retry_secs);
+        }
+        entry.1 = entry.1.saturating_add(add);
+        Ok(())
     }
 
     /// Block one `(key, model, protocol)` route until the next discovery refresh (API-8).
@@ -617,7 +717,20 @@ impl RuntimeState {
         now_ms: i64,
     ) {
         self.last_key_used_ms.insert(key_id, now_ms);
-        self.key_health.insert(key_id, KeyHealthEntry::default());
+        // F042: Do not allow an older in-flight request completing during an active cooldown
+        // or quarantine to wipe out `cooldown_until_ms` or `consecutive_failures` before `now_ms >= until`.
+        let mut entry = self.key_health.entry(key_id).or_default();
+        let active_cooldown = entry.cooldown_until_ms.is_some_and(|until| now_ms < until);
+        let active_exhausted = entry.exhausted_until_ms.is_some_and(|until| now_ms < until);
+        if entry.quarantine_reason.is_none() && !active_cooldown {
+            entry.healthy = true;
+            entry.cooldown_until_ms = None;
+            entry.consecutive_failures = 0;
+            if !active_exhausted {
+                entry.exhausted_until_ms = None;
+            }
+        }
+        drop(entry);
         // A success can clear a previous cooldown, so it is a health transition
         // that must be visible to the write-behind durable projection (REL-1).
         self.health.bump_version();
@@ -646,9 +759,16 @@ impl RuntimeState {
         let mut entry = self.key_health.entry(key_id).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         let mut strike = None;
+        let backoff_mult = 1_i64 << entry.consecutive_failures.saturating_sub(1).min(4);
         match outcome {
             AttemptOutcome::Http429 => {
-                entry.cooldown_until_ms = Some(now_ms + retry_after_ms.unwrap_or(60_000));
+                let delay = retry_after_ms.unwrap_or(60_000 * backoff_mult).min(900_000);
+                let until = now_ms.saturating_add(delay);
+                entry.cooldown_until_ms = Some(
+                    entry
+                        .cooldown_until_ms
+                        .map_or(until, |existing| existing.max(until)),
+                );
             }
             AttemptOutcome::Http401 | AttemptOutcome::Http403 => {
                 let decision = self
@@ -671,7 +791,13 @@ impl RuntimeState {
             AttemptOutcome::ConnectError
             | AttemptOutcome::Http5xx
             | AttemptOutcome::WriteStalled => {
-                entry.cooldown_until_ms = Some(now_ms + retry_after_ms.unwrap_or(15_000));
+                let delay = retry_after_ms.unwrap_or(15_000 * backoff_mult).min(300_000);
+                let until = now_ms.saturating_add(delay);
+                entry.cooldown_until_ms = Some(
+                    entry
+                        .cooldown_until_ms
+                        .map_or(until, |existing| existing.max(until)),
+                );
             }
             _ => {}
         }
@@ -1069,6 +1195,68 @@ mod tests {
             .select_next(&group, &candidates, 0, &entropy, None)
             .expect("selection after reload");
         assert_eq!(after_reload, first);
+    }
+
+    /// Spec: RTE-3, LIM-1, USG-6, REL-5; F032, F037, F040, F041, F042, F047, F048
+    #[test]
+    fn phase_2b_runtime_state_cache_ratio_cooldown_tpm_and_snapshot_eligibility() {
+        let runtime = RuntimeState::new();
+        let route = route_a();
+
+        // F032: EWMA cache ratio starts at 0.0 and updates with alpha = 0.1
+        assert_eq!(runtime.route_cache_ratio(route), 0.0);
+        runtime.record_route_cache_ratio(route, 200, 800, 0);
+        let ratio = runtime.route_cache_ratio(route);
+        assert!((ratio - 0.08).abs() < 1e-6, "expected 0.08 after first sample, got {ratio}");
+
+        // F040: Client key TPM sliding-minute rate limiter
+        let ck = ClientKeyId::generate();
+        assert!(runtime.try_consume_client_key_tpm(ck, 600, Some(1000), 60_000).is_ok());
+        assert!(runtime.try_consume_client_key_tpm(ck, 500, Some(1000), 65_000).is_err());
+        assert!(runtime.try_consume_client_key_tpm(ck, 500, Some(1000), 120_000).is_ok());
+
+        // F042: In-flight success during active cooldown preserves cooldown_until_ms and consecutive_failures
+        let origin = OriginKey::from_base_url("https://api.openai.com/v1", false);
+        let key_id = UpstreamKeyId::generate();
+        let _ = runtime.record_upstream_failure(
+            &origin,
+            key_id,
+            ck,
+            AttemptOutcome::Http429,
+            None,
+            1_000,
+        );
+        let entry1 = runtime.key_health_entry(key_id);
+        assert_eq!(entry1.consecutive_failures, 1);
+        assert_eq!(entry1.cooldown_until_ms, Some(61_000));
+        // Older in-flight request finishes at t=2_000 (< 61_000)
+        runtime.record_upstream_success(&origin, key_id, Some(route), Some(150), 2_000);
+        let entry_mid = runtime.key_health_entry(key_id);
+        assert_eq!(entry_mid.cooldown_until_ms, Some(61_000));
+        assert_eq!(entry_mid.consecutive_failures, 1);
+        // Second failure doubles backoff to 120_000 ms
+        let _ = runtime.record_upstream_failure(
+            &origin,
+            key_id,
+            ck,
+            AttemptOutcome::Http429,
+            None,
+            62_000,
+        );
+        let entry2 = runtime.key_health_entry(key_id);
+        assert_eq!(entry2.consecutive_failures, 2);
+        assert_eq!(entry2.cooldown_until_ms, Some(182_000));
+        // Success after cooldown expiry clears cooldown
+        runtime.record_upstream_success(&origin, key_id, Some(route), Some(120), 183_000);
+        assert!(runtime.is_key_routable(key_id, 183_000));
+
+        // F047: Upstream snapshot reporting exhausted status or zero balance blocks eligibility
+        runtime.publish_upstream_snapshot(
+            key_id,
+            serde_json::json!({"status": "exhausted", "resets_at": 250_000}),
+        );
+        assert!(!runtime.is_key_routable(key_id, 200_000));
+        assert!(runtime.is_key_routable(key_id, 260_000));
     }
 }
 

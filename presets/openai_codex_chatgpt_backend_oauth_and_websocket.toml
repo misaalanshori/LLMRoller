@@ -1,0 +1,38 @@
+# OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE & WebSocket v2 with Zstd) provider preset (F103).
+# Spec: apiclientreferences/pi/openai-codex.md, apiclientreferences/fx/openai-codex.md, apiclientreferences/opencode/openai-codex.md, apiclientreferences/9router/codex.md
+
+kind = "custom"
+preset_id = "openai_codex_chatgpt_backend_oauth_and_websocket"
+name = "OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE & WebSocket v2 with Zstd)"
+base_url = "https://chatgpt.com/backend-api/codex/responses"
+ua_policy = "pass"
+supported_protocols = ["responses"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"openai-beta" = "responses=experimental"
+"originator" = "codex_cli_rs"
+"user-agent" = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gpt-5-3-codex-spark" = "gpt-5.3-codex-spark"
+"gpt-5-2-codex" = "gpt-5.2-codex"
+"gpt-5-1-codex-max" = "gpt-5.1-codex-max"
+"gpt-5-1-codex-mini" = "gpt-5.1-codex-mini"

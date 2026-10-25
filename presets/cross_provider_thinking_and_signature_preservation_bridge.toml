@@ -1,0 +1,35 @@
+# Cross-Provider Thinking Block & Thought Signature Normalization (Anthropic `signature` vs Gemini `thoughtSignature` vs OpenAI `encrypted_content`) provider preset (F175).
+# Spec: apiclientreferences/pi/provider-architecture.md, apiclientreferences/pi-antigravity/antigravity.md, apiclientreferences/9router/overview.md
+
+kind = "custom"
+preset_id = "cross_provider_thinking_and_signature_preservation_bridge"
+name = "Cross-Provider Thinking Block & Thought Signature Normalization (Anthropic `signature` vs Gemini `thoughtSignature` vs OpenAI `encrypted_content`)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "cross_provider_thinking_and_signature_preservation_bridge"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gemini-3*" = "gemini-3*"
+"gpt-5*" = "gpt-5*"
+"deepseek-r1" = "deepseek-r1"
+"glm-5" = "glm-5"
+"kimi-k2-thinking)" = "kimi-k2-thinking)"

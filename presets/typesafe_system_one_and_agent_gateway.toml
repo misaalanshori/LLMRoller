@@ -1,0 +1,35 @@
+# TypeSafe System One (`app.typesafe.ai` Agent Gateway with Ed25519 Signed Tokens & Multi-Upstream Routing) provider preset (F110).
+# Spec: apiclientreferences/fx/system-one.md
+
+kind = "custom"
+preset_id = "typesafe_system_one_and_agent_gateway"
+name = "TypeSafe System One (`app.typesafe.ai` Agent Gateway with Ed25519 Signed Tokens & Multi-Upstream Routing)"
+base_url = "https://app.typesafe.ai/api/v2/agent"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "typesafe_system_one_and_agent_gateway"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gpt-5-4" = "gpt-5.4"
+"gemini-3-1-pro" = "gemini-3.1-pro"
+"grok-4-20-beta" = "grok-4.20-beta"

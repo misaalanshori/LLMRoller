@@ -246,9 +246,15 @@ pub async fn sweep_orphaned_trace_blocks(
     chunk_limit: i64,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "DELETE FROM trace_blocks WHERE rowid IN (
-             SELECT rowid FROM trace_blocks WHERE last_referenced_at < ? ORDER BY last_referenced_at LIMIT ?
-         )",
+        r#"DELETE FROM trace_blocks WHERE rowid IN (
+             SELECT b.rowid FROM trace_blocks b
+             WHERE b.last_referenced_at < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM trace_record_blocks r
+                   WHERE r.owner_user_id = b.owner_user_id AND r.block_hash = b.block_hash
+               )
+             ORDER BY b.last_referenced_at LIMIT ?
+         )"#,
     )
     .bind(cutoff_ms)
     .bind(chunk_limit)

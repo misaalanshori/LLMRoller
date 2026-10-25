@@ -1,0 +1,35 @@
+# Synthetic (`api.synthetic.new/openai/v1` & `api.synthetic.new/anthropic`) provider preset (F143).
+# Spec: apiclientreferences/opencode/synthetic.md, apiclientreferences/9router/synthetic.md
+
+kind = "custom"
+preset_id = "synthetic_new_glhf_openai_and_anthropic"
+name = "Synthetic (`api.synthetic.new/openai/v1` & `api.synthetic.new/anthropic`)"
+base_url = "https://api.synthetic.new/openai/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"hf-deepseek-ai/deepseek-v3-2" = "hf:deepseek-ai/DeepSeek-V3.2"
+"hf-deepseek-ai/deepseek-r1-0528" = "hf:deepseek-ai/DeepSeek-R1-0528"
+"hf-moonshotai/kimi-k2-5" = "hf:moonshotai/Kimi-K2.5"
+"hf-zai-org/glm-4-7" = "hf:zai-org/GLM-4.7"
+"hf-minimaxai/minimax-m2-5" = "hf:MiniMaxAI/MiniMax-M2.5"

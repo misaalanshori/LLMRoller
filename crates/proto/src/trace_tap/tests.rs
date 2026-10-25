@@ -384,3 +384,32 @@ fn test_responses_sse_function_call_deltas_and_reasoning_text_delta() {
         "{\"city\":\"Bandung\"}"
     );
 }
+
+#[doc = "Spec: TRC-2, PERF-5, F014, F015 - bounded tool call index and global trace budget enforcement"]
+#[test]
+fn test_bounded_tool_call_index_and_global_trace_budget_accounting() {
+    let mut tap = TraceTap::new().0;
+    // F015: huge tool_calls index must not OOM; it marks output.truncated = true and caps allocation
+    tap.feed_sse_data_json(&serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 100_000_000_u64,
+                    "id": "call_oom",
+                    "function": {"name": "evil", "arguments": "{}"}
+                }]
+            }
+        }]
+    }));
+    assert!(tap.output.truncated);
+    assert!(tap.output.assistant_tool_calls.is_empty());
+
+    // F014: reserve_global_bytes tracks against GLOBAL_TRACE_BYTES and releases on Drop
+    let before = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
+    {
+        let tap2 = TraceTap::new().0;
+        assert!(tap2.reserve_global_bytes(4096));
+        assert!(GLOBAL_TRACE_BYTES.load(Ordering::Relaxed) >= before + 4096);
+    }
+    assert_eq!(GLOBAL_TRACE_BYTES.load(Ordering::Relaxed), before);
+}

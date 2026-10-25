@@ -1,0 +1,34 @@
+# Baseten Model APIs (`inference.baseten.co/v1`) provider preset (F136).
+# Spec: apiclientreferences/opencode/baseten.md
+
+kind = "custom"
+preset_id = "baseten_model_apis"
+name = "Baseten Model APIs (`inference.baseten.co/v1`)"
+base_url = "https://inference.baseten.co/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "baseten_model_apis"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-v3-2" = "deepseek-ai/DeepSeek-V3.2"
+"moonshotai/kimi-k2-5" = "moonshotai/Kimi-K2.5"
+"zai-org/glm-5" = "zai-org/GLM-5"
+"minimaxai/minimax-m2-5" = "MiniMaxAI/MiniMax-M2.5"

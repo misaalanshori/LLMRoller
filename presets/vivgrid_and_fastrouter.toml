@@ -1,0 +1,33 @@
+# Vivgrid (`api.vivgrid.com/v1`) & FastRouter (`go.fastrouter.ai/api/v1`) provider preset (F169).
+# Spec: apiclientreferences/opencode/vivgrid.md, apiclientreferences/opencode/fastrouter.md
+
+kind = "custom"
+preset_id = "vivgrid_and_fastrouter"
+name = "Vivgrid (`api.vivgrid.com/v1`) & FastRouter (`go.fastrouter.ai/api/v1`)"
+base_url = "https://api.vivgrid.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "vivgrid_and_fastrouter"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"claude-opus-4-6" = "claude-opus-4-6"
+"gemini-3-1-pro" = "gemini-3.1-pro"

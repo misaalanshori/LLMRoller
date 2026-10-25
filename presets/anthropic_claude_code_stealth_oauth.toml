@@ -1,0 +1,44 @@
+# Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header & Tool Prefixing) provider preset (F104).
+# Spec: apiclientreferences/pi/anthropic.md, apiclientreferences/fx/anthropic.md, apiclientreferences/opencode/anthropic.md, apiclientreferences/9router/claude.md
+
+kind = "custom"
+preset_id = "anthropic_claude_code_stealth_oauth"
+name = "Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header & Tool Prefixing)"
+base_url = "https://api.anthropic.com/v1/messages?beta=true"
+ua_policy = "pass"
+supported_protocols = ["messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"user-agent" = "claude-cli/2.1.63 (external, cli)"
+"x-app" = "cli"
+"anthropic-dangerous-direct-browser-access" = "true"
+"anthropic-beta" = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+"x-stainless-lang" = "js"
+"x-stainless-package-version" = "0.74.0"
+"x-stainless-os" = "MacOS"
+"x-stainless-arch" = "arm64"
+"x-stainless-runtime" = "node"
+"x-stainless-runtime-version" = "v24.3.0"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"claude-opus-4-5-20251101" = "claude-opus-4-5-20251101"
+"claude-sonnet-4-5-20250929" = "claude-sonnet-4-5-20250929"
+"claude-haiku-4-5-20251001" = "claude-haiku-4-5-20251001"

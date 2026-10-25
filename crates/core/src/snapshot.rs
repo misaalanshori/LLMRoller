@@ -254,29 +254,48 @@ impl ConfigSnapshot {
         let trimmed = raw_model.trim();
         let normalized = crate::catalog::normalize_model_id(trimmed)
             .map_err(|_| SnapshotResolveError::NotFound)?;
+        let stripped_vendor = trimmed
+            .rsplit_once('/')
+            .map(|(_, s)| s)
+            .unwrap_or(trimmed);
+        let stripped_norm = crate::catalog::normalize_model_id(stripped_vendor)
+            .unwrap_or_else(|_| normalized.clone());
 
-        let initial_pk = if let Some(&pk) = self.aliases.get(trimmed) {
+        let ci_lookup = |map: &HashMap<String, ModelPk>, needle: &str| -> Option<ModelPk> {
+            map.get(needle).copied().or_else(|| {
+                map.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(needle))
+                    .map(|(_, &pk)| pk)
+            })
+        };
+
+        let initial_pk = if let Some(pk) = ci_lookup(&self.aliases, trimmed) {
             pk
-        } else if let Some(&pk) = self.aliases.get(&normalized) {
+        } else if let Some(pk) = ci_lookup(&self.aliases, &normalized) {
             pk
-        } else if let Some(&pk) = self.models_by_canonical.get(&normalized) {
+        } else if let Some(pk) = ci_lookup(&self.aliases, stripped_vendor) {
             pk
-        } else if let Some(&pk) = self.models_by_canonical.get(trimmed) {
+        } else if let Some(pk) = ci_lookup(&self.models_by_canonical, &normalized) {
             pk
-        } else if let Some(&pk) = self.redirects.get(trimmed) {
+        } else if let Some(pk) = ci_lookup(&self.models_by_canonical, trimmed) {
             pk
-        } else if let Some(&pk) = self.redirects.get(&normalized) {
+        } else if let Some(pk) = ci_lookup(&self.models_by_canonical, &stripped_norm) {
+            pk
+        } else if let Some(pk) = ci_lookup(&self.redirects, trimmed) {
+            pk
+        } else if let Some(pk) = ci_lookup(&self.redirects, &normalized) {
+            pk
+        } else if let Some(pk) = ci_lookup(&self.redirects, &stripped_norm) {
             pk
         } else {
-            // Fallback: exact upstream model ID match when unambiguous.
+            // Fallback 1: exact or case-insensitive upstream model ID match when unambiguous.
             let mut found: Option<ModelPk> = None;
-            for (pk, model) in self.models.iter() {
-                let _ = model;
-                if self
-                    .routes_by_model
-                    .get(pk)
-                    .is_some_and(|routes| routes.iter().any(|r| r.upstream_model_id == trimmed))
-                {
+            for pk in self.models.keys() {
+                if self.routes_by_model.get(pk).is_some_and(|routes| {
+                    routes
+                        .iter()
+                        .any(|r| r.upstream_model_id.eq_ignore_ascii_case(trimmed))
+                }) {
                     if let Some(existing) = found
                         && existing != *pk
                     {
@@ -285,19 +304,43 @@ impl ConfigSnapshot {
                     found = Some(*pk);
                 }
             }
+            // Fallback 2: vendor-stripped suffix match (`{vendor}/{requested}`) when unambiguous (F027).
+            if found.is_none() {
+                for pk in self.models.keys() {
+                    if self.routes_by_model.get(pk).is_some_and(|routes| {
+                        routes.iter().any(|r| {
+                            r.upstream_model_id.rsplit_once('/').is_some_and(
+                                |(_, suffix)| {
+                                    suffix.eq_ignore_ascii_case(stripped_vendor)
+                                        || suffix.eq_ignore_ascii_case(&stripped_norm)
+                                },
+                            )
+                        })
+                    }) {
+                        if let Some(existing) = found
+                            && existing != *pk
+                        {
+                            return Err(SnapshotResolveError::Ambiguous);
+                        }
+                        found = Some(*pk);
+                    }
+                }
+            }
             found.ok_or(SnapshotResolveError::NotFound)?
         };
 
-        // Follow redirects keyed by the old canonical id.
+        // Follow redirects keyed by the old canonical id (max 4 hops, multi-hop cycle detected; F027).
         let mut current = initial_pk;
-        for _ in 0..4 {
+        let mut visited = vec![current];
+        for hop in 0..=4 {
             let Some(model) = self.models.get(&current) else {
                 return Err(SnapshotResolveError::NotFound);
             };
-            if let Some(&next) = self.redirects.get(&model.canonical_id) {
-                if next == current {
+            if let Some(next) = ci_lookup(&self.redirects, &model.canonical_id) {
+                if hop == 4 || visited.contains(&next) {
                     return Err(SnapshotResolveError::RedirectLoop);
                 }
+                visited.push(next);
                 current = next;
             } else {
                 break;
@@ -352,9 +395,34 @@ impl ConfigSnapshot {
         let pid = provider_id.to_string();
         let pkind = provider_kind.as_str().to_string();
         let raw_model = upstream_model_id.to_string();
+        let stripped_tag = upstream_model_id
+            .split_once(':')
+            .map(|(base, _)| base.to_string());
         let norm_model = crate::catalog::normalize_model_id(upstream_model_id).ok();
+        let date_stripped = norm_model
+            .as_deref()
+            .and_then(strip_model_date_suffix)
+            .or_else(|| strip_model_date_suffix(upstream_model_id));
 
-        for model_candidate in std::iter::once(&raw_model).chain(norm_model.as_ref()) {
+        let mut candidates = Vec::with_capacity(4);
+        candidates.push(raw_model);
+        if let Some(tag_base) = stripped_tag
+            && !candidates.contains(&tag_base)
+        {
+            candidates.push(tag_base);
+        }
+        if let Some(norm) = norm_model
+            && !candidates.contains(&norm)
+        {
+            candidates.push(norm);
+        }
+        if let Some(ds) = date_stripped
+            && !candidates.contains(&ds)
+        {
+            candidates.push(ds);
+        }
+
+        for model_candidate in &candidates {
             if let Some(entry) = self.prices.get(&PriceKey {
                 provider_id: pid.clone(),
                 provider_kind: pkind.clone(),
@@ -399,6 +467,36 @@ impl ConfigSnapshot {
                 })
             })
     }
+}
+
+/// Strips a trailing `-YYYY-MM-DD`, `-YYYY.MM.DD`, or `-YYYYMMDD` release-date suffix from a model slug (`F044`).
+#[must_use]
+pub fn strip_model_date_suffix(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.len() > 11 {
+        let tail = &trimmed[trimmed.len() - 11..];
+        let bytes = tail.as_bytes();
+        if bytes[0] == b'-'
+            && bytes[1..5].iter().all(u8::is_ascii_digit)
+            && matches!(bytes[5], b'-' | b'.')
+            && bytes[6..8].iter().all(u8::is_ascii_digit)
+            && matches!(bytes[8], b'-' | b'.')
+            && bytes[9..11].iter().all(u8::is_ascii_digit)
+        {
+            return Some(trimmed[..trimmed.len() - 11].to_string());
+        }
+    }
+    if trimmed.len() > 9 {
+        let tail = &trimmed[trimmed.len() - 9..];
+        let bytes = tail.as_bytes();
+        if bytes[0] == b'-'
+            && bytes[1..9].iter().all(u8::is_ascii_digit)
+            && (tail.starts_with("-202") || tail.starts_with("-203"))
+        {
+            return Some(trimmed[..trimmed.len() - 9].to_string());
+        }
+    }
+    None
 }
 
 impl Default for ConfigSnapshot {
@@ -515,5 +613,29 @@ mod tests {
             )
             .expect("provider-wide fallback");
         assert_eq!(share.upstream_key_id, None);
+    }
+
+    #[test]
+    #[doc = "Spec: MDL-6, F027 - case-insensitive alias, vendor-prefixed suffix, and multi-hop redirect cycle detection"]
+    fn snapshot_resolves_case_insensitive_vendor_suffix_and_detects_multi_hop_redirect_cycle() {
+        let pk_a = ModelPk::generate();
+        let pk_b = ModelPk::generate();
+        let mut snapshot = ConfigSnapshot::default();
+        Arc::make_mut(&mut snapshot.models).insert(pk_a, model(pk_a, "gpt-5.4"));
+        Arc::make_mut(&mut snapshot.models).insert(pk_b, model(pk_b, "gpt-5.4-legacy"));
+        Arc::make_mut(&mut snapshot.models_by_canonical).insert("gpt-5.4".to_string(), pk_a);
+        Arc::make_mut(&mut snapshot.models_by_canonical).insert("gpt-5.4-legacy".to_string(), pk_b);
+        Arc::make_mut(&mut snapshot.aliases).insert("GPT5-Fast".to_string(), pk_a);
+
+        assert_eq!(snapshot.resolve_model("gpt5-fast").expect("case-insensitive alias").id, pk_a);
+        assert_eq!(snapshot.resolve_model("openai/gpt-5.4").expect("vendor-prefixed canonical").id, pk_a);
+
+        // Two-hop redirect cycle pk_a <-> pk_b must return RedirectLoop
+        Arc::make_mut(&mut snapshot.redirects).insert("gpt-5.4".to_string(), pk_b);
+        Arc::make_mut(&mut snapshot.redirects).insert("gpt-5.4-legacy".to_string(), pk_a);
+        assert_eq!(
+            snapshot.resolve_model("gpt-5.4"),
+            Err(SnapshotResolveError::RedirectLoop)
+        );
     }
 }

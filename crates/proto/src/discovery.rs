@@ -51,6 +51,8 @@ pub struct DiscoveredModel {
     pub canonical_slug: Option<String>,
     pub context_window: Option<i64>,
     pub discovered_pricing: Option<DiscoveredPricing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_protocols: Option<Vec<String>>,
 }
 
 fn parse_usd_per_token_to_micro_per_mtok(val: Option<&Value>) -> Option<i64> {
@@ -74,8 +76,13 @@ fn parse_discovered_model(value: &Value) -> Option<DiscoveredModel> {
             canonical_slug: None,
             context_window: None,
             discovered_pricing: None,
+            supported_protocols: None,
         });
     };
+    // Skip models explicitly marked disabled by the upstream catalog (`F020`, e.g. OpenDesign AMR)
+    if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     let canonical_slug = obj
         .get("canonical_slug")
         .and_then(Value::as_str)
@@ -84,8 +91,39 @@ fn parse_discovered_model(value: &Value) -> Option<DiscoveredModel> {
     let context_window = obj
         .get("context_length")
         .or_else(|| obj.get("context_window"))
+        .or_else(|| obj.get("max_context_length"))
+        .or_else(|| obj.get("metadata").and_then(|m| m.get("context_limit")))
+        .or_else(|| obj.get("metadata").and_then(|m| m.get("context_length")))
+        .or_else(|| obj.get("top_provider").and_then(|tp| tp.get("context_length")))
         .and_then(Value::as_i64)
         .filter(|&n| n > 0);
+    let supported_protocols = obj
+        .get("supported_endpoints")
+        .or_else(|| obj.get("supported_protocols"))
+        .or_else(|| obj.get("endpoints"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            let mut protos = Vec::new();
+            for item in arr.iter().filter_map(Value::as_str) {
+                let lower = item.trim().to_ascii_lowercase();
+                let mapped = if lower.contains("chat") {
+                    Some("chat")
+                } else if lower.contains("response") {
+                    Some("responses")
+                } else if lower.contains("message") || lower.contains("anthropic") {
+                    Some("messages")
+                } else {
+                    None
+                };
+                if let Some(p) = mapped
+                    && !protos.iter().any(|existing| existing == p)
+                {
+                    protos.push(p.to_string());
+                }
+            }
+            protos
+        })
+        .filter(|v| !v.is_empty());
     let discovered_pricing = obj.get("pricing").and_then(|pricing| {
         let input = parse_usd_per_token_to_micro_per_mtok(pricing.get("prompt"))?;
         let output = parse_usd_per_token_to_micro_per_mtok(pricing.get("completion"))?;
@@ -107,6 +145,7 @@ fn parse_discovered_model(value: &Value) -> Option<DiscoveredModel> {
         canonical_slug,
         context_window,
         discovered_pricing,
+        supported_protocols,
     })
 }
 
@@ -353,5 +392,43 @@ mod tests {
         assert_eq!(pricing.cache_read_micro_usd_per_mtok, 300_000);
         assert_eq!(pricing.cache_write_micro_usd_per_mtok, 3_750_000);
         assert_eq!(pricing.reasoning_micro_usd_per_mtok, Some(15_000_000));
+    }
+
+    #[test]
+    #[doc = "Spec: MDL-1, F020 - filters enabled:false models and extracts metadata.context_limit and supported_endpoints"]
+    fn discovery_filters_disabled_models_and_extracts_nested_context_limit() {
+        let raw = br#"{
+            "data": [
+                {"id": "claude-sonnet-4-6", "enabled": true, "metadata": {"context_limit": 200000}, "supported_endpoints": ["/v1/messages"]},
+                {"id": "disabled-beta-model", "enabled": false, "metadata": {"context_limit": 128000}},
+                {"id": "openai/gpt-5.4", "top_provider": {"context_length": 400000}, "supported_protocols": ["chat", "responses"]}
+            ]
+        }"#;
+        let models = parse_models_response(raw).expect("parse models");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
+        assert_eq!(models[0].context_window, Some(200_000));
+        assert_eq!(
+            models[0].supported_protocols.as_deref(),
+            Some(&["messages".to_string()][..])
+        );
+        assert_eq!(models[1].id, "openai/gpt-5.4");
+        assert_eq!(models[1].context_window, Some(400_000));
+        assert_eq!(
+            models[1].supported_protocols.as_deref(),
+            Some(&["chat".to_string(), "responses".to_string()][..])
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: PRV-2, MDL-1, F097 - open_design_amr preset anthropic-version header and discovery parser"]
+    fn regression_test_f097_open_design_amr_preset_missing_anthropic() {
+        let toml = ProviderKind::OpenDesignAmr.preset_toml();
+        assert!(toml.contains("\"anthropic-version\" = \"2023-06-01\""));
+        let raw = br#"{"data":[{"id":"claude-opus-4-6","enabled":true,"metadata":{"context_limit":200000,"output_limit":16384}},{"id":"claude-disabled","enabled":false,"metadata":{"context_limit":100000}}]}"#;
+        let models = parse_models_response(raw).expect("amr models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-opus-4-6");
+        assert_eq!(models[0].context_window, Some(200_000));
     }
 }

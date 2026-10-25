@@ -8,11 +8,14 @@ use bytes::BytesMut;
 /// Maximum holding buffer size before committing streaming response (64 KiB).
 pub const PRE_COMMIT_BUFFER_LIMIT: usize = 64 * 1024;
 
-/// Finds the end index (exclusive) of the first complete SSE frame (`\n\n` or `\r\n\r\n`).
+/// Finds the end index (exclusive) of the first complete SSE frame (`\n\n`, `\r\n\r\n`, or `\r\r`; `F009`).
 pub fn find_frame_delimiter(buf: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + 1 < buf.len() {
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if buf[i] == b'\r' && buf[i + 1] == b'\r' {
             return Some(i + 2);
         }
         if i + 3 < buf.len()
@@ -28,7 +31,7 @@ pub fn find_frame_delimiter(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Checks if an SSE frame consists solely of comment lines (`: ...`) or `event: ping`.
+/// Checks if an SSE frame consists solely of comment lines (`: ...`) or keepalive `event: ping` / `{"type": "ping"}` (`F030`).
 pub fn is_comment_frame(frame: &[u8]) -> bool {
     let Ok(s) = std::str::from_utf8(frame) else {
         return false;
@@ -43,12 +46,21 @@ pub fn is_comment_frame(frame: &[u8]) -> bool {
         if trimmed.starts_with(':') || trimmed == "event: ping" || trimmed == "event:ping" {
             continue;
         }
-        if trimmed.starts_with("data:") && trimmed.contains("\"type\":\"ping\"") {
-            continue;
+        if trimmed.starts_with("data:") {
+            let compact: String = trimmed.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            if compact.contains("\"type\":\"ping\"") {
+                continue;
+            }
         }
         return false;
     }
     has_lines
+}
+
+/// Alias for [`is_comment_frame`] used by streaming timeout and pre-commit checks (`F030`).
+#[must_use]
+pub fn is_keepalive_or_comment_frame(frame: &[u8]) -> bool {
+    is_comment_frame(frame)
 }
 
 fn is_non_null_error_value(err: &serde_json::Value) -> bool {

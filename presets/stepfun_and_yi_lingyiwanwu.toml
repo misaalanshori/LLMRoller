@@ -1,0 +1,33 @@
+# StepFun (`api.stepfun.com/v1`) & 01.AI Yi (`api.lingyiwanwu.com/v1`) provider preset (F163).
+# Spec: apiclientreferences/opencode/stepfun.md
+
+kind = "custom"
+preset_id = "stepfun_and_yi_lingyiwanwu"
+name = "StepFun (`api.stepfun.com/v1`) & 01.AI Yi (`api.lingyiwanwu.com/v1`)"
+base_url = "https://api.stepfun.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "stepfun_and_yi_lingyiwanwu"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"step-3-5-flash" = "step-3.5-flash"
+"step-3" = "step-3"
+"yi-lightning" = "yi-lightning"

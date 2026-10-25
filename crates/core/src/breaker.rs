@@ -234,3 +234,39 @@ impl Drop for OriginProbeGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: REL-5, F026 - HalfOpen breaker admits at most one concurrent probe and releases on guard drop"]
+    fn half_open_breaker_admits_single_probe_and_recovers_on_guard_drop() {
+        let breaker = Arc::new(Mutex::new(OriginBreaker::new()));
+        {
+            let mut b = breaker.lock();
+            for _ in 0..5 {
+                b.record_host_failure(1_000);
+            }
+            assert_eq!(b.state, BreakerState::Open { until_ms: 16_000 });
+        }
+
+        // At t = 16_000, the first caller claims the single half-open probe slot.
+        let is_probe_1 = breaker.lock().try_acquire(16_000);
+        assert_eq!(is_probe_1, Some(true));
+        let guard_1 = OriginProbeGuard::new(Arc::clone(&breaker), true);
+
+        // Concurrent second caller while probe_in_flight == true is rejected.
+        assert!(!breaker.lock().is_admitted(16_000));
+        assert_eq!(breaker.lock().try_acquire(16_000), None);
+
+        // Dropping guard_1 without recording outcome releases the probe slot.
+        drop(guard_1);
+        assert!(breaker.lock().is_admitted(16_000));
+
+        // Next caller can now acquire the probe slot and close the breaker on success.
+        assert_eq!(breaker.lock().try_acquire(16_001), Some(true));
+        breaker.lock().record_success(16_002);
+        assert_eq!(breaker.lock().state, BreakerState::Closed);
+    }
+}

@@ -25,6 +25,7 @@ pub enum EndpointKind {
     Usage,
     CountTokens,
     ResponsesCompact,
+    Embeddings,
 }
 
 /// Ordered five-class upstream error categorization per Section 10.5.2.
@@ -72,17 +73,50 @@ pub const MODEL_NOT_FOUND_SUBSTRINGS: [&str; 6] = [
     "unknown model",
 ];
 
-/// Whether an upstream 404 response matches model-not-found patterns (Section 10.5, MDL-1, REL-5).
+const EMBEDDED_REQUEST_REJECTED_SUBSTRINGS: [&str; 6] = [
+    "invalid_request_error",
+    "context_length_exceeded",
+    "content_policy_violation",
+    "content_filter",
+    "invalid_value",
+    "bad_request",
+];
+
+/// Extract the JSON payload from a multi-line SSE error frame (`event: error\ndata: {...}`),
+/// or return the raw UTF-8 string when the input is not SSE-framed (`F017`).
+#[must_use]
+pub fn extract_sse_data_or_raw(body_8k: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(body_8k);
+    let mut data_lines = Vec::new();
+    let mut saw_sse_prefix = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("event:") {
+            saw_sse_prefix = true;
+        } else if let Some(rest) = trimmed.strip_prefix("data:") {
+            saw_sse_prefix = true;
+            data_lines.push(rest.trim());
+        }
+    }
+    if saw_sse_prefix && !data_lines.is_empty() {
+        data_lines.join("\n")
+    } else {
+        raw.into_owned()
+    }
+}
+
+/// Whether an upstream 404 (or embedded 200 error) response matches model-not-found patterns (Section 10.5, MDL-1, REL-5, F001).
 #[must_use]
 pub fn is_model_not_found_error(
     status: u16,
     body_8k: &[u8],
     classifiers: Option<&ErrorClassifiers>,
 ) -> bool {
-    if status != 404 {
+    if !matches!(status, 200 | 404) {
         return false;
     }
-    let body_str = String::from_utf8_lossy(body_8k).to_ascii_lowercase();
+    let extracted = extract_sse_data_or_raw(body_8k);
+    let body_str = extracted.to_ascii_lowercase();
     if let Some(custom) = classifiers
         && ErrorClassifiers::matches(&custom.model_not_found_substrings, &body_str)
     {
@@ -93,43 +127,71 @@ pub fn is_model_not_found_error(
         .any(|sub| body_str.contains(sub))
 }
 
+/// Whether an upstream response represents an overloaded status (`HTTP 529` or `overloaded_error`, `F017`, `F018`).
+#[must_use]
+pub fn is_overloaded_error(status: u16, body_8k: &[u8]) -> bool {
+    if status == 529 {
+        return true;
+    }
+    if matches!(status, 200 | 429 | 500..=599) {
+        let extracted = extract_sse_data_or_raw(body_8k).to_ascii_lowercase();
+        if extracted.contains("overloaded_error")
+            || extracted.contains("site is overloaded")
+            || extracted.contains("server_is_overloaded")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether an HTTP status represents an upstream origin timeout (`408`, `504`, or Cloudflare `524`; `F018`).
+#[must_use]
+pub const fn is_origin_timeout_status(status: u16) -> bool {
+    matches!(status, 408 | 504 | 524)
+}
+
 /// Classify an upstream error response against the five ordered classes per Section 10.5.2.
 #[must_use]
 pub fn classify_error(status: u16, body_8k: &[u8]) -> ErrorClass {
     classify_error_with_classifiers(status, body_8k, None)
 }
 
-/// Classify an upstream error response honoring per-provider `error_classifiers` (PRV-3).
+/// Classify an upstream error response honoring per-provider `error_classifiers` (PRV-3, F001, F017, F018).
 #[must_use]
 pub fn classify_error_with_classifiers(
     status: u16,
     body_8k: &[u8],
     classifiers: Option<&ErrorClassifiers>,
 ) -> ErrorClass {
-    let body_str = String::from_utf8_lossy(body_8k).to_ascii_lowercase();
+    let extracted = extract_sse_data_or_raw(body_8k);
+    let body_str = extracted.to_ascii_lowercase();
 
     if let Some(custom) = classifiers {
-        if matches!(status, 402 | 403 | 429)
+        if matches!(status, 200 | 402 | 403 | 429)
             && ErrorClassifiers::matches(&custom.quota_exhausted_substrings, &body_str)
         {
             return ErrorClass::QuotaExhausted;
         }
-        if status == 403
+        if matches!(status, 200 | 400 | 403 | 422)
             && ErrorClassifiers::matches(&custom.request_rejected_substrings, &body_str)
         {
             return ErrorClass::RequestRejected;
         }
-        if status == 403 && ErrorClassifiers::matches(&custom.plan_restricted_substrings, &body_str)
+        if matches!(status, 200 | 403)
+            && ErrorClassifiers::matches(&custom.plan_restricted_substrings, &body_str)
         {
             return ErrorClass::PlanRestricted;
         }
-        if ErrorClassifiers::matches(&custom.credential_invalid_substrings, &body_str) {
+        if matches!(status, 200 | 401 | 403)
+            && ErrorClassifiers::matches(&custom.credential_invalid_substrings, &body_str)
+        {
             return ErrorClass::CredentialInvalid;
         }
     }
 
-    // 1. QuotaExhausted: Status in {402, 403, 429} and body matches quota_exhausted_substrings
-    if matches!(status, 402 | 403 | 429)
+    // 1. QuotaExhausted: Status in {200, 402, 403, 429} and body matches quota_exhausted_substrings
+    if matches!(status, 200 | 402 | 403 | 429)
         && QUOTA_EXHAUSTED_SUBSTRINGS
             .iter()
             .any(|sub| body_str.contains(sub))
@@ -137,9 +199,9 @@ pub fn classify_error_with_classifiers(
         return ErrorClass::QuotaExhausted;
     }
 
-    // 2. RequestRejected: Status 403 matching "flagged", "moderation", or content permission error,
-    // or status in {400, 404, 408, 409, 413, 422, 499}
-    if status == 403
+    // 2. RequestRejected: Status 200/403 matching "flagged", "moderation", or content permission error,
+    // embedded 200 invalid_request_error, or status in {400, 404, 408, 409, 413, 422, 499}
+    if matches!(status, 200 | 403)
         && (REQUEST_REJECTED_SUBSTRINGS
             .iter()
             .any(|sub| body_str.contains(sub))
@@ -147,12 +209,19 @@ pub fn classify_error_with_classifiers(
     {
         return ErrorClass::RequestRejected;
     }
+    if status == 200
+        && EMBEDDED_REQUEST_REJECTED_SUBSTRINGS
+            .iter()
+            .any(|sub| body_str.contains(sub))
+    {
+        return ErrorClass::RequestRejected;
+    }
     if matches!(status, 400 | 404 | 408 | 409 | 413 | 422 | 499) {
         return ErrorClass::RequestRejected;
     }
 
-    // 3. PlanRestricted: Status 403 matching plan_restricted_substrings
-    if status == 403
+    // 3. PlanRestricted: Status 200/403 matching plan_restricted_substrings
+    if matches!(status, 200 | 403)
         && PLAN_RESTRICTED_SUBSTRINGS
             .iter()
             .any(|sub| body_str.contains(sub))
@@ -160,14 +229,27 @@ pub fn classify_error_with_classifiers(
         return ErrorClass::PlanRestricted;
     }
 
-    // 4. CredentialInvalid: Status 401, or status 403 matching credential_invalid_substrings
+    // 4. CredentialInvalid: Status 401, or status 200/403 matching credential_invalid_substrings
     if status == 401
-        || (status == 403
-            && CREDENTIAL_INVALID_SUBSTRINGS
+        || (matches!(status, 200 | 403)
+            && (CREDENTIAL_INVALID_SUBSTRINGS
                 .iter()
-                .any(|sub| body_str.contains(sub)))
+                .any(|sub| body_str.contains(sub))
+                || body_str.contains("authentication_error")))
     {
         return ErrorClass::CredentialInvalid;
+    }
+
+    // Embedded HTTP 200 rate_limit_error maps to Other(429) so rate-limit cooldown applies (F001, F017)
+    if status == 200
+        && (body_str.contains("rate_limit_error") || body_str.contains("rate_limit_exceeded"))
+    {
+        return ErrorClass::Other(429);
+    }
+
+    // Embedded HTTP 200 overloaded_error maps to Other(529) (F017, F018)
+    if status == 200 && is_overloaded_error(status, body_8k) {
+        return ErrorClass::Other(529);
     }
 
     // 5. Unclassified403: Any other status 403
@@ -223,6 +305,7 @@ impl ProviderAdapter for OpencodeGoAdapter {
             EndpointKind::Usage => format!("{trimmed}/usage"),
             EndpointKind::CountTokens => format!("{trimmed}/messages/count_tokens"),
             EndpointKind::ResponsesCompact => format!("{trimmed}/responses/compact"),
+            EndpointKind::Embeddings => format!("{trimmed}/embeddings"),
         }
     }
 
@@ -231,7 +314,7 @@ impl ProviderAdapter for OpencodeGoAdapter {
     }
 
     fn default_chat_stream_mode(&self) -> ChatStreamMode {
-        ChatStreamMode::Native
+        ChatStreamMode::Inject
     }
 
     fn default_ua_policy(&self) -> UaPolicy {
@@ -266,9 +349,13 @@ impl ProviderAdapter for CommandCodeAdapter {
             EndpointKind::Responses => format!("{trimmed}/responses"),
             EndpointKind::Messages => format!("{trimmed}/messages"),
             EndpointKind::Models => format!("{trimmed}/models"),
-            EndpointKind::Usage => format!("{trimmed}/alpha/billing/credits"),
+            EndpointKind::Usage => {
+                let origin = trimmed.trim_end_matches("/provider/v1");
+                format!("{origin}/alpha/billing/credits")
+            }
             EndpointKind::CountTokens => format!("{trimmed}/messages/count_tokens"),
             EndpointKind::ResponsesCompact => format!("{trimmed}/responses/compact"),
+            EndpointKind::Embeddings => format!("{trimmed}/embeddings"),
         }
     }
 
@@ -315,6 +402,7 @@ impl ProviderAdapter for OpenDesignAmrAdapter {
             EndpointKind::Usage => format!("{trimmed}/usage"),
             EndpointKind::CountTokens => format!("{trimmed}/messages/count_tokens"),
             EndpointKind::ResponsesCompact => format!("{trimmed}/responses/compact"),
+            EndpointKind::Embeddings => format!("{trimmed}/embeddings"),
         }
     }
 
@@ -361,6 +449,7 @@ impl ProviderAdapter for OpenrouterAdapter {
             EndpointKind::Usage => format!("{trimmed}/key"),
             EndpointKind::CountTokens => format!("{trimmed}/messages/count_tokens"),
             EndpointKind::ResponsesCompact => format!("{trimmed}/responses/compact"),
+            EndpointKind::Embeddings => format!("{trimmed}/embeddings"),
         }
     }
 
@@ -407,6 +496,7 @@ impl ProviderAdapter for CustomAdapter {
             EndpointKind::Usage => format!("{trimmed}/usage"),
             EndpointKind::CountTokens => format!("{trimmed}/messages/count_tokens"),
             EndpointKind::ResponsesCompact => format!("{trimmed}/responses/compact"),
+            EndpointKind::Embeddings => format!("{trimmed}/embeddings"),
         }
     }
 

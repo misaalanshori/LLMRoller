@@ -1,0 +1,33 @@
+# RooCode Cloud (`api.roocode.com/v1`) & Blackbox AI (`api.blackbox.ai/v1`) provider preset (F159).
+# Spec: apiclientreferences/9router/roocode.md, apiclientreferences/9router/blackbox.md
+
+kind = "custom"
+preset_id = "roocode_cloud_and_kilocode_openrouter_compatible"
+name = "RooCode Cloud (`api.roocode.com/v1`) & Blackbox AI (`api.blackbox.ai/v1`)"
+base_url = "https://api.roocode.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "roocode_cloud_and_kilocode_openrouter_compatible"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gpt-5-4" = "gpt-5.4"
+"deepseek-v3-2" = "deepseek-v3.2"

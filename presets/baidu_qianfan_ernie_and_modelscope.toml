@@ -1,0 +1,33 @@
+# Baidu Qianfan (`qianfan.baidubce.com/v2`) & Alibaba ModelScope (`api-inference.modelscope.cn/v1`) provider preset (F161).
+# Spec: apiclientreferences/9router/qianfan.md, apiclientreferences/opencode/modelscope.md
+
+kind = "custom"
+preset_id = "baidu_qianfan_ernie_and_modelscope"
+name = "Baidu Qianfan (`qianfan.baidubce.com/v2`) & Alibaba ModelScope (`api-inference.modelscope.cn/v1`)"
+base_url = "https://qianfan.baidubce.com/v2"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "baidu_qianfan_ernie_and_modelscope"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"ernie-4-5-turbo-128k" = "ernie-4.5-turbo-128k"
+"deepseek-v3" = "deepseek-v3"
+"qwen/qwen3-coder-480b-a35b-instruct" = "Qwen/Qwen3-Coder-480B-A35B-Instruct"

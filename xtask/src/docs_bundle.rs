@@ -239,7 +239,7 @@ fn read_bigbang_parts(root: &Path) -> Result<BTreeMap<String, String>, String> {
 
 fn generate_srdd(root: &Path) -> Result<String, String> {
     let parts = read_srdd_parts(root)?;
-    let expected = 0..=22;
+    let expected = 0..=24;
     let present: BTreeSet<u32> = parts
         .keys()
         .filter_map(|key| key.parse::<u32>().ok())
@@ -489,7 +489,7 @@ mod tests {
             fs::create_dir_all(root.join("docs/srdd")).expect("srdd dir");
             fs::create_dir_all(root.join("docs/bigbang")).expect("bigbang dir");
 
-            for number in 0..=22 {
+            for number in 0..=24 {
                 let body = if number == 6 {
                     "# 6. SRDD: Functional\n\nAUTH-1 is tested here.\n".to_string()
                 } else {

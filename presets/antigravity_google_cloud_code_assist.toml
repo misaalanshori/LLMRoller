@@ -1,0 +1,38 @@
+# Google Antigravity (Cloud Code Assist v1internal Sandbox & Prod Dual-Endpoint) provider preset (F101).
+# Spec: apiclientreferences/pi-antigravity/antigravity.md, apiclientreferences/9router/antigravity.md, apiclientreferences/pi/google-gemini-cli.md
+
+kind = "custom"
+preset_id = "antigravity_google_cloud_code_assist"
+name = "Google Antigravity (Cloud Code Assist v1internal Sandbox & Prod Dual-Endpoint)"
+base_url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+ua_policy = "pass"
+supported_protocols = ["chat", "messages", "responses"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"user-agent" = "antigravity/1.107.0 darwin/arm64"
+"x-goog-api-client" = "google-cloud-sdk vscode_cloudshelleditor/0.1"
+"client-metadata" = "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"MACOS\",\"pluginType\":\"GEMINI\"}"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gemini-3-1-pro-high" = "gemini-3.1-pro-high"
+"gemini-3-1-pro-low" = "gemini-3.1-pro-low"
+"gemini-3-flash" = "gemini-3-flash"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"claude-opus-4-6-thinking" = "claude-opus-4-6-thinking"
+"gpt-oss-120b-medium" = "gpt-oss-120b-medium"

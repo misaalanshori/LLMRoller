@@ -1,0 +1,34 @@
+# Nebius AI Studio (`api.studio.nebius.ai/v1` / `api.tokenfactory.nebius.com/v1`) provider preset (F133).
+# Spec: apiclientreferences/opencode/nebius.md, apiclientreferences/9router/nebius.md
+
+kind = "custom"
+preset_id = "nebius_ai_studio_token_factory"
+name = "Nebius AI Studio (`api.studio.nebius.ai/v1` / `api.tokenfactory.nebius.com/v1`)"
+base_url = "https://api.tokenfactory.nebius.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "nebius_ai_studio_token_factory"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-r1-0528" = "deepseek-ai/DeepSeek-R1-0528"
+"deepseek-ai/deepseek-v3-0324" = "deepseek-ai/DeepSeek-V3-0324"
+"qwen/qwen3-235b-a22b-instruct-2507" = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+"moonshotai/kimi-k2-5" = "moonshotai/Kimi-K2.5"

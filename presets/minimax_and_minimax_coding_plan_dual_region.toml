@@ -1,0 +1,36 @@
+# MiniMax & MiniMax Coding Plan (`api.minimax.io/anthropic/v1/messages` & `api.minimaxi.com` CN) provider preset (F115).
+# Spec: apiclientreferences/pi/minimax.md, apiclientreferences/opencode/minimax.md, apiclientreferences/9router/minimax.md
+
+kind = "custom"
+preset_id = "minimax_and_minimax_coding_plan_dual_region"
+name = "MiniMax & MiniMax Coding Plan (`api.minimax.io/anthropic/v1/messages` & `api.minimaxi.com` CN)"
+base_url = "https://api.minimax.io/anthropic/v1/messages"
+ua_policy = "pass"
+supported_protocols = ["messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"minimax-m2-7" = "MiniMax-M2.7"
+"minimax-m2-7-highspeed" = "MiniMax-M2.7-highspeed"
+"minimax-m2-5" = "MiniMax-M2.5"
+"minimax-m2-5-highspeed" = "MiniMax-M2.5-highspeed"
+"minimax-m2-1" = "MiniMax-M2.1"
+"minimax-m2" = "MiniMax-M2"

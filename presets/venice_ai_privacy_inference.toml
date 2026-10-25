@@ -1,0 +1,36 @@
+# Venice AI (`api.venice.ai/api/v1`) provider preset (F142).
+# Spec: apiclientreferences/opencode/venice.md
+
+kind = "custom"
+preset_id = "venice_ai_privacy_inference"
+name = "Venice AI (`api.venice.ai/api/v1`)"
+base_url = "https://api.venice.ai/api/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "venice_ai_privacy_inference"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"openai-gpt-54" = "openai-gpt-54"
+"deepseek-v3-2" = "deepseek-v3.2"
+"kimi-k2-5" = "kimi-k2-5"
+"zai-org-glm-5" = "zai-org-glm-5"

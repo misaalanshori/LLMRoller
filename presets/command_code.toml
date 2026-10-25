@@ -11,7 +11,7 @@ chat = "/chat/completions"
 responses = "/responses"
 messages = "/messages"
 models = "/models"
-usage = "/alpha/billing/credits"
+usage = "https://api.commandcode.ai/alpha/billing/credits"
 
 [aux_endpoints]
 count_tokens = true
@@ -20,9 +20,20 @@ responses_compact = true
 [usage_reporting]
 chat_stream = "native"
 
+[add_headers]
+"x-command-code-version" = "0.25.7"
+"x-cli-environment" = "cli"
+
 [session_profile]
 headers = ["x-session-affinity", "x-session-id"]
 body_field = "prompt_cache_key"
 
 [aliases]
+"claude-opus-4-6" = "claude-opus-4.6"
 "claude-sonnet-4-6" = "claude-sonnet-4.6"
+"claude-haiku-4-5" = "claude-haiku-4.5"
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"glm-5" = "glm-5"
+"kimi-k2-5" = "kimi-k2.5"
+"minimax-m2-5" = "minimax-m2.5"

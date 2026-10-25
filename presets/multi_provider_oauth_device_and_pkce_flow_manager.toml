@@ -1,0 +1,39 @@
+# Built-In OAuth2 PKCE & Device Code Flow Manager in Admin Control Plane (`crates/admin` & `crates/store`) provider preset (F178).
+# Spec: apiclientreferences/pi/provider-architecture.md, apiclientreferences/9router/overview.md, apiclientreferences/opencode/provider-architecture.md
+
+kind = "custom"
+preset_id = "multi_provider_oauth_device_and_pkce_flow_manager"
+name = "Built-In OAuth2 PKCE & Device Code Flow Manager in Admin Control Plane (`crates/admin` & `crates/store`)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "multi_provider_oauth_device_and_pkce_flow_manager"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"codex" = "codex"
+"claude-code" = "claude-code"
+"antigravity" = "antigravity"
+"gemini-cli" = "gemini-cli"
+"github-copilot" = "github-copilot"
+"kimi-coding" = "kimi-coding"
+"qwen" = "qwen"
+"kiro" = "kiro"
+"cursor" = "cursor"

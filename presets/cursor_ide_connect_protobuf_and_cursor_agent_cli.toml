@@ -1,0 +1,39 @@
+# Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat & cursor-agent CLI Bridge) provider preset (F106).
+# Spec: apiclientreferences/9router/cursor.md, apiclientreferences/fx/cursor-agent.md
+
+kind = "custom"
+preset_id = "cursor_ide_connect_protobuf_and_cursor_agent_cli"
+name = "Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat & cursor-agent CLI Bridge)"
+base_url = "https://api2.cursor.sh/aiserver.v1.ChatService/StreamChat"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-cursor-client-version" = "2.3.41"
+"x-cursor-client-type" = "ide"
+"x-cursor-checksum" = "{{cursor_checksum}}"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"default" = "default"
+"claude-4-5-opus-high-thinking" = "claude-4.5-opus-high-thinking"
+"claude-4-5-opus-high" = "claude-4.5-opus-high"
+"claude-4-5-sonnet-thinking" = "claude-4.5-sonnet-thinking"
+"claude-4-5-sonnet" = "claude-4.5-sonnet"
+"claude-4-6-opus-max" = "claude-4.6-opus-max"
+"gpt-5-2-codex" = "gpt-5.2-codex"

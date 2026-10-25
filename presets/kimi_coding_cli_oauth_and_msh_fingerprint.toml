@@ -1,0 +1,36 @@
+# Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers) provider preset (F108).
+# Spec: apiclientreferences/9router/kimi-coding.md, apiclientreferences/pi/kimi-coding.md
+
+kind = "custom"
+preset_id = "kimi_coding_cli_oauth_and_msh_fingerprint"
+name = "Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers)"
+base_url = "https://api.kimi.com/coding/v1/messages"
+ua_policy = "pass"
+supported_protocols = ["messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"user-agent" = "KimiCLI/1.3"
+"x-msh-platform" = "kimi_cli"
+"x-msh-version" = "1.3.0"
+"x-msh-device-id" = "{{device_id}}"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"kimi-for-coding" = "kimi-for-coding"
+"kimi-k2-5" = "kimi-k2.5"
+"kimi-k2-thinking" = "kimi-k2-thinking"

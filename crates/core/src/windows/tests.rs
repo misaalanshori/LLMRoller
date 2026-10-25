@@ -335,3 +335,28 @@ fn test_atomic_budget_counter_manual_offset_and_calendar_month_window_guard() {
     assert_eq!(cal_counter.effective_used(nov_01 + 1_000), 1_500_000);
     assert_eq!(cal_counter.effective_used(nov_02 + 1_000), 0);
 }
+
+#[doc = "Spec: LIM-1 — F033 saturating reservation release and F046 threshold alert deduplication"]
+#[test]
+fn test_phase_2b_saturating_reservation_and_alert_dedup() {
+    let counter = Arc::new(AtomicBudgetCounter::new(99, 10_000_000, 10, 18_000_000));
+    let t0 = 1_800_000_000_000;
+
+    // F033: Even if reserved is externally zeroed before drop, saturating release never underflows below 0
+    let res = Reservation::try_reserve(vec![counter.clone()], 500_000, t0).expect("reserve");
+    counter.reserved.store(0, Ordering::SeqCst);
+    drop(res);
+    assert_eq!(counter.reserved.load(Ordering::SeqCst), 0);
+
+    // F046: Crossing 80% threshold fires alert exactly once per window instance
+    assert!(!counter.should_emit_threshold_alert(t0));
+    counter.record_actual(t0, 8_100_000);
+    assert!(
+        counter.should_emit_threshold_alert(t0 + 1_000),
+        "first threshold crossing in window must emit alert"
+    );
+    assert!(
+        !counter.should_emit_threshold_alert(t0 + 2_000),
+        "second check in same window instance must be deduplicated"
+    );
+}

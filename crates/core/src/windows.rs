@@ -520,6 +520,7 @@ pub struct AtomicBudgetCounter {
     pub reserved: AtomicI64,
     pub observation: RwLock<Option<UpstreamObservation>>,
     pub manual_offset: RwLock<Option<ManualOffset>>,
+    pub last_alerted_window_start: AtomicI64,
 }
 
 impl AtomicBudgetCounter {
@@ -584,6 +585,7 @@ impl AtomicBudgetCounter {
             reserved: AtomicI64::new(0),
             observation: RwLock::new(None),
             manual_offset: RwLock::new(None),
+            last_alerted_window_start: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -629,6 +631,49 @@ impl AtomicBudgetCounter {
             }
         }
         *self.observation.write() = Some(observation);
+    }
+
+    /// Current window instance start timestamp for deduplicating threshold alerts (`F046`).
+    #[must_use]
+    pub fn current_window_start_ms(&self, now_ms: i64) -> i64 {
+        let mut state = self.state.write();
+        match &mut *state {
+            WindowState::Rolling(ring) => (now_ms / ring.period_ms.max(1)) * ring.period_ms.max(1),
+            WindowState::AnchoredFixed(w) => {
+                w.advance(now_ms);
+                w.window_start_ms
+            }
+            WindowState::AnchoredCalendarMonth(w) => {
+                w.advance(now_ms);
+                w.window_start_ms
+            }
+            WindowState::AnchoredProvider(w) => w
+                .window_start_ms
+                .unwrap_or_else(|| (now_ms / w.period_ms.max(1)) * w.period_ms.max(1)),
+        }
+    }
+
+    /// Evaluates whether the counter has crossed the warning threshold (`80%` or `100 - reserve_percent`)
+    /// for the first time in the current window instance (`F046`, `LIM-1`).
+    #[must_use]
+    pub fn should_emit_threshold_alert(&self, now_ms: i64) -> bool {
+        if self.limit_micro_usd <= 0 {
+            return false;
+        }
+        let warn_pct = (100 - self.reserve_percent).clamp(1, 100).min(80);
+        let threshold = (self.limit_micro_usd * warn_pct) / 100;
+        let used = self.effective_used(now_ms);
+        if used < threshold {
+            return false;
+        }
+        let win_start = self.current_window_start_ms(now_ms);
+        let prev = self.last_alerted_window_start.load(Ordering::Acquire);
+        if prev == win_start {
+            return false;
+        }
+        self.last_alerted_window_start
+            .compare_exchange(prev, win_start, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -766,10 +811,12 @@ impl Reservation {
         for counter in &self.counters {
             // Post actual cost first
             counter.record_actual(now_ms, actual_micro_usd);
-            // Then release in-flight reservation
-            counter
-                .reserved_in_flight()
-                .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+            // Then release in-flight reservation with saturating floor at zero (F033)
+            let _ = counter.reserved_in_flight().fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |curr| Some((curr - self.estimate_micro_usd).max(0)),
+            );
         }
         self.committed = true;
     }
@@ -779,9 +826,11 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.committed {
             for counter in &self.counters {
-                counter
-                    .reserved_in_flight()
-                    .fetch_sub(self.estimate_micro_usd, Ordering::AcqRel);
+                let _ = counter.reserved_in_flight().fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |curr| Some((curr - self.estimate_micro_usd).max(0)),
+                );
             }
         }
     }

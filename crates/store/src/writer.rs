@@ -410,6 +410,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         let mut lock = queues.durable_state.lock();
         std::mem::take(&mut *lock).into_iter().collect()
     };
+    let durable_backup = durable_items.clone();
 
     for (idx, (_key, op)) in durable_items.into_iter().enumerate() {
         let sp_name = format!("item_{idx}");
@@ -618,6 +619,7 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         std::mem::take(&mut *lock).into_iter().collect()
     };
     let trace_backup = trace_items.clone();
+    let mut deferred_traces: Vec<SealedTurnResult> = Vec::new();
     for (idx, trace) in trace_items.into_iter().enumerate() {
         let sp_name = format!("trace_{idx}");
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
@@ -633,11 +635,6 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                     .await;
             }
             Err(error) => {
-                tracing::warn!(
-                    usage_event_id = %trace.usage_event_id,
-                    %error,
-                    "dropping trace whose usage event is unavailable"
-                );
                 let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "ROLLBACK TO SAVEPOINT {sp_name}"
                 )))
@@ -646,7 +643,30 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 let _ = sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
                     .execute(&mut *transaction)
                     .await;
+                // F016: If the parent usage_event is still pending in usage_writer.raw_events,
+                // defer the trace to the next flush cycle instead of dropping it on a FK race.
+                let parent_still_queued = queues
+                    .usage_writer
+                    .raw_events
+                    .lock()
+                    .iter()
+                    .any(|(ev, _)| ev.id == trace.usage_event_id);
+                if parent_still_queued {
+                    deferred_traces.push(trace);
+                } else {
+                    tracing::warn!(
+                        usage_event_id = %trace.usage_event_id,
+                        %error,
+                        "dropping trace whose usage event is unavailable"
+                    );
+                }
             }
+        }
+    }
+    if !deferred_traces.is_empty() {
+        let mut lock = queues.sealed_traces.lock();
+        for item in deferred_traces.into_iter().rev() {
+            lock.push_front(item);
         }
     }
 
@@ -662,19 +682,55 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         }
     }
 
-    if let Err(err) = transaction.commit().await {
-        tracing::error!(
-            "SQLite batch commit failed ({err}); restoring rollups and traces to memory"
-        );
-        if usage_res.is_ok() {
+    match transaction.commit().await {
+        Ok(()) => {
             queues
-                .usage_writer
-                .restore_batch(r5_backup, rh_backup, raw_backup);
+                .sqlite_full
+                .store(false, std::sync::atomic::Ordering::Release);
         }
-        let mut trace_lock = queues.sealed_traces.lock();
-        for item in trace_backup.into_iter().rev() {
-            trace_lock.push_front(item);
+        Err(err) => {
+            if is_sqlite_disk_full_error(&err) {
+                queues
+                    .sqlite_full
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            tracing::error!(
+                "SQLite batch commit failed ({err}); restoring durable_state, rollups, and traces to memory"
+            );
+            {
+                let mut durable_lock = queues.durable_state.lock();
+                for (k, op) in durable_backup {
+                    durable_lock.entry(k).or_insert(op);
+                }
+            }
+            if usage_res.is_ok() {
+                queues
+                    .usage_writer
+                    .restore_batch(r5_backup, rh_backup, raw_backup);
+            }
+            let mut trace_lock = queues.sealed_traces.lock();
+            for item in trace_backup.into_iter().rev() {
+                trace_lock.push_front(item);
+            }
         }
+    }
+}
+
+/// Returns `true` if `err` represents `SQLITE_FULL` (code 13) or `SQLITE_IOERR` (code 10) (`F054`, `REL-3`).
+#[must_use]
+pub fn is_sqlite_disk_full_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            let code_match = db_err
+                .code()
+                .is_some_and(|c| c == "13" || c == "10" || c.starts_with("13") || c.starts_with("10"));
+            let msg = db_err.message().to_ascii_lowercase();
+            code_match
+                || msg.contains("database or disk is full")
+                || msg.contains("disk i/o error")
+                || msg.contains("no space left")
+        }
+        _ => false,
     }
 }
 

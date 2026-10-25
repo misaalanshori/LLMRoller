@@ -1,0 +1,39 @@
+# OpenAI Official Platform (`api.openai.com/v1` Direct Preset with `/v1/responses`, `/v1/responses/compact`, and `/v1/chat/completions`) provider preset (F172).
+# Spec: apiclientreferences/pi/openai-responses.md, apiclientreferences/pi/openai-completions.md, apiclientreferences/fx/openai.md, apiclientreferences/opencode/openai.md
+
+kind = "custom"
+preset_id = "openai_official_direct_platform_preset"
+name = "OpenAI Official Platform (`api.openai.com/v1` Direct Preset with `/v1/responses`, `/v1/responses/compact`, and `/v1/chat/completions`)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "openai_official_direct_platform_preset"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-4-pro" = "gpt-5.4-pro"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gpt-5" = "gpt-5"
+"gpt-5-mini" = "gpt-5-mini"
+"gpt-4-1" = "gpt-4.1"
+"gpt-4o" = "gpt-4o"
+"o3" = "o3"
+"o4-mini" = "o4-mini"

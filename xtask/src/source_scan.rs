@@ -18,6 +18,7 @@ pub(crate) struct Scan {
     partial: BTreeMap<String, BTreeSet<PathBuf>>,
     unjustified_mutants_skips: Vec<String>,
     empty_test_stubs: Vec<String>,
+    dropped_watch_senders: Vec<String>,
     pub(crate) files_scanned: usize,
 }
 
@@ -89,6 +90,12 @@ impl Scan {
     }
 
     pub(crate) fn reject_empty_test_stubs(&self) -> Result<(), String> {
+        if !self.dropped_watch_senders.is_empty() {
+            return Err(format!(
+                "immediately dropped watch::channel senders (`let (_tx, rx) = watch::channel`) are forbidden (F051/F093):\n  {}",
+                self.dropped_watch_senders.join("\n  ")
+            ));
+        }
         if self.empty_test_stubs.is_empty() {
             return Ok(());
         }
@@ -136,6 +143,10 @@ impl Scan {
         }
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
+            if trimmed.starts_with("let (_") && trimmed.contains("watch::channel") {
+                self.dropped_watch_senders
+                    .push(format!("{}:{}", path.display(), index + 1));
+            }
             if trimmed.starts_with("#[test]")
                 || trimmed.starts_with("#[tokio::test")
                 || trimmed.starts_with("#[sqlx::test")

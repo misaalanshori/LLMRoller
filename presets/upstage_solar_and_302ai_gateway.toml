@@ -1,0 +1,33 @@
+# Upstage Solar (`api.upstage.ai/v1/solar`) & 302.AI (`api.302.ai/v1`) provider preset (F150).
+# Spec: apiclientreferences/opencode/upstage.md, apiclientreferences/opencode/302ai.md
+
+kind = "custom"
+preset_id = "upstage_solar_and_302ai_gateway"
+name = "Upstage Solar (`api.upstage.ai/v1/solar`) & 302.AI (`api.302.ai/v1`)"
+base_url = "https://api.upstage.ai/v1/solar"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "upstage_solar_and_302ai_gateway"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"solar-pro3" = "solar-pro3"
+"solar-pro2" = "solar-pro2"
+"solar-mini" = "solar-mini"

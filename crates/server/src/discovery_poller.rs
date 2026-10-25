@@ -82,13 +82,26 @@ pub fn start_discovery_poller(
     mpsc::UnboundedSender<DiscoveryTarget>,
     tokio::task::JoinHandle<()>,
 ) {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    start_discovery_poller_with_stop(deps, stop_rx, Some(stop_tx))
+}
+
+/// Spawn the discovery supervisor bound to an external shutdown `watch::Receiver<bool>` (`F052`, `F055`).
+pub fn start_discovery_poller_with_stop(
+    deps: DiscoveryPollerDeps,
+    stop_rx: watch::Receiver<bool>,
+    keep_alive_tx: Option<watch::Sender<bool>>,
+) -> (
+    mpsc::UnboundedSender<DiscoveryTarget>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let initial_tx = tx.clone();
     let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
     let supervisor = JobSupervisor::new("discovery");
-    let (_stop_tx, stop_rx) = watch::channel(false);
 
     let handle = tokio::spawn(async move {
+        let _keep_alive = keep_alive_tx;
         // Trigger initial discovery pass for unpopulated keys shortly after boot (MDL-1)
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -96,7 +109,7 @@ pub fn start_discovery_poller(
         });
 
         supervisor
-            .run_supervised(stop_rx, move |_stop_rx| {
+            .run_supervised(stop_rx, move |mut job_stop| {
                 let rx_arc = rx_arc.clone();
                 let deps = deps.clone();
                 async move {
@@ -120,6 +133,7 @@ pub fn start_discovery_poller(
                     let mut rx_guard = rx_arc.lock().await;
                     loop {
                         let target = tokio::select! {
+                            _ = job_stop.changed() => break,
                             _ = ticker.tick() => DiscoveryTarget::AllEnabled,
                             _ = recovery_ticker.tick() => DiscoveryTarget::AllEnabled,
                             Some(target) = rx_guard.recv() => target,
@@ -295,11 +309,15 @@ async fn discover_key(
         tracing::warn!(key = %key.id, skipped = invalid, "skipping invalid upstream model IDs");
     }
     let mut context_windows = std::collections::HashMap::new();
+    let mut model_protocols = std::collections::HashMap::new();
     let models: Vec<String> = discovered
         .into_iter()
         .map(|model| {
             if let Some(context_window) = model.context_window {
                 context_windows.insert(model.id.clone(), context_window);
+            }
+            if let Some(protos) = model.supported_protocols {
+                model_protocols.insert(model.id.clone(), protos);
             }
             model.id
         })
@@ -312,6 +330,7 @@ async fn discover_key(
         now_ms: llmroller_core::seams::SystemClock::new().now_ms(),
         models,
         context_windows,
+        model_protocols,
         response_bytes_len: body.len(),
     };
     writer
@@ -344,6 +363,7 @@ struct PersistDiscovery {
     now_ms: i64,
     models: Vec<String>,
     context_windows: std::collections::HashMap<String, i64>,
+    model_protocols: std::collections::HashMap<String, Vec<String>>,
     response_bytes_len: usize,
 }
 
@@ -353,7 +373,7 @@ impl ControlOp for PersistDiscovery {
         tx: &'a mut Transaction<'_, Sqlite>,
     ) -> Pin<Box<dyn Future<Output = Result<(), WriterError>> + Send + 'a>> {
         Box::pin(async move {
-            let result = llmroller_store::models::upsert_discovered_models_with_context_tx(
+            let result = llmroller_store::models::upsert_discovered_models_with_metadata_tx(
                 tx,
                 &self.key_id,
                 self.is_global,
@@ -361,6 +381,7 @@ impl ControlOp for PersistDiscovery {
                 self.now_ms,
                 &self.models,
                 &self.context_windows,
+                &self.model_protocols,
                 self.response_bytes_len,
             )
             .await?;

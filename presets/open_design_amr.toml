@@ -20,8 +20,14 @@ responses_compact = false
 [usage_reporting]
 chat_stream = "inject"
 
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
 [session_profile]
 headers = ["x-session-affinity", "x-session-id"]
 body_field = "prompt_cache_key"
 
 [aliases]
+"claude-opus-4-6" = "claude-opus-4.6"
+"claude-sonnet-4-5-20250929" = "claude-sonnet-4.5"
+"claude-haiku-4-5-20251001" = "claude-haiku-4.5"

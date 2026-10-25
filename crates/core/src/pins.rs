@@ -556,12 +556,37 @@ impl PinStore {
         }
     }
 
-    /// Sweeper removes expired pins every 60s (RTE-10).
+    /// Sweeper removes expired pins every 60s (RTE-10, F039).
     pub fn sweep(&self, now_ms: i64) {
-        self.entries.retain(|_, arc| {
+        self.entries.retain(|pin_key, arc| {
             let entry = arc.lock();
-            now_ms < entry.expires_ms
+            let keep = now_ms < entry.expires_ms;
+            if !keep {
+                self.last_persisted_ms.remove(pin_key);
+            }
+            keep
         });
+    }
+
+    /// Count only unexpired pins at `now_ms` (`F039`, `RTE-10`).
+    #[must_use]
+    pub fn active_len(&self, now_ms: i64) -> usize {
+        self.entries
+            .iter()
+            .filter(|item| item.value().lock().expires_ms > now_ms)
+            .count()
+    }
+
+    /// Snapshot all unexpired `(PinKey, PinEntry)` pairs at `now_ms` (`F039`).
+    #[must_use]
+    pub fn list_active(&self, now_ms: i64) -> Vec<(PinKey, PinEntry)> {
+        self.entries
+            .iter()
+            .filter_map(|item| {
+                let entry = item.value().lock().clone();
+                (entry.expires_ms > now_ms).then(|| (item.key().clone(), entry))
+            })
+            .collect()
     }
 }
 

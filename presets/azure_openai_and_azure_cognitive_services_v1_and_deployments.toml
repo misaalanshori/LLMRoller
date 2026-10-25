@@ -1,0 +1,38 @@
+# Azure OpenAI & Azure AI Foundry (`/openai/v1/responses`, `/openai/deployments/{id}/chat/completions`, and `/models/chat/completions`) provider preset (F118).
+# Spec: apiclientreferences/pi/azure-openai-responses.md, apiclientreferences/opencode/azure.md
+
+kind = "custom"
+preset_id = "azure_openai_and_azure_cognitive_services_v1_and_deployments"
+name = "Azure OpenAI & Azure AI Foundry (`/openai/v1/responses`, `/openai/deployments/{id}/chat/completions`, and `/models/chat/completions`)"
+base_url = "https://{resource}.openai.azure.com/openai/v1/responses"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "azure_openai_and_azure_cognitive_services_v1_and_deployments"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gpt-4-1" = "gpt-4.1"
+"gpt-4o" = "gpt-4o"
+"o3" = "o3"
+"o4-mini" = "o4-mini"
+"deepseek-r1" = "DeepSeek-R1"
+"claude-sonnet-4-5" = "claude-sonnet-4-5"

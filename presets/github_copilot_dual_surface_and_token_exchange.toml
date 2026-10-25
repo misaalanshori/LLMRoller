@@ -1,0 +1,46 @@
+# GitHub Copilot (OAuth Device Flow, Copilot Token Exchange, and Multi-Protocol Chat/Responses/Messages Routing) provider preset (F105).
+# Spec: apiclientreferences/pi/github-copilot.md, apiclientreferences/fx/github-copilot.md, apiclientreferences/opencode/github-copilot.md, apiclientreferences/9router/github.md
+
+kind = "custom"
+preset_id = "github_copilot_dual_surface_and_token_exchange"
+name = "GitHub Copilot (OAuth Device Flow, Copilot Token Exchange, and Multi-Protocol Chat/Responses/Messages Routing)"
+base_url = "https://api.githubcopilot.com"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"editor-version" = "vscode/1.110.0"
+"editor-plugin-version" = "copilot-chat/0.38.0"
+"copilot-integration-id" = "vscode-chat"
+"openai-intent" = "conversation-edits"
+"x-github-api-version" = "2025-04-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-4o" = "gpt-4o"
+"gpt-4-1" = "gpt-4.1"
+"gpt-5" = "gpt-5"
+"gpt-5-mini" = "gpt-5-mini"
+"gpt-5-1-codex" = "gpt-5.1-codex"
+"gpt-5-2-codex" = "gpt-5.2-codex"
+"claude-sonnet-4" = "claude-sonnet-4"
+"claude-sonnet-4-5" = "claude-sonnet-4.5"
+"claude-opus-4-5" = "claude-opus-4.5"
+"gemini-2-5-pro" = "gemini-2.5-pro"
+"o3-mini" = "o3-mini"
+"o4-mini" = "o4-mini"

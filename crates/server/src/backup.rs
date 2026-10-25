@@ -35,9 +35,18 @@ pub async fn run_backup(
         out_path.file_name().unwrap_or_default().to_string_lossy()
     ));
 
+    struct TempPathGuard(std::path::PathBuf, bool);
+    impl Drop for TempPathGuard {
+        fn drop(&mut self) {
+            if !self.1 && self.0.exists() {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+    }
     if tmp_path.exists() {
         let _ = fs::remove_file(&tmp_path);
     }
+    let mut temp_guard = TempPathGuard(tmp_path.clone(), false);
 
     let tmp_str = tmp_path.to_string_lossy().replace('\\', "/");
     let escaped_tmp_str = tmp_str.replace('\'', "''");
@@ -66,6 +75,7 @@ pub async fn run_backup(
 
     // Atomic rename to destination
     fs::rename(&tmp_path, out_path)?;
+    temp_guard.1 = true;
 
     // fsync the parent directory
     if let Ok(parent_dir) = File::open(parent) {

@@ -220,3 +220,61 @@ h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.25rem; }
 [data-nav-layout="sidebar"] .nav-links { flex-direction: column; gap: 0.5rem; }
 [data-nav-layout="sidebar"] .header-right { margin-top: auto; flex-direction: column; align-items: stretch; gap: 1rem; }
 [data-nav-layout="sidebar"] .main-container { margin-left: 240px; width: calc(100% - 240px); max-width: none; }
+
+/* Auth & Setup Standalone Pages (CSP style-src 'self', F077) */
+body.auth-page {
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+}
+.auth-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 440px;
+    padding: 2rem;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+}
+.auth-card h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    text-align: center;
+}
+.auth-card p.subtitle {
+    color: var(--muted);
+    font-size: 0.875rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+}
+.auth-card .alert {
+    display: none;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid var(--danger);
+    color: #fca5a5;
+    padding: 0.75rem;
+    border-radius: 6px;
+    font-size: 0.875rem;
+    margin-bottom: 1.25rem;
+}
+.auth-card button[type="submit"] {
+    width: 100%;
+    padding: 0.75rem;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 0.9375rem;
+    cursor: pointer;
+    transition: background 0.2s;
+    margin-top: 0.5rem;
+}
+.auth-card button[type="submit"]:hover {
+    background: var(--primary-hover);
+}

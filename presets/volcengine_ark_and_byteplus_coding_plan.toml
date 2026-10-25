@@ -1,0 +1,35 @@
+# ByteDance Volcengine Ark (`ark.cn-beijing.volces.com/api/v3`) & BytePlus Ark (`ark.ap-southeast.bytepluses.com/api/v3`) provider preset (F141).
+# Spec: apiclientreferences/9router/volcengine.md, apiclientreferences/9router/byteplus.md
+
+kind = "custom"
+preset_id = "volcengine_ark_and_byteplus_coding_plan"
+name = "ByteDance Volcengine Ark (`ark.cn-beijing.volces.com/api/v3`) & BytePlus Ark (`ark.ap-southeast.bytepluses.com/api/v3`)"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "volcengine_ark_and_byteplus_coding_plan"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"doubao-seed-code" = "doubao-seed-code"
+"deepseek-v3-2" = "deepseek-v3.2"
+"glm-4-7" = "glm-4.7"
+"kimi-k2-5" = "kimi-k2.5"
+"minimax-m2-5" = "minimax-m2.5"

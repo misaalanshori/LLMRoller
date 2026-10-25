@@ -1,0 +1,35 @@
+# NVIDIA NIM (`integrate.api.nvidia.com/v1`) provider preset (F131).
+# Spec: apiclientreferences/opencode/nvidia.md, apiclientreferences/9router/nvidia.md
+
+kind = "custom"
+preset_id = "nvidia_nim_integrate_api"
+name = "NVIDIA NIM (`integrate.api.nvidia.com/v1`)"
+base_url = "https://integrate.api.nvidia.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "nvidia_nim_integrate_api"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"deepseek-ai/deepseek-v3-2" = "deepseek-ai/deepseek-v3.2"
+"moonshotai/kimi-k2-5" = "moonshotai/kimi-k2.5"
+"z-ai/glm5" = "z-ai/glm5"
+"qwen/qwen3-5-397b-a17b" = "qwen/qwen3.5-397b-a17b"
+"nvidia/llama-3-1-nemotron-ultra-253b-v1" = "nvidia/llama-3.1-nemotron-ultra-253b-v1"

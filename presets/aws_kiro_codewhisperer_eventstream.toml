@@ -1,0 +1,35 @@
+# AWS Kiro (CodeWhisperer Social/IDC/BuilderID OAuth & AWS EventStream Binary Framing) provider preset (F107).
+# Spec: apiclientreferences/9router/kiro.md
+
+kind = "custom"
+preset_id = "aws_kiro_codewhisperer_eventstream"
+name = "AWS Kiro (CodeWhisperer Social/IDC/BuilderID OAuth & AWS EventStream Binary Framing)"
+base_url = "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-amzn-kiro-agent-mode" = "vibe"
+"amz-sdk-invocation-id" = "{{uuid}}"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-sonnet-4-5" = "claude-sonnet-4.5"
+"claude-sonnet-4" = "claude-sonnet-4"
+"claude-haiku-4-5" = "claude-haiku-4.5"
+"claude-opus-4-5" = "claude-opus-4.5"

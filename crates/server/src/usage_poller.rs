@@ -49,10 +49,20 @@ impl std::fmt::Debug for UsagePollerDeps {
 
 /// Spawn the supervised usage polling loop. Returns the join handle.
 pub fn start_usage_poller(deps: UsagePollerDeps) -> tokio::task::JoinHandle<()> {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    start_usage_poller_with_stop(deps, stop_rx, Some(stop_tx))
+}
+
+/// Spawn the supervised usage polling loop bound to an external shutdown `watch::Receiver<bool>` (`F051`, `F055`).
+pub fn start_usage_poller_with_stop(
+    deps: UsagePollerDeps,
+    stop_rx: watch::Receiver<bool>,
+    keep_alive_tx: Option<watch::Sender<bool>>,
+) -> tokio::task::JoinHandle<()> {
     let supervisor = JobSupervisor::new("usage_poller");
-    let (_stop_tx, stop_rx) = watch::channel(false);
 
     tokio::spawn(async move {
+        let _keep_alive = keep_alive_tx;
         supervisor
             .run_supervised(stop_rx, move |mut job_stop| {
                 let deps = deps.clone();
@@ -307,7 +317,7 @@ mod tests {
                 "{}"
             )
             .as_deref(),
-            Some("https://api.commandcode.ai/provider/v1/alpha/billing/credits")
+            Some("https://api.commandcode.ai/alpha/billing/credits")
         );
         assert_eq!(
             llmroller_proxy::usage_passthrough::resolve_provider_usage_url(

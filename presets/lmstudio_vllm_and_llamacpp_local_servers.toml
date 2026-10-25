@@ -1,0 +1,32 @@
+# LM Studio (`localhost:1234/v1`), vLLM (`localhost:8000/v1`), and llama.cpp Server provider preset (F157).
+# Spec: apiclientreferences/opencode/lmstudio.md, apiclientreferences/pi/openai-completions.md
+
+kind = "custom"
+preset_id = "lmstudio_vllm_and_llamacpp_local_servers"
+name = "LM Studio (`localhost:1234/v1`), vLLM (`localhost:8000/v1`), and llama.cpp Server"
+base_url = "http://127.0.0.1:1234/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "lmstudio_vllm_and_llamacpp_local_servers"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"local-model" = "local-model"
+"qwen2-5-coder-32b-instruct" = "qwen2.5-coder-32b-instruct"

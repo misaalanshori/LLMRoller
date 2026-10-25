@@ -1,9 +1,11 @@
 // LLMRoller Web UI Vanilla JS Event Delegation & HTMX Integration
 // All interactions use event delegation on document to strictly adhere to CSP: script-src 'self'
 
-htmx.config.includeIndicatorStyles = false;
-htmx.config.allowEval = false;
-htmx.config.allowScriptTags = false;
+if (typeof htmx !== 'undefined') {
+    htmx.config.includeIndicatorStyles = false;
+    htmx.config.allowEval = false;
+    htmx.config.allowScriptTags = false;
+}
 
 function getCsrfToken() {
     const meta = document.querySelector('meta[name="csrf-token"]');
@@ -187,6 +189,10 @@ document.addEventListener('submit', function(e) {
         handleCreateGlobalProvider(e);
     } else if (e.target.id === 'form-new-alias') {
         handleAddAlias(e);
+    } else if (e.target.id === 'login-form') {
+        handleLoginSubmit(e);
+    } else if (e.target.id === 'setup-form') {
+        handleSetupSubmit(e);
     }
 });
 
@@ -278,8 +284,9 @@ async function handleCreateUpstreamKey(e) {
         strict_tier: tierVal ? parseInt(tierVal, 10) : 1
     };
 
+    const apiBase = window.location.pathname.startsWith('/admin') ? '/admin/api' : '/api/user';
     try {
-        await fetch(`/api/user/providers/${provider_id}/keys`, {
+        await fetch(`${apiBase}/providers/${provider_id}/keys`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify(payload)
@@ -740,5 +747,92 @@ async function openChatPreview(sessionHash) {
         }).join('');
     } catch (e) {
         container.innerHTML = `<p class="text-danger">Failed to load chat preview: ${escapeHtml(e && e.message ? e.message : e)}</p>`;
+    }
+}
+
+async function handleLoginSubmit(e) {
+    e.preventDefault();
+    const form = e.target;
+    const errBox = document.getElementById('error-box');
+    const btn = document.getElementById('submit-btn');
+    if (errBox) errBox.style.display = 'none';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Signing in...';
+    }
+    const payload = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+        totp_code: form.totp_code && form.totp_code.value.trim() ? form.totp_code.value.trim() : null
+    };
+    try {
+        const res = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'X-CSRF-Token': getCsrfToken()
+            },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            window.location.href = data.role === 'admin' ? '/admin' : '/app';
+        } else {
+            const msg = (data.error && data.error.message) ? data.error.message : (data.error || ('Authentication failed with status ' + res.status));
+            if (errBox) {
+                errBox.textContent = msg;
+                errBox.style.display = 'block';
+            }
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Sign In';
+            }
+        }
+    } catch (_err) {
+        form.submit();
+    }
+}
+
+async function handleSetupSubmit(e) {
+    e.preventDefault();
+    const form = e.target;
+    const errBox = document.getElementById('error-box');
+    const btn = document.getElementById('submit-btn');
+    if (errBox) errBox.style.display = 'none';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Initializing...';
+    }
+    const payload = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+        setup_token: form.setup_token.value.trim()
+    };
+    try {
+        const res = await fetch('/admin/api/setup', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            window.location.href = '/login?setup_success=1';
+        } else {
+            const msg = (data.error && data.error.message) ? data.error.message : (data.error || ('Setup failed with status ' + res.status));
+            if (errBox) {
+                errBox.textContent = msg;
+                errBox.style.display = 'block';
+            }
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Initialize Administrator';
+            }
+        }
+    } catch (_err) {
+        form.submit();
     }
 }

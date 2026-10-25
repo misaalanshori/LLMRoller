@@ -300,6 +300,17 @@ pub fn resolve_provider_usage_url(
     if base.ends_with("/api/v1") && rel.starts_with("api/v1/") {
         return Some(format!("{}/{}", base.trim_end_matches("/api/v1"), rel));
     }
+    // F019 & F095: CommandCode base_url ends with `/provider/v1`, whereas billing endpoints
+    // (`/alpha/billing/credits`, `/internal/billing/credits`) live at the origin root.
+    if base.ends_with("/provider/v1")
+        && (rel.starts_with("alpha/") || rel.starts_with("internal/"))
+    {
+        return Some(format!(
+            "{}/{}",
+            base.trim_end_matches("/provider/v1"),
+            rel
+        ));
+    }
     Some(format!("{base}/{rel}"))
 }
 
@@ -508,11 +519,27 @@ async fn fresh_poll_usage(
     crate::ssrf::validate_url(&target, provider.allow_private_network)
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
 
-    let response = state
+    let auth_scheme = provider
+        .config
+        .auth
+        .for_endpoint(llmroller_core::provider::ProviderEndpoint::Usage);
+    let (auth_header, auth_prefix) = auth_scheme
+        .as_ref()
+        .map_or(("authorization", "Bearer "), |scheme| {
+            (scheme.header.as_str(), scheme.prefix.as_str())
+        });
+    let mut req_builder = state
         .select_http_client(provider.allow_private_network)
         .get(&target)
-        .header("authorization", format!("Bearer {secret}"))
-        .timeout(FRESH_POLL_TIMEOUT)
+        .header(auth_header, format!("{auth_prefix}{secret}"))
+        .timeout(FRESH_POLL_TIMEOUT);
+    for (h_name, h_val) in &provider.config.add_headers {
+        let lower = h_name.to_ascii_lowercase();
+        if lower != "host" && lower != "content-length" && lower != auth_header {
+            req_builder = req_builder.header(h_name.as_str(), h_val.as_str());
+        }
+    }
+    let response = req_builder
         .send()
         .await
         .map_err(|error| format!("usage request failed: {error}"))?;
@@ -1081,6 +1108,20 @@ mod tests {
         assert_eq!(
             resolve_usage_key(&snapshot, &admin, &params, None, None, 0).expect("admin lookup"),
             Some(key_id)
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1, F019 - CommandCode usage URL strips /provider/v1 to hit origin root /alpha/billing/credits"]
+    fn command_code_usage_url_strips_provider_v1_prefix() {
+        let resolved = resolve_provider_usage_url(
+            "https://api.commandcode.ai/provider/v1",
+            ProviderKind::CommandCode,
+            "{}",
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("https://api.commandcode.ai/alpha/billing/credits")
         );
     }
 }

@@ -31,6 +31,14 @@ pub fn data_plane_router(state: ProxyAuthState) -> Router {
             "/v1/chat/completions",
             post(crate::orchestrator::post_chat_completions),
         )
+        .route(
+            "/v1/embeddings",
+            post(crate::orchestrator::post_embeddings),
+        )
+        .route(
+            "/embeddings",
+            post(crate::orchestrator::post_embeddings),
+        )
         .route("/v1/responses", post(crate::orchestrator::post_responses))
         .route(
             "/v1/responses/compact",
@@ -156,12 +164,16 @@ fn visible_models(
             continue;
         }
         if let Some(allowed) = &client_key.allowed_models
+            && !llmroller_core::client_key::is_model_allowed_by_patterns(
+                allowed,
+                &model.canonical_id,
+                &model.canonical_id,
+            )
             && !allowed.iter().any(|entry| {
-                entry == &model.canonical_id
-                    || snapshot
-                        .aliases
-                        .get(entry)
-                        .is_some_and(|target_pk| *target_pk == model.id)
+                snapshot
+                    .aliases
+                    .get(entry)
+                    .is_some_and(|target_pk| *target_pk == model.id)
             })
         {
             continue;

@@ -21,6 +21,7 @@ pub struct SseUsageTap {
     pub saw_terminal_event: bool,
     pub has_terminal_output_usage: bool,
     pub stop_reason: Option<String>,
+    pub response_id: Option<String>,
     pending: Vec<u8>,
 }
 
@@ -35,6 +36,7 @@ impl SseUsageTap {
             saw_terminal_event: false,
             has_terminal_output_usage: false,
             stop_reason: None,
+            response_id: None,
             pending: Vec::with_capacity(4096),
         }
     }
@@ -58,12 +60,25 @@ impl SseUsageTap {
         }
     }
 
-    /// Returns whether the stream reached a clean protocol-level EOF without trailing partial bytes.
+    /// Flushes any trailing unterminated SSE frame at stream EOF (`F009`).
+    pub fn finish(&mut self) {
+        if self.pending.iter().any(|b| !b.is_ascii_whitespace()) {
+            let tail = std::mem::take(&mut self.pending);
+            self.process_frame(&tail);
+        } else {
+            self.pending.clear();
+        }
+    }
+
+    /// Returns whether the stream reached a clean protocol-level EOF (`F009`).
     #[must_use]
     pub fn is_complete_at_eof(&self) -> bool {
-        let pending_clean = self.pending.iter().all(|b| b.is_ascii_whitespace());
-        pending_clean
-            && (self.saw_done || self.saw_terminal_event || self.has_terminal_output_usage)
+        if self.pending.iter().any(|b| !b.is_ascii_whitespace()) {
+            let mut copy = self.clone();
+            copy.finish();
+            return copy.saw_done || copy.saw_terminal_event || copy.has_terminal_output_usage;
+        }
+        self.saw_done || self.saw_terminal_event || self.has_terminal_output_usage
     }
 
     fn process_frame(&mut self, frame: &[u8]) {
@@ -160,10 +175,22 @@ impl SseUsageTap {
                 }
             }
             EndpointKind::Responses | EndpointKind::ResponsesCompact => {
+                if self.response_id.is_none()
+                    && let Some(rid) = json
+                        .pointer("/response/id")
+                        .or_else(|| json.get("response_id"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                {
+                    self.response_id = Some(rid.to_string());
+                }
                 let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if matches!(
                     event_type,
-                    "response.completed" | "response.incomplete" | "response.failed"
+                    "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                        | "response.done"
                 ) {
                     self.saw_terminal_event = true;
                 }
@@ -171,10 +198,13 @@ impl SseUsageTap {
                     self.accumulated_output_text_bytes += delta.len();
                 }
                 if let Some(u) = extract_responses_json_usage(&json) {
-                    self.observed_usage = Some(u);
+                    self.observed_usage = Some(merge_responses_usage(self.observed_usage, u));
                     if matches!(
                         event_type,
-                        "response.completed" | "response.incomplete" | "response.failed"
+                        "response.completed"
+                            | "response.incomplete"
+                            | "response.failed"
+                            | "response.done"
                     ) || u.output_tokens > 0
                     {
                         self.has_terminal_output_usage = true;
@@ -185,6 +215,16 @@ impl SseUsageTap {
                 let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if msg_type == "message_stop" {
                     self.saw_terminal_event = true;
+                    if let Some(usage_obj) = json
+                        .get("usage")
+                        .or_else(|| json.get("delta").and_then(|d| d.get("usage")))
+                    {
+                        let extracted = extract_messages_json_usage(&json).unwrap_or_default();
+                        let prev = self.observed_usage;
+                        self.observed_usage =
+                            Some(merge_messages_usage(prev, extracted, usage_obj));
+                        self.has_terminal_output_usage = true;
+                    }
                 } else if msg_type == "message_start" {
                     if let Some(u) = extract_messages_json_usage(&json) {
                         self.observed_usage = Some(u);
@@ -204,7 +244,9 @@ impl SseUsageTap {
                         }
                     }
                 } else if msg_type == "message_delta"
-                    && let Some(usage_obj) = json.get("usage")
+                    && let Some(usage_obj) = json
+                        .get("usage")
+                        .or_else(|| json.get("delta").and_then(|d| d.get("usage")))
                 {
                     let extracted = extract_messages_json_usage(&json).unwrap_or_default();
                     let prev = self.observed_usage;
@@ -222,6 +264,11 @@ impl SseUsageTap {
     /// before terminal output usage arrived, preserves the observed input/cache tokens
     /// while estimating `output_tokens` as `ceil(accumulated_output_text_bytes / 4)` (`F-003`, `USG-3`).
     pub fn finalize_usage(&self) -> ExtractedUsage {
+        if self.pending.iter().any(|b| !b.is_ascii_whitespace()) {
+            let mut flushed = self.clone();
+            flushed.finish();
+            return flushed.finalize_usage();
+        }
         let estimated_out = if self.accumulated_output_text_bytes == 0 {
             0
         } else {
@@ -242,6 +289,46 @@ impl SseUsageTap {
                 provider_cost_micro_usd: None,
             }
         }
+    }
+}
+
+
+fn merge_responses_usage(
+    previous: Option<ExtractedUsage>,
+    current: ExtractedUsage,
+) -> ExtractedUsage {
+    let Some(prev) = previous else {
+        return current;
+    };
+    ExtractedUsage {
+        input_uncached_tokens: if current.input_uncached_tokens > 0 {
+            current.input_uncached_tokens
+        } else {
+            prev.input_uncached_tokens
+        },
+        cache_read_tokens: if current.cache_read_tokens > 0 {
+            current.cache_read_tokens
+        } else {
+            prev.cache_read_tokens
+        },
+        cache_write_tokens: if current.cache_write_tokens > 0 {
+            current.cache_write_tokens
+        } else {
+            prev.cache_write_tokens
+        },
+        output_tokens: if current.output_tokens > 0 {
+            current.output_tokens
+        } else {
+            prev.output_tokens
+        },
+        reasoning_tokens: if current.reasoning_tokens > 0 {
+            current.reasoning_tokens
+        } else {
+            prev.reasoning_tokens
+        },
+        provider_cost_micro_usd: current
+            .provider_cost_micro_usd
+            .or(prev.provider_cost_micro_usd),
     }
 }
 

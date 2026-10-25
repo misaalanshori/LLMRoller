@@ -1,0 +1,35 @@
+# Amazon Bedrock (`bedrock-runtime.{region}.amazonaws.com` ConverseStream & InvokeModelWithResponseStream with SigV4 & Bearer API Key) provider preset (F117).
+# Spec: apiclientreferences/pi/amazon-bedrock.md, apiclientreferences/fx/bedrock.md, apiclientreferences/opencode/amazon-bedrock.md
+
+kind = "custom"
+preset_id = "amazon_bedrock_sigv4_and_bearer_converse_stream"
+name = "Amazon Bedrock (`bedrock-runtime.{region}.amazonaws.com` ConverseStream & InvokeModelWithResponseStream with SigV4 & Bearer API Key)"
+base_url = "https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "amazon_bedrock_sigv4_and_bearer_converse_stream"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"us-anthropic-claude-opus-4-6-v1" = "us.anthropic.claude-opus-4-6-v1"
+"us-anthropic-claude-sonnet-4-6" = "us.anthropic.claude-sonnet-4-6"
+"us-anthropic-claude-haiku-4-5-20251001-v1-0" = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+"amazon-nova-pro-v1-0" = "amazon.nova-pro-v1:0"
+"deepseek-r1-v1-0" = "deepseek.r1-v1:0"

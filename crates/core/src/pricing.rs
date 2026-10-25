@@ -339,12 +339,33 @@ pub fn apply_plan_multiplier(
     plan_multiplier_bps: i64,
     billing_coverage_mode: &str,
 ) -> i64 {
+    if billing_coverage_mode == "free_tier" && plan_multiplier_bps == 0 {
+        return 0;
+    }
     if billing_coverage_mode != "subscription_plan" {
         return list_cost_micro_usd;
     }
     let bps = plan_multiplier_bps.clamp(0, 100_000);
-    let scaled = (i128::from(list_cost_micro_usd) * i128::from(bps) + 5_000) / 10_000;
+    if list_cost_micro_usd <= 0 || bps <= 0 {
+        return 0;
+    }
+    let scaled = div_ceil_i128(i128::from(list_cost_micro_usd) * i128::from(bps), 10_000);
     i64::try_from(scaled).unwrap_or(i64::MAX)
+}
+
+/// Computes the effective upstream key/provider cost in micro-USD, returning `0` when
+/// the upstream key or model is marked `free_tier` (`:free` suffix or `billing_coverage_mode == "free_tier"` with `free_tier = true`, `F035`).
+#[must_use]
+pub fn apply_effective_upstream_cost(
+    list_cost_micro_usd: i64,
+    plan_multiplier_bps: i64,
+    billing_coverage_mode: &str,
+    is_free_tier_key: bool,
+) -> i64 {
+    if is_free_tier_key || billing_coverage_mode == "free_tier" {
+        return 0;
+    }
+    apply_plan_multiplier(list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode)
 }
 
 /// Streaming binary-aware JSON string tokenizer counting text vs binary blocks.
@@ -406,8 +427,11 @@ pub fn estimate_input_tokens(body: &[u8]) -> i64 {
                     };
 
                     let is_data_uri = raw_str.starts_with(b"data:");
-                    if (is_url_data || is_data_uri || (is_binary_key && is_mostly_base64(raw_str)))
-                        && raw_str.len() > 1024
+                    let is_large_inline_base64 =
+                        raw_str.len() > 16_384 && is_mostly_base64(raw_str);
+                    if ((is_url_data || is_data_uri || (is_binary_key && is_mostly_base64(raw_str)))
+                        && raw_str.len() > 1024)
+                        || is_large_inline_base64
                     {
                         binary_blocks += 1;
                     } else {

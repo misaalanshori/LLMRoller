@@ -35,7 +35,7 @@ pub fn extract_json_usage(
     json: &serde_json::Value,
 ) -> Option<ExtractedUsage> {
     match endpoint {
-        EndpointKind::Chat => extract_chat_json_usage(json),
+        EndpointKind::Chat | EndpointKind::Embeddings => extract_chat_json_usage(json),
         EndpointKind::Responses | EndpointKind::ResponsesCompact => {
             extract_responses_json_usage(json)
         }
@@ -166,30 +166,36 @@ pub fn extract_chat_json_usage(json: &serde_json::Value) -> Option<ExtractedUsag
     })
 }
 
-/// Extracts usage from OpenAI `responses` format (`POST /v1/responses`).
+/// Extracts usage from OpenAI `responses` format (`POST /v1/responses`, `F021`).
 pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
     let usage = json
         .get("usage")
-        .or_else(|| json.get("response").and_then(|r| r.get("usage")))?;
+        .or_else(|| json.get("response").and_then(|r| r.get("usage")))
+        .or_else(|| json.get("item").and_then(|i| i.get("usage")))?;
     if usage.is_null() {
         return None;
     }
 
     let input_tokens = usage
         .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .max(0);
     let output_tokens = usage
         .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .max(0);
 
-    let in_details = usage.get("input_tokens_details");
+    let in_details = usage
+        .get("input_tokens_details")
+        .or_else(|| usage.get("prompt_tokens_details"));
     let cache_read_tokens = in_details
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
+        .or_else(|| usage.get("cached_tokens").and_then(|v| v.as_i64()))
         .unwrap_or(0)
         .max(0);
     let cache_write_tokens = in_details
@@ -213,11 +219,13 @@ pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<Extracte
 
     let reasoning_tokens = usage
         .get("output_tokens_details")
+        .or_else(|| usage.get("completion_tokens_details"))
         .and_then(|d| {
             d.get("reasoning_tokens")
                 .or_else(|| d.get("thinking_tokens"))
         })
         .and_then(|v| v.as_i64())
+        .or_else(|| usage.get("reasoning_tokens").and_then(|v| v.as_i64()))
         .unwrap_or(0)
         .max(0);
 
@@ -241,7 +249,8 @@ pub fn extract_responses_json_usage(json: &serde_json::Value) -> Option<Extracte
 pub fn extract_messages_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
     let usage = json
         .get("usage")
-        .or_else(|| json.get("message").and_then(|m| m.get("usage")))?;
+        .or_else(|| json.get("message").and_then(|m| m.get("usage")))
+        .or_else(|| json.get("delta").and_then(|d| d.get("usage")))?;
     if usage.is_null() {
         return None;
     }

@@ -58,6 +58,7 @@ pub struct ProxyAuthState {
     pub sealer_pool: Option<Arc<llmroller_store::traces::SealerPool>>,
     pub http_client_public: reqwest::Client,
     pub http_client_private_allowed: reqwest::Client,
+    pub token_manager: crate::token_manager::TokenManager,
     pub clock: Arc<dyn llmroller_core::seams::Clock>,
     pub entropy: Arc<dyn llmroller_core::seams::EntropySource>,
     pub discovery_tx:
@@ -104,6 +105,7 @@ impl ProxyAuthState {
                 .expect("the public HTTP client requires a working TLS backend"),
             http_client_private_allowed: crate::ssrf::create_guarded_client(true)
                 .expect("the private-network HTTP client requires a working TLS backend"),
+            token_manager: crate::token_manager::TokenManager::new(),
             clock: Arc::new(llmroller_core::seams::SystemClock::new()),
             entropy: Arc::new(llmroller_core::seams::OsEntropy),
             discovery_tx: None,

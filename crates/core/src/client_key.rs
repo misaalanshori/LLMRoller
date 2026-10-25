@@ -263,7 +263,7 @@ pub fn evaluate_request_gates(
             });
         }
         if let Some(ref allowed) = key_record.allowed_models
-            && !allowed.iter().any(|m| m == model)
+            && !is_model_allowed_by_patterns(allowed, model, model)
         {
             return Err(GateFailure::G6ModelForbidden {
                 model: model.to_owned(),
@@ -274,7 +274,52 @@ pub fn evaluate_request_gates(
     Ok((key_record.clone(), *hash_role))
 }
 
-/// Parse an `allowed_cidrs` entry as either a CIDR prefix (`192.0.2.0/24`) or a bare IPv4/IPv6 address (`203.0.113.5`, `2001:db8::1`; `F-050`, `CLK-6`).
+/// Evaluate whether a requested or canonical model matches a client key's `allowed_models`
+/// list, supporting exact matches, case-insensitive canonical matches, `"*"`, and prefix
+/// wildcards such as `"gpt-4o*"` or `"anthropic/*"` (`F043`, `CLK-1`).
+#[must_use]
+pub fn is_model_allowed_by_patterns(
+    allowed: &[String],
+    requested_model: &str,
+    canonical_id: &str,
+) -> bool {
+    let req_norm = crate::catalog::normalize_model_id(requested_model)
+        .unwrap_or_else(|_| requested_model.to_ascii_lowercase());
+    let can_norm = crate::catalog::normalize_model_id(canonical_id)
+        .unwrap_or_else(|_| canonical_id.to_ascii_lowercase());
+    for pattern in allowed {
+        let pat = pattern.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        if pat == "*" {
+            return true;
+        }
+        if let Some(prefix) = pat.strip_suffix('*') {
+            let p_low = prefix.to_ascii_lowercase();
+            let p_stripped = p_low.rsplit_once('/').map_or(p_low.as_str(), |(_, s)| s);
+            if requested_model.to_ascii_lowercase().starts_with(&p_low)
+                || canonical_id.to_ascii_lowercase().starts_with(&p_low)
+                || req_norm.starts_with(&p_low)
+                || can_norm.starts_with(&p_low)
+                || (!p_stripped.is_empty()
+                    && (canonical_id.to_ascii_lowercase().starts_with(p_stripped)
+                        || can_norm.starts_with(p_stripped)))
+            {
+                return true;
+            }
+        } else if pat.eq_ignore_ascii_case(requested_model)
+            || pat.eq_ignore_ascii_case(canonical_id)
+            || crate::catalog::normalize_model_id(pat)
+                .is_ok_and(|p_norm| p_norm == req_norm || p_norm == can_norm)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+///Parse an `allowed_cidrs` entry as either a CIDR prefix (`192.0.2.0/24`) or a bare IPv4/IPv6 address (`203.0.113.5`, `2001:db8::1`; `F-050`, `CLK-6`).
 #[must_use]
 pub fn parse_ip_or_cidr(s: &str) -> Option<IpNet> {
     let trimmed = s.trim();

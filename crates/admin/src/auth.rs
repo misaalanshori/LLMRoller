@@ -740,10 +740,16 @@ async fn post_login(
         .map_err(|_| AuthError::LoginBusy)?
         .map_err(|_| AuthError::Internal)?;
 
-    // 4. Lookup user and verify password
+    // 4. Lookup user and verify password (with constant-time dummy Argon2id and rate-limit recording on missing user; F081)
+    const DUMMY_ARGON2_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZTEyMzQ1Ng$RSub7nN5qN1sK7O+8m+6P0vK3X2zW9Y1qP4L5M6N7O8";
     let record = match find_login_record(&state.reader_pool, &payload.username).await {
         Ok(Some(record)) => record,
         Ok(None) => {
+            let pwd = payload.password.clone();
+            let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_ARGON2_PHC)).await;
+            state
+                .limiter
+                .record_failure(&payload.username, client_ip, now_ms);
             log_login_failed(
                 &state,
                 &payload.username,
@@ -812,8 +818,9 @@ async fn post_login(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // Record login success in rate limiter
+    // Record login success in rate limiter and update users.last_login_at (F081)
     state.limiter.record_success(&payload.username, client_ip);
+    let _ = llmroller_store::users::mark_login(&state.pool, record.user.id, now_ms).await;
 
     // Audit log success (AUD-1, SEC-13, F048)
     if let Some(ref audit_key) = state.audit_hmac_key {

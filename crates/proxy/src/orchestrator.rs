@@ -209,6 +209,23 @@ pub async fn post_messages(
     .await
 }
 
+/// Handler for POST /v1/embeddings (`F028`).
+pub async fn post_embeddings(
+    State(state): State<ProxyAuthState>,
+    headers: HeaderMap,
+    client_key: Option<Extension<ClientKeyRecord>>,
+    body: Bytes,
+) -> Response {
+    handle_inference_request(
+        state,
+        EndpointKind::Embeddings,
+        headers,
+        body,
+        client_key.map(|e| e.0),
+    )
+    .await
+}
+
 /// Builds a protocol-aware OpenAI or Anthropic error envelope (`API-1`, `API-2`, `API-8`).
 #[must_use]
 pub fn build_protocol_error_response(
@@ -694,6 +711,7 @@ fn linked_candidate(
             .priority_override
             .unwrap_or(key.priority)
             .clamp(1, 1000),
+        strict_tier: key.strict_tier,
         provider_kind: provider.kind,
         share_id,
     })
@@ -994,15 +1012,28 @@ async fn forward_state_bound_response_op(
         });
     let client = state.select_http_client(provider.allow_private_network);
     let request_id = RequestId::generate().to_string();
-    let upstream = match client
+    let mut req_builder = client
         .request(method.clone(), &url)
         .header(auth_header, format!("{auth_prefix}{secret}"))
         .header("x-request-id", &request_id)
-        .send()
-        .await
-    {
-        Ok(response) => response,
+        .header(header::ACCEPT_ENCODING, "identity");
+    for (h_name, h_val) in &provider.config.add_headers {
+        let lower = h_name.to_ascii_lowercase();
+        if lower != "host" && lower != "content-length" && lower != auth_header {
+            req_builder = req_builder.header(h_name.as_str(), h_val.as_str());
+        }
+    }
+    let send_timeout = Duration::from_millis(provider.config.first_activity_timeout_ms());
+    let upstream = match tokio::time::timeout(send_timeout, req_builder.send()).await {
+        Ok(Ok(response)) => response,
         Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout_error",
+                "the linked upstream key timed out",
+            );
+        }
+        Ok(Err(_)) => {
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unreachable",
@@ -1013,6 +1044,7 @@ async fn forward_state_bound_response_op(
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_encoding = upstream_content_encoding(upstream.headers());
     let candidate_tier = if provider.owner_user_id.is_none() {
         CandidatePoolTier::Global
     } else if provider.owner_user_id == Some(caller.owner_user_id) {
@@ -1033,10 +1065,19 @@ async fn forward_state_bound_response_op(
         &request_id,
         &provider.config.response_header_allow,
     );
-    let body = match upstream.bytes().await {
-        Ok(body) => body,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    let body_timeout = Duration::from_millis(provider.config.nonstream_response_timeout_ms());
+    let raw_body = match tokio::time::timeout(body_timeout, upstream.bytes()).await {
+        Ok(Ok(body)) => body,
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout_error",
+                "the linked upstream key timed out while reading response body",
+            );
+        }
+        Ok(Err(_)) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    let body = decode_upstream_body(content_encoding.as_deref(), raw_body).unwrap_or_default();
 
     if status.is_success() {
         if method == Method::DELETE && subpath.is_empty() {
@@ -1211,9 +1252,11 @@ pub async fn post_messages_count_tokens(
         }
     };
     if let Some(ref allowed) = caller.allowed_models
-        && !allowed
-            .iter()
-            .any(|entry| entry == &model.canonical_id || entry == model_str)
+        && !llmroller_core::client_key::is_model_allowed_by_patterns(
+            allowed,
+            model_str,
+            &model.canonical_id,
+        )
     {
         return messages_error(
             StatusCode::FORBIDDEN,
@@ -1275,12 +1318,25 @@ pub async fn post_messages_count_tokens(
         else {
             continue;
         };
-        let secret = match unseal_upstream_key(&state, &snapshot, &key) {
+        let raw_secret = match unseal_upstream_key(&state, &snapshot, &key) {
             Ok(secret) => secret,
             Err(()) => continue,
         };
-        let url = get_adapter(candidate.provider_kind)
-            .build_endpoint_url(&candidate.base_url, EndpointKind::CountTokens);
+        let secret = match state
+            .token_manager
+            .resolve_secret(
+                key.id,
+                &raw_secret,
+                state.select_http_client(candidate.allow_private_network),
+                candidate.allow_private_network,
+                now,
+            )
+            .await
+        {
+            Ok(secret) => secret,
+            Err(_) => continue,
+        };
+        let url = endpoint_url(&candidate, EndpointKind::CountTokens);
         if crate::ssrf::validate_url(&url, candidate.allow_private_network).is_err() {
             continue;
         }
@@ -1306,15 +1362,15 @@ pub async fn post_messages_count_tokens(
             Err(response) => return *response,
         };
 
-        let response = match client
-            .post(&url)
-            .body(edited)
-            .headers(outbound)
-            .send()
-            .await
+        let send_timeout = Duration::from_millis(candidate.config.first_activity_timeout_ms());
+        let response = match tokio::time::timeout(
+            send_timeout,
+            client.post(&url).body(edited).headers(outbound).send(),
+        )
+        .await
         {
-            Ok(response) => response,
-            Err(_) => {
+            Ok(Ok(response)) => response,
+            _ => {
                 continue;
             }
         };
@@ -1332,14 +1388,30 @@ pub async fn post_messages_count_tokens(
             aux_unsupported_seen = true;
             continue;
         }
-        let content_type = response.headers().get(CONTENT_TYPE).cloned();
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        let is_admin = snapshot
+            .users
+            .get(&caller.owner_user_id)
+            .is_some_and(|user| user.role == Role::Admin);
+        let req_id_str = RequestId::generate().to_string();
+        let filtered_headers = llmroller_proto::headers::apply_response_header_pipeline(
+            response.headers(),
+            candidate.pool_tier(),
+            is_admin,
+            &req_id_str,
+            &candidate.config.response_header_allow,
+        );
+        let content_encoding = upstream_content_encoding(response.headers());
+        let body_timeout = Duration::from_millis(candidate.config.nonstream_response_timeout_ms());
+        let raw_bytes = match tokio::time::timeout(body_timeout, response.bytes()).await {
+            Ok(Ok(bytes)) => bytes,
+            _ => return StatusCode::BAD_GATEWAY.into_response(),
         };
+        let bytes = decode_upstream_body(content_encoding.as_deref(), raw_bytes).unwrap_or_default();
         let mut builder = Response::builder().status(status);
-        if let Some(content_type) = content_type {
-            builder = builder.header(CONTENT_TYPE, content_type);
+        for (name, value) in filtered_headers {
+            if let Some(name) = name {
+                builder = builder.header(name, value);
+            }
         }
         return builder
             .body(Body::from(bytes))
@@ -1444,6 +1516,7 @@ pub(crate) struct RouteCandidate {
     pool_tier: CandidatePoolTier,
     ownership_scope: llmroller_core::rbac::OwnershipScope,
     priority: i64,
+    strict_tier: i64,
     provider_kind: ProviderKind,
     share_id: Option<ShareId>,
 }
@@ -1714,6 +1787,7 @@ fn collect_routes(
                 .or(route.priority_override)
                 .unwrap_or(key.priority)
                 .clamp(1, 1000),
+            strict_tier: key.strict_tier,
             provider_kind: provider.kind,
             share_id,
         });
@@ -1750,12 +1824,13 @@ const fn provider_scope_label(candidate: &RouteCandidate) -> &'static str {
 const fn provider_endpoint(endpoint: EndpointKind) -> Option<ProviderEndpoint> {
     match endpoint {
         EndpointKind::Chat => Some(ProviderEndpoint::Chat),
-        EndpointKind::Responses | EndpointKind::ResponsesCompact => {
-            Some(ProviderEndpoint::Responses)
-        }
-        EndpointKind::Messages | EndpointKind::CountTokens => Some(ProviderEndpoint::Messages),
+        EndpointKind::Responses => Some(ProviderEndpoint::Responses),
+        EndpointKind::ResponsesCompact => Some(ProviderEndpoint::ResponsesCompact),
+        EndpointKind::Messages => Some(ProviderEndpoint::Messages),
+        EndpointKind::CountTokens => Some(ProviderEndpoint::CountTokens),
         EndpointKind::Models => Some(ProviderEndpoint::Models),
         EndpointKind::Usage => Some(ProviderEndpoint::Usage),
+        EndpointKind::Embeddings => Some(ProviderEndpoint::Embeddings),
     }
 }
 
@@ -1775,6 +1850,12 @@ fn endpoint_url(candidate: &RouteCandidate, endpoint: EndpointKind) -> String {
             format!("/{path}")
         };
         return format!("{}{separated}", candidate.base_url.trim_end_matches('/'));
+    }
+    if candidate.provider_kind == ProviderKind::Custom
+        && let Some(ref preset_id) = candidate.config.preset_id
+        && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
+    {
+        return (spec.build_endpoint_url)(&candidate.base_url, endpoint);
     }
     get_adapter(candidate.provider_kind).build_endpoint_url(&candidate.base_url, endpoint)
 }
@@ -1869,6 +1950,12 @@ fn build_upstream_headers(
         outbound.insert(header::USER_AGENT, value);
     }
 
+    let hw_profile = llmroller_proto::fingerprint::DeviceProfile::from_key_id(
+        &candidate.upstream_key_id.to_string(),
+    );
+    let sess_token_for_tpl = session
+        .map(|s| s.outbound_token(candidate.pool_tier()))
+        .unwrap_or("");
     for (name, value) in &candidate.config.add_headers {
         let lower = name.to_ascii_lowercase();
         if lower == "host"
@@ -1882,11 +1969,73 @@ fn build_upstream_headers(
             tracing::warn!(header = %name, "ignoring invalid provider add_headers name");
             continue;
         };
-        let Ok(value) = HeaderValue::from_str(value) else {
+        let expanded = llmroller_proto::fingerprint::expand_header_template(
+            value,
+            &hw_profile,
+            &hw_profile.device_id,
+            sess_token_for_tpl,
+            1_776_000_000,
+        );
+        let Ok(value) = HeaderValue::from_str(&expanded) else {
             tracing::warn!(header = %name, "ignoring invalid provider add_headers value");
             continue;
         };
         outbound.insert(name, value);
+    }
+
+    // F095, F096, F097, F098: Synthesize built-in provider compatibility headers when absent
+    match candidate.provider_kind {
+        ProviderKind::CommandCode => {
+            outbound
+                .entry(HeaderName::from_static("x-command-code-version"))
+                .or_insert_with(|| HeaderValue::from_static("0.25.7"));
+            outbound
+                .entry(HeaderName::from_static("x-cli-environment"))
+                .or_insert_with(|| HeaderValue::from_static("cli"));
+        }
+        ProviderKind::OpencodeGo => {
+            outbound
+                .entry(HeaderName::from_static("x-opencode-client"))
+                .or_insert_with(|| HeaderValue::from_static("app"));
+            let default_oc_sess = format!("ses_{}", &hw_profile.machine_id_sha256[..32]);
+            if !outbound.contains_key("x-opencode-session")
+                && let Ok(hv) = HeaderValue::from_str(&default_oc_sess)
+            {
+                outbound.insert(HeaderName::from_static("x-opencode-session"), hv);
+            }
+        }
+        ProviderKind::OpenDesignAmr => {
+            outbound
+                .entry(HeaderName::from_static("anthropic-version"))
+                .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
+        }
+        ProviderKind::Openrouter => {
+            outbound
+                .entry(HeaderName::from_static("http-referer"))
+                .or_insert_with(|| {
+                    HeaderValue::from_static("https://github.com/llmroller/llmroller")
+                });
+            outbound
+                .entry(HeaderName::from_static("x-title"))
+                .or_insert_with(|| HeaderValue::from_static("LLMRoller"));
+        }
+        ProviderKind::Custom => {
+            if let Some(ref preset_id) = candidate.config.preset_id
+                && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
+            {
+                for (hk, hv) in (spec.synthesize_headers)(
+                    &candidate.upstream_key_id.to_string(),
+                    sess_token_for_tpl,
+                ) {
+                    if let (Ok(h_name), Ok(h_val)) = (
+                        HeaderName::from_bytes(hk.as_bytes()),
+                        HeaderValue::from_str(&hv),
+                    ) {
+                        outbound.entry(h_name).or_insert(h_val);
+                    }
+                }
+            }
+        }
     }
 
     // Section 11.2: write the provider's affinity fields. On Own-tier keys the
@@ -2129,9 +2278,24 @@ fn select_next_candidate(
     now: i64,
     entropy: &dyn EntropySource,
 ) -> Option<RouteCandidate> {
+    let is_strict = snapshot
+        .models
+        .get(&model_pk)
+        .is_some_and(|m| m.distribution.eq_ignore_ascii_case("strict"));
+    let min_strict_tier = if is_strict {
+        eligible
+            .iter()
+            .filter(|candidate| !tried.contains(&candidate.upstream_key_id))
+            .map(|candidate| candidate.strict_tier)
+            .min()
+    } else {
+        None
+    };
+
     let candidates: Vec<(RouteId, i64)> = eligible
         .iter()
         .filter(|candidate| !tried.contains(&candidate.upstream_key_id))
+        .filter(|candidate| min_strict_tier.is_none_or(|min_t| candidate.strict_tier == min_t))
         .map(|candidate| {
             let weight = if snapshot.settings.headroom_scaling_enabled {
                 let bps = runtime.headroom_bps_for_route(
@@ -2241,9 +2405,10 @@ fn note_pre_first_byte_failure(
     )
 }
 
-/// Compute the monthly and per-window reservation estimate for an attempt.
+/// Compute the monthly and per-window reservation estimate for an attempt (`F032`).
 fn estimate_cost_micro_usd(
     snapshot: &ConfigSnapshot,
+    runtime_state: &RuntimeState,
     candidate: &RouteCandidate,
     input_tokens: i64,
     max_output_tokens: Option<i64>,
@@ -2256,8 +2421,14 @@ fn estimate_cost_micro_usd(
             &candidate.upstream_model_id,
         )
         .map_or(fallback, |entry| entry.base_rates);
-    let raw_est =
-        estimate_reservation_cost_micro_usd(input_tokens, 0.0, &rates, max_output_tokens, None);
+    let cache_ratio = runtime_state.route_cache_ratio(candidate.route_id());
+    let raw_est = estimate_reservation_cost_micro_usd(
+        input_tokens,
+        cache_ratio,
+        &rates,
+        max_output_tokens,
+        None,
+    );
     let (mode, bps) = snapshot
         .providers
         .get(&candidate.provider_id)
@@ -2510,6 +2681,11 @@ fn resolve_session(
         || (step.is_generic() && client_key.constant_session_mode == "fingerprint_generic_ids");
     let (session_hash, fallback_id_opt) = if use_step8 {
         let (sys, usr) = canonical.as_ref()?;
+        // F038: Requests with no user message (only a system prompt or empty messages)
+        // must not collide on a shared Step 8 session fingerprint.
+        if usr.is_empty() {
+            return None;
+        }
         let fallback_id = llmroller_core::session::compute_step8_fingerprint(
             &client_key.id,
             canonical_id,
@@ -2614,13 +2790,148 @@ fn upstream_error_response(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn retry_after_ms(headers: &HeaderMap) -> Option<i64> {
-    headers
+/// Parse a Go-style duration string (`"6m0s"`, `"1h2m3.5s"`, `"500ms"`, `"45s"`) or plain seconds into milliseconds (`F029`).
+#[must_use]
+pub fn parse_go_duration_ms(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = s.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some((secs * 1000.0).ceil() as i64);
+    }
+    if let Some(ms_str) = s.strip_suffix("ms")
+        && let Ok(ms) = ms_str.trim().parse::<f64>()
+        && ms.is_finite()
+        && ms >= 0.0
+    {
+        return Some(ms.ceil() as i64);
+    }
+    let mut total_ms: f64 = 0.0;
+    let mut num_buf = String::new();
+    let mut matched_unit = false;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num_buf.push(ch);
+        } else if ch == 'm' && chars.peek() == Some(&'s') {
+            let _ = chars.next();
+            let val: f64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            total_ms += val;
+            matched_unit = true;
+        } else if matches!(ch, 'h' | 'm' | 's') {
+            let val: f64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            let mult = match ch {
+                'h' => 3_600_000.0,
+                'm' => 60_000.0,
+                's' => 1_000.0,
+                _ => return None,
+            };
+            total_ms += val * mult;
+            matched_unit = true;
+        } else if !ch.is_ascii_whitespace() {
+            return None;
+        }
+    }
+    if matched_unit && num_buf.is_empty() && total_ms.is_finite() && total_ms >= 0.0 {
+        Some(total_ms.ceil() as i64)
+    } else {
+        None
+    }
+}
+
+/// Parse rate-limit backoff delay in milliseconds from upstream headers and optional error body (`F029`).
+#[must_use]
+pub fn parse_rate_limit_backoff_ms(headers: &HeaderMap, body: &[u8], now_ms: i64) -> Option<i64> {
+    if let Some(ms_str) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        && let Ok(ms) = ms_str.parse::<f64>()
+        && ms.is_finite()
+        && ms >= 0.0
+    {
+        return Some(ms.ceil() as i64);
+    }
+
+    if let Some(ra_str) = headers
         .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .filter(|seconds| *seconds >= 0)
-        .map(|seconds| seconds.saturating_mul(1000))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        if let Some(ms) = parse_go_duration_ms(ra_str) {
+            return Some(ms);
+        }
+        if let Ok(dt) =
+            time::OffsetDateTime::parse(ra_str, &time::format_description::well_known::Rfc2822)
+                .or_else(|_| {
+                    time::OffsetDateTime::parse(
+                        ra_str,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                })
+        {
+            let target_ms = i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(now_ms);
+            return Some((target_ms - now_ms).max(0));
+        }
+    }
+
+    for hdr in [
+        "x-codex-primary-reset-after-seconds",
+        "x-ratelimit-reset-after",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    ] {
+        if let Some(val_str) = headers.get(hdr).and_then(|v| v.to_str().ok())
+            && let Some(ms) = parse_go_duration_ms(val_str)
+        {
+            return Some(ms);
+        }
+    }
+
+    if let Some(reset_str) = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        if let Ok(num) = reset_str.parse::<i64>()
+            && num > 0
+        {
+            if num >= 1_000_000_000_000 {
+                return Some((num - now_ms).max(0));
+            } else if num >= 1_000_000_000 {
+                return Some((num.saturating_mul(1000) - now_ms).max(0));
+            } else {
+                return Some(num.saturating_mul(1000));
+            }
+        }
+        if let Some(ms) = parse_go_duration_ms(reset_str) {
+            return Some(ms);
+        }
+    }
+
+    if !body.is_empty()
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(secs) = val
+            .pointer("/error/reset_seconds")
+            .or_else(|| val.pointer("/error/retry_after"))
+            .and_then(serde_json::Value::as_f64)
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some((secs * 1000.0).ceil() as i64);
+    }
+
+    None
+}
+
+fn retry_after_ms(headers: &HeaderMap) -> Option<i64> {
+    parse_rate_limit_backoff_ms(headers, b"", now_ms())
 }
 
 fn gate_error_response(
@@ -2723,11 +3034,17 @@ struct TraceCapture {
 impl TraceCapture {
     fn new(request_body: Bytes, retention_days: i64, first_chunk: Option<&Bytes>) -> Self {
         let (mut tap, _receiver) = TraceTap::new();
+        // F013 & F014: Account captured request_body against the 256 MiB GLOBAL_TRACE_BYTES budget.
+        let retained_body = if tap.reserve_global_bytes(request_body.len()) {
+            request_body
+        } else {
+            Bytes::new()
+        };
         if let Some(chunk) = first_chunk {
             tap.feed_sse_chunk(chunk);
         }
         Self {
-            request_body,
+            request_body: retained_body,
             retention_days,
             tap,
         }
@@ -2967,6 +3284,8 @@ struct StreamFinalizer {
     state: ProxyAuthState,
     usage: UsageContext,
     attempt_key_id: UpstreamKeyId,
+    model_pk: ModelPk,
+    store_flag: bool,
     http_status: u16,
     tap: SseUsageTap,
     thread_id: String,
@@ -2992,9 +3311,12 @@ impl StreamFinalizer {
         self.finalized = true;
 
         let finished_ms = now_ms();
+        // F009: Flush any trailing unterminated SSE frame before computing final usage.
+        self.tap.finish();
         let mut extracted = self.tap.finalize_usage();
         let is_incomplete = termination.is_incomplete();
-        if is_incomplete
+        let missing_upstream_usage = self.tap.observed_usage.is_none();
+        if (is_incomplete || missing_upstream_usage)
             && extracted.input_uncached_tokens == 0
             && extracted.cache_read_tokens == 0
             && extracted.cache_write_tokens == 0
@@ -3010,7 +3332,8 @@ impl StreamFinalizer {
             self.fallback_rates,
             self.started_ms,
         );
-        if is_incomplete && extracted.provider_cost_micro_usd.is_none() {
+        if (is_incomplete || missing_upstream_usage) && extracted.provider_cost_micro_usd.is_none()
+        {
             cost.cost_source = CostSource::EstimatedIncomplete;
         }
         let effective_cost = llmroller_core::pricing::apply_plan_multiplier(
@@ -3064,45 +3387,63 @@ impl StreamFinalizer {
                 self.ttfb_ms,
                 Some(finished_ms - self.started_ms),
             );
-            if let Some(trace) = self.trace.take() {
-                let accepted =
-                    prepare_trace_request(&trace.request_body, trace.retention_days, finished_ms)
-                        .is_some_and(|prepared| {
-                            submit_trace_job(
-                                &self.state,
-                                TraceJobMeta {
-                                    usage_event_id: &event.id,
-                                    request_id: self.usage.request_id,
-                                    ts: finished_ms,
-                                    owner_user_id: self.usage.owner_user_id,
-                                    client_key_id: self.usage.client_key_id,
-                                    session_hash: self
-                                        .usage
-                                        .session_hash
-                                        .as_deref()
-                                        .unwrap_or_default(),
-                                    thread_id: &self.thread_id,
-                                    canonical_id: &self.usage.canonical_model,
-                                    protocol: &self.usage.endpoint_str,
-                                    response_raw: None,
-                                },
-                                prepared,
-                                &trace.tap.output,
-                                trace
-                                    .tap
-                                    .trace_dropped
-                                    .load(std::sync::atomic::Ordering::Acquire),
-                            )
-                        });
-                event.trace_dropped = !accepted;
-                if !accepted {
-                    crate::metrics::record_trace_dropped();
+            let pending_trace = self.trace.take().map(|mut trace| {
+                trace.tap.finish_sse();
+                let prepared =
+                    prepare_trace_request(&trace.request_body, trace.retention_days, finished_ms);
+                (trace, prepared)
+            });
+            if let Some((ref trace, ref prepared)) = pending_trace {
+                let can_submit = prepared.is_some()
+                    && self.state.sealer_pool.is_some()
+                    && self.state.master_key_id.is_some()
+                    && !trace
+                        .tap
+                        .trace_dropped
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if !can_submit {
+                    event.trace_dropped = true;
                 }
             }
+            let event_id = event.id.clone();
+            // F016: Enqueue UsageEventRecord BEFORE submitting SealJob so usage_events row
+            // is always queued ahead of sealed trace persistence.
             writer
                 .queues
                 .usage_writer
                 .enqueue(event, std::mem::take(&mut self.attempts));
+            if let Some((trace, prepared_opt)) = pending_trace {
+                let accepted = prepared_opt.is_some_and(|prepared| {
+                    submit_trace_job(
+                        &self.state,
+                        TraceJobMeta {
+                            usage_event_id: &event_id,
+                            request_id: self.usage.request_id,
+                            ts: finished_ms,
+                            owner_user_id: self.usage.owner_user_id,
+                            client_key_id: self.usage.client_key_id,
+                            session_hash: self
+                                .usage
+                                .session_hash
+                                .as_deref()
+                                .unwrap_or_default(),
+                            thread_id: &self.thread_id,
+                            canonical_id: &self.usage.canonical_model,
+                            protocol: &self.usage.endpoint_str,
+                            response_raw: None,
+                        },
+                        prepared,
+                        &trace.tap.output,
+                        trace
+                            .tap
+                            .trace_dropped
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    )
+                });
+                if !accepted {
+                    crate::metrics::record_trace_dropped();
+                }
+            }
         }
 
         let ep = match self.usage.endpoint_str.as_str() {
@@ -3148,12 +3489,22 @@ impl StreamFinalizer {
             );
         }
 
+        self.state.runtime_state.record_route_cache_ratio(
+            RouteId {
+                upstream_key_id: self.attempt_key_id,
+                model_pk: self.model_pk,
+            },
+            extracted.input_uncached_tokens,
+            extracted.cache_read_tokens,
+            extracted.cache_write_tokens,
+        );
+
+        let status_label = if termination.is_incomplete() {
+            "incomplete"
+        } else {
+            "completed"
+        };
         if let Some(link) = &self.response_link {
-            let status = if termination.is_incomplete() {
-                "incomplete"
-            } else {
-                "completed"
-            };
             enqueue_response_link(
                 &self.state,
                 link.owner_user_id,
@@ -3162,9 +3513,25 @@ impl StreamFinalizer {
                 link.upstream_key_id,
                 &link.session_hash,
                 &link.response_id,
-                status,
+                status_label,
                 link.store_flag,
                 link.created_at,
+            );
+        } else if self.usage.endpoint_str == "responses"
+            && let Some(ref response_id) = self.tap.response_id
+        {
+            // F049 & F050: Persist response_link when response.created arrived after first_chunk
+            enqueue_response_link(
+                &self.state,
+                self.usage.owner_user_id,
+                self.usage.client_key_id,
+                self.model_pk,
+                self.attempt_key_id,
+                self.usage.session_hash.as_deref().unwrap_or(""),
+                response_id,
+                status_label,
+                self.store_flag,
+                self.started_ms,
             );
         }
     }
@@ -3315,11 +3682,13 @@ pub async fn handle_inference_request(
         EndpointKind::Responses => "responses",
         EndpointKind::ResponsesCompact => "responses_compact",
         EndpointKind::Messages => "messages",
+        EndpointKind::Embeddings => "embeddings",
         _ => "chat",
     };
     let protocol = match endpoint {
         // The compact endpoint speaks the Responses wire protocol but has its own upstream path.
         EndpointKind::ResponsesCompact => "responses",
+        EndpointKind::Embeddings => "chat",
         _ => endpoint_str,
     };
     let aux_label = aux_endpoint_label(endpoint);
@@ -3406,10 +3775,21 @@ pub async fn handle_inference_request(
         );
     };
 
-    // Compaction is a one-shot operation; force the non-streaming path even if the
-    // client supplied `stream: true` (API-1).
-    let is_streaming = endpoint != EndpointKind::ResponsesCompact
-        && scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
+    // F004 & API-1: POST /v1/responses/compact is strictly non-streaming; reject stream: true with HTTP 400.
+    if matches!(endpoint, EndpointKind::ResponsesCompact | EndpointKind::Embeddings)
+        && scan.stream.as_ref().is_some_and(|(stream, _)| *stream)
+    {
+        crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+        return protocol_error(
+            is_messages,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("stream is not supported on /v1/{endpoint_str}"),
+            Some(&request_id_str),
+            None,
+        );
+    }
+    let is_streaming = scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
     let store_flag = response_store_flag(&scan, &body);
     let now = now_ms();
 
@@ -3479,11 +3859,13 @@ pub async fn handle_inference_request(
         .get(&caller.owner_user_id)
         .is_some_and(|user| user.role == Role::Admin);
 
-    // 4. Gate G6: client key model allow-list.
+    // 4. Gate G6: client key model allow-list (supporting wildcards and canonical IDs; F043).
     if let Some(ref allowed) = caller.allowed_models
-        && !allowed
-            .iter()
-            .any(|entry| entry == &model.canonical_id || entry == model_str)
+        && !llmroller_core::client_key::is_model_allowed_by_patterns(
+            allowed,
+            model_str,
+            &model.canonical_id,
+        )
     {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
         return protocol_error(
@@ -3656,15 +4038,46 @@ pub async fn handle_inference_request(
                     );
                 }
                 Err(PoolSelectionError::NoEligibleRoute) => {
-                    crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-                    return protocol_error(
-                        is_messages,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no_eligible_route",
-                        "no eligible upstream route available for this caller",
-                        Some(&request_id_str),
-                        Some(1),
-                    );
+                    // F096 & F099: If no native same-protocol route exists, check whether any
+                    // candidate route supports a transcodable upstream protocol (chat/responses/messages)
+                    // without having an explicit protocol block on the inbound protocol.
+                    let transcoded_selection = if aux_label.is_none()
+                        && matches!(protocol, "chat" | "responses" | "messages")
+                    {
+                        let mut transcodable = eligibility.clone();
+                        for r in &mut transcodable {
+                            if !r.protocols.iter().any(|p| p == protocol)
+                                && !r.protocol_blocked
+                                && r.protocols.iter().any(|p| {
+                                    matches!(p.as_str(), "chat" | "responses" | "messages")
+                                        && !state.runtime_state.is_route_protocol_blocked(
+                                            r.upstream_key_id,
+                                            r.model_pk,
+                                            p,
+                                            now,
+                                        )
+                                })
+                            {
+                                r.protocols.push(protocol.to_string());
+                            }
+                        }
+                        select_pool(&transcodable, &context, shares, scope).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(selection) = transcoded_selection {
+                        selection
+                    } else {
+                        crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+                        return protocol_error(
+                            is_messages,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "no_eligible_route",
+                            "no eligible upstream route available for this caller",
+                            Some(&request_id_str),
+                            Some(1),
+                        );
+                    }
                 }
             };
 
@@ -3699,15 +4112,19 @@ pub async fn handle_inference_request(
 
     // Stage 1: Gate G7 monthly caps are reserved before any upstream connection.
     let requested_output = requested_max_output_tokens(&body);
+    let first_cache_ratio = state
+        .runtime_state
+        .route_cache_ratio(tier_candidates[0].route_id());
     let estimate = estimate_cost_micro_usd(
         &snapshot,
+        &state.runtime_state,
         &tier_candidates[0],
         estimate_input_tokens(&body),
         requested_output,
     )
     .max(estimate_reservation_cost_micro_usd(
         estimate_input_tokens(&body),
-        0.0,
+        first_cache_ratio,
         &Rates::from(&snapshot.settings.unpriced_fallback_rates),
         requested_output,
         None,
@@ -3895,9 +4312,38 @@ pub async fn handle_inference_request(
             try_outcomes.push(TryOutcome::Unavailable);
             continue;
         };
-        let secret = match unseal_upstream_key(&state, &snapshot, &key) {
+        let raw_secret = match unseal_upstream_key(&state, &snapshot, &key) {
             Ok(secret) => secret,
             Err(()) => {
+                try_outcomes.push(TryOutcome::Unavailable);
+                attempts.push(attempt_record(
+                    request_id,
+                    attempt_no as i64,
+                    now,
+                    candidate.upstream_key_id,
+                    candidate_share_id.clone(),
+                    llmroller_core::usage::AttemptOutcome::ConnectError,
+                    None,
+                    body.len(),
+                    0,
+                    "none",
+                ));
+                continue;
+            }
+        };
+        let secret = match state
+            .token_manager
+            .resolve_secret(
+                key.id,
+                &raw_secret,
+                state.select_http_client(candidate.allow_private_network),
+                candidate.allow_private_network,
+                now,
+            )
+            .await
+        {
+            Ok(secret) => secret,
+            Err(_) => {
                 try_outcomes.push(TryOutcome::Unavailable);
                 attempts.push(attempt_record(
                     request_id,
@@ -3931,10 +4377,11 @@ pub async fn handle_inference_request(
             .get(&candidate.provider_id)
             .map(|p| (p.billing_coverage_mode.as_str(), p.plan_multiplier_bps))
             .unwrap_or(("pay_as_you_go", 10_000));
+        let cand_cache_ratio = state.runtime_state.route_cache_ratio(candidate.route_id());
         let attempt_estimate = llmroller_core::pricing::apply_plan_multiplier(
             estimate_reservation_cost_micro_usd(
                 input_tokens_est,
-                0.0,
+                cand_cache_ratio,
                 &candidate_rates,
                 requested_output,
                 None,
@@ -4007,7 +4454,36 @@ pub async fn handle_inference_request(
             }
         };
 
-        let target_url = endpoint_url(&candidate, endpoint);
+        // F096 & F099: Determine whether this candidate natively supports `protocol` or requires cross-protocol transcoding.
+        let route_protos: Option<Vec<String>> = snapshot
+            .routes_by_model
+            .get(&model.id)
+            .and_then(|routes| {
+                routes
+                    .iter()
+                    .find(|r| r.upstream_key_id == candidate.upstream_key_id)
+                    .map(|r| r.protocols.clone())
+            });
+        let (attempt_endpoint, transcode_pair) = if aux_label.is_none()
+            && matches!(protocol, "chat" | "responses" | "messages")
+            && let Some(ref protos) = route_protos
+            && !protos.iter().any(|p| p == protocol)
+            && let Some(target_p) = protos
+                .iter()
+                .find(|p| matches!(p.as_str(), "messages" | "responses" | "chat"))
+        {
+            let ep = match target_p.as_str() {
+                "messages" => EndpointKind::Messages,
+                "responses" => EndpointKind::Responses,
+                _ => EndpointKind::Chat,
+            };
+            let src_wire = llmroller_proto::transcode::WireProtocol::from_catalog_str(protocol);
+            let dst_wire = llmroller_proto::transcode::WireProtocol::from_catalog_str(target_p);
+            (ep, src_wire.zip(dst_wire))
+        } else {
+            (endpoint, None)
+        };
+        let target_url = endpoint_url(&candidate, attempt_endpoint);
         if crate::ssrf::validate_url(&target_url, candidate.allow_private_network).is_err() {
             attempts.push(attempt_record(
                 request_id,
@@ -4058,8 +4534,10 @@ pub async fn handle_inference_request(
             .body_field
             .as_deref()
             .zip(session_token)
-            .filter(|_| matches!(endpoint, EndpointKind::Chat | EndpointKind::Responses));
-        let (edited_body, strip_injected_usage) = match edit_body_with_session_limit(
+            .filter(|_| {
+                get_adapter(candidate.provider_kind).supports_session_body_on_endpoint(endpoint)
+            });
+        let (mut edited_body, strip_injected_usage) = match edit_body_with_session_limit(
             body.clone(),
             candidate.pool_tier(),
             Some(&candidate.upstream_model_id),
@@ -4070,12 +4548,81 @@ pub async fn handle_inference_request(
             Ok(edited) => edited,
             Err(_) => (body.clone(), false),
         };
+        // F005: On failover across keys for /v1/responses, strip unpinned previous_response_id
+        // and cross-account encrypted reasoning items so the backup key does not return 400.
+        if attempt_no > 1 && matches!(endpoint, EndpointKind::Responses | EndpointKind::ResponsesCompact) {
+            edited_body = llmroller_proto::body_edit::sanitize_responses_failover_body(
+                edited_body,
+                hard_link.is_none(),
+            );
+        }
+        // F099: If the candidate uses a different upstream wire protocol, transcode the request body.
+        if let Some((src_wire, dst_wire)) = transcode_pair
+            && let Ok(transcoded) = llmroller_proto::transcode::transcode_request(
+                src_wire,
+                dst_wire,
+                &edited_body,
+                &candidate.upstream_model_id,
+            )
+        {
+            edited_body = Bytes::from(transcoded);
+        }
+        // F101-F180: Apply compiled-in provider preset payload normalizations when `preset_id` is configured.
+        if let Some(ref preset_id) = candidate.config.preset_id
+            && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
+        {
+            edited_body = (spec.normalize_request_body)(edited_body, &candidate.upstream_model_id);
+        }
+        // F096: On OpenCode Go /v1/responses, force `store: false` and strip prior `reasoning` items.
+        if candidate.provider_kind == ProviderKind::OpencodeGo
+            && attempt_endpoint == EndpointKind::Responses
+        {
+            edited_body =
+                llmroller_proto::body_edit::sanitize_opencode_go_responses_body(edited_body);
+        }
+        // F007, F024, F098: Apply provider OpenAI Chat Completions compatibility normalizations,
+        // OpenRouter Anthropic prompt cache breakpoint injection, and declarative body_edits.
+        let has_compat =
+            attempt_endpoint == EndpointKind::Chat && candidate.config.openai_compat.is_some();
+        let has_or_cache = attempt_endpoint == EndpointKind::Chat
+            && candidate.provider_kind == ProviderKind::Openrouter;
+        let has_rules = !candidate.config.body_edits.is_empty();
+        if (has_compat || has_or_cache || has_rules)
+            && let Ok(mut json_doc) = serde_json::from_slice::<serde_json::Value>(&edited_body)
+        {
+            let mut doc_changed = false;
+            if let Some(ref compat) = candidate.config.openai_compat
+                && attempt_endpoint == EndpointKind::Chat
+                && llmroller_proto::body_edit::apply_openai_completions_compat(&mut json_doc, compat)
+            {
+                doc_changed = true;
+            }
+            if has_or_cache
+                && llmroller_proto::body_edit::inject_openrouter_anthropic_cache_control(
+                    &mut json_doc,
+                    &candidate.upstream_model_id,
+                )
+            {
+                doc_changed = true;
+            }
+            if has_rules
+                && llmroller_proto::body_edit::apply_body_edit_rules(
+                    &mut json_doc,
+                    &candidate.config.body_edits,
+                )
+            {
+                doc_changed = true;
+            }
+            if doc_changed && let Ok(serialized) = serde_json::to_vec(&json_doc) {
+                edited_body = Bytes::from(serialized);
+            }
+        }
 
         let outbound_headers = match build_upstream_headers(
             &headers,
             &candidate,
             &secret,
-            endpoint,
+            attempt_endpoint,
             resolved_session.as_ref(),
         ) {
             Ok(headers) => headers,
@@ -4088,8 +4635,13 @@ pub async fn handle_inference_request(
         }
 
         let attempt_started = now_ms();
-        let activity_timeout = Duration::from_millis(candidate.config.first_activity_timeout_ms());
-        let send_res = tokio::time::timeout(activity_timeout, request_builder.send()).await;
+        // F003: Streaming requests use first_activity_timeout_ms (60s); non-streaming requests use nonstream_response_timeout_ms (600s).
+        let send_timeout = if is_streaming {
+            Duration::from_millis(candidate.config.first_activity_timeout_ms())
+        } else {
+            Duration::from_millis(candidate.config.nonstream_response_timeout_ms())
+        };
+        let send_res = tokio::time::timeout(send_timeout, request_builder.send()).await;
         let mut response = match send_res {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
@@ -4188,7 +4740,9 @@ pub async fn handle_inference_request(
                 for (name, value) in &outbound_headers {
                     retry_builder = retry_builder.header(name, value);
                 }
-                if let Ok(retry_resp) = retry_builder.send().await {
+                if let Ok(Ok(retry_resp)) =
+                    tokio::time::timeout(send_timeout, retry_builder.send()).await
+                {
                     response = retry_resp;
                     status = response.status();
                 }
@@ -4196,9 +4750,15 @@ pub async fn handle_inference_request(
         }
 
         if !status.is_success() {
-            last_retry_after_ms = retry_after_ms(response.headers());
             let upstream_headers = response.headers().clone();
-            let error_body = read_bounded_error_body(response).await;
+            let err_encoding = upstream_content_encoding(&upstream_headers);
+            let raw_error_body = read_bounded_error_body(response).await;
+            // F023: Decompress compressed upstream error payloads before classification and passthrough.
+            let error_body = decode_upstream_body(err_encoding.as_deref(), raw_error_body.clone())
+                .unwrap_or(raw_error_body);
+            // F029: Parse rate-limit backoff across Retry-After, retry-after-ms, Go durations, and JSON body.
+            last_retry_after_ms =
+                parse_rate_limit_backoff_ms(&upstream_headers, &error_body, now);
             // Auxiliary endpoints have independent support. A 404/405/501 means this
             // key does not implement the endpoint; cache that fact without treating it
             // as a credential or host failure (API-8).
@@ -4475,7 +5035,14 @@ pub async fn handle_inference_request(
                         "none",
                     ));
                 }
-                ErrorClass::Other(_) if status == StatusCode::TOO_MANY_REQUESTS => {
+                ErrorClass::Other(_)
+                    if status == StatusCode::TOO_MANY_REQUESTS
+                        || llmroller_proto::adapters::is_overloaded_error(
+                            status.as_u16(),
+                            classify_prefix,
+                        ) =>
+                {
+                    // F018: HTTP 429 and HTTP 529 / overloaded_error apply key rate-limit backoff without tripping OriginBreaker.
                     let outcome = llmroller_core::usage::AttemptOutcome::Http429;
                     let _ = state.runtime_state.record_upstream_failure(
                         &origin,
@@ -4504,6 +5071,47 @@ pub async fn handle_inference_request(
                         0,
                         "none",
                     ));
+                }
+                ErrorClass::Other(_)
+                    if llmroller_proto::adapters::is_origin_timeout_status(status.as_u16()) =>
+                {
+                    // F018: HTTP 504 / Cloudflare 524 origin timeout maps to WaitTimeout.
+                    let outcome = llmroller_core::usage::AttemptOutcome::WaitTimeout;
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        outcome,
+                        last_retry_after_ms,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::WaitTimeout);
+                    let (charged_micro_usd, charge_basis) =
+                        failure_charge(outcome, input_only_estimate);
+                    if charged_micro_usd > 0
+                        && let Some(res) = reservation.take()
+                    {
+                        res.commit(charged_micro_usd, now);
+                    }
+                    let att = attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        candidate_share_id.clone(),
+                        outcome,
+                        Some(status.as_u16()),
+                        body.len(),
+                        charged_micro_usd,
+                        charge_basis,
+                    );
+                    attempts.push(att);
                 }
                 ErrorClass::Other(_) if status.is_server_error() => {
                     let outcome = llmroller_core::usage::AttemptOutcome::Http5xx;
@@ -4799,6 +5407,25 @@ pub async fn handle_inference_request(
                                 }
                                 try_outcomes.push(TryOutcome::HostFailure);
                             }
+                            ErrorClass::Other(429 | 529) => {
+                                let _ = state.runtime_state.record_upstream_failure(
+                                    &origin,
+                                    candidate.upstream_key_id,
+                                    caller.id,
+                                    llmroller_core::usage::AttemptOutcome::Http429,
+                                    None,
+                                    now,
+                                );
+                                enqueue_key_health(
+                                    state.writer.as_ref(),
+                                    &state.runtime_state,
+                                    candidate.upstream_key_id,
+                                    now,
+                                );
+                                try_outcomes.push(TryOutcome::RateLimited {
+                                    retry_after_secs: Some(1),
+                                });
+                            }
                             _ => {
                                 let _ = state.runtime_state.record_upstream_failure(
                                     &origin,
@@ -4978,6 +5605,8 @@ pub async fn handle_inference_request(
                     state: state.clone(),
                     usage,
                     attempt_key_id: candidate.upstream_key_id,
+                    model_pk: model.id,
+                    store_flag,
                     http_status: status.as_u16(),
                     tap,
                     thread_id: trace_thread_id.clone(),
@@ -5201,12 +5830,78 @@ pub async fn handle_inference_request(
                     candidate.upstream_key_id,
                     candidate_share_id.clone(),
                     attempt_outcome,
-                    Some(502),
+                    Some(if is_timeout { 504 } else { 502 }),
                     body.len(),
                     charged_micro_usd,
                     charge_basis,
                 );
                 attempts.push(att);
+                // F003: Once HTTP 200 headers were received on a non-streaming request, a body read
+                // timeout MUST NOT fail over by default because the upstream already accepted and
+                // billed the prompt; only fail over if `timeout_failover` is explicitly enabled.
+                if is_timeout && status_value.is_success() && !candidate.config.timeout_failover() {
+                    if let Some(guard) = client_guard.take() {
+                        guard.commit(charged_micro_usd);
+                    }
+                    cap_guards.commit(charged_micro_usd);
+                    if let Some(writer) = &state.writer {
+                        let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                            .providers
+                            .get(&candidate.provider_id)
+                            .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                            .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
+                        let usage = UsageContext {
+                            request_id,
+                            client_key_id: caller.id,
+                            owner_user_id: caller.owner_user_id,
+                            canonical_model: model.canonical_id.clone(),
+                            upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                            provider_id: Some(candidate.provider_id.to_string()),
+                            provider_scope: Some(provider_scope_label(&candidate).to_string()),
+                            share_id: candidate.share_id.map(|share| share.to_string()),
+                            upstream_model_id: candidate.upstream_model_id.clone(),
+                            endpoint_str: endpoint_str.to_string(),
+                            session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                            pin_outcome: pin_ticket
+                                .as_ref()
+                                .map(|ticket| ticket.outcome.as_str().to_string()),
+                            failovers,
+                            error_code: Some("timeout_error".to_string()),
+                            billing_coverage_mode,
+                            plan_multiplier_bps,
+                            service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
+                            request_headers_json: request_headers_json.clone(),
+                        };
+                        let mut est_usage = llmroller_proto::json_usage::ExtractedUsage::default();
+                        est_usage.input_uncached_tokens = input_tokens_est;
+                        let event = usage.event(
+                            now,
+                            StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                            false,
+                            true,
+                            Termination::IdleTimeout.as_str(),
+                            &est_usage,
+                            charged_micro_usd,
+                            CostSource::EstimatedIncomplete,
+                            None,
+                            None,
+                            Some(now_ms() - attempt_started),
+                        );
+                        writer
+                            .queues
+                            .usage_writer
+                            .enqueue(event, std::mem::take(&mut attempts));
+                    }
+                    crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+                    return protocol_error(
+                        is_messages,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout_error",
+                        "upstream timed out while reading non-streaming response body",
+                        Some(&request_id_str),
+                        None,
+                    );
+                }
                 failovers += 1;
                 crate::metrics::record_failover();
                 try_outcomes.push(try_outcome);
@@ -5255,48 +5950,177 @@ pub async fn handle_inference_request(
 
         let json_value: serde_json::Value =
             serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
-        // RTE-8: Upstream errors embedded inside HTTP 200 JSON bodies trigger classification and failover.
-        if json_value
+        // RTE-8 & F002: Upstream errors embedded inside HTTP 200 JSON bodies MUST NEVER promote
+        // provisional session pins or return 200 OK; classify and fail over (or reject on 400).
+        let is_embedded_error = json_value
             .get("error")
-            .is_some_and(|e| !e.is_null() && (e.is_object() || e.is_string()))
-        {
+            .or_else(|| json_value.pointer("/response/error"))
+            .is_some_and(|e| {
+                e.is_object() || e.as_str().is_some_and(|s| !s.trim().is_empty())
+            })
+            || json_value.get("type").and_then(|t| t.as_str()) == Some("error");
+        if is_embedded_error {
             let classify_prefix = &body_bytes[..body_bytes.len().min(ERROR_CLASSIFY_BYTES)];
             let class = classify_error_with_classifiers(
                 200,
                 classify_prefix,
                 Some(&candidate.config.error_classifiers),
             );
-            if matches!(
-                class,
-                ErrorClass::QuotaExhausted
-                    | ErrorClass::PlanRestricted
-                    | ErrorClass::CredentialInvalid
-            ) {
-                if class == ErrorClass::QuotaExhausted {
+            match class {
+                ErrorClass::RequestRejected => {
+                    drop(reservation);
+                    let att = attempt_record(
+                        request_id,
+                        attempt_no as i64,
+                        now,
+                        candidate.upstream_key_id,
+                        candidate_share_id.clone(),
+                        llmroller_core::usage::AttemptOutcome::from_http_status(400),
+                        Some(400),
+                        body.len(),
+                        0,
+                        "none",
+                    );
+                    attempts.push(att);
+                    crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                    return upstream_error_response(
+                        StatusCode::BAD_REQUEST,
+                        &response_headers,
+                        body_bytes,
+                        &candidate,
+                        &request_id.to_string(),
+                        is_admin,
+                    );
+                }
+                ErrorClass::QuotaExhausted => {
                     state.runtime_state.record_quota_exhausted(
                         candidate.upstream_key_id,
                         None,
                         now,
                     );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::QuotaExhausted {
+                        retry_after_secs: None,
+                    });
                 }
-                let att = attempt_record(
-                    request_id,
-                    attempt_no as i64,
-                    now,
-                    candidate.upstream_key_id,
-                    candidate_share_id.clone(),
-                    llmroller_core::usage::AttemptOutcome::ErrorFrame,
-                    Some(status_value.as_u16()),
-                    body.len(),
-                    input_only_estimate,
-                    "estimated_input",
-                );
-                attempts.push(att);
-                failovers += 1;
-                crate::metrics::record_failover();
-                try_outcomes.push(TryOutcome::HostFailure);
-                continue;
+                ErrorClass::PlanRestricted => {
+                    let until = now.saturating_add(PROTOCOL_BLOCK_MS);
+                    state.runtime_state.block_route_protocol(
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        until,
+                    );
+                    enqueue_route_protocol_block(
+                        &state,
+                        candidate.upstream_key_id,
+                        candidate.model_pk,
+                        protocol,
+                        "plan_restricted",
+                        until,
+                    );
+                    try_outcomes.push(TryOutcome::PlanRestricted);
+                }
+                ErrorClass::CredentialInvalid => {
+                    let strike = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        llmroller_core::usage::AttemptOutcome::Http401,
+                        None,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
+                    if strike == Some(StrikeResult::ProbeRequired) {
+                        spawn_credential_probe(
+                            &state,
+                            &candidate.base_url,
+                            candidate.allow_private_network,
+                            &secret,
+                            candidate.upstream_key_id,
+                        );
+                    }
+                    try_outcomes.push(TryOutcome::HostFailure);
+                }
+                ErrorClass::Other(429 | 529) => {
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        llmroller_core::usage::AttemptOutcome::Http429,
+                        None,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::RateLimited {
+                        retry_after_secs: Some(1),
+                    });
+                }
+                _ => {
+                    let _ = state.runtime_state.record_upstream_failure(
+                        &origin,
+                        candidate.upstream_key_id,
+                        caller.id,
+                        llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                        None,
+                        now,
+                    );
+                    enqueue_key_health(
+                        state.writer.as_ref(),
+                        &state.runtime_state,
+                        candidate.upstream_key_id,
+                        now,
+                    );
+                    try_outcomes.push(TryOutcome::HostFailure);
+                }
             }
+            if let Some(res) = reservation.take() {
+                res.commit(input_only_estimate, now);
+            }
+            let att = attempt_record(
+                request_id,
+                attempt_no as i64,
+                now,
+                candidate.upstream_key_id,
+                candidate_share_id.clone(),
+                llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                Some(status_value.as_u16()),
+                body.len(),
+                input_only_estimate,
+                "estimated_input",
+            );
+            attempts.push(att);
+            if let Some(replacement) = note_pre_first_byte_failure(
+                &state,
+                pin_key.as_ref(),
+                pin_ticket.as_ref(),
+                candidate.upstream_key_id,
+                &pin_context,
+            ) && let Some(next) = tier_candidates
+                .iter()
+                .find(|entry| entry.upstream_key_id == replacement.upstream_key_id)
+            {
+                pinned_order.push(next.clone());
+                pin_ticket = Some(replacement);
+            }
+            failovers += 1;
+            crate::metrics::record_failover();
+            continue;
         }
         if matches!(endpoint, EndpointKind::Responses)
             && let Some(response_id) = json_response_id(&json_value)
@@ -5314,7 +6138,19 @@ pub async fn handle_inference_request(
                 now,
             );
         }
-        let extracted = extract_json_usage(endpoint, &json_value).unwrap_or_default();
+        let extracted = extract_json_usage(attempt_endpoint, &json_value).unwrap_or_default();
+        let body_bytes = if let Some((src_wire, dst_wire)) = transcode_pair {
+            llmroller_proto::transcode::transcode_response(
+                dst_wire,
+                src_wire,
+                &body_bytes,
+                &model.canonical_id,
+            )
+            .map(Bytes::from)
+            .unwrap_or(body_bytes)
+        } else {
+            body_bytes
+        };
         let price_entry = snapshot
             .price_for(
                 &candidate.provider_id,
@@ -5345,6 +6181,12 @@ pub async fn handle_inference_request(
         }
         cap_guards.commit(effective_cost);
 
+        state.runtime_state.record_route_cache_ratio(
+            candidate.route_id(),
+            extracted.input_uncached_tokens,
+            extracted.cache_read_tokens,
+            extracted.cache_write_tokens,
+        );
         let attempt_latency = (now - attempt_started).max(0) as u64;
         state.runtime_state.record_upstream_success(
             &origin,
@@ -5432,39 +6274,24 @@ pub async fn handle_inference_request(
                 None,
                 Some(now_ms() - attempt_started),
             );
-            if let Some((request_body, tap)) = trace_output {
+            let pending_ns_trace = trace_output.map(|(request_body, tap)| {
                 let raw_size = serde_json::to_vec(&json_value).map_or(usize::MAX, |raw| raw.len());
                 let response_raw = (raw_size
                     <= llmroller_proto::trace_tap::MAX_RESPONSE_OUTPUT_BYTES)
                     .then(|| json_value.clone());
-                let accepted = prepare_trace_request(&request_body, trace_retention_days, now)
-                    .is_some_and(|prepared| {
-                        submit_trace_job(
-                            &state,
-                            TraceJobMeta {
-                                usage_event_id: &event.id,
-                                request_id,
-                                ts: now,
-                                owner_user_id: caller.owner_user_id,
-                                client_key_id: caller.id,
-                                session_hash: pin_key
-                                    .as_ref()
-                                    .map_or("", |key| key.session_hash.as_str()),
-                                thread_id: &trace_thread_id,
-                                canonical_id: &model.canonical_id,
-                                protocol: endpoint_str,
-                                response_raw,
-                            },
-                            prepared,
-                            &tap.output,
-                            tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire),
-                        )
-                    });
-                event.trace_dropped = !accepted;
-                if !accepted {
-                    crate::metrics::record_trace_dropped();
+                let prepared = prepare_trace_request(&request_body, trace_retention_days, now);
+                (tap, response_raw, prepared)
+            });
+            if let Some((ref tap, _, ref prepared)) = pending_ns_trace {
+                let can_submit = prepared.is_some()
+                    && state.sealer_pool.is_some()
+                    && state.master_key_id.is_some()
+                    && !tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire);
+                if !can_submit {
+                    event.trace_dropped = true;
                 }
             }
+            let event_id = event.id.clone();
             writer.queues.durable_state.lock().insert(
                 llmroller_store::writer::DurableKey::ClientKeyTouch(caller.id.to_string()),
                 llmroller_store::writer::DurableOp::ClientKeyTouchLastUsed {
@@ -5472,10 +6299,39 @@ pub async fn handle_inference_request(
                     last_used_at: now,
                 },
             );
+            // F016: Enqueue UsageEventRecord BEFORE submitting SealJob so usage_events row
+            // is always queued ahead of sealed trace persistence.
             writer
                 .queues
                 .usage_writer
                 .enqueue(event, std::mem::take(&mut attempts));
+            if let Some((tap, response_raw, prepared_opt)) = pending_ns_trace {
+                let accepted = prepared_opt.is_some_and(|prepared| {
+                    submit_trace_job(
+                        &state,
+                        TraceJobMeta {
+                            usage_event_id: &event_id,
+                            request_id,
+                            ts: now,
+                            owner_user_id: caller.owner_user_id,
+                            client_key_id: caller.id,
+                            session_hash: pin_key
+                                .as_ref()
+                                .map_or("", |key| key.session_hash.as_str()),
+                            thread_id: &trace_thread_id,
+                            canonical_id: &model.canonical_id,
+                            protocol: endpoint_str,
+                            response_raw,
+                        },
+                        prepared,
+                        &tap.output,
+                        tap.trace_dropped.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                });
+                if !accepted {
+                    crate::metrics::record_trace_dropped();
+                }
+            }
         }
 
         crate::metrics::record_request_metric(endpoint_str, "2xx", "completed");
@@ -5693,6 +6549,7 @@ mod tests {
             pool_tier: tier,
             ownership_scope: llmroller_core::rbac::OwnershipScope::Global,
             priority: 1,
+            strict_tier: 1,
             provider_kind: ProviderKind::OpencodeGo,
             share_id,
         }
@@ -6157,6 +7014,39 @@ mod tests {
             resolve_caller_scope(&key, &snapshot),
             RoutingScope::OwnOnly,
             "explicit routing_scope overrides user default"
+        );
+    }
+
+    #[test]
+    #[doc = "Spec: RTE-8, F029 - rate limit backoff parser supports retry-after-ms, Go duration strings, epoch resets, and embedded JSON reset_seconds"]
+    fn rate_limit_backoff_parser_supports_all_upstream_header_and_body_formats() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(parse_rate_limit_backoff_ms(&h, b"", 1_000_000), Some(1500));
+
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-ratelimit-reset-requests", HeaderValue::from_static("6m0s"));
+        assert_eq!(parse_rate_limit_backoff_ms(&h2, b"", 1_000_000), Some(360_000));
+
+        let mut h3 = HeaderMap::new();
+        h3.insert("x-codex-primary-reset-after-seconds", HeaderValue::from_static("45"));
+        assert_eq!(parse_rate_limit_backoff_ms(&h3, b"", 1_000_000), Some(45_000));
+
+        let mut h4 = HeaderMap::new();
+        h4.insert("x-ratelimit-reset", HeaderValue::from_static("1775000010"));
+        assert_eq!(
+            parse_rate_limit_backoff_ms(&h4, b"", 1_775_000_000_000),
+            Some(10_000)
+        );
+
+        let h_empty = HeaderMap::new();
+        assert_eq!(
+            parse_rate_limit_backoff_ms(
+                &h_empty,
+                br#"{"error":{"reset_seconds":12.5}}"#,
+                1_000_000
+            ),
+            Some(12_500)
         );
     }
 }

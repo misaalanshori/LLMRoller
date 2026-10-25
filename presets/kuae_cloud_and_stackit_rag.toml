@@ -1,0 +1,33 @@
+# KUAE Cloud (`coding-plan-endpoint.kuaecloud.net/v1`) & STACKIT (`api.openai-compat.model-serving.eu01.onstackit.cloud/v1`) provider preset (F171).
+# Spec: apiclientreferences/opencode/kuae.md, apiclientreferences/opencode/stackit.md
+
+kind = "custom"
+preset_id = "kuae_cloud_and_stackit_rag"
+name = "KUAE Cloud (`coding-plan-endpoint.kuaecloud.net/v1`) & STACKIT (`api.openai-compat.model-serving.eu01.onstackit.cloud/v1`)"
+base_url = "https://coding-plan-endpoint.kuaecloud.net/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "kuae_cloud_and_stackit_rag"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"glm-5" = "GLM-5"
+"glm-4-7" = "GLM-4.7"
+"deepseek-v3-2" = "DeepSeek-V3.2"

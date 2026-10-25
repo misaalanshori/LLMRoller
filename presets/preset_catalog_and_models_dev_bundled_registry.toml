@@ -1,0 +1,33 @@
+# Bundled Preset & Model Capability Registry (`presets/*.toml` Expansion from 5 to 60+ Out-of-the-Box Provider Presets) provider preset (F180).
+# Spec: apiclientreferences/opencode/provider-architecture.md, apiclientreferences/pi/provider-architecture.md, apiclientreferences/9router/overview.md
+
+kind = "custom"
+preset_id = "preset_catalog_and_models_dev_bundled_registry"
+name = "Bundled Preset & Model Capability Registry (`presets/*.toml` Expansion from 5 to 60+ Out-of-the-Box Provider Presets)"
+base_url = "https://api.openai.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "preset_catalog_and_models_dev_bundled_registry"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"gpt-5-4" = "gpt-5.4"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gemini-3-1-pro" = "gemini-3.1-pro"

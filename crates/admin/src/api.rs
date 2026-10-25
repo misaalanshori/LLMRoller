@@ -3175,18 +3175,28 @@ async fn delete_admin_traces_handler(
                         .execute(&mut **tx)
                         .await
                         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    sqlx::query(
+                        r#"DELETE FROM trace_blocks WHERE NOT EXISTS (
+                               SELECT 1 FROM trace_record_blocks r
+                               WHERE r.owner_user_id = trace_blocks.owner_user_id
+                                 AND r.block_hash = trace_blocks.block_hash
+                           )"#,
+                    )
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
                 }
                 None => {
                     sqlx::query("DELETE FROM trace_records")
                         .execute(&mut **tx)
                         .await
                         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    sqlx::query("DELETE FROM trace_blocks")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
                 }
             }
-            sqlx::query("DELETE FROM trace_blocks")
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             Ok(())
         })
     })
@@ -8355,7 +8365,6 @@ fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &
             ));
         }
     } else {
-        out.push_str("<th>Time</th><th>Status</th><th>Model</th><th>User / Key</th><th>Duration</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>");
         for r in rows {
             let req_id = escape_html(r.get("request_id").and_then(|v| v.as_str()).unwrap_or(""));
             let ts = r.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -9088,6 +9097,10 @@ pub fn router(state: ApiAppState) -> Router {
             patch(patch_user_upstream_key_handler).delete(delete_user_upstream_key_handler),
         )
         .route(
+            "/admin/api/upstream-keys/{id}/test",
+            post(post_test_upstream_key_handler),
+        )
+        .route(
             "/admin/api/upstream-keys/{id}/reset-health",
             post(post_reset_upstream_key_health_handler),
         )
@@ -9340,13 +9353,41 @@ mod catalog_sync_tests {
     }
 
     #[test]
-    #[doc = "Spec: SEC-19, UI-1, UI-3"]
+    #[doc = "Spec: SEC-5, SEC-19, UI-1, UI-3; F077, F079, F080, F094"]
     fn templates_have_zero_inline_handlers_and_correct_data_plane_port() {
         let app_html = include_str!("../templates/app.html");
+        let admin_html = include_str!("../templates/admin.html");
+        let login_html = include_str!("../templates/login.html");
+        let setup_html = include_str!("../templates/setup.html");
         assert!(!app_html.contains("onchange="));
         assert!(!app_html.contains("onclick="));
         assert!(app_html.contains("http://127.0.0.1:8080"));
         assert!(!app_html.contains("http://127.0.0.1:8082"));
+        // F077: login.html and setup.html must have zero inline <style> or <script> blocks
+        assert!(!login_html.contains("<style"));
+        assert!(!login_html.contains("<script>"));
+        assert!(!setup_html.contains("<style"));
+        assert!(!setup_html.contains("<script>"));
+        // F079: admin.html must include #modal-new-upstream-key
+        assert!(admin_html.contains("id="modal-new-upstream-key""));
+        // F080 & F094: render_logs_table_html emits exactly one <thead> and escapes XSS payloads
+        let logs_json = serde_json::json!({
+            "rows": [{
+                "request_id": "req_<script>",
+                "ts": 1000,
+                "status": 200,
+                "canonical_id": "<script>alert(1)</script>",
+                "client_key_label": "key_<b>",
+                "latency_ms": 42,
+                "total_tokens": 100,
+                "cost_formatted": "$0.001"
+            }]
+        });
+        let rendered = super::render_logs_table_html(&logs_json, false, "/admin/partials/logs");
+        assert_eq!(rendered.matches("<thead>").count(), 1);
+        assert_eq!(rendered.matches("<tbody>").count(), 1);
+        assert!(!rendered.contains("<script>"));
+        assert!(rendered.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 
     #[test]

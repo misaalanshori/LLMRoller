@@ -1,0 +1,35 @@
+# Anthropic Official API (`api.anthropic.com/v1` Direct API Key Preset with Automatic Prompt Cache Breakpoints) provider preset (F173).
+# Spec: apiclientreferences/pi/anthropic.md, apiclientreferences/fx/anthropic.md, apiclientreferences/opencode/anthropic.md
+
+kind = "custom"
+preset_id = "anthropic_official_direct_api_preset"
+name = "Anthropic Official API (`api.anthropic.com/v1` Direct API Key Preset with Automatic Prompt Cache Breakpoints)"
+base_url = "https://api.anthropic.com/v1"
+ua_policy = "pass"
+supported_protocols = ["messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"anthropic-version" = "2023-06-01"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"claude-opus-4-5-20251101" = "claude-opus-4-5-20251101"
+"claude-sonnet-4-5-20250929" = "claude-sonnet-4-5-20250929"
+"claude-haiku-4-5-20251001" = "claude-haiku-4-5-20251001"

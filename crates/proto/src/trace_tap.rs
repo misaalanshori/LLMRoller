@@ -25,6 +25,8 @@ pub const MAX_INFLIGHT_TRACE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB per turn
 /// per-turn cap is [`MAX_TURN_NEW_BLOCKS_BYTES`] (TRC-2, Section 12.6).
 pub const MAX_REQUEST_TRACE_BYTES: usize = MAX_TURN_NEW_BLOCKS_BYTES;
 pub const MAX_SSE_PENDING_BYTES: usize = 2 * 1024 * 1024; // incomplete frame guard
+/// Maximum tool calls assembled per turn to prevent malicious/corrupt index OOM (`F015`).
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 256;
 
 /// Global accumulator tracking trace memory usage across all active streams (PERF-5).
 pub static GLOBAL_TRACE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -395,11 +397,33 @@ impl TraceTap {
     /// Feed one parsed SSE `data:` JSON object and reassemble assistant deltas.
     ///
     /// Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
+    /// Reserve `bytes` against the 256 MiB global trace memory budget (`F014`, `PERF-5`).
+    pub fn reserve_global_bytes(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        if self.trace_dropped.load(Ordering::Acquire) {
+            return false;
+        }
+        let curr_global = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
+        if curr_global.saturating_add(bytes) > GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed) {
+            self.trace_dropped.store(true, Ordering::Release);
+            return false;
+        }
+        GLOBAL_TRACE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        self.allocated_bytes.fetch_add(bytes, Ordering::Relaxed);
+        true
+    }
+
     pub fn feed_sse_data_json(&mut self, value: &serde_json::Value) {
         if self.output.truncated {
             return;
         }
         let raw = value.to_string();
+        if !self.reserve_global_bytes(raw.len()) {
+            self.output.truncated = true;
+            return;
+        }
         self.inflight_bytes = self.inflight_bytes.saturating_add(raw.len());
         if self.inflight_bytes > MAX_INFLIGHT_TRACE_BYTES {
             self.output.truncated = true;
@@ -605,6 +629,16 @@ impl TraceTap {
         if self.sse_pending.len() > MAX_SSE_PENDING_BYTES {
             self.sse_pending.clear();
             self.output.truncated = true;
+        }
+    }
+
+    /// Flush any trailing unterminated SSE frame at stream EOF (`F009`).
+    pub fn finish_sse(&mut self) {
+        if !self.output.truncated && self.sse_pending.iter().any(|b| !b.is_ascii_whitespace()) {
+            let tail = std::mem::take(&mut self.sse_pending);
+            self.feed_sse_frame(&tail);
+        } else {
+            self.sse_pending.clear();
         }
     }
 
@@ -820,6 +854,10 @@ impl TraceTap {
             .get("index")
             .and_then(serde_json::Value::as_u64)
             .map_or(0, |index| index as usize);
+        if index >= MAX_TOOL_CALLS_PER_TURN {
+            self.output.truncated = true;
+            return;
+        }
         while self.output.assistant_tool_calls.len() <= index {
             self.output.assistant_tool_calls.push(AssembledToolCall {
                 id: String::new(),

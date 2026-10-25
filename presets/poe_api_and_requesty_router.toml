@@ -1,0 +1,34 @@
+# Poe API (`api.poe.com/v1`) & Requesty Router (`router.requesty.ai/v1`) provider preset (F145).
+# Spec: apiclientreferences/opencode/poe.md, apiclientreferences/opencode/requesty.md
+
+kind = "custom"
+preset_id = "poe_api_and_requesty_router"
+name = "Poe API (`api.poe.com/v1`) & Requesty Router (`router.requesty.ai/v1`)"
+base_url = "https://api.poe.com/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-llmroller-preset" = "poe_api_and_requesty_router"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "Claude-Opus-4.6"
+"claude-sonnet-4-6" = "Claude-Sonnet-4.6"
+"gpt-5-4" = "GPT-5.4"
+"gemini-3-1-pro" = "Gemini-3.1-Pro"

@@ -1,0 +1,40 @@
+# OpenCode Zen (`/zen/v1` Multi-Protocol Gateway for OpenAI Responses, Anthropic Messages, Google Gemini, and Chat Completions) provider preset (F111).
+# Spec: apiclientreferences/opencode/opencode-zen-go.md, apiclientreferences/pi/opencode.md
+
+kind = "custom"
+preset_id = "opencode_zen_and_console_multi_protocol_gateway"
+name = "OpenCode Zen (`/zen/v1` Multi-Protocol Gateway for OpenAI Responses, Anthropic Messages, Google Gemini, and Chat Completions)"
+base_url = "https://opencode.ai/zen/v1"
+ua_policy = "pass"
+supported_protocols = ["chat", "responses", "messages"]
+
+[paths]
+chat = "/chat/completions"
+responses = "/responses"
+messages = "/messages"
+models = "/models"
+
+[aux_endpoints]
+count_tokens = false
+responses_compact = false
+
+[usage_reporting]
+chat_stream = "inject"
+
+[add_headers]
+"x-opencode-client" = "app"
+"user-agent" = "opencode/1.2.15"
+
+[session_profile]
+headers = ["x-session-id", "x-session-affinity"]
+
+[aliases]
+"claude-opus-4-6" = "claude-opus-4-6"
+"claude-sonnet-4-6" = "claude-sonnet-4-6"
+"gpt-5-4" = "gpt-5.4"
+"gpt-5-3-codex" = "gpt-5.3-codex"
+"gemini-3-1-pro" = "gemini-3.1-pro"
+"big-pickle" = "big-pickle"
+"glm-5" = "glm-5"
+"kimi-k2-5" = "kimi-k2.5"
+"minimax-m2-5" = "minimax-m2.5"
