@@ -50,7 +50,7 @@ fn test_provider_adapter_contracts() {
 
         let ua_policy = adapter.default_ua_policy();
         match kind {
-            ProviderKind::OpencodeGo => assert_eq!(ua_policy, UaPolicy::Label),
+            ProviderKind::OpencodeGo => assert_eq!(ua_policy, UaPolicy::Profile),
             _ => assert_eq!(ua_policy, UaPolicy::Pass),
         }
 

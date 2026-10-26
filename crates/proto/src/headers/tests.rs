@@ -10,8 +10,8 @@ use llmroller_core::rbac::PoolTier;
 
 use crate::headers::{
     SmugglingError, UaPolicy, apply_request_header_pipeline, apply_response_header_pipeline,
-    resolve_user_agent, sanitize_csv_cell, scrub_canary_tokens, validate_header_value_bytes,
-    validate_request_smuggling,
+    resolve_user_agent, sanitize_csv_cell, scrub_canary_tokens, ua_profile_by_name,
+    validate_header_value_bytes, validate_request_smuggling,
 };
 
 /// Spec: API-2, API-3, SEC-8, SEC-15
@@ -325,45 +325,60 @@ fn test_response_header_pipeline() {
     assert!(out_own.get("x-llmroller-upstream-scope").is_none());
 }
 
-/// Spec: API-3
-/// Verify User-Agent policy modes: pass, label, reject.
-#[doc = "Spec: API-3"]
+/// Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#122-user-agent-policy | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+/// Verify User-Agent policy modes: pass, profile, reject. LLMRoller has no User-Agent of its own (TRN-0).
+#[doc = "Spec: API-3, TRN-0"]
 #[test]
 fn test_user_agent_policy_modes() {
-    // 1. Pass mode
+    // 1. Pass mode forwards the client's UA, and sends none when the client sent none.
     assert_eq!(
-        resolve_user_agent(UaPolicy::Pass, Some("custom-client/1.0")).expect("pass UA"),
-        "custom-client/1.0"
+        resolve_user_agent(UaPolicy::Pass, Some("custom-client/1.0"), None).expect("pass UA"),
+        Some("custom-client/1.0".to_string())
     );
     assert_eq!(
-        resolve_user_agent(UaPolicy::Pass, None).expect("empty UA default"),
-        "llmroller/1.0"
+        resolve_user_agent(UaPolicy::Pass, None, None).expect("no UA"),
+        None
     );
 
-    // 2. Label mode: Coding agents pass through, generic HTTP libraries get replaced with llmroller/1.0
+    // 2. Profile mode: accepted client UAs pass through; everything else gets the profile's UA.
+    let profile = ua_profile_by_name("opencode_go").expect("opencode_go profile");
     assert_eq!(
-        resolve_user_agent(UaPolicy::Label, Some("claude-cli/1.0.5")).expect("coding agent"),
-        "claude-cli/1.0.5"
+        resolve_user_agent(UaPolicy::Profile, Some("claude-cli/1.0.5"), Some(profile))
+            .expect("coding agent"),
+        Some("claude-cli/1.0.5".to_string())
     );
     assert_eq!(
-        resolve_user_agent(UaPolicy::Label, Some("curl/7.81.0")).expect("curl replaced"),
-        "llmroller/1.0"
+        resolve_user_agent(UaPolicy::Profile, Some("curl/7.81.0"), Some(profile))
+            .expect("curl replaced"),
+        Some("opencode/1.2.15".to_string())
     );
     assert_eq!(
-        resolve_user_agent(UaPolicy::Label, Some("python-requests/2.28.1"))
-            .expect("python replaced"),
-        "llmroller/1.0"
+        resolve_user_agent(UaPolicy::Profile, None, Some(profile)).expect("missing replaced"),
+        Some("opencode/1.2.15".to_string())
     );
+    // Profile mode without a resolvable profile behaves like pass and never invents an identity.
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Profile, Some("curl/7.81.0"), None).expect("no profile"),
+        Some("curl/7.81.0".to_string())
+    );
+    assert_eq!(
+        resolve_user_agent(UaPolicy::Profile, None, None).expect("no profile, no UA"),
+        None
+    );
+    assert!(ua_profile_by_name("no_such_profile").is_none());
 
     // 3. Reject mode: Generic HTTP libraries or empty are rejected with error (maps to HTTP 400)
-    assert!(resolve_user_agent(UaPolicy::Reject, Some("curl/7.81.0")).is_err());
-    assert!(resolve_user_agent(UaPolicy::Reject, None).is_err());
-    assert!(resolve_user_agent(UaPolicy::Reject, Some("   ")).is_err());
+    assert!(resolve_user_agent(UaPolicy::Reject, Some("curl/7.81.0"), None).is_err());
+    assert!(resolve_user_agent(UaPolicy::Reject, None, None).is_err());
+    assert!(resolve_user_agent(UaPolicy::Reject, Some("   "), None).is_err());
     assert_eq!(
-        resolve_user_agent(UaPolicy::Reject, Some("opencode/2.0"))
+        resolve_user_agent(UaPolicy::Reject, Some("opencode/2.0"), None)
             .expect("valid agent in reject mode"),
-        "opencode/2.0"
+        Some("opencode/2.0".to_string())
     );
+
+    // 4. No built-in profile may carry an llmroller identifier (TRN-0).
+    assert!(!profile.required.to_ascii_lowercase().contains("llmroller"));
 }
 
 /// Spec: SEC-6
@@ -484,4 +499,67 @@ fn test_request_header_pipeline_strips_proxy_forwarding_org_and_accept_encoding(
         out.get("accept-encoding").and_then(|v| v.to_str().ok()),
         Some("identity")
     );
+}
+
+/// Spec: ./docs/srdd/7. SRDD - Non-Functional Requirements.md#73-transparency-and-compatibility-trn--com | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+/// TRN-0: an opencode-shaped request reaches the upstream with every client header intact (unknown
+/// ones included), in order, and no proxy marker is added.
+#[doc = "Spec: TRN-0, API-3"]
+#[test]
+fn test_trn0_real_client_headers_pass_through_without_proxy_markers() {
+    let mut inbound = HeaderMap::new();
+    inbound.append(
+        "authorization",
+        "Bearer llr_client".parse().expect("header value"),
+    );
+    inbound.append(
+        "user-agent",
+        "opencode/1.2.15".parse().expect("header value"),
+    );
+    inbound.append(
+        "x-opencode-session",
+        "ses_abc".parse().expect("header value"),
+    );
+    inbound.append("x-opencode-client", "cli".parse().expect("header value"));
+    inbound.append(
+        "x-some-future-agent-header",
+        "v1".parse().expect("header value"),
+    );
+    inbound.append("anthropic-beta", "a".parse().expect("header value"));
+    inbound.append("anthropic-beta", "b".parse().expect("header value"));
+
+    let out = apply_request_header_pipeline(
+        &inbound,
+        PoolTier::Own,
+        Some(("authorization", "Bearer sk-upstream")),
+        &[],
+        &StripHeaderTokens::default(),
+    )
+    .expect("pipeline");
+
+    for name in [
+        "user-agent",
+        "x-opencode-session",
+        "x-opencode-client",
+        "x-some-future-agent-header",
+    ] {
+        assert_eq!(out.get(name), inbound.get(name), "{name} must pass through");
+    }
+    let betas: Vec<_> = out.get_all("anthropic-beta").iter().collect();
+    assert_eq!(
+        betas,
+        inbound.get_all("anthropic-beta").iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.get("authorization").expect("auth header"),
+        "Bearer sk-upstream"
+    );
+    for (name, value) in &out {
+        let line = format!("{name}: {}", value.to_str().unwrap_or_default()).to_ascii_lowercase();
+        assert!(!line.contains("llmroller"), "proxy marker leaked: {line}");
+        assert!(!matches!(
+            name.as_str(),
+            "via" | "forwarded" | "x-forwarded-for"
+        ));
+    }
 }

@@ -415,7 +415,10 @@ pub struct UsageProfile {
 #[serde(rename_all = "snake_case")]
 pub enum UaPolicySetting {
     Pass,
-    Label,
+    /// Required-client profile (`ua_profile`, SRDD 12.2). `label` is the pre-rename spelling that
+    /// existing stored provider configs may still carry.
+    #[serde(alias = "label")]
+    Profile,
     Reject,
 }
 
@@ -568,6 +571,9 @@ pub struct ProviderConfig {
     pub response_header_allow: Vec<String>,
     #[serde(default)]
     pub ua_policy: Option<UaPolicySetting>,
+    /// Required-client profile name used by `ua_policy = profile` (SRDD 12.2, 23.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ua_profile: Option<String>,
     #[serde(default)]
     pub session_profile: Option<SessionProfile>,
     #[serde(default)]
@@ -598,6 +604,7 @@ impl Default for ProviderConfig {
             add_headers: BTreeMap::new(),
             response_header_allow: Vec::new(),
             ua_policy: None,
+            ua_profile: None,
             session_profile: None,
             usage_profile: None,
             error_classifiers: ErrorClassifiers::default(),
@@ -749,7 +756,8 @@ mod tests {
       },
       "add_headers": {},
       "response_header_allow": [],
-      "ua_policy": "label",
+      "ua_policy": "profile",
+      "ua_profile": "opencode_go",
       "session_profile": {
         "headers_if_absent": ["x-opencode-session"],
         "body_field_if_absent": null,
@@ -821,7 +829,13 @@ mod tests {
                 .map(<[String]>::len),
             Some(0)
         );
-        assert_eq!(config.ua_policy, Some(UaPolicySetting::Label));
+        assert_eq!(config.ua_policy, Some(UaPolicySetting::Profile));
+        assert_eq!(config.ua_profile.as_deref(), Some("opencode_go"));
+
+        // Pre-rename stored configs spell the policy `label`; they must keep parsing.
+        let legacy = ProviderConfig::try_from_json(r#"{"ua_policy":"label"}"#)
+            .expect("legacy label spelling");
+        assert_eq!(legacy.ua_policy, Some(UaPolicySetting::Profile));
 
         let session = config.session_profile.as_ref().expect("session profile");
         assert_eq!(session.headers, vec!["x-opencode-session".to_string()]);

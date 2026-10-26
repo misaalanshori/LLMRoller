@@ -88,7 +88,8 @@ async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() 
         "add_headers": {"x-custom-provider": "1"},
         "strip_headers": ["x-client-secret"],
         "strip_header_tokens": ["beta-drop"],
-        "ua_policy": "label",
+        "ua_policy": "profile",
+        "ua_profile": "opencode_go",
         "response_header_allow": ["x-upstream-custom"],
         "auth": {"chat": {"header": "authorization", "prefix": "Bearer "}}
     }"#;
@@ -141,8 +142,8 @@ async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() 
             .headers
             .get(header::USER_AGENT)
             .map(|v| v.as_bytes()),
-        Some(&b"llmroller/1.0"[..]),
-        "ua_policy=label must replace generic library User-Agent values"
+        Some(&b"opencode/1.2.15"[..]),
+        "ua_policy=profile must replace generic library User-Agent values with the profile UA"
     );
     assert_eq!(
         recorded
@@ -152,6 +153,75 @@ async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() 
         Some(&b"Bearer sk-mock-key"[..]),
         "the configured auth scheme must receive the decrypted upstream secret"
     );
+}
+
+// Spec: ./docs/srdd/7. SRDD - Non-Functional Requirements.md#73-transparency-and-compatibility-trn--com | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+#[tokio::test]
+#[doc = "Spec: TRN-0, API-3 — upstream sees the real client: no User-Agent invented, unknown headers kept, no llmroller marker"]
+async fn test_trn0_upstream_sees_real_client_without_llmroller_markers() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("trn0.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE5; 32]);
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, "{}").await;
+    let app = build_wire_app(&pool, &master_key).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+
+    // A client that sends no User-Agent: none may appear upstream.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-future-agent-header", "kept")
+        .body(Body::from(body))
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert!(
+        !recorded.headers.contains_key(header::USER_AGENT),
+        "no client User-Agent means no upstream User-Agent: {:?}",
+        recorded.headers
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-future-agent-header")
+            .map(|v| v.as_bytes()),
+        Some(&b"kept"[..]),
+        "unknown client headers must pass through"
+    );
+
+    // A real client: its User-Agent arrives unchanged.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "opencode/1.2.15")
+        .body(Body::from(body))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert_eq!(
+        recorded
+            .headers
+            .get(header::USER_AGENT)
+            .map(|v| v.as_bytes()),
+        Some(&b"opencode/1.2.15"[..])
+    );
+    for (name, value) in &recorded.headers {
+        let line = format!("{name}: {}", value.to_str().unwrap_or_default()).to_ascii_lowercase();
+        assert!(
+            !line.contains("llmroller"),
+            "proxy marker leaked upstream: {line}"
+        );
+    }
 }
 
 #[tokio::test]

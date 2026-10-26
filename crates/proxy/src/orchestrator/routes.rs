@@ -381,7 +381,14 @@ pub(crate) fn build_upstream_headers(
     let incoming_ua = inbound
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let resolved_ua = resolve_user_agent(policy, incoming_ua).map_err(|reason| {
+    let profile = llmroller_proto::headers::ua_profile_by_name(
+        candidate
+            .config
+            .ua_profile
+            .as_deref()
+            .unwrap_or_else(|| candidate.provider_kind.as_str()),
+    );
+    let resolved_ua = resolve_user_agent(policy, incoming_ua, profile).map_err(|reason| {
         Box::new(protocol_error(
             is_messages,
             StatusCode::BAD_REQUEST,
@@ -391,7 +398,10 @@ pub(crate) fn build_upstream_headers(
             None,
         ))
     })?;
-    if let Ok(value) = HeaderValue::from_str(&resolved_ua) {
+    // `None` means the client sent no User-Agent: send none, like a direct connection (TRN-0).
+    if let Some(ua) = resolved_ua
+        && let Ok(value) = HeaderValue::from_str(&ua)
+    {
         outbound.insert(header::USER_AGENT, value);
     }
 

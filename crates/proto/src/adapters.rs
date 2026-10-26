@@ -477,7 +477,7 @@ impl ProviderAdapter for OpencodeGoAdapter {
     }
 
     fn default_ua_policy(&self) -> UaPolicy {
-        UaPolicy::Label
+        UaPolicy::Profile
     }
 
     fn default_session_profile(&self) -> SessionProfile {

@@ -4,7 +4,8 @@
 kind = "opencode_go"
 name = "OpenCode Go"
 base_url = "https://opencode.ai/zen/go/v1"
-ua_policy = "label"
+ua_policy = "profile"
+ua_profile = "opencode_go"
 
 [paths]
 chat = "/chat/completions"

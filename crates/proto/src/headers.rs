@@ -344,15 +344,16 @@ pub fn apply_response_header_pipeline(
     out
 }
 
-/// User-Agent policy modes per Section 12.2.
+/// User-Agent policy modes per Section 12.2. LLMRoller never invents a User-Agent of its own (TRN-0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UaPolicy {
-    /// Forward the client's User-Agent header unchanged, or send llmroller/1.0 if empty.
+    /// Forward the client's User-Agent header unchanged, and send none when the client sent none.
     #[default]
     Pass,
-    /// Forward coding-agent User-Agent strings, and replace generic HTTP library strings with llmroller/1.0.
-    Label,
+    /// The provider mandates a client identity (`UaProfile`): accepted client User-Agents pass
+    /// through, any other or missing User-Agent is replaced with the profile's required value.
+    Profile,
     /// Return HTTP 400 if the client sends an empty or generic library User-Agent.
     Reject,
 }
@@ -361,9 +362,33 @@ impl From<llmroller_core::provider::UaPolicySetting> for UaPolicy {
     fn from(value: llmroller_core::provider::UaPolicySetting) -> Self {
         match value {
             llmroller_core::provider::UaPolicySetting::Pass => Self::Pass,
-            llmroller_core::provider::UaPolicySetting::Label => Self::Label,
+            llmroller_core::provider::UaPolicySetting::Profile => Self::Profile,
             llmroller_core::provider::UaPolicySetting::Reject => Self::Reject,
         }
+    }
+}
+
+/// Required-client profile for providers that only accept one client identity (Section 23.3).
+#[derive(Debug, PartialEq, Eq)]
+pub struct UaProfile {
+    /// Case-insensitive `User-Agent` prefixes forwarded unchanged (a trailing `*` is implied).
+    pub accept: &'static [&'static str],
+    /// `User-Agent` sent when the client's value is missing or not accepted. Empty `accept` means
+    /// this value is always sent.
+    pub required: &'static str,
+}
+
+const OPENCODE_GO_PROFILE: UaProfile = UaProfile {
+    accept: &["opencode/", "claude-cli/", "codex-cli/", "hermes/"],
+    required: "opencode/1.2.15",
+};
+
+/// Look up a built-in required-client profile by `ua_profile` name.
+#[must_use]
+pub fn ua_profile_by_name(name: &str) -> Option<&'static UaProfile> {
+    match name {
+        "opencode_go" => Some(&OPENCODE_GO_PROFILE),
+        _ => None,
     }
 }
 
@@ -372,25 +397,37 @@ impl From<llmroller_core::provider::UaPolicySetting> for UaPolicy {
 #[error("invalid user-agent rejected by policy: {0:?}")]
 pub struct UaPolicyRejectedError(pub String);
 
-/// Resolve the effective outbound User-Agent header string per Section 12.2.
+/// Resolve the effective outbound User-Agent per Section 12.2. `None` means send no User-Agent.
+///
+/// `profile` is only consulted by [`UaPolicy::Profile`]; without a resolvable profile that mode
+/// behaves like [`UaPolicy::Pass`] rather than inventing an identity.
 pub fn resolve_user_agent(
     policy: UaPolicy,
     incoming_ua: Option<&str>,
-) -> Result<String, UaPolicyRejectedError> {
-    const DEFAULT_UA: &str = "llmroller/1.0";
+    profile: Option<&UaProfile>,
+) -> Result<Option<String>, UaPolicyRejectedError> {
+    let client_ua = incoming_ua.filter(|ua| !ua.trim().is_empty());
     match policy {
-        UaPolicy::Pass => match incoming_ua {
-            Some(ua) if !ua.trim().is_empty() => Ok(ua.to_string()),
-            _ => Ok(DEFAULT_UA.to_string()),
-        },
-        UaPolicy::Label => match incoming_ua {
-            Some(ua) if is_coding_agent_ua(ua) => Ok(ua.to_string()),
-            _ => Ok(DEFAULT_UA.to_string()),
-        },
-        UaPolicy::Reject => match incoming_ua {
-            Some(ua) if !ua.trim().is_empty() && !is_generic_library_ua(ua) => Ok(ua.to_string()),
+        UaPolicy::Pass => Ok(client_ua.map(str::to_string)),
+        UaPolicy::Profile => Ok(match profile {
+            None => client_ua.map(str::to_string),
+            Some(p) => Some(match client_ua {
+                Some(ua)
+                    if p.accept
+                        .iter()
+                        .any(|prefix| ua.to_ascii_lowercase().starts_with(prefix)) =>
+                {
+                    ua.to_string()
+                }
+                _ => p.required.to_string(),
+            }),
+        }),
+        UaPolicy::Reject => match client_ua {
+            Some(ua) if !is_generic_library_ua(ua) => Ok(Some(ua.to_string())),
             Some(ua) => Err(UaPolicyRejectedError(ua.to_string())),
-            None => Err(UaPolicyRejectedError("<empty>".to_string())),
+            None => Err(UaPolicyRejectedError(
+                incoming_ua.map_or_else(|| "<empty>".to_string(), str::to_string),
+            )),
         },
     }
 }
@@ -424,16 +461,6 @@ pub fn extract_caller_client_name(inbound: &HeaderMap) -> Option<String> {
         }
     }
     None
-}
-
-/// Determine whether a User-Agent identifies a recognized coding agent per Section 12.2.
-#[must_use]
-pub fn is_coding_agent_ua(ua: &str) -> bool {
-    let lower = ua.to_ascii_lowercase();
-    lower.starts_with("claude-cli/")
-        || lower.starts_with("codex-cli/")
-        || lower.starts_with("opencode/")
-        || lower.starts_with("hermes/")
 }
 
 /// Determine whether a User-Agent identifies a generic HTTP library.
