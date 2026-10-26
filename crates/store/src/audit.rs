@@ -340,7 +340,15 @@ pub async fn append(
     .await?;
 
     if seq % 100 == 0 {
-        println!("{}", format_audit_anchor(seq, &hash, entry.ts));
+        let anchor_json = format_audit_anchor(seq, &hash, entry.ts);
+        tracing::info!(
+            target: "llmroller::audit_anchor",
+            seq = seq,
+            entry_hash = %hash,
+            ts = entry.ts,
+            anchor = %anchor_json,
+            "audit log hash chain anchor"
+        );
     }
 
     Ok((seq, hash))

@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "deepseek_api_and_interleaved_reasoning_content"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

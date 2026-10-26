@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "mistral_and_codestral_api_compat"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

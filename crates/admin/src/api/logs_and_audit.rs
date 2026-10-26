@@ -400,12 +400,18 @@ pub(crate) async fn get_log_detail_internal(
     .await
     .unwrap_or_default();
 
+    let event_provider_scope: String = row
+        .try_get::<Option<String>, _>("provider_scope")
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let is_own_personal = matches!(event_provider_scope.as_str(), "personal" | "own");
+
     let attempts = attempt_rows
         .into_iter()
         .map(|ar| {
             let kid: String = ar.try_get("upstream_key_id").unwrap_or_default();
             let share_id: Option<String> = ar.try_get("share_id").unwrap_or_default();
-            let kid_projected = if is_admin {
+            let kid_projected = if is_admin || (is_own_personal && share_id.is_none()) {
                 Some(kid)
             } else if share_id.is_some() {
                 Some("shared pool".to_string())

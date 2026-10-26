@@ -183,12 +183,11 @@ pub(crate) async fn get_admin_session_preview_handler(
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
     .is_some();
 
-    let ip_addr = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .map(str::to_string);
+    let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8081));
+    let ip_addr = Some(
+        crate::auth::extract_client_ip(peer_addr, &headers, &state.auth.config.trusted_proxies)
+            .to_string(),
+    );
 
     let owner_user_id: Option<String> = sqlx::query_scalar(
         "SELECT owner_user_id FROM trace_records WHERE session_hash = ? LIMIT 1",
@@ -555,12 +554,11 @@ pub(crate) async fn get_admin_trace_record_handler(
     let actor = authenticate_admin(&state, &headers, false).await?;
     let admin_id = actor.user_id().map(|u| u.to_string());
     let now_ms = state.auth.clock.now_ms();
-    let ip_addr = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .map(str::to_string);
+    let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8081));
+    let ip_addr = Some(
+        crate::auth::extract_client_ip(peer_addr, &headers, &state.auth.config.trusted_proxies)
+            .to_string(),
+    );
 
     let session_hash_opt: Option<String> =
         sqlx::query_scalar("SELECT session_hash FROM trace_records WHERE request_id = ? LIMIT 1")
@@ -592,7 +590,7 @@ pub(crate) async fn get_admin_trace_record_handler(
                 action: "trace.viewed",
                 target_type: "trace",
                 target_id: Some(dedup_target),
-                detail_json: "{}",
+                detail_json: &serde_json::json!({ "request_id": request_id }).to_string(),
             },
         )
         .await;
@@ -949,12 +947,25 @@ pub(crate) async fn post_user_move_pin_body_handler(
     }
 
     let now_ms = state.auth.clock.now_ms();
+    let target_tier_int: i64 = if key_record.owner_user_id == Some(user_id) {
+        0
+    } else if key_record.owner_user_id.is_some() {
+        1
+    } else {
+        2
+    };
+    let target_tier_enum = match target_tier_int {
+        0 => llmroller_core::eligibility::CandidatePoolTier::Own,
+        1 => llmroller_core::eligibility::CandidatePoolTier::Shared,
+        _ => llmroller_core::eligibility::CandidatePoolTier::Global,
+    };
     let _ = sqlx::query(
-        "UPDATE pins SET upstream_key_id = ?, last_used_at = ?
+        "UPDATE pins SET upstream_key_id = ?, pool_tier = ?, last_used_at = ?
          WHERE session_hash = ?
            AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
     )
     .bind(target_key.to_string())
+    .bind(target_tier_int)
     .bind(now_ms)
     .bind(&session_hash)
     .bind(user_id.to_string())
@@ -962,7 +973,7 @@ pub(crate) async fn post_user_move_pin_body_handler(
     .await;
 
     if let Some(store) = &state.pin_store {
-                let rows = sqlx::query(
+        let rows = sqlx::query(
             "SELECT p.client_key_id, m.canonical_id
              FROM pins p
              JOIN client_keys ck ON p.client_key_id = ck.id
@@ -987,7 +998,7 @@ pub(crate) async fn post_user_move_pin_body_handler(
                     session_hash: session_hash.clone(),
                     canonical_id: model_id,
                 };
-                store.admin_move(&pin_key, target_key, now_ms);
+                store.admin_move_with_tier(&pin_key, target_key, Some(target_tier_enum), now_ms);
             }
         }
     }
@@ -1011,13 +1022,36 @@ pub(crate) async fn post_admin_move_session_pin_handler(
         .map_err(|e| map_price_error(StatusCode::UNPROCESSABLE_ENTITY, e))?;
 
     let now_ms = state.auth.clock.now_ms();
+    let key_meta: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT k.owner_user_id, pr.ownership_scope
+         FROM upstream_keys k
+         JOIN providers pr ON pr.id = k.provider_id
+         WHERE k.id = ?",
+    )
+    .bind(target_key.to_string())
+    .fetch_optional(&state.auth.pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some((key_owner_uid, key_scope)) = key_meta else {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "upstream key not found"));
+    };
 
     if let Some(ref cid) = payload.canonical_id {
         let _ = sqlx::query(
-            "UPDATE pins SET upstream_key_id = ?, last_used_at = ?
+            "UPDATE pins
+             SET upstream_key_id = ?,
+                 pool_tier = CASE
+                     WHEN ? = 'global' THEN 2
+                     WHEN ? IS NOT NULL AND ? = (SELECT owner_user_id FROM client_keys WHERE id = pins.client_key_id) THEN 0
+                     ELSE 1
+                 END,
+                 last_used_at = ?
              WHERE session_hash = ? AND model_pk IN (SELECT model_pk FROM models WHERE canonical_id = ?)",
         )
         .bind(target_key.to_string())
+        .bind(&key_scope)
+        .bind(&key_owner_uid)
+        .bind(&key_owner_uid)
         .bind(now_ms)
         .bind(&session_hash)
         .bind(cid)
@@ -1025,9 +1059,20 @@ pub(crate) async fn post_admin_move_session_pin_handler(
         .await;
     } else {
         let _ = sqlx::query(
-            "UPDATE pins SET upstream_key_id = ?, last_used_at = ? WHERE session_hash = ?",
+            "UPDATE pins
+             SET upstream_key_id = ?,
+                 pool_tier = CASE
+                     WHEN ? = 'global' THEN 2
+                     WHEN ? IS NOT NULL AND ? = (SELECT owner_user_id FROM client_keys WHERE id = pins.client_key_id) THEN 0
+                     ELSE 1
+                 END,
+                 last_used_at = ?
+             WHERE session_hash = ?",
         )
         .bind(target_key.to_string())
+        .bind(&key_scope)
+        .bind(&key_owner_uid)
+        .bind(&key_owner_uid)
         .bind(now_ms)
         .bind(&session_hash)
         .execute(&state.auth.pool)
@@ -1035,8 +1080,8 @@ pub(crate) async fn post_admin_move_session_pin_handler(
     }
 
     if let Some(store) = &state.pin_store {
-                let rows = sqlx::query(
-            "SELECT p.client_key_id, m.canonical_id
+        let rows = sqlx::query(
+            "SELECT p.client_key_id, p.pool_tier, m.canonical_id
              FROM pins p
              LEFT JOIN models m ON p.model_pk = m.model_pk
              WHERE p.session_hash = ?",
@@ -1048,6 +1093,12 @@ pub(crate) async fn post_admin_move_session_pin_handler(
 
         for r in rows {
             let ckid_str: String = r.try_get("client_key_id").unwrap_or_default();
+            let tier_int: i64 = r.try_get("pool_tier").unwrap_or(2);
+            let tier_enum = match tier_int {
+                0 => llmroller_core::eligibility::CandidatePoolTier::Own,
+                1 => llmroller_core::eligibility::CandidatePoolTier::Shared,
+                _ => llmroller_core::eligibility::CandidatePoolTier::Global,
+            };
             let model_id: String = r
                 .try_get::<Option<String>, _>("canonical_id")
                 .unwrap_or_default()
@@ -1058,7 +1109,7 @@ pub(crate) async fn post_admin_move_session_pin_handler(
                     session_hash: session_hash.clone(),
                     canonical_id: model_id,
                 };
-                store.admin_move(&pin_key, target_key, now_ms);
+                store.admin_move_with_tier(&pin_key, target_key, Some(tier_enum), now_ms);
             }
         }
     }

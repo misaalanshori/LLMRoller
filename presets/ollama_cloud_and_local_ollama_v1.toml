@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "ollama_cloud_and_local_ollama_v1"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

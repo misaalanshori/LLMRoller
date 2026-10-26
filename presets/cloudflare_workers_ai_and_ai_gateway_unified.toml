@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "cloudflare_workers_ai_and_ai_gateway_unified"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

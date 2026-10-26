@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "volcengine_ark_and_byteplus_coding_plan"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

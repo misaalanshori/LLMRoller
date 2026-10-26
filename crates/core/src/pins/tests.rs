@@ -672,3 +672,38 @@ fn test_phase_2b_pin_active_filtering_and_wildcard_models() {
         "deepseek-r1"
     ));
 }
+
+// Spec: ./docs/srdd/10. SRDD - Routing Design.md#104-session-pin-state-machine | Phase: ./docs/bigbang/big-bang-phases-3.md#32-sub-phase-32-two-phase-session-pinstore-and-response-link-hard-affinity
+#[doc = "Spec: RTE-11"]
+#[test]
+fn test_admin_move_with_tier_updates_pool_tier_and_generation() {
+    let store = PinStore::new(100);
+    let ck = ClientKeyId::generate();
+    let k_global = UpstreamKeyId::generate();
+    let k_own = UpstreamKeyId::generate();
+    let pk = PinKey {
+        client_key_id: ck,
+        canonical_id: "claude-sonnet-4.6".to_string(),
+        session_hash: "sess_move_tier".to_string(),
+    };
+    store.upsert_confirmed(pk.clone(), k_global, CandidatePoolTier::Global, 1_000, 60_000);
+    store.admin_move_with_tier(&pk, k_own, Some(CandidatePoolTier::Own), 2_000);
+
+    let clock = crate::seams::FakeClock::new(2_500);
+    let ticket = store
+        .acquire(
+            &pk,
+            &clock,
+            60_000,
+            false,
+            300,
+            RoutingScope::PersonalFirst,
+            Some(CandidatePoolTier::Own),
+            |id| id == k_own,
+            |_| Some((k_own, CandidatePoolTier::Own)),
+        )
+        .expect("ticket");
+    assert_eq!(ticket.upstream_key_id, k_own);
+    assert_eq!(ticket.pool_tier, CandidatePoolTier::Own);
+    assert_eq!(ticket.outcome, PinOutcome::Followed);
+}

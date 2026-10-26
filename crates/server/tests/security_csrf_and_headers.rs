@@ -64,7 +64,7 @@ async fn setup_csrf_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey
     (dir, writer_pool, master_key, admin.id)
 }
 
-#[doc = "Spec: UI-1, UI-3, UI-4, SEC-5"]
+#[doc = "Spec: UI-1, UI-3, UI-4, SEC-5 | Phase: ./docs/bigbang/08_PHASE_7_DASHBOARD_UX_AND_FINAL_SECURITY_HARDENING.md#T7.4"]
 #[test]
 fn test_template_lint_zero_external_assets_and_zero_eval() {
     // 1. Template lint scans all crates/admin/templates/**/*.html (UI-3)
@@ -117,15 +117,25 @@ fn test_template_lint_zero_external_assets_and_zero_eval() {
             "Template {} contains inline event handler (CSP script-src 'self' violation)",
             path.display()
         );
+
+        // Zero inline style="..." attributes to comply with strict style-src 'self' CSP (FND-043, FND-044, SEC-5, UI-3)
+        assert!(
+            !content.contains("style=\"") && !content.contains("style='"),
+            "Template {} contains inline style attribute (CSP style-src 'self' violation)",
+            path.display()
+        );
     }
 
-    // 2. /static/app.js sets required HTMX CSP flags
+    // 2. /static/app.js sets required HTMX CSP flags and has zero inline style="..." mutations (FND-045)
     assert!(APP_JS.contains("htmx.config.includeIndicatorStyles = false;"));
     assert!(APP_JS.contains("htmx.config.allowEval = false;"));
     assert!(APP_JS.contains("htmx.config.allowScriptTags = false;"));
+    assert!(!APP_JS.contains("style.right"));
+    assert!(!APP_JS.contains("style=\""));
 
-    // 3. /static/app.css contains spinner indicators
+    // 3. /static/app.css contains spinner indicators and drawer classes (FND-043, FND-045)
     assert!(APP_CSS.contains(".htmx-indicator"));
+    assert!(APP_CSS.contains(".inspection-drawer.open"));
 }
 
 fn collect_html_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -141,7 +151,7 @@ fn collect_html_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-#[doc = "Spec: UI-1, UI-3, UI-4, SEC-5"]
+#[doc = "Spec: UI-1, UI-3, UI-4, SEC-5 | Phase: ./docs/bigbang/08_PHASE_7_DASHBOARD_UX_AND_FINAL_SECURITY_HARDENING.md#T7.4"]
 #[tokio::test]
 async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
     let (dir, pool, master_key, _admin_id) = setup_csrf_test_db().await;
@@ -197,7 +207,7 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         .expect("str");
     assert_eq!(x_content, "nosniff");
 
-    // 2. Static asset endpoint /static/app.js
+    // 2. Static asset endpoint /static/app.js + ETag / Cache-Control / 304 Not Modified (FND-046, UI-3)
     let static_req = Request::builder()
         .method("GET")
         .uri("/static/app.js")
@@ -205,6 +215,30 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         .expect("req");
     let static_res = app.clone().oneshot(static_req).await.expect("res");
     assert_eq!(static_res.status(), StatusCode::OK);
+    let cache_ctrl = static_res
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .expect("cache-control")
+        .to_str()
+        .expect("str");
+    assert_eq!(cache_ctrl, "public, max-age=31536000, immutable");
+    let etag = static_res
+        .headers()
+        .get(header::ETAG)
+        .expect("etag")
+        .to_str()
+        .expect("str")
+        .to_string();
+
+    let static_304_req = Request::builder()
+        .method("GET")
+        .uri("/static/app.js")
+        .header(header::IF_NONE_MATCH, &etag)
+        .body(Body::empty())
+        .expect("req");
+    let static_304_res = app.clone().oneshot(static_304_req).await.expect("res");
+    assert_eq!(static_304_res.status(), StatusCode::NOT_MODIFIED);
+
     let static_body = static_res
         .into_body()
         .collect()
@@ -309,6 +343,12 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         .expect("body")
         .to_bytes();
     let app_html = std::str::from_utf8(&app_body_bytes).expect("utf8");
+
+    // Verify /app contains 80-preset dropdown & Service Accounts / Security tabs (FND-045, FND-047)
+    assert!(app_html.contains("openrouter"));
+    assert!(app_html.contains("tab-service-accounts"));
+    assert!(app_html.contains("tab-account-security"));
+    assert!(app_html.contains("personal-usage-chart"));
 
     // Extract x-csrf-token from <body hx-headers='{"x-csrf-token": "..."}'>
     let token_marker = r#"{"x-csrf-token": ""#;

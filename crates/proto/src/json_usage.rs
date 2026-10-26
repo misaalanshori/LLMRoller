@@ -29,11 +29,126 @@ impl ExtractedUsage {
     }
 }
 
+/// Extracts normalized usage from Google Gemini / Cloud Code Assist (`usageMetadata`), AWS Bedrock (`usage.inputTokens`), or Cohere (`meta.billed_units`) JSON objects (`FND-014`, `USG-1`).
+pub fn extract_extended_provider_json_usage(json: &serde_json::Value) -> Option<ExtractedUsage> {
+    // 1. Google Gemini / Vertex AI / Cloud Code Assist: usageMetadata or response.usageMetadata
+    if let Some(um) = json
+        .get("usageMetadata")
+        .or_else(|| json.pointer("/response/usageMetadata"))
+        && um.is_object()
+    {
+        let prompt_tokens = um
+            .get("promptTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let cache_read_tokens = um
+            .get("cachedContentTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let output_tokens = um
+            .get("candidatesTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let reasoning_tokens = um
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let input_uncached_tokens = prompt_tokens.saturating_sub(cache_read_tokens).max(0);
+        return Some(ExtractedUsage {
+            input_uncached_tokens,
+            cache_read_tokens,
+            cache_write_tokens: 0,
+            output_tokens,
+            reasoning_tokens,
+            provider_cost_micro_usd: extract_provider_cost(um),
+        });
+    }
+
+    // 2. AWS Bedrock Converse / ConverseStream or Command Code camelCase usage
+    if let Some(usage) = json
+        .get("usage")
+        .or_else(|| json.pointer("/metadata/usage"))
+        && usage.is_object()
+        && (usage.get("inputTokens").is_some()
+            || usage.get("outputTokens").is_some()
+            || usage.get("promptTokens").is_some()
+            || usage.get("completionTokens").is_some())
+    {
+        let input_tokens = usage
+            .get("inputTokens")
+            .or_else(|| usage.get("promptTokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let output_tokens = usage
+            .get("outputTokens")
+            .or_else(|| usage.get("completionTokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let cache_read_tokens = usage
+            .get("cacheReadInputTokens")
+            .or_else(|| usage.get("cachedTokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let cache_write_tokens = usage
+            .get("cacheWriteInputTokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        return Some(ExtractedUsage {
+            input_uncached_tokens: input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            reasoning_tokens: 0,
+            provider_cost_micro_usd: extract_provider_cost(usage),
+        });
+    }
+
+    // 3. Cohere v2 / Command Code billed_units
+    if let Some(bu) = json
+        .pointer("/meta/billed_units")
+        .or_else(|| json.pointer("/usage/billed_units"))
+        .or_else(|| json.pointer("/usage/tokens"))
+        && bu.is_object()
+    {
+        let input_tokens = bu
+            .get("input_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let output_tokens = bu
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        return Some(ExtractedUsage {
+            input_uncached_tokens: input_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens,
+            reasoning_tokens: 0,
+            provider_cost_micro_usd: None,
+        });
+    }
+
+    None
+}
+
 /// Extracts normalized usage from a parsed JSON response object according to the endpoint protocol.
 pub fn extract_json_usage(
     endpoint: EndpointKind,
     json: &serde_json::Value,
 ) -> Option<ExtractedUsage> {
+    if let Some(ext) = extract_extended_provider_json_usage(json) {
+        return Some(ext);
+    }
     match endpoint {
         EndpointKind::Chat | EndpointKind::Embeddings => extract_chat_json_usage(json),
         EndpointKind::Responses | EndpointKind::ResponsesCompact => {

@@ -294,11 +294,19 @@ pub async fn run_retention_pass(
     policy: &RetentionPolicy,
 ) -> Result<(), sqlx::Error> {
     let raw_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days * 86_400_000);
+    let rollup_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days.max(31) * 86_400_000);
     let seven_days_cutoff = now_ms.saturating_sub(7 * 86_400_000);
     let ninety_days_cutoff = now_ms.saturating_sub(90 * 86_400_000);
 
+    if let Ok(mut tx) = pool.begin().await {
+        let _ = sweep_expired_web_sessions(&mut tx, now_ms).await?;
+        let _ = sweep_expired_response_links(&mut tx, now_ms).await?;
+        let _ = tx.commit().await;
+    }
     let _ = sweep_expired_usage_events(pool, raw_cutoff, 1_000).await?;
     let _ = enforce_max_usage_events_rows_pool(pool, policy.usage_events_max_rows, 1_000).await?;
+    let _ = sweep_expired_usage_rollups_5min(pool, rollup_cutoff, 1_000).await?;
+    let _ = sweep_expired_usage_rollups_hourly(pool, ninety_days_cutoff, 1_000).await?;
     let _ = sweep_expired_pins(pool, now_ms).await?;
     let _ = sweep_expired_trace_records(pool, now_ms).await?;
     let _ = sweep_orphaned_trace_blocks(pool, raw_cutoff, 1_000).await?;
@@ -342,5 +350,62 @@ mod tests {
             .await
             .expect("count cpl");
         assert_eq!(remaining, 0);
+    }
+}
+
+#[cfg(test)]
+mod fnd021_tests {
+    use super::*;
+    use crate::migrations::migrate;
+    use crate::pool::{Role, open_pool};
+
+    #[tokio::test]
+    #[doc = "Spec: REL-3, TRC-5, PERF-4"]
+    async fn retention_pass_prunes_expired_sessions_links_rollups_and_orphan_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("retention_traces.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, created_at)
+             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'u1', 'h', 'user', 1000)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            "INSERT INTO web_sessions (id_hash, user_id, csrf_hash, created_at, last_seen_at, expires_at)
+             VALUES ('sess_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'csrf_1', 1000, 1000, 2000)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert web_session");
+
+        sqlx::query(
+            "INSERT INTO trace_blocks (block_hash, owner_user_id, payload_enc, master_key_id, byte_len, last_referenced_at)
+             VALUES ('blk_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', X'00', 'mk_1', 16, 1000)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert trace_block");
+
+        let now_ms = 100 * 86_400_000;
+        run_retention_pass(&pool, now_ms, &RetentionPolicy::default())
+            .await
+            .expect("retention pass");
+
+        let remaining_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("remaining sessions");
+        let remaining_blocks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks")
+            .fetch_one(&pool)
+            .await
+            .expect("remaining blocks");
+        assert_eq!(remaining_sessions, 0);
+        assert_eq!(remaining_blocks, 0);
     }
 }

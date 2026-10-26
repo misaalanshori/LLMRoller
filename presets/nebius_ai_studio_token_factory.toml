@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "nebius_ai_studio_token_factory"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

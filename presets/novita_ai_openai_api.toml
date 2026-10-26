@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "novita_ai_openai_api"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

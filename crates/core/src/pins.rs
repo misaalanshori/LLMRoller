@@ -453,9 +453,23 @@ impl PinStore {
 
     /// Admin manually moves pin to target key (RTE-11).
     pub fn admin_move(&self, pin_key: &PinKey, new_key_id: UpstreamKeyId, now_ms: i64) {
+        self.admin_move_with_tier(pin_key, new_key_id, None, now_ms);
+    }
+
+    /// Admin or user manually moves pin to target key and updates its pool_tier (RTE-11, FND-003).
+    pub fn admin_move_with_tier(
+        &self,
+        pin_key: &PinKey,
+        new_key_id: UpstreamKeyId,
+        new_pool_tier: Option<CandidatePoolTier>,
+        now_ms: i64,
+    ) {
         if let Some(entry_arc) = self.entries.get(pin_key) {
             let mut entry = entry_arc.lock();
             entry.upstream_key_id = new_key_id;
+            if let Some(tier) = new_pool_tier {
+                entry.pool_tier = tier;
+            }
             entry.generation += 1;
             entry.tried_this_generation.clear();
             entry.last_used_ms = now_ms;

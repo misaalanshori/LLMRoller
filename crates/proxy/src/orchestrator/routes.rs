@@ -296,8 +296,7 @@ pub(crate) fn endpoint_url(candidate: &RouteCandidate, endpoint: EndpointKind) -
         };
         return format!("{}{separated}", candidate.base_url.trim_end_matches('/'));
     }
-    if candidate.provider_kind == ProviderKind::Custom
-        && let Some(ref preset_id) = candidate.config.preset_id
+    if let Some(ref preset_id) = candidate.config.preset_id
         && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
     {
         return (spec.build_endpoint_url)(&candidate.base_url, endpoint);
@@ -327,6 +326,7 @@ pub(crate) fn build_upstream_headers(
     secret: &str,
     endpoint: EndpointKind,
     session: Option<&ResolvedSession>,
+    now_ms: i64,
 ) -> Result<HeaderMap, Box<Response>> {
     use llmroller_proto::headers::{
         HeaderPipelineError, UaPolicy, apply_request_header_pipeline, resolve_user_agent,
@@ -401,47 +401,105 @@ pub(crate) fn build_upstream_headers(
     let sess_token_for_tpl = session
         .map(|s| s.outbound_token(candidate.pool_tier()))
         .unwrap_or("");
+    let caller_client_name = llmroller_proto::headers::extract_caller_client_name(inbound);
+    let now_unix_secs = u64::try_from((now_ms / 1000).max(0)).unwrap_or(0);
     for (name, value) in &candidate.config.add_headers {
         let lower = name.to_ascii_lowercase();
         if lower == "host"
             || lower == "content-length"
             || lower == "authorization"
             || lower == auth_header
+            || lower.starts_with("x-llmroller-")
         {
             continue;
         }
-        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+        let Ok(h_name) = HeaderName::from_bytes(name.as_bytes()) else {
             tracing::warn!(header = %name, "ignoring invalid provider add_headers name");
             continue;
         };
-        let expanded = llmroller_proto::fingerprint::expand_header_template(
+        let expanded = llmroller_proto::fingerprint::expand_header_template_with_caller(
             value,
             &hw_profile,
             &hw_profile.device_id,
             sess_token_for_tpl,
-            1_776_000_000,
+            now_unix_secs,
+            caller_client_name.as_deref(),
+            incoming_ua,
         );
-        let Ok(value) = HeaderValue::from_str(&expanded) else {
+        if expanded.trim().is_empty() {
+            continue;
+        }
+        let Ok(h_val) = HeaderValue::from_str(&expanded) else {
             tracing::warn!(header = %name, "ignoring invalid provider add_headers value");
             continue;
         };
-        outbound.insert(name, value);
+        // Transparent proxy invariant (SRDD 12.1): preserve caller-supplied headers (such as
+        // x-client-name, x-title, http-referer, anthropic-beta) unless add_headers explicitly
+        // overrides User-Agent for a CLI harness or the caller did not supply the header.
+        if lower == "user-agent" || !inbound.contains_key(&h_name) {
+            outbound.insert(h_name, h_val);
+        } else {
+            outbound.entry(h_name).or_insert(h_val);
+        }
     }
 
-    // F095, F096, F097, F098: Synthesize built-in provider compatibility headers when absent
+    // F095, F096, F097, F098, F101-F180: Synthesize built-in provider compatibility headers when absent
+    if let Some(ref preset_id) = candidate.config.preset_id
+        && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
+    {
+        for (hk, hv) in (spec.synthesize_headers)(
+            &candidate.upstream_key_id.to_string(),
+            sess_token_for_tpl,
+        ) {
+            if hk.to_ascii_lowercase().starts_with("x-llmroller-") {
+                continue;
+            }
+            let expanded = llmroller_proto::fingerprint::expand_header_template_with_caller(
+                &hv,
+                &hw_profile,
+                &hw_profile.device_id,
+                sess_token_for_tpl,
+                now_unix_secs,
+                caller_client_name.as_deref(),
+                incoming_ua,
+            );
+            if expanded.trim().is_empty() {
+                continue;
+            }
+            if let (Ok(h_name), Ok(h_val)) = (
+                HeaderName::from_bytes(hk.as_bytes()),
+                HeaderValue::from_str(&expanded),
+            ) {
+                if hk.eq_ignore_ascii_case("user-agent") && incoming_ua.is_none() {
+                    outbound.insert(h_name, h_val);
+                } else {
+                    outbound.entry(h_name).or_insert(h_val);
+                }
+            }
+        }
+    }
     match candidate.provider_kind {
         ProviderKind::CommandCode => {
-            outbound
-                .entry(HeaderName::from_static("x-command-code-version"))
-                .or_insert_with(|| HeaderValue::from_static("0.25.7"));
-            outbound
-                .entry(HeaderName::from_static("x-cli-environment"))
-                .or_insert_with(|| HeaderValue::from_static("cli"));
+            for (hk, hv) in llmroller_proto::providers::command_code::command_code_cli_headers(
+                sess_token_for_tpl,
+            ) {
+                if let (Ok(h_name), Ok(h_val)) = (
+                    HeaderName::from_bytes(hk.as_bytes()),
+                    HeaderValue::from_str(&hv),
+                ) {
+                    outbound.entry(h_name).or_insert(h_val);
+                }
+            }
         }
         ProviderKind::OpencodeGo => {
             outbound
                 .entry(HeaderName::from_static("x-opencode-client"))
-                .or_insert_with(|| HeaderValue::from_static("app"));
+                .or_insert_with(|| {
+                    caller_client_name
+                        .as_deref()
+                        .and_then(|c| HeaderValue::from_str(c).ok())
+                        .unwrap_or_else(|| HeaderValue::from_static("app"))
+                });
             let default_oc_sess = format!("ses_{}", &hw_profile.machine_id_sha256[..32]);
             if !outbound.contains_key("x-opencode-session")
                 && let Ok(hv) = HeaderValue::from_str(&default_oc_sess)
@@ -455,32 +513,16 @@ pub(crate) fn build_upstream_headers(
                 .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
         }
         ProviderKind::Openrouter => {
-            outbound
-                .entry(HeaderName::from_static("http-referer"))
-                .or_insert_with(|| {
-                    HeaderValue::from_static("https://github.com/llmroller/llmroller")
-                });
-            outbound
-                .entry(HeaderName::from_static("x-title"))
-                .or_insert_with(|| HeaderValue::from_static("LLMRoller"));
-        }
-        ProviderKind::Custom => {
-            if let Some(ref preset_id) = candidate.config.preset_id
-                && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
+            // Transparent proxy: never identify as LLMRoller. If the caller sent x-client-name,
+            // x-title, or a User-Agent, translate the caller's client name to x-title when absent.
+            if !outbound.contains_key("x-title")
+                && let Some(ref client_name) = caller_client_name
+                && let Ok(hv) = HeaderValue::from_str(client_name)
             {
-                for (hk, hv) in (spec.synthesize_headers)(
-                    &candidate.upstream_key_id.to_string(),
-                    sess_token_for_tpl,
-                ) {
-                    if let (Ok(h_name), Ok(h_val)) = (
-                        HeaderName::from_bytes(hk.as_bytes()),
-                        HeaderValue::from_str(&hv),
-                    ) {
-                        outbound.entry(h_name).or_insert(h_val);
-                    }
-                }
+                outbound.insert(HeaderName::from_static("x-title"), hv);
             }
         }
+        ProviderKind::Custom => {}
     }
 
     // Section 11.2: write the provider's affinity fields. On Own-tier keys the
@@ -900,7 +942,7 @@ pub(crate) fn unseal_upstream_key(
     snapshot: &ConfigSnapshot,
     key: &UpstreamKeyRecord,
 ) -> Result<String, ()> {
-    let now_ms = SystemClock::new().now_ms();
+    let now_ms = state.clock.now_ms();
     let Some(master_key) = state.master_key.clone() else {
         state
             .runtime_state

@@ -419,6 +419,24 @@ impl ConstantSessionDetector {
             .is_some()
     }
 
+    /// Evaluates an opening prompt and returns `(is_currently_flagged, newly_flagged)` (`RTE-1`, `RTE-2`, `FND-002`).
+    pub fn observe_and_check(
+        &self,
+        client_key_id: ClientKeyId,
+        session_hash: String,
+        ctx: &PromptContext<'_'>,
+        now_ms: i64,
+    ) -> (bool, bool) {
+        let newly_flagged = self.record_and_evaluate(
+            client_key_id,
+            session_hash.clone(),
+            ctx,
+            now_ms,
+        );
+        let currently_flagged = newly_flagged || self.is_flagged(client_key_id, &session_hash);
+        (currently_flagged, newly_flagged)
+    }
+
     /// Periodic sweep of expired opening slots and idle unflagged detector entries (`PERF-3`, `F-102`).
     pub fn sweep_idle(&self, now_ms: i64) {
         let now_minute = (now_ms / 60_000) as u32;

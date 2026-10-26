@@ -214,9 +214,9 @@ pub(crate) async fn get_partial_providers_handler(
 
         let mut keys_html = String::new();
         if key_rows.is_empty() {
-            keys_html = "<p class=\"text-muted\" style=\"font-size: 0.8125rem; padding: 0.5rem 0;\">No upstream keys under this provider. Add one to enable routing.</p>".to_string();
+            keys_html = "<p class=\"text-muted py-2-sm\">No upstream keys under this provider. Add one to enable routing.</p>".to_string();
         } else {
-            keys_html.push_str("<table class=\"data-table\" style=\"margin-top: 0.5rem; background: #080c18;\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
+            keys_html.push_str("<table class=\"data-table table-sub\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
             for k in key_rows {
                 let kid: String = k.try_get("id").unwrap_or_default();
                 let klabel: String = k.try_get("label").unwrap_or_default();
@@ -236,7 +236,7 @@ pub(crate) async fn get_partial_providers_handler(
                         <td>Tier {tier}</td>\
                         <td><span class=\"badge badge-{}\">{}</span></td>\
                         <td>\
-                            <button class=\"btn btn-xs btn-ghost\" data-action=\"test-key\" data-key-id=\"{kid}\">Test</button>\
+                            <button class=\"btn btn-xs btn-ghost\" data-action=\"test-key\" data-key-id=\"{kid}\">Test</button><button class=\"btn btn-xs btn-outline\" data-modal-open=\"modal-budget-window\" data-key-id=\"{kid}\">Budget</button>\
                             <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/upstream-keys/{kid}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Remove this upstream key?\">Remove</button>\
                         </td>\
                     </tr>",
@@ -251,8 +251,8 @@ pub(crate) async fn get_partial_providers_handler(
             "<div class=\"provider-box\">\
                 <div class=\"provider-header\">\
                     <div>\
-                        <h4 style=\"font-size: 1rem; margin-bottom: 0.25rem;\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
-                        <div style=\"font-size: 0.8125rem; font-family: monospace; color: var(--muted);\">{base_url}</div>\
+                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <div class=\"prov-url-mono\">{base_url}</div>\
                     </div>\
                     <div>\
                         <button class=\"btn btn-xs btn-primary\" data-modal-open=\"modal-new-upstream-key\" data-provider-id=\"{pid}\" data-provider-name=\"{name}\">+ Add Key</button>\
@@ -516,7 +516,7 @@ pub(crate) async fn get_partial_admin_overview_handler(
 
     let unpriced_badge = if unpriced > 0 {
         format!(
-            "<span class=\"badge badge-warning\" style=\"margin-top: 0.25rem;\">{unpriced} unpriced models</span>"
+            "<span class=\"badge badge-warning\" >{unpriced} unpriced models</span>"
         )
     } else {
         String::new()
@@ -527,9 +527,9 @@ pub(crate) async fn get_partial_admin_overview_handler(
             <div class=\"card stat-card\">\
                 <div class=\"stat-label\">Projected Disk Usage</div>\
                 <div id=\"disk-meter\" class=\"disk-meter\">\
-                    <p class=\"stat-val\" style=\"font-size: 1.5rem;\">Projected Disk Usage: {proj_disk} MB</p>\
+                    <p class=\"stat-val\" >Projected Disk Usage: {proj_disk} MB</p>\
                     {unpriced_badge}\
-                    <div class=\"stat-desc\" style=\"font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;\">\
+                    <div class=\"stat-desc\" >\
                         {events_cnt} events ({ret_days}d retention)\
                     </div>\
                 </div>\
@@ -661,9 +661,9 @@ pub(crate) async fn get_partial_admin_providers_handler(
 
         let mut keys_html = String::new();
         if key_rows.is_empty() {
-            keys_html = "<p class=\"text-muted\" style=\"font-size: 0.8125rem; padding: 0.5rem 0;\">No upstream keys under this global provider.</p>".to_string();
+            keys_html = "<p class=\"text-muted py-2-sm\">No upstream keys under this global provider.</p>".to_string();
         } else {
-            keys_html.push_str("<table class=\"data-table\" style=\"margin-top: 0.5rem; background: #080c18;\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
+            keys_html.push_str("<table class=\"data-table table-sub\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
             for k in key_rows {
                 let kid: String = k.try_get("id").unwrap_or_default();
                 let klabel: String = k.try_get("label").unwrap_or_default();
@@ -697,8 +697,8 @@ pub(crate) async fn get_partial_admin_providers_handler(
             "<div class=\"provider-box\">\
                 <div class=\"provider-header\">\
                     <div>\
-                        <h4 style=\"font-size: 1rem; margin-bottom: 0.25rem;\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
-                        <div style=\"font-size: 0.8125rem; font-family: monospace; color: var(--muted);\">{base_url}</div>\
+                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <div class=\"prov-url-mono\">{base_url}</div>\
                     </div>\
                     <div>\
                         <button class=\"btn btn-xs btn-primary\" data-modal-open=\"modal-new-upstream-key\" data-provider-id=\"{pid}\" data-provider-name=\"{name}\">+ Add Key</button>\
@@ -856,7 +856,7 @@ pub(crate) async fn get_partial_user_audit_handler(
                 <td>{ts}</td>\
                 <td><span class=\"badge badge-info\">{action}</span></td>\
                 <td>{target_str}</td>\
-                <td style=\"font-family: monospace; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\">{payload}</td>\
+                <td class=\"cell-payload-mono\">{payload}</td>\
             </tr>"
         ));
     }
@@ -919,7 +919,7 @@ pub(crate) async fn get_partial_admin_audit_handler(
                 <td><code>{actor_str}</code></td>\
                 <td><span class=\"badge badge-info\">{action}</span></td>\
                 <td>{target_str}</td>\
-                <td style=\"font-family: monospace; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\">{payload}</td>\
+                <td class=\"cell-payload-mono\">{payload}</td>\
             </tr>"
         ));
     }
@@ -1016,7 +1016,7 @@ pub(crate) fn render_logs_table_html(json: &serde_json::Value, is_api: bool, det
             };
 
             out.push_str(&format!(
-                "<tr style=\"cursor:pointer;\" hx-get=\"{detail_base}/{req_id}\" hx-target=\"#drawer-content\" data-action=\"open-drawer\">\
+                "<tr class=\"row-clickable\" hx-get=\"{detail_base}/{req_id}\" hx-target=\"#drawer-content\" data-action=\"open-drawer\">\
                     <td>{ts}</td>\
                     <td>{status_badge}</td>\
                     <td><strong>{model}</strong></td>\
@@ -1204,7 +1204,7 @@ pub(crate) fn render_log_detail_drawer_html(json: &serde_json::Value) -> String 
             </div>\
             <div class=\"drawer-section\">\
                 <h4>6. Upstream Attempts</h4>\
-                <ul style=\"padding-left: 1.25rem; font-size: 0.8125rem;\">{attempts_html}</ul>\
+                <ul class=\"list-compact\">{attempts_html}</ul>\
             </div>\
             <div class=\"drawer-section\">\
                 <h4>7. Trace & Diagnostics</h4>\
@@ -1325,16 +1325,16 @@ pub(crate) fn render_usage_ledger_html(json: &serde_json::Value) -> String {
         / 1_000_000.0;
 
     let mut out = format!(
-        "<div class=\"card\" style=\"margin-bottom: 1.5rem;\">\
-            <div style=\"display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; text-align: center;\">\
-                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Total tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{total_tokens}</div></div>\
-                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Input tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{input_tokens}</div></div>\
-                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Output tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{output_tokens}</div></div>\
-                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Cache read tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{cache_read}</div></div>\
-                <div><div class=\"text-muted\" style=\"font-size: 0.75rem; text-transform: uppercase;\">Cache write tokens</div><div style=\"font-size: 1.5rem; font-weight: 700;\">{cache_write}</div></div>\
+        "<div class=\"card mb-6\">\
+            <div class=\"ledger-strip-grid\">\
+                <div><div class=\"text-muted ledger-strip-label\">Total tokens</div><div class=\"ledger-strip-val\">{total_tokens}</div></div>\
+                <div><div class=\"text-muted ledger-strip-label\">Input tokens</div><div class=\"ledger-strip-val\">{input_tokens}</div></div>\
+                <div><div class=\"text-muted ledger-strip-label\">Output tokens</div><div class=\"ledger-strip-val\">{output_tokens}</div></div>\
+                <div><div class=\"text-muted ledger-strip-label\">Cache read tokens</div><div class=\"ledger-strip-val\">{cache_read}</div></div>\
+                <div><div class=\"text-muted ledger-strip-label\">Cache write tokens</div><div class=\"ledger-strip-val\">{cache_write}</div></div>\
             </div>\
-            <div style=\"margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; font-size: 0.875rem;\">\
-                <div>Billed Cost: <strong>${billed_usd:.4}</strong> (List: <span style=\"text-decoration: line-through;\">${list_usd:.4}</span>)</div>\
+            <div class=\"ledger-strip-footer\">\
+                <div>Billed Cost: <strong>${billed_usd:.4}</strong> (List: <span class=\"text-strike\">${list_usd:.4}</span>)</div>\
                 <div class=\"text-success\">Plan Covered Savings: <strong>${savings_usd:.4}</strong></div>\
             </div>\
         </div>\
@@ -1411,7 +1411,7 @@ pub(crate) fn render_usage_ledger_html(json: &serde_json::Value) -> String {
 
         let credits_used = if coverage == "subscription_plan" {
             format!(
-                "<span style=\"text-decoration: line-through;\">${list_usd:.4}</span> <span class=\"badge badge-success\">Covered by plan credits</span>"
+                "<span class=\"text-strike\">${list_usd:.4}</span> <span class=\"badge badge-success\">Covered by plan credits</span>"
             )
         } else {
             format!("<span>${cost_usd:.4}</span>")

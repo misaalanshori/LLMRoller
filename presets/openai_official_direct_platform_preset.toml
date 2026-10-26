@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "openai_official_direct_platform_preset"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

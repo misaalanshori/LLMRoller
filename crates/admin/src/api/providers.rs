@@ -12,6 +12,56 @@ pub(crate) async fn get_user_providers(
     Ok(Json(providers))
 }
 
+/// Resolves optional `preset_id` defaults (`default_base_url` and `default_provider_config`) from
+/// `llmroller_proto::providers::ALL_PROVIDER_PRESET_SPECS` (`F101`–`F180`).
+pub(crate) fn apply_preset_defaults(
+    base_url: String,
+    config_json: String,
+    preset_id: Option<&str>,
+) -> (String, String) {
+    let parsed_cfg = ProviderConfig::from_json(&config_json);
+    let effective_preset = preset_id.or(parsed_cfg.preset_id.as_deref());
+    let Some(slug) = effective_preset else {
+        return (base_url, config_json);
+    };
+    let Some(spec) = llmroller_proto::providers::lookup_provider_preset(slug) else {
+        return (base_url, config_json);
+    };
+    let resolved_url = if base_url.trim().is_empty() {
+        spec.default_base_url.to_string()
+    } else {
+        base_url
+    };
+    let resolved_cfg = if config_json.trim().is_empty() || config_json.trim() == "{}" {
+        serde_json::to_string(&(spec.default_provider_config)()).unwrap_or(config_json)
+    } else {
+        config_json
+    };
+    (resolved_url, resolved_cfg)
+}
+
+/// Returns all 80 compiled-in provider presets (`F101`–`F180`).
+pub(crate) async fn get_provider_presets_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_actor(&state, &headers, false).await?;
+    let presets: Vec<serde_json::Value> = llmroller_proto::providers::ALL_PROVIDER_PRESET_SPECS
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "finding_id": spec.finding_id,
+                "preset_id": spec.preset_id,
+                "display_name": spec.display_name,
+                "default_base_url": spec.default_base_url,
+                "supported_protocols": spec.supported_protocols,
+                "default_models": spec.default_models,
+            })
+        })
+        .collect();
+    Ok(Json(presets))
+}
+
 pub(crate) async fn post_user_provider(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -20,12 +70,17 @@ pub(crate) async fn post_user_provider(
     let actor = authenticate_actor(&state, &headers, true).await?;
     validate_provider_config_json(&payload.config_json)?;
     let owner_user_id = actor.user_id();
+    let (base_url, config_json) = apply_preset_defaults(
+        payload.base_url,
+        payload.config_json,
+        payload.preset_id.as_deref(),
+    );
 
     let new_provider = NewProvider {
         name: payload.name,
         kind: payload.kind,
-        base_url: payload.base_url,
-        config_json: payload.config_json,
+        base_url,
+        config_json,
         ownership_scope: OwnershipScope::Personal,
         owner_user_id,
         usage_url_cross_origin_ack: payload.usage_url_cross_origin_ack,
@@ -209,11 +264,16 @@ pub(crate) async fn post_admin_provider(
 ) -> Result<(StatusCode, Json<Provider>), (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_admin(&state, &headers, true).await?;
     validate_provider_config_json(&payload.config_json)?;
+    let (base_url, config_json) = apply_preset_defaults(
+        payload.base_url,
+        payload.config_json,
+        payload.preset_id.as_deref(),
+    );
     let new_provider = NewProvider {
         name: payload.name,
         kind: payload.kind,
-        base_url: payload.base_url,
-        config_json: payload.config_json,
+        base_url,
+        config_json,
         ownership_scope: OwnershipScope::Global,
         owner_user_id: None,
         usage_url_cross_origin_ack: payload.usage_url_cross_origin_ack,

@@ -22,7 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "google_generative_ai_studio_and_vertex_ai"
+"x-goog-api-client" = "genai-rs/1.0.0"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

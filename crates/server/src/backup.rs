@@ -144,7 +144,19 @@ pub async fn restore_backup(
     if let Ok(file) = File::open(&staging_path) {
         let _ = file.sync_all();
     }
+    // FND-027: Remove any pre-existing -wal and -shm sidecar files before and after swapping the restored database
+    // so SQLite never replays old WAL frames onto the newly restored database file.
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = target_db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(std::path::PathBuf::from(sidecar));
+    }
     fs::rename(&staging_path, target_db_path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = target_db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(std::path::PathBuf::from(sidecar));
+    }
     if let Ok(parent_dir) = File::open(parent) {
         let _ = parent_dir.sync_all();
     }

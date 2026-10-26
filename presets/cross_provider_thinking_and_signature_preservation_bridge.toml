@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "cross_provider_thinking_and_signature_preservation_bridge"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

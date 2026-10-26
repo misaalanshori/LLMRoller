@@ -857,7 +857,8 @@ async fn finalize(
     let updated = sqlx::query(
         "UPDATE instance_meta SET active_master_key_id = ?, rotation_state = 'idle', \
          rotation_from_key_id = NULL, rotation_to_key_id = NULL, \
-         rotation_cursor_table = NULL, rotation_cursor_id = NULL, updated_at = ? \
+         rotation_cursor_table = NULL, rotation_cursor_id = NULL, \
+         config_version = config_version + 1, updated_at = ? \
          WHERE singleton = 1",
     )
     .bind(new_key_id)

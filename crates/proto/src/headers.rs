@@ -395,6 +395,34 @@ pub fn resolve_user_agent(
     }
 }
 
+/// Extracts the original caller's client identifier from inbound headers (`x-client-name`, `x-title`,
+/// or the primary product token from `user-agent`) for transparent proxy forwarding (`SRDD 12.1`).
+///
+/// Never returns `"llmroller"` or `"LLMRoller"` so the proxy remains transparent unless the caller
+/// itself explicitly sent that identifier.
+#[must_use]
+pub fn extract_caller_client_name(inbound: &HeaderMap) -> Option<String> {
+    for hdr in ["x-client-name", "x-title", "http-x-title", "x-app-name"] {
+        if let Some(val) = inbound.get(hdr).and_then(|v| v.to_str().ok()) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("llmroller") {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(ua) = inbound.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
+        let trimmed = ua.trim();
+        if !trimmed.is_empty() {
+            let first_token = trimmed.split_whitespace().next().unwrap_or(trimmed);
+            let product = first_token.split('/').next().unwrap_or(first_token).trim();
+            if !product.is_empty() && !product.eq_ignore_ascii_case("llmroller") {
+                return Some(product.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Determine whether a User-Agent identifies a recognized coding agent per Section 12.2.
 #[must_use]
 pub fn is_coding_agent_ua(ua: &str) -> bool {

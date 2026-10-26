@@ -459,3 +459,38 @@ fn test_responses_failover_sanitization_openai_compat_and_wildcard_body_edits() 
         "ephemeral"
     );
 }
+
+// Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#123-surgical-json-body-validation-and-edits | Phase: ./docs/bigbang/big-bang-phases-2.md#24-sub-phase-24-zero-copy-surgical-json-span-editor-duplicate-key-guard-and-body-edit-fuzzer
+#[test]
+#[doc = "Spec: API-1, TRN-1 - extract model and stream flag from Gemini URL path, Bedrock modelId, and Cloud Code Assist request envelope"]
+fn test_scan_top_level_with_fallback_extracts_gemini_path_and_nested_models() {
+    let gemini_body = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+    let scan = scan_top_level_with_fallback(
+        gemini_body,
+        Some("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"),
+    )
+    .expect("scan gemini");
+    assert_eq!(
+        scan.model.as_ref().map(|(m, _)| m.as_str()),
+        Some("gemini-2.5-pro")
+    );
+    assert_eq!(scan.stream.map(|(s, _)| s), Some(true));
+
+    let cca_body = br#"{"project":"p1","request":{"model":"gemini-2.5-flash","stream":true,"contents":[]}}"#;
+    let scan_cca = scan_top_level_with_fallback(cca_body, None).expect("scan cca");
+    assert_eq!(
+        scan_cca.model.as_ref().map(|(m, _)| m.as_str()),
+        Some("gemini-2.5-flash")
+    );
+    assert_eq!(scan_cca.stream.map(|(s, _)| s), Some(true));
+
+    let bedrock_body = br#"{"modelId":"anthropic.claude-sonnet-4-6-v1:0","messages":[]}"#;
+    let scan_bed =
+        scan_top_level_with_fallback(bedrock_body, Some("/model/anthropic.claude-sonnet-4-6-v1:0/converse-stream"))
+            .expect("scan bedrock");
+    assert_eq!(
+        scan_bed.model.as_ref().map(|(m, _)| m.as_str()),
+        Some("anthropic.claude-sonnet-4-6-v1:0")
+    );
+    assert_eq!(scan_bed.stream.map(|(s, _)| s), Some(true));
+}

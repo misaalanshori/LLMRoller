@@ -44,7 +44,7 @@ pub(crate) async fn handle_streaming_attempt(
         cand_cov_mode: _,
         cand_mult_bps: _,
         attempt_endpoint: _,
-        transcode_pair: _,
+        transcode_pair,
         strip_injected_usage,
         pinned_order,
         live_pin_ticket,
@@ -402,7 +402,7 @@ pub(crate) async fn handle_streaming_attempt(
                     return None;
                 }
 
-                let ttfb_ms = (now_ms() - attempt_started).max(0);
+                let ttfb_ms = (state.clock.now_ms() - attempt_started).max(0);
                 if ttfb_ms >= 10_000 {
                     crate::metrics::record_upstream_slow(&candidate.provider_id.to_string());
                 }
@@ -527,7 +527,33 @@ pub(crate) async fn handle_streaming_attempt(
                     estimated_input_tokens: input_tokens_est,
                     started_ms: attempt_started,
                     ttfb_ms: Some(ttfb_ms),
+                    bytes_sent: first_chunk.as_ref().map_or(0, Bytes::len),
                     finalized: false,
+                };
+
+                let stream_transcoder = if let Some((src_wire, dst_wire)) = transcode_pair {
+                    if src_wire != dst_wire
+                        || dst_wire == llmroller_proto::transcode::WireProtocol::CommandCodeGenerate
+                    {
+                        Some(llmroller_proto::transcode::SseStreamTranscoder::new(
+                            dst_wire,
+                            src_wire,
+                            &model.canonical_id,
+                        ))
+                    } else {
+                        None
+                    }
+                } else if candidate.provider_kind == ProviderKind::CommandCode
+                    && let Some(src_wire) =
+                        llmroller_proto::transcode::WireProtocol::from_catalog_str(protocol)
+                {
+                    Some(llmroller_proto::transcode::SseStreamTranscoder::new(
+                        llmroller_proto::transcode::WireProtocol::CommandCodeGenerate,
+                        src_wire,
+                        &model.canonical_id,
+                    ))
+                } else {
+                    None
                 };
 
                 let lifecycle = RequestLifecycle::new(request_id, attempt_started, None);
@@ -535,6 +561,7 @@ pub(crate) async fn handle_streaming_attempt(
                     upstream,
                     pending: VecDeque::new(),
                     forwarder: SseChunkForwarder::new(strip_injected_usage),
+                    transcoder: stream_transcoder,
                     finalizer: Some(finalizer),
                     lifecycle,
                     idle_timeout: Duration::from_millis(candidate.config.stream_idle_timeout_ms()),
@@ -544,18 +571,26 @@ pub(crate) async fn handle_streaming_attempt(
                     _in_flight: in_flight.take().expect("in-flight guard"),
                     done: false,
                 };
-                // Feed the pre-commit chunk through the SAME forwarder that owns the
+                // Feed the pre-commit chunk through the SAME transcoder/forwarder that owns the
                 // stream state. A temporary forwarder would discard an incomplete
-                // trailing frame, corrupting the first client-visible SSE event (F015).
+                // trailing frame, corrupting the first client-visible SSE event (F015, FND-031).
                 if let Some(bytes) = first_chunk {
-                    for part in stream_state.forwarder.process_chunk(&bytes) {
-                        stream_state.pending.push_back(part);
+                    if let Some(ref mut tc) = stream_state.transcoder {
+                        for transcoded_frame in tc.push_chunk(&bytes) {
+                            for part in stream_state.forwarder.process_chunk(&transcoded_frame) {
+                                stream_state.pending.push_back(part);
+                            }
+                        }
+                    } else {
+                        for part in stream_state.forwarder.process_chunk(&bytes) {
+                            stream_state.pending.push_back(part);
+                        }
                     }
                 }
                 let metered = stream::unfold(stream_state, |mut stream_state| async move {
                     loop {
                         if let Some(bytes) = stream_state.pending.pop_front() {
-                            stream_state.lifecycle.record_first_frame(now_ms());
+                            stream_state.lifecycle.record_first_frame(stream_state.finalizer.as_ref().map_or_else(now_ms, |f| f.state.clock.now_ms()));
                             return Some((Ok::<Bytes, std::io::Error>(bytes), stream_state));
                         }
                         if stream_state.done {
@@ -606,19 +641,33 @@ pub(crate) async fn handle_streaming_attempt(
                             }
                             StreamStep::Item(Some(Ok(chunk))) => {
                                 if let Some(finalizer) = &mut stream_state.finalizer {
+                                    finalizer.bytes_sent = finalizer.bytes_sent.saturating_add(chunk.len());
                                     finalizer.tap.feed_chunk(&chunk);
                                     if let Some(trace) = &mut finalizer.trace {
                                         trace.tap.feed_sse_chunk(&chunk);
                                     }
                                 }
-                                let parts = stream_state.forwarder.process_chunk(&chunk);
-                                stream_state.pending.extend(parts);
+                                if let Some(ref mut tc) = stream_state.transcoder {
+                                    for transcoded_frame in tc.push_chunk(&chunk) {
+                                        let parts = stream_state.forwarder.process_chunk(&transcoded_frame);
+                                        stream_state.pending.extend(parts);
+                                    }
+                                } else {
+                                    let parts = stream_state.forwarder.process_chunk(&chunk);
+                                    stream_state.pending.extend(parts);
+                                }
                             }
                             StreamStep::Item(Some(Err(_))) => {
                                 stream_state.finish(Termination::UpstreamTruncated);
                                 return None;
                             }
                             StreamStep::Item(None) => {
+                                if let Some(ref mut tc) = stream_state.transcoder {
+                                    for transcoded_tail in tc.finish() {
+                                        let parts = stream_state.forwarder.process_chunk(&transcoded_tail);
+                                        stream_state.pending.extend(parts);
+                                    }
+                                }
                                 if let Some(tail) = stream_state.forwarder.finish() {
                                     stream_state.pending.push_back(tail);
                                 }

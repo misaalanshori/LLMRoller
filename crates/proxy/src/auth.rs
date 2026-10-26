@@ -296,9 +296,7 @@ pub async fn client_key_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
+    let now_ms = state.clock.now_ms();
 
     let peer_addr = request
         .extensions()
@@ -524,6 +522,7 @@ pub async fn client_key_auth_middleware(
                     )
                 }
                 GateFailure::G4CidrForbidden => {
+                    state.record_failure(client_ip, "cidr_forbidden", now_ms).await;
                     record_gate_usage_event(403, "permission_error");
                     crate::orchestrator::build_protocol_error_response(
                         is_messages_path,

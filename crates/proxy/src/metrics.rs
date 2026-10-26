@@ -127,6 +127,7 @@ pub fn record_upstream_ttfb(endpoint: &'static str, provider_kind: &str, seconds
         "provider_kind" => provider_kind.to_owned(),
     )
     .record(seconds);
+    record_ttft_seconds(endpoint, provider_kind, seconds);
 }
 
 /// Maximum number of distinct canonical model IDs tracked as their own
@@ -205,6 +206,67 @@ pub fn record_job_failed(job: &'static str) {
 pub fn record_wal_bytes(bytes: u64) {
     let _ = get_or_init_prometheus_recorder();
     metrics::gauge!("llmroller_wal_bytes").set(bytes as f64);
+}
+
+/// Set the current number of active SSE streams (`OBS-1`, `FND-040`).
+pub fn record_active_streams(count: usize) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::gauge!("llmroller_active_streams").set(count as f64);
+}
+
+/// Set the circuit-breaker state (`0 = closed`, `1 = half_open`, `2 = open`) for a provider (`OBS-1`, `FND-040`).
+pub fn record_circuit_breaker_state(provider_id: &str, state_code: u8) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("provider_id", provider_id)];
+    let _ = validate_metric_labels(&labels);
+    metrics::gauge!(
+        "llmroller_circuit_breaker_state",
+        "provider_id" => provider_id.to_owned()
+    )
+    .set(f64::from(state_code));
+}
+
+/// Set the current number of in-flight trace sealer jobs (`OBS-1`, `FND-040`).
+pub fn record_sealer_in_flight(count: usize) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::gauge!("llmroller_sealer_in_flight").set(count as f64);
+}
+
+/// Record a queue drop event by reason (`"raw_events"`, `"trace_input"`, `"sealer_backlog"`) (`OBS-1`, `FND-040`).
+pub fn record_queue_drop(reason: &'static str) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("reason", reason)];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!("llmroller_queue_drops_total", "reason" => reason).increment(1);
+}
+
+/// Record an OAuth token refresh outcome (`"refreshed"` or `"failed"`) (`OBS-1`, `FND-040`).
+pub fn record_oauth_refresh(outcome: &'static str) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("outcome", outcome)];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!("llmroller_oauth_refreshes_total", "outcome" => outcome).increment(1);
+}
+
+/// Record a session pin lookup outcome (`"hit"`, `"miss"`, `"repin"`) (`OBS-1`, `FND-040`).
+pub fn record_pin_hit(outcome: &'static str) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("outcome", outcome)];
+    let _ = validate_metric_labels(&labels);
+    metrics::counter!("llmroller_pin_hits_total", "outcome" => outcome).increment(1);
+}
+
+/// Record time-to-first-token (TTFT) in seconds alongside `llmroller_upstream_ttfb_seconds` (`OBS-1`, `FND-040`).
+pub fn record_ttft_seconds(endpoint: &'static str, provider_kind: &str, seconds: f64) {
+    let _ = get_or_init_prometheus_recorder();
+    let labels = [("endpoint", endpoint), ("provider_kind", provider_kind)];
+    let _ = validate_metric_labels(&labels);
+    metrics::histogram!(
+        "llmroller_ttft_seconds",
+        "endpoint" => endpoint,
+        "provider_kind" => provider_kind.to_owned(),
+    )
+    .record(seconds);
 }
 
 /// Record a failed upstream attempt that triggered failover (RTE-8).
@@ -329,5 +391,23 @@ mod tests {
         record_trace_dropped();
         assert!(validate_metric_labels(&[("provider_id", "prv_test")]).is_ok());
         assert!(validate_metric_labels(&[("user_email", "bad")]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fnd040_tests {
+    use super::*;
+
+    #[test]
+    #[doc = "Spec: OBS-1"]
+    fn records_extended_srdd_17_metrics_within_closed_allowlist() {
+        record_active_streams(3);
+        record_circuit_breaker_state("prv_1", 0);
+        record_sealer_in_flight(1);
+        record_queue_drop("raw_events");
+        record_oauth_refresh("refreshed");
+        record_pin_hit("hit");
+        record_ttft_seconds("chat", "openrouter", 0.05);
+        assert_eq!(CLOSED_LABEL_ALLOWLIST.len(), 10);
     }
 }

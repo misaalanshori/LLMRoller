@@ -317,6 +317,7 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     let open_streams = Arc::new(AtomicUsize::new(2));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
+    let (listener_stop_tx, listener_stop_rx) = tokio::sync::watch::channel(false);
     let shutdown = ShutdownSupervisor::new(
         is_ready.clone(),
         open_streams.clone(),
@@ -324,7 +325,8 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
         pool.clone(),
         Duration::from_millis(10), // fast drain grace for test
         Duration::from_millis(50), // fast drain timeout for test
-    );
+    )
+    .with_listener_stop(listener_stop_tx);
 
     // Simulate active in-flight stream that listens for shutdown_notify
     let cut_observed = Arc::new(AtomicBool::new(false));
@@ -339,8 +341,9 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     let exit_code = shutdown.execute_graceful_shutdown().await;
     assert_eq!(exit_code, 0);
 
-    // Step 1: /readyz flipped to 503 (is_ready == false)
+    // Step 1 & Step 2: /readyz flipped to 503 and listener_stop signaled immediately
     assert!(!is_ready.load(Ordering::SeqCst));
+    assert!(*listener_stop_rx.borrow());
 
     // Step 4: Stragglers cancelled with ShutdownCut
     assert!(cut_observed.load(Ordering::SeqCst));

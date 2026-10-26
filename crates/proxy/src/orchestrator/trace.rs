@@ -290,6 +290,7 @@ pub(crate) struct StreamFinalizer {
     pub(crate) estimated_input_tokens: i64,
     pub(crate) started_ms: i64,
     pub(crate) ttfb_ms: Option<i64>,
+    pub(crate) bytes_sent: usize,
     pub(crate) finalized: bool,
 }
 
@@ -300,7 +301,7 @@ impl StreamFinalizer {
         }
         self.finalized = true;
 
-        let finished_ms = now_ms();
+        let finished_ms = self.state.clock.now_ms();
         // F009: Flush any trailing unterminated SSE frame before computing final usage.
         self.tap.finish();
         let mut extracted = self.tap.finalize_usage();
@@ -344,17 +345,30 @@ impl StreamFinalizer {
         }
         self.cap_guards.commit(effective_cost);
 
+        let final_attempt_outcome = match termination {
+            Termination::Completed => llmroller_core::usage::AttemptOutcome::Served,
+            Termination::IdleTimeout => llmroller_core::usage::AttemptOutcome::WaitTimeout,
+            Termination::UpstreamTruncated => llmroller_core::usage::AttemptOutcome::ConnectError,
+            Termination::ClientGone | Termination::ShutdownCut => {
+                llmroller_core::usage::AttemptOutcome::WriteStalled
+            }
+        };
+        let final_charge_basis = if termination.is_incomplete() && self.tap.observed_usage.is_none() {
+            "estimated_incomplete"
+        } else {
+            "actual"
+        };
         let served_attempt = attempt_record(
             self.usage.request_id,
             self.attempts.len() as i64 + 1,
             finished_ms,
             self.attempt_key_id,
             self.usage.share_id.clone(),
-            llmroller_core::usage::AttemptOutcome::Served,
+            final_attempt_outcome,
             Some(self.http_status),
-            0,
+            self.bytes_sent,
             effective_cost,
-            "actual",
+            final_charge_basis,
         );
         self.attempts.push(served_attempt);
 
@@ -541,14 +555,16 @@ pub struct ActiveStreamGuard(Arc<AtomicUsize>);
 impl ActiveStreamGuard {
     #[must_use]
     pub fn acquire(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
+        let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::metrics::record_active_streams(next);
         Self(counter)
     }
 }
 
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.0.fetch_sub(1, Ordering::SeqCst);
+        crate::metrics::record_active_streams(prev.saturating_sub(1));
     }
 }
 

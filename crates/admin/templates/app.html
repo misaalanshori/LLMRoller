@@ -20,6 +20,8 @@
         <button class="tab-btn" data-tab="tab-sessions">Active Sessions</button>
         <button class="tab-btn" data-tab="tab-logs">Logs</button>
         <button class="tab-btn" data-tab="tab-ledger">Usage Ledger</button>
+        <button class="tab-btn" data-tab="tab-service-accounts">Service Accounts</button>
+        <button class="tab-btn" data-tab="tab-security">Account & Security</button>
         <button class="tab-btn" data-tab="tab-audit">Audit Log</button>
     </div>
 
@@ -43,8 +45,16 @@
             </div>
             <div class="card stat-card">
                 <div class="stat-label">Default Routing</div>
-                <div class="stat-val text-primary" style="font-size: 1.1rem; padding-top: 0.5rem;">SWRR</div>
+                <div class="stat-val text-primary stat-val-compact">SWRR</div>
                 <div class="stat-desc">Smooth Weighted Round Robin</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Personal Spend & Token Throughput</h3>
+            <p id="personal-uplot-summary" class="card-desc">Loading personal usage telemetry...</p>
+            <div id="personal-usage-chart" class="uplot-container uplot-box">
+                <span class="text-muted">Personal usage time-series</span>
             </div>
         </div>
 
@@ -252,7 +262,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                 </div>
             </div>
             <div id="logs-table-container" hx-get="/app/partials/logs?stream=inference" hx-trigger="load">
-                <p class="text-muted text-center" style="padding: 1.5rem;">Loading logs...</p>
+                <p class="text-muted text-center p-6">Loading logs...</p>
             </div>
         </div>
     </div>
@@ -267,7 +277,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                 </div>
             </div>
             <div id="ledger-content" hx-get="/app/partials/ledger" hx-trigger="load">
-                <p class="text-muted text-center" style="padding: 1.5rem;">Loading usage ledger...</p>
+                <p class="text-muted text-center p-6">Loading usage ledger...</p>
             </div>
         </div>
     </div>
@@ -299,7 +309,122 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             </div>
         </div>
     </div>
+
+    <!-- Tab: Service Accounts & CIDR Allowlists (SRDD 14.j / 14.k, FND-045) -->
+    <div id="tab-service-accounts" class="tab-pane">
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Service Accounts & CIDR Allowlists</h3>
+                    <p class="card-desc">Machine identities with up to 64 IPv4/IPv6 CIDR restrictions.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" data-modal-open="modal-new-service-account">+ New Service Account</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Description</th>
+                            <th>CIDR Allowlist</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="service-accounts-body">
+                        <tr><td colspan="5" class="text-center text-muted">Loading service accounts...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Account & Security (SRDD 14.u, FND-045) -->
+    <div id="tab-security" class="tab-pane">
+        <div class="grid-2col">
+            <div class="card">
+                <h3>Change Password</h3>
+                <p class="card-desc">Update your password and revoke other active web sessions.</p>
+                <form id="form-change-password">
+                    <div class="form-group">
+                        <label for="sec-current-password">Current Password</label>
+                        <input id="sec-current-password" type="password" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="sec-new-password">New Password (min 12 chars)</label>
+                        <input id="sec-new-password" type="password" minlength="12" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Update Password</button>
+                </form>
+            </div>
+            <div class="card">
+                <h3>Two-Factor Authentication (TOTP)</h3>
+                <p class="card-desc">Enroll a TOTP authenticator app and generate single-use recovery codes.</p>
+                <div id="totp-enrollment-box">
+                    <button type="button" class="btn btn-primary" data-action="enroll-totp">Enroll 2FA Authenticator</button>
+                </div>
+                <form id="form-verify-totp" class="mt-4">
+                    <div class="form-group">
+                        <label for="sec-totp-code">Confirm 6-Digit TOTP Code</label>
+                        <input id="sec-totp-code" type="text" inputmode="numeric" placeholder="123456">
+                    </div>
+                    <button type="submit" class="btn btn-sm btn-primary">Verify & Enable 2FA</button>
+                </form>
+            </div>
+        </div>
+        <div class="grid-2col mt-6">
+            <div class="card">
+                <h3>Active Web Sessions</h3>
+                <p class="card-desc">Browsers currently signed in to your workspace account.</p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Session</th>
+                                <th>IP Address</th>
+                                <th>Last Seen</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="web-sessions-body">
+                            <tr><td colspan="4" class="text-center text-muted">Loading active web sessions...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card">
+                <h3>UI Theme & Routing Preferences</h3>
+                <form id="form-user-preferences">
+                    <div class="form-group">
+                        <label for="pref-theme">Theme</label>
+                        <select id="pref-theme">
+                            <option value="dark">Dark (#0d0d0d)</option>
+                            <option value="light">Light (#ffffff)</option>
+                            <option value="system">System</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="pref-nav-layout">Navigation Layout</label>
+                        <select id="pref-nav-layout">
+                            <option value="top_tabs">Top Tabs</option>
+                            <option value="sidebar">Sidebar</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="pref-locale">Locale</label>
+                        <select id="pref-locale">
+                            <option value="en">English (en)</option>
+                            <option value="id">Bahasa Indonesia (id)</option>
+                            <option value="zh-CN">简体中文 (zh-CN)</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Save Preferences</button>
+                </form>
+            </div>
+        </div>
+    </div>
 </div>
+
 
 <!-- Modal: New Client Key -->
 <div id="modal-new-key" class="modal-backdrop">
@@ -375,12 +500,40 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             </div>
             <div class="form-group">
                 <label for="prov-kind">Provider Kind</label>
-                <select id="prov-kind">
+                <select id="prov-kind" name="provider_kind">
                     <option value="openrouter" selected>OpenRouter</option>
                     <option value="opencode_go">OpenCode Go</option>
                     <option value="command_code">Command Code</option>
                     <option value="open_design_amr">Open Design AMR</option>
-                    <option value="custom">Custom Upstream URL</option>
+                    <option value="custom">Custom / Preset Upstream (80 Built-In Presets)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="prov-preset-id">Provider Preset Catalog (80 Presets)</label>
+                <select id="prov-preset-id">
+                    <option value="">None (Standard Kind)</option>
+                    <option value="anthropic">Anthropic Messages API</option>
+                    <option value="openai">OpenAI Platform</option>
+                    <option value="google_gemini">Google Gemini API</option>
+                    <option value="google_vertex">Google Vertex AI</option>
+                    <option value="aws_bedrock">AWS Bedrock Converse</option>
+                    <option value="azure_openai">Azure OpenAI</option>
+                    <option value="deepseek">DeepSeek API</option>
+                    <option value="groq">Groq Cloud</option>
+                    <option value="together_ai">Together AI</option>
+                    <option value="fireworks_ai">Fireworks AI</option>
+                    <option value="mistral">Mistral AI</option>
+                    <option value="cohere">Cohere v2</option>
+                    <option value="xai">xAI Grok</option>
+                    <option value="perplexity">Perplexity Sonar</option>
+                    <option value="cerebras">Cerebras Inference</option>
+                    <option value="sambanova">SambaNova Cloud</option>
+                    <option value="github_copilot">GitHub Copilot</option>
+                    <option value="claude_code_oauth">Claude Code OAuth</option>
+                    <option value="openai_codex_oauth">OpenAI Codex CLI OAuth</option>
+                    <option value="ollama_local">Ollama Local</option>
+                    <option value="vllm_local">vLLM Local</option>
+                    <option value="lmstudio_local">LM Studio Local</option>
                 </select>
             </div>
             <div class="form-group">
@@ -488,6 +641,69 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
 </div>
 
 <!-- Inspection Drawer: Request Details (USG-9, SRDD 14.m) -->
-<div id="right-inspection-drawer" class="inspection-drawer" style="display: none;">
+<div id="right-inspection-drawer" class="inspection-drawer">
     <div id="drawer-content"></div>
+</div>
+
+<!-- Modal: New Service Account (SRDD 14.j, FND-045) -->
+<div id="modal-new-service-account" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Create Service Account</h3>
+            <button class="modal-close" data-modal-close="modal-new-service-account">&times;</button>
+        </div>
+        <form id="form-new-service-account">
+            <div class="form-group">
+                <label for="sa-name">Service Account Name</label>
+                <input id="sa-name" type="text" required placeholder="e.g. ci-pipeline-runner">
+            </div>
+            <div class="form-group">
+                <label for="sa-desc">Description</label>
+                <input id="sa-desc" type="text" placeholder="Automated CI agent identity">
+            </div>
+            <div class="form-group">
+                <label for="sa-cidrs">CIDR Allowlist (comma-separated)</label>
+                <input id="sa-cidrs" type="text" placeholder="e.g. 10.0.0.0/8, 192.168.1.0/24">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" data-modal-close="modal-new-service-account">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Service Account</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: Budget Window (SRDD 14.g, FND-045) -->
+<div id="modal-budget-window" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Configure Upstream Key Budget Window</h3>
+            <button class="modal-close" data-modal-close="modal-budget-window">&times;</button>
+        </div>
+        <form id="form-budget-window">
+            <input type="hidden" id="bw-upstream-key-id">
+            <div class="form-group">
+                <label for="bw-window-kind">Window Kind</label>
+                <select id="bw-window-kind">
+                    <option value="rolling">Rolling Window</option>
+                    <option value="anchored_calendar_month">Anchored Calendar Month</option>
+                    <option value="anchored_fixed">Anchored Fixed Period</option>
+                </select>
+            </div>
+            <div class="grid-2col">
+                <div class="form-group">
+                    <label for="bw-period-hours">Period (Hours)</label>
+                    <input id="bw-period-hours" type="number" value="5" min="1" max="744">
+                </div>
+                <div class="form-group">
+                    <label for="bw-limit-usd">Spend Limit ($ USD)</label>
+                    <input id="bw-limit-usd" type="number" step="0.01" required placeholder="e.g. 25.00">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" data-modal-close="modal-budget-window">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Budget Window</button>
+            </div>
+        </form>
+    </div>
 </div>

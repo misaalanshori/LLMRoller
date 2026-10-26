@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "pollinations_ai_and_puters_free_gateways"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

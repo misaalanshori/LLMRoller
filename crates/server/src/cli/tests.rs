@@ -126,3 +126,37 @@ use super::{Cli, Command};
         }
     }
 
+    #[test]
+    #[doc = "Spec: OBS-1, POR-1, RTE-11"]
+    fn serve_parses_log_level_and_log_format_and_pool_tier_roundtrips() {
+        let cli = Cli::try_parse_from([
+            "llmroller",
+            "serve",
+            "--log-level",
+            "debug",
+            "--log-format",
+            "pretty",
+        ])
+        .expect("valid serve CLI with log flags");
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.log_level, "debug");
+                assert_eq!(args.log_format, "pretty");
+            }
+            _ => panic!("expected Serve"),
+        }
+
+        use llmroller_core::eligibility::CandidatePoolTier;
+        for (code, expected) in [
+            (0_u8, CandidatePoolTier::Own),
+            (1_u8, CandidatePoolTier::Shared),
+            (2_u8, CandidatePoolTier::Global),
+            (3_u8, CandidatePoolTier::Blended),
+        ] {
+            let decoded = CandidatePoolTier::from_u8(code).expect("valid tier code");
+            assert_eq!(decoded, expected);
+            assert_eq!(decoded.as_u8(), code);
+        }
+        assert!(CandidatePoolTier::from_u8(4).is_none());
+    }
+

@@ -230,7 +230,7 @@ async fn v1_models_handler(
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let now = llmroller_core::seams::SystemClock::new().now_ms();
+    let now = state.clock.now_ms();
     let (models, aliases) = visible_models(&snapshot, &client_key, now);
 
     if headers.contains_key("anthropic-version") {

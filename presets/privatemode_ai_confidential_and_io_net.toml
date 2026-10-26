@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "privatemode_ai_confidential_and_io_net"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

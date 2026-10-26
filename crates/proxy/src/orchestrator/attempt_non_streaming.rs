@@ -90,6 +90,20 @@ pub(crate) async fn handle_non_streaming_attempt(
                 {
                     res.commit(charged_micro_usd, now);
                 }
+                let _ = state.runtime_state.record_upstream_failure(
+                    origin,
+                    candidate.upstream_key_id,
+                    caller.id,
+                    attempt_outcome,
+                    None,
+                    now,
+                );
+                enqueue_key_health(
+                    state.writer.as_ref(),
+                    &state.runtime_state,
+                    candidate.upstream_key_id,
+                    now,
+                );
                 let att = attempt_record(
                     request_id,
                     attempt_no as i64,
@@ -154,7 +168,7 @@ pub(crate) async fn handle_non_streaming_attempt(
                             CostSource::EstimatedIncomplete,
                             None,
                             None,
-                            Some(now_ms() - attempt_started),
+                            Some(state.clock.now_ms() - attempt_started),
                         );
                         writer
                             .queues
@@ -180,6 +194,20 @@ pub(crate) async fn handle_non_streaming_attempt(
         let body_bytes = match decode_upstream_body(content_encoding.as_deref(), body_bytes) {
             Ok(bytes) => bytes,
             Err(_) => {
+                let _ = state.runtime_state.record_upstream_failure(
+                    origin,
+                    candidate.upstream_key_id,
+                    caller.id,
+                    llmroller_core::usage::AttemptOutcome::ErrorFrame,
+                    None,
+                    now,
+                );
+                enqueue_key_health(
+                    state.writer.as_ref(),
+                    &state.runtime_state,
+                    candidate.upstream_key_id,
+                    now,
+                );
                 attempts.push(attempt_record(
                     request_id,
                     attempt_no as i64,
@@ -575,7 +603,7 @@ pub(crate) async fn handle_non_streaming_attempt(
                 cost.cost_source,
                 llmroller_proto::json_usage::extract_json_stop_reason(endpoint, &json_value),
                 None,
-                Some(now_ms() - attempt_started),
+                Some(state.clock.now_ms() - attempt_started),
             );
             let pending_ns_trace = trace_output.map(|(request_body, tap)| {
                 let raw_size = serde_json::to_vec(&json_value).map_or(usize::MAX, |raw| raw.len());
@@ -673,7 +701,7 @@ pub(crate) async fn handle_non_streaming_attempt(
                 cost.cost_micro_usd as u64,
             );
         }
-        let latency_duration = (now_ms() - attempt_started).max(0);
+        let latency_duration = (state.clock.now_ms() - attempt_started).max(0);
         crate::metrics::record_upstream_ttfb(
             endpoint_str,
             &candidate.provider_kind.to_string(),

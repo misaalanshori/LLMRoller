@@ -40,6 +40,27 @@ type UpstreamByteStream =
 
 /// Decode a possibly compressed upstream body as a stateful stream so chunk boundaries
 /// never matter (TRN-3). Unsupported encodings fail the stream and trigger failover.
+pub(crate) fn cap_decompressed_stream<S>(inner: S) -> UpstreamByteStream
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let mut cumulative = 0usize;
+    Box::pin(inner.map(move |res| match res {
+        Ok(chunk) => {
+            cumulative = cumulative.saturating_add(chunk.len());
+            if cumulative > crate::forward::MAX_DECOMPRESSED_BYTES {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SEC-8 decompressed stream exceeded 16 MiB limit",
+                ))
+            } else {
+                Ok(chunk)
+            }
+        }
+        Err(e) => Err(e),
+    }))
+}
+
 pub(crate) fn decode_upstream_stream(
     response: reqwest::Response,
     encoding: Option<String>,
@@ -53,11 +74,11 @@ pub(crate) fn decode_upstream_stream(
     let normalized = encoding.to_ascii_lowercase();
     let reader = StreamReader::new(raw);
     match normalized.as_str() {
-        "gzip" => Box::pin(ReaderStream::new(GzipDecoder::new(reader))),
-        "deflate" => Box::pin(ReaderStream::new(DeflateDecoder::new(reader))),
-        "zlib" => Box::pin(ReaderStream::new(ZlibDecoder::new(reader))),
-        "br" => Box::pin(ReaderStream::new(BrotliDecoder::new(reader))),
-        "zstd" => Box::pin(ReaderStream::new(ZstdDecoder::new(reader))),
+        "gzip" => cap_decompressed_stream(ReaderStream::new(GzipDecoder::new(reader))),
+        "deflate" => cap_decompressed_stream(ReaderStream::new(DeflateDecoder::new(reader))),
+        "zlib" => cap_decompressed_stream(ReaderStream::new(ZlibDecoder::new(reader))),
+        "br" => cap_decompressed_stream(ReaderStream::new(BrotliDecoder::new(reader))),
+        "zstd" => cap_decompressed_stream(ReaderStream::new(ZstdDecoder::new(reader))),
         _ => {
             let message = format!("unsupported content-encoding: {encoding}");
             Box::pin(stream::once(async move {
@@ -74,6 +95,7 @@ pub(crate) struct StreamState {
     pub(crate) upstream: UpstreamByteStream,
     pub(crate) pending: VecDeque<Bytes>,
     pub(crate) forwarder: SseChunkForwarder,
+    pub(crate) transcoder: Option<llmroller_proto::transcode::SseStreamTranscoder>,
     pub(crate) finalizer: Option<StreamFinalizer>,
     pub(crate) lifecycle: RequestLifecycle,
     /// Gap allowed between upstream bytes after the first valid frame.

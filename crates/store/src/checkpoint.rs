@@ -39,7 +39,15 @@ impl WalCheckpointSupervisor {
             self.is_ready.store(true, Ordering::SeqCst);
         }
 
-        if wal_bytes >= WAL_RESTART_THRESHOLD_BYTES {
+        if wal_bytes >= WAL_SATURATION_THRESHOLD_BYTES {
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+                .execute(pool)
+                .await?;
+            // Once emergency TRUNCATE checkpoint succeeds and disk is not full, restore readiness (FND-028).
+            if !self.storage_full.load(Ordering::SeqCst) {
+                self.is_ready.store(true, Ordering::SeqCst);
+            }
+        } else if wal_bytes >= WAL_RESTART_THRESHOLD_BYTES {
             sqlx::query("PRAGMA wal_checkpoint(RESTART);")
                 .execute(pool)
                 .await?;

@@ -323,7 +323,19 @@ impl ThreeQueueUsageWriter {
 
         let raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)> = {
             let mut lock = self.raw_events.lock();
-            std::mem::take(&mut *lock)
+            let mut batch = VecDeque::new();
+            let mut bytes_acc = 0usize;
+            while batch.len() < crate::writer::BATCH_MAX_ITEMS && bytes_acc < crate::writer::BATCH_MAX_BYTES {
+                let Some(item) = lock.pop_front() else {
+                    break;
+                };
+                bytes_acc += 512
+                    + item.0.request_headers_json.as_ref().map_or(0, String::len)
+                    + item.0.metadata_json.as_ref().map_or(0, String::len)
+                    + item.1.len() * 128;
+                batch.push_back(item);
+            }
+            batch
         };
 
         let r5_backup = r5_items.clone();
@@ -346,9 +358,19 @@ impl ThreeQueueUsageWriter {
         rh_items: HashMap<RollupHourlyKey, RollupDelta>,
         raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)>,
     ) -> Result<usize, sqlx::Error> {
-        // 1. Commit 5-minute rollups
-        for (k, d) in r5_items {
-            sqlx::query(
+        // 1. Commit 5-minute rollups with per-row SAVEPOINT isolation (FND-022)
+        for (idx, (k, d)) in r5_items.into_iter().enumerate() {
+            let sp = format!("sp_r5_{idx}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp}")))
+                .execute(&mut **tx)
+                .await?;
+            let norm_scope = match k.provider_scope.as_str() {
+                "own" | "personal" => "personal",
+                "shared" => "shared",
+                "global" => "global",
+                _ => "none",
+            };
+            let res = sqlx::query(
                 r#"INSERT INTO usage_rollups_5min (
                        bucket_ms, upstream_key_id, canonical_id, client_key_id,
                        owner_user_id, provider_scope, share_id, cost_micro_usd, requests
@@ -363,17 +385,36 @@ impl ThreeQueueUsageWriter {
             .bind(&k.canonical_id)
             .bind(&k.client_key_id)
             .bind(&k.owner_user_id)
-            .bind(&k.provider_scope)
+            .bind(norm_scope)
             .bind(&k.share_id)
             .bind(d.cost_micro_usd)
             .bind(d.requests)
             .execute(&mut **tx)
-            .await?;
+            .await;
+            if let Err(err) = res {
+                tracing::warn!(error = %err, "dropping invalid 5-min rollup without aborting batch");
+                sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp}")))
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp}")))
+                .execute(&mut **tx)
+                .await?;
         }
 
-        // 2. Commit hourly rollups
-        for (k, d) in rh_items {
-            sqlx::query(
+        // 2. Commit hourly rollups with per-row SAVEPOINT isolation (FND-022)
+        for (idx, (k, d)) in rh_items.into_iter().enumerate() {
+            let sp = format!("sp_rh_{idx}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("SAVEPOINT {sp}")))
+                .execute(&mut **tx)
+                .await?;
+            let norm_scope = match k.provider_scope.as_str() {
+                "own" | "personal" => "personal",
+                "shared" => "shared",
+                "global" => "global",
+                _ => "none",
+            };
+            let res = sqlx::query(
                 r#"INSERT INTO usage_rollups_hourly (
                        hour_ms, owner_user_id, client_key_id, upstream_key_id,
                        provider_id, provider_scope, share_id, canonical_id,
@@ -398,7 +439,7 @@ impl ThreeQueueUsageWriter {
             .bind(&k.client_key_id)
             .bind(&k.upstream_key_id)
             .bind(&k.provider_id)
-            .bind(&k.provider_scope)
+            .bind(norm_scope)
             .bind(&k.share_id)
             .bind(&k.canonical_id)
             .bind(d.requests)
@@ -411,7 +452,16 @@ impl ThreeQueueUsageWriter {
             .bind(d.cost_micro_usd)
             .bind(d.list_cost_micro_usd)
             .execute(&mut **tx)
-            .await?;
+            .await;
+            if let Err(err) = res {
+                tracing::warn!(error = %err, "dropping invalid hourly rollup without aborting batch");
+                sqlx::query(sqlx::AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp}")))
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!("RELEASE SAVEPOINT {sp}")))
+                .execute(&mut **tx)
+                .await?;
         }
 
         let raw_count = raw_items.len();

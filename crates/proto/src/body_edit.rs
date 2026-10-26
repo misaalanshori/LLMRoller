@@ -86,6 +86,68 @@ pub struct TopLevelScan {
     pub metadata_span: Option<Range<usize>>,
 }
 
+
+/// Scan top-level JSON request and fall back to nested `/request/model`, `/config/model`, `/modelId`,
+/// or URL-path model hints (e.g. `/v1beta/models/{model}:generateContent` or `:streamGenerateContent`) (`FND-015`).
+pub fn scan_top_level_with_fallback(
+    bytes: &[u8],
+    path_hint: Option<&str>,
+) -> Result<TopLevelScan, BodyEditError> {
+    let mut scan = scan_top_level(bytes)?;
+    if scan.model.is_none() || scan.stream.is_none() {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if scan.model.is_none() {
+                if let Some(m) = val
+                    .get("modelId")
+                    .or_else(|| val.pointer("/request/model"))
+                    .or_else(|| val.pointer("/config/model"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    scan.model = Some((m.to_string(), 0..0));
+                }
+            }
+            if scan.stream.is_none() {
+                if let Some(st) = val
+                    .pointer("/request/stream")
+                    .or_else(|| val.pointer("/params/stream"))
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    scan.stream = Some((st, 0..0));
+                }
+            }
+        }
+    }
+    if let Some(path) = path_hint {
+        if scan.model.is_none() {
+            if let Some(m) = extract_model_from_url_path(path) {
+                scan.model = Some((m, 0..0));
+            }
+        }
+        if scan.stream.is_none() && (path.contains(":streamGenerateContent") || path.contains("/converse-stream")) {
+            scan.stream = Some((true, 0..0));
+        }
+    }
+    Ok(scan)
+}
+
+/// Extract a model identifier from Gemini or Bedrock URL paths (`/models/{model}:generateContent` or `/model/{model}/converse`).
+#[must_use]
+pub fn extract_model_from_url_path(path: &str) -> Option<String> {
+    let without_query = path.split('?').next().unwrap_or(path);
+    for marker in ["/models/", "/model/"] {
+        if let Some(idx) = without_query.find(marker) {
+            let after = &without_query[idx + marker.len()..];
+            let segment = after.split('/').next().unwrap_or(after);
+            let model = segment.split(':').next().unwrap_or(segment).trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Scan top-level object members in a single pass enforcing all validation constraints.
 pub fn scan_top_level(bytes: &[u8]) -> Result<TopLevelScan, BodyEditError> {
     if bytes.starts_with(b"\xef\xbb\xbf") {

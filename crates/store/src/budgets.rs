@@ -36,6 +36,8 @@ pub async fn reconstruct_budgets_from_rollups(
     max_window_period_ms: i64,
 ) -> Result<RebuiltState, sqlx::Error> {
     let cutoff_ms = now_ms - max_window_period_ms - 300_000;
+    let current_month_start_ms = UtcYearMonth::from_epoch_millis(now_ms).start_epoch_millis();
+    let month_cutoff_ms = cutoff_ms.min(current_month_start_ms);
 
     let bucket_width_ms = RollingRing::new(max_window_period_ms).bucket_width_ms;
     let mut key_rings: HashMap<UpstreamKeyId, RollingRing> = HashMap::new();
@@ -110,7 +112,7 @@ pub async fn reconstruct_budgets_from_rollups(
            WHERE bucket_ms >= ?
            GROUP BY client_key_id, epoch_day"#,
     )
-    .bind(cutoff_ms)
+    .bind(month_cutoff_ms)
     .fetch(pool);
     while let Some(r) = client_rows.try_next().await? {
         let client_key_id_str: &str = r.try_get(0)?;
@@ -132,7 +134,7 @@ pub async fn reconstruct_budgets_from_rollups(
            WHERE bucket_ms >= ? AND provider_scope = 'global'
            GROUP BY owner_user_id, epoch_day"#,
     )
-    .bind(cutoff_ms)
+    .bind(month_cutoff_ms)
     .fetch(pool);
     while let Some(r) = user_rows.try_next().await? {
         let owner_user_id_str: &str = r.try_get(0)?;
@@ -153,7 +155,7 @@ pub async fn reconstruct_budgets_from_rollups(
            WHERE bucket_ms >= ? AND share_id <> ''
            GROUP BY share_id, epoch_day"#,
     )
-    .bind(cutoff_ms)
+    .bind(month_cutoff_ms)
     .fetch(pool);
     while let Some(r) = share_rows.try_next().await? {
         let share_id_str: &str = r.try_get(0)?;
@@ -309,6 +311,40 @@ pub async fn sum_budget_adjustments_for_window(
     .fetch_one(pool)
     .await?;
     Ok(sum.unwrap_or(0))
+}
+
+/// Compute the active manual calibration offset for a budget window in the window instance containing `now_ms` (`LIM-1`, `FND-006`).
+///
+/// Only sums adjustments whose `effective_at` falls within `[now_ms - period_ms, now_ms]` (or matching `window_instance_start`),
+/// and preserves the authentic `MAX(effective_at)` timestamp so the offset expires at `effective_at + period_ms` rather than
+/// being reset to `now_ms` on restart.
+pub async fn active_manual_offset_for_window(
+    pool: &SqlitePool,
+    budget_window_id: &str,
+    period_ms: i64,
+    now_ms: i64,
+) -> Result<Option<llmroller_core::windows::ManualOffset>, sqlx::Error> {
+    let min_effective = now_ms.saturating_sub(period_ms);
+    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT SUM(delta_micro_usd), MAX(effective_at)
+         FROM budget_adjustments
+         WHERE budget_window_id = ? AND effective_at > ? AND effective_at <= ?",
+    )
+    .bind(budget_window_id)
+    .bind(min_effective)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
+    match row {
+        (Some(delta), Some(effective_at_ms)) if delta != 0 => {
+            Ok(Some(llmroller_core::windows::ManualOffset {
+                effective_at_ms,
+                delta_micro_usd: delta,
+                period_ms,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// List all budget adjustments for a budget window ordered by effective_at descending (`LIM-1`, `F-064`).

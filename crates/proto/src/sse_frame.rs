@@ -8,6 +8,9 @@ use bytes::BytesMut;
 /// Maximum holding buffer size before committing streaming response (64 KiB).
 pub const PRE_COMMIT_BUFFER_LIMIT: usize = 64 * 1024;
 
+/// Maximum SSE frame size (16 MiB) aligned with SEC-8 to support multimodal base64 image/audio tool outputs (`FND-016`).
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Finds the end index (exclusive) of the first complete SSE frame (`\n\n`, `\r\n\r\n`, or `\r\r`; `F009`).
 pub fn find_frame_delimiter(buf: &[u8]) -> Option<usize> {
     let mut i = 0;

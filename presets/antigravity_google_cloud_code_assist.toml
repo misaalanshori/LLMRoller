@@ -22,7 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"user-agent" = "antigravity/1.107.0 darwin/arm64"
+"user-agent" = "antigravity/1.107.0 {{os}}/{{arch}}"
 "x-goog-api-client" = "google-cloud-sdk vscode_cloudshelleditor/0.1"
 "client-metadata" = "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"MACOS\",\"pluginType\":\"GEMINI\"}"
 

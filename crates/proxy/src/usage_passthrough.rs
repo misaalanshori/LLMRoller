@@ -657,7 +657,7 @@ pub async fn get_v1_usage_handler(
         None
     };
 
-    let now = SystemClock::new().now_ms();
+    let now = state.clock.now_ms();
     let snapshot = state.snapshot.load();
     let target_key = match resolve_usage_key(
         &snapshot,
@@ -819,7 +819,7 @@ pub async fn get_v1_key_handler(
     State(state): State<ProxyAuthState>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    let now = SystemClock::new().now_ms();
+    let now = state.clock.now_ms();
     let used_micro = state
         .runtime_state
         .accumulators
@@ -911,7 +911,7 @@ pub async fn get_v1_usage_raw_handler(
         None
     };
 
-    let now = SystemClock::new().now_ms();
+    let now = state.clock.now_ms();
     let snapshot = state.snapshot.load();
     let has_explicit_target =
         params.upstream_key_id.is_some() || params.model.is_some() || session_hash.is_some();

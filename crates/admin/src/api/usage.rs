@@ -18,8 +18,8 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
             .bind(now_ms - 86400 * 1000)
             .fetch_one(&state.auth.pool)
             .await
-            .unwrap_or(0)
-            .max(1000);
+            .unwrap_or(0);
+    let projected_daily_requests = daily_requests.max(1000);
 
     let trace_bytes: i64 =
         sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(byte_len), 0) FROM trace_blocks")
@@ -28,7 +28,7 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
             .unwrap_or(0);
 
     let projected_bytes =
-        ((daily_requests as f64) * (retention_days as f64) * 600.0 * 1.3) + (trace_bytes as f64);
+        ((projected_daily_requests as f64) * (retention_days as f64) * 600.0 * 1.3) + (trace_bytes as f64);
     let projected_disk_mb = (projected_bytes / (1024.0 * 1024.0) * 10.0).round() / 10.0;
 
     let unpriced_count: i64 = sqlx::query_scalar::<_, i64>(
@@ -93,12 +93,15 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
 // ---------------------------------------------------------------------------
 // Usage Explorer & CSV Export (USG-1..USG-3, SEC-6)
 // ---------------------------------------------------------------------------
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct UsageFilterParams {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub limit: Option<i64>,
     pub after: Option<String>,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub initiator: Option<String>,
 }
 
 pub(crate) async fn get_user_usage_summary_handler(
@@ -732,26 +735,29 @@ pub(crate) async fn get_usage_events_internal(
 pub(crate) async fn get_user_usage_export_csv_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, false).await?;
     let user_id = actor
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-    export_csv_internal(&state, Some(user_id.to_string())).await
+    export_csv_internal(&state, Some(user_id.to_string()), params).await
 }
 
 pub(crate) async fn get_admin_usage_export_csv_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<UsageFilterParams>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
-    export_csv_internal(&state, None).await
+    export_csv_internal(&state, None, params).await
 }
 
 pub(crate) async fn export_csv_internal(
     state: &ApiAppState,
     owner_user_id: Option<String>,
+    params: UsageFilterParams,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use llmroller_proto::headers::sanitize_csv_cell;
     
@@ -760,12 +766,22 @@ pub(crate) async fn export_csv_internal(
                 input_uncached_tokens, cache_read_tokens, output_tokens, error_code
          FROM usage_events
          WHERE owner_user_id = ?
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR provider_id = ?)
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR service_account_id = ? OR client_key_id = ?)
          ORDER BY id DESC
          LIMIT 5000"
     } else {
         "SELECT id, ts, canonical_id, status, cost_micro_usd,
                 input_uncached_tokens, cache_read_tokens, output_tokens, error_code
          FROM usage_events
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)
+           AND (? IS NULL OR provider_id = ?)
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR service_account_id = ? OR client_key_id = ?)
          ORDER BY id DESC
          LIMIT 5000"
     };
@@ -773,10 +789,34 @@ pub(crate) async fn export_csv_internal(
     let rows = if let Some(ref uid) = owner_user_id {
         sqlx::query(query_str)
             .bind(uid)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .bind(params.provider_id.as_deref())
+            .bind(params.provider_id.as_deref())
+            .bind(params.model.as_deref())
+            .bind(params.model.as_deref())
+            .bind(params.initiator.as_deref())
+            .bind(params.initiator.as_deref())
+            .bind(params.initiator.as_deref())
             .fetch_all(&state.auth.pool)
             .await
     } else {
-        sqlx::query(query_str).fetch_all(&state.auth.pool).await
+        sqlx::query(query_str)
+            .bind(params.since)
+            .bind(params.since)
+            .bind(params.until)
+            .bind(params.until)
+            .bind(params.provider_id.as_deref())
+            .bind(params.provider_id.as_deref())
+            .bind(params.model.as_deref())
+            .bind(params.model.as_deref())
+            .bind(params.initiator.as_deref())
+            .bind(params.initiator.as_deref())
+            .bind(params.initiator.as_deref())
+            .fetch_all(&state.auth.pool)
+            .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

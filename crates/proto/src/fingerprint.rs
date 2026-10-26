@@ -55,15 +55,20 @@ impl DeviceProfile {
         }
     }
 
-    /// Combined `os/arch` descriptor (`darwin/arm64`).
+    /// Normalized lowercase OS token (`darwin`, `linux`, `windows`).
     #[must_use]
-    pub fn os_arch(&self) -> String {
-        let os_lower = if self.os.eq_ignore_ascii_case("macos") {
+    pub fn os_lower(&self) -> String {
+        if self.os.eq_ignore_ascii_case("macos") {
             "darwin".to_string()
         } else {
             self.os.to_ascii_lowercase()
-        };
-        format!("{os_lower}/{}", self.arch.to_ascii_lowercase())
+        }
+    }
+
+    /// Combined `os/arch` descriptor (`darwin/arm64`).
+    #[must_use]
+    pub fn os_arch(&self) -> String {
+        format!("{}/{}", self.os_lower(), self.arch.to_ascii_lowercase())
     }
 
     /// Compute the Cursor IDE `x-cursor-Checksum` header value using the 6-byte Jyh-XOR
@@ -314,10 +319,54 @@ pub fn expand_header_template(
     if out.contains("{{os_arch}}") {
         out = out.replace("{{os_arch}}", &profile.os_arch());
     }
+    if out.contains("{{os}}") {
+        out = out.replace("{{os}}", &profile.os_lower());
+    }
+    if out.contains("{{arch}}") {
+        out = out.replace("{{arch}}", &profile.arch.to_ascii_lowercase());
+    }
+    if out.contains("{{os_version}}") {
+        out = out.replace("{{os_version}}", &profile.os_version);
+    }
+    if out.contains("{{hostname}}") {
+        out = out.replace("{{hostname}}", &profile.hostname);
+    }
+    if out.contains("{{device_model}}") {
+        out = out.replace("{{device_model}}", &profile.device_model);
+    }
     if out.contains("{{cch}}") {
         out = out.replace("{{cch}}", &profile.claude_cch(eff_session));
     }
     out
+}
+
+/// Expand dynamic template placeholders including caller-translated client name and User-Agent (`SRDD 12.1`).
+#[must_use]
+pub fn expand_header_template_with_caller(
+    template: &str,
+    profile: &DeviceProfile,
+    request_uuid: &str,
+    session_id: &str,
+    timestamp_secs: u64,
+    caller_client_name: Option<&str>,
+    caller_ua: Option<&str>,
+) -> String {
+    let mut out = expand_header_template(template, profile, request_uuid, session_id, timestamp_secs);
+    if out.contains("{{caller_client_name}}") {
+        out = out.replace("{{caller_client_name}}", caller_client_name.unwrap_or(""));
+    }
+    if out.contains("{{caller_ua}}") {
+        out = out.replace("{{caller_ua}}", caller_ua.unwrap_or(""));
+    }
+    out
+}
+
+/// Returns the current wall-clock Unix timestamp in seconds (`F101`–`F180`).
+#[must_use]
+pub fn current_unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1_776_000_000, |d| d.as_secs())
 }
 
 fn format_deterministic_uuid(hex64: &str) -> String {

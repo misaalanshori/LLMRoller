@@ -130,6 +130,10 @@ pub(crate) async fn build_harness(mock_address: SocketAddr, trace_enabled: bool)
     let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
     let mut state = ProxyAuthState::new(shared_snapshot, pool.clone(), Vec::new())
         .with_master_key(master_key.clone());
+    state.runtime_state = Arc::new(RuntimeState::new());
+    state.session_hmac_secret = Some(secret_bytes(vec![0x42; 32]));
+    state.instance_id = Some(instance_id);
+    state.master_key_id = Some(INSTANCE_KEY_ID.to_owned());
     state.is_ready.store(true, Ordering::SeqCst);
     if trace_enabled {
         let sealer = Arc::new(XChaCha20Poly1305Sealer::new(

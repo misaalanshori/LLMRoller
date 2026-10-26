@@ -216,6 +216,172 @@ impl TokenManager {
             .map_or(DEFAULT_TOKEN_TTL_MS, |s| s.saturating_mul(1000));
         let expires_at_ms = now_ms.saturating_add(ttl_ms);
         self.put_cached(key_id, access_token.clone(), expires_at_ms);
+        crate::metrics::record_oauth_refresh("refreshed");
+        Ok(access_token)
+    }
+
+    /// Resolves a dynamic OAuth2 / JWT secret and, when a token exchange occurs, seals and
+    /// persists the refreshed `access_token` (and any rotated `refresh_token`) back to SQLite (`FND-039`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_and_persist_secret(
+        &self,
+        key_id: UpstreamKeyId,
+        provider_id: llmroller_core::ids::ProviderId,
+        raw_secret: &str,
+        client: &reqwest::Client,
+        allow_private_network: bool,
+        now_ms: i64,
+        writer: Option<&llmroller_store::writer::WriterHandle>,
+        master_key: Option<&llmroller_store::crypto::MasterKey>,
+        master_key_id: Option<&str>,
+        instance_id: Option<[u8; 16]>,
+        entropy: &Arc<dyn llmroller_core::seams::EntropySource>,
+    ) -> Result<String, String> {
+        let Some(mut spec) = Self::parse_dynamic_spec(raw_secret) else {
+            return Ok(raw_secret.to_string());
+        };
+
+        if let Some(cached) = self.cache.get(&key_id)
+            && cached.is_fresh(now_ms)
+        {
+            return Ok(cached.access_token.clone());
+        }
+
+        if let Some(ref inline_token) = spec.access_token
+            && !inline_token.is_empty()
+            && spec
+                .expires_at_ms
+                .is_none_or(|exp| now_ms.saturating_add(TOKEN_REFRESH_LEAD_MS) < exp)
+        {
+            let expires_at = spec
+                .expires_at_ms
+                .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_TOKEN_TTL_MS));
+            self.put_cached(key_id, inline_token.clone(), expires_at);
+            return Ok(inline_token.clone());
+        }
+
+        let token_url = spec
+            .token_url
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| "dynamic credential missing token_url".to_string())?;
+        crate::ssrf::validate_url(token_url, allow_private_network)
+            .map_err(|_| "token_url rejected by SSRF guard".to_string())?;
+
+        let mut form: Vec<(&str, &str)> = Vec::new();
+        if let Some(ref refresh_token) = spec.refresh_token {
+            form.push(("grant_type", "refresh_token"));
+            form.push(("refresh_token", refresh_token.as_str()));
+            if let Some(ref cid) = spec.client_id {
+                form.push(("client_id", cid.as_str()));
+            }
+            if let Some(ref csec) = spec.client_secret {
+                form.push(("client_secret", csec.as_str()));
+            }
+        } else if let Some(ref assertion) = spec.assertion {
+            form.push(("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"));
+            form.push(("assertion", assertion.as_str()));
+        } else {
+            return Err("dynamic credential requires refresh_token or assertion".to_string());
+        }
+        if let Some(ref scope) = spec.scope {
+            form.push(("scope", scope.as_str()));
+        }
+
+        let form_body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form)
+            .finish();
+
+        let response = client
+            .post(token_url)
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form_body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("token exchange request failed: {e}"))?;
+        if !response.status().is_success() {
+            crate::metrics::record_oauth_refresh("failed");
+            return Err(format!(
+                "token exchange returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("invalid token exchange JSON: {e}"))?;
+        let access_token = body
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "token response missing access_token".to_string())?
+            .to_string();
+        let ttl_ms = body
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .filter(|&s| s > 0)
+            .map_or(DEFAULT_TOKEN_TTL_MS, |s| s.saturating_mul(1000));
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+
+        // Update spec with new access_token, expires_at_ms, and optional rotated refresh_token (FND-039)
+        spec.access_token = Some(access_token.clone());
+        spec.expires_at_ms = Some(expires_at_ms);
+        if let Some(new_refresh) = body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            spec.refresh_token = Some(new_refresh.to_string());
+        }
+
+        self.put_cached(key_id, access_token.clone(), expires_at_ms);
+        crate::metrics::record_oauth_refresh("refreshed");
+
+        if let (Some(writer), Some(mk), Some(mk_id), Some(inst_id)) =
+            (writer, master_key, master_key_id, instance_id)
+            && let Ok(updated_json) = serde_json::to_string(&spec)
+        {
+            use llmroller_store::crypto::SecretSealer as _;
+            let sealer = llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+                mk.clone(),
+                inst_id,
+                Arc::clone(entropy),
+            );
+            let key_str = key_id.to_string();
+            let prov_str = provider_id.to_string();
+            if let Ok(sealed) = sealer.seal(
+                "upstream_key",
+                &[mk_id.as_bytes(), key_str.as_bytes(), prov_str.as_bytes()],
+                updated_json.as_bytes(),
+            ) {
+                let last4: String = access_token
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                writer.queues.durable_state.lock().insert(
+                    llmroller_store::writer::DurableKey::UpstreamKeySecretUpdate(key_str.clone()),
+                    llmroller_store::writer::DurableOp::UpstreamKeySecretUpdate {
+                        upstream_key_id: key_str,
+                        secret_enc: sealed,
+                        master_key_id: mk_id.to_string(),
+                        secret_last4: if last4.is_empty() {
+                            "oath".to_string()
+                        } else {
+                            last4
+                        },
+                    },
+                );
+            }
+        }
+
         Ok(access_token)
     }
 }

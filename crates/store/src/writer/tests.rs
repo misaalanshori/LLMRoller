@@ -468,3 +468,30 @@ async fn stale_health_version_update_does_not_overwrite_newer_version() {
     assert_eq!(r_health, "healthy");
     assert_eq!(r_version, 10);
 }
+
+#[tokio::test]
+#[doc = "Spec: REL-1, REL-2, SEC-5, TRC-1"]
+async fn writer_enforces_batch_max_items_and_auth_failure_increment() {
+    let (_dir, pool) = setup_writer_db().await;
+    let queues = Arc::new(DataQueues::default());
+
+    for i in 0..(super::BATCH_MAX_ITEMS + 5) {
+        queues.durable_state.lock().insert(
+            DurableKey::AuthFailureCounter(1_000, "invalid_key".to_string(), format!("198.51.100.{i}")),
+            DurableOp::AuthFailureCounterIncrement {
+                minute_ms: 1_000,
+                reason: "invalid_key".to_string(),
+                ip_prefix: format!("198.51.100.{i}"),
+            },
+        );
+    }
+
+    flush_data_queues(&pool, &queues).await;
+    assert_eq!(
+        queues.durable_state.lock().len(),
+        5,
+        "flush_data_queues must bound durable batch drain to BATCH_MAX_ITEMS (FND-017)"
+    );
+    flush_data_queues(&pool, &queues).await;
+    assert_eq!(queues.durable_state.lock().len(), 0);
+}

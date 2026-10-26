@@ -437,3 +437,53 @@ async fn reset_admin_restores_access_and_appends_break_glass_audit_row() {
             .expect("audit");
     assert_eq!(action, "admin.break_glass");
 }
+
+#[tokio::test]
+#[doc = "Spec: AUTH-4, AUTH-9, SEC-3, SEC-5"]
+async fn totp_recovery_optimistic_concurrency_and_reset_admin_bump_config_version() {
+    let (_directory, pool) = database().await;
+    crate::instance::load_or_initialize(
+        &pool,
+        "key-1",
+        &MasterKey::from_bytes([0x42; 32]),
+        Arc::new(DeterministicRng::new(0x42)),
+        NOW,
+    )
+    .await
+    .expect("bootstrap instance_meta");
+
+    let entropy = Arc::new(DeterministicRng::new(0x77));
+    let admin = create_admin(&pool, &entropy, "admin").await;
+    let actor = ActorScope::user(admin.id, Role::Admin);
+    let seal = sealer(Arc::clone(&entropy));
+    let enrollment = enroll_totp(&pool, &actor, &seal, "key-1", entropy.as_ref())
+        .await
+        .expect("enroll");
+    let totp = totp_for(enrollment.secret_base32.expose_secret());
+    let now_seconds = u64::try_from(NOW / 1_000).expect("now");
+    let code = totp.generate(now_seconds).to_string();
+    confirm_totp(&pool, &actor, &code, &seal, "key-1", NOW)
+        .await
+        .expect("confirm");
+
+    let recovery = enrollment.recovery_codes[0].expose_secret().to_owned();
+    let used = verify_login_totp(&pool, admin.id, &recovery, &seal, "key-1", NOW + 60_000)
+        .await
+        .expect("recovery first use");
+    assert_eq!(used, super::TotpVerification::Recovery);
+    let reused = verify_login_totp(&pool, admin.id, &recovery, &seal, "key-1", NOW + 61_000).await;
+    assert!(matches!(reused, Err(UserError::InvalidTotp)));
+
+    let v_before: i64 = sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
+        .fetch_one(&pool)
+        .await
+        .expect("v_before");
+    let _reset = reset_admin(&pool, None, entropy.as_ref(), NOW + 70_000, AUDIT_KEY)
+        .await
+        .expect("reset_admin");
+    let v_after: i64 = sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
+        .fetch_one(&pool)
+        .await
+        .expect("v_after");
+    assert!(v_after > v_before, "reset_admin must bump instance_meta.config_version (FND-020)");
+}

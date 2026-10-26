@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "friendli_ai_and_Inception_mercury_diffusion"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

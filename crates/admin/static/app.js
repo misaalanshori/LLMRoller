@@ -84,6 +84,11 @@ document.addEventListener('click', function(e) {
             const targetInput = document.getElementById('target-provider-id');
             if (targetInput) targetInput.value = provId;
         }
+        const keyId = modalOpenBtn.getAttribute('data-key-id');
+        if (keyId) {
+            const bwKeyInput = document.getElementById('bw-upstream-key-id');
+            if (bwKeyInput) bwKeyInput.value = keyId;
+        }
         if (modalId === 'modal-new-share') {
             populateShareProviders();
         }
@@ -145,12 +150,12 @@ document.addEventListener('click', function(e) {
     const drawerOpen = e.target.closest('[data-action="open-drawer"]');
     if (drawerOpen) {
         const drawer = document.getElementById('right-inspection-drawer');
-        if (drawer) drawer.style.display = 'flex';
+        if (drawer) drawer.classList.add('open');
     }
     const drawerClose = e.target.closest('[data-action="close-drawer"]');
     if (drawerClose) {
         const drawer = document.getElementById('right-inspection-drawer');
-        if (drawer) drawer.style.display = 'none';
+        if (drawer) drawer.classList.remove('open');
         return;
     }
 
@@ -167,6 +172,21 @@ document.addEventListener('click', function(e) {
     if (deleteAliasBtn) {
         const alias = deleteAliasBtn.getAttribute('data-alias');
         deleteAlias(alias);
+        return;
+    }
+
+    // 11. Enroll TOTP 2FA (FND-045)
+    const enrollTotpBtn = e.target.closest('[data-action="enroll-totp"]');
+    if (enrollTotpBtn) {
+        handleEnrollTotp();
+        return;
+    }
+
+    // 12. Revoke Web Session (FND-045)
+    const revokeSessBtn = e.target.closest('[data-action="revoke-web-session"]');
+    if (revokeSessBtn) {
+        const prefix = revokeSessBtn.getAttribute('data-id-prefix');
+        revokeWebSession(prefix);
         return;
     }
 });
@@ -193,6 +213,20 @@ document.addEventListener('submit', function(e) {
         handleLoginSubmit(e);
     } else if (e.target.id === 'setup-form') {
         handleSetupSubmit(e);
+    } else if (e.target.id === 'form-traceability-config') {
+        handleSaveTraceabilityConfig(e);
+    } else if (e.target.id === 'form-change-password') {
+        handleChangePassword(e);
+    } else if (e.target.id === 'form-verify-totp') {
+        handleVerifyTotp(e);
+    } else if (e.target.id === 'form-user-preferences') {
+        handleSaveUserPreferences(e);
+    } else if (e.target.id === 'form-new-service-account') {
+        handleCreateServiceAccount(e);
+    } else if (e.target.id === 'form-budget-window') {
+        handleSaveBudgetWindow(e);
+    } else if (e.target.id === 'form-new-price') {
+        handleSavePriceEntry(e);
     }
 });
 
@@ -561,13 +595,13 @@ async function loadAdminSettings() {
                 input = `<textarea id="${id}" data-json="true" rows="4">${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
             }
             const save = key === 'traceability_config'
-                ? '<span class="text-muted" style="font-size: 0.75rem;">Use the Traceability tab to change this setting.</span>'
+                ? '<span class="text-muted text-xs">Use the Traceability tab to change this setting.</span>'
                 : `<button class="btn btn-xs btn-primary" data-action="save-setting" data-key="${escapeHtml(key)}">Save</button>`;
             return `<div class="setting-item">
                 <div class="setting-key">${escapeHtml(key)}</div>
                 <div class="setting-desc">${escapeHtml(label)}</div>
                 ${input}
-                <div style="margin-top: 0.5rem;">${save}</div>
+                <div class="mt-2">${save}</div>
             </div>`;
         }).join('');
     } catch (err) {
@@ -648,7 +682,7 @@ async function loadUsageChart() {
             usageChart = null;
         }
         container.innerHTML = '';
-        container.style.display = 'block';
+        container.classList.remove('hidden');
         usageChart = new uPlot({
             width: container.clientWidth || 640,
             height: 240,
@@ -683,6 +717,9 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAdminSettings();
     loadAdminAliases();
     loadUsageChart();
+    loadPersonalOverviewAndChart();
+    loadServiceAccounts();
+    loadWebSessions();
 });
 
 async function openChatPreview(sessionHash) {
@@ -755,7 +792,7 @@ async function handleLoginSubmit(e) {
     const form = e.target;
     const errBox = document.getElementById('error-box');
     const btn = document.getElementById('submit-btn');
-    if (errBox) errBox.style.display = 'none';
+    if (errBox) errBox.classList.remove('visible');
     if (btn) {
         btn.disabled = true;
         btn.textContent = 'Signing in...';
@@ -782,7 +819,7 @@ async function handleLoginSubmit(e) {
             const msg = (data.error && data.error.message) ? data.error.message : (data.error || ('Authentication failed with status ' + res.status));
             if (errBox) {
                 errBox.textContent = msg;
-                errBox.style.display = 'block';
+                errBox.classList.add('visible');
             }
             if (btn) {
                 btn.disabled = false;
@@ -799,7 +836,7 @@ async function handleSetupSubmit(e) {
     const form = e.target;
     const errBox = document.getElementById('error-box');
     const btn = document.getElementById('submit-btn');
-    if (errBox) errBox.style.display = 'none';
+    if (errBox) errBox.classList.remove('visible');
     if (btn) {
         btn.disabled = true;
         btn.textContent = 'Initializing...';
@@ -825,7 +862,7 @@ async function handleSetupSubmit(e) {
             const msg = (data.error && data.error.message) ? data.error.message : (data.error || ('Setup failed with status ' + res.status));
             if (errBox) {
                 errBox.textContent = msg;
-                errBox.style.display = 'block';
+                errBox.classList.add('visible');
             }
             if (btn) {
                 btn.disabled = false;
@@ -834,5 +871,281 @@ async function handleSetupSubmit(e) {
         }
     } catch (_err) {
         form.submit();
+    }
+}
+
+let personalUsageChart = null;
+
+async function loadPersonalOverviewAndChart() {
+    const keysEl = document.getElementById('stat-keys-count');
+    const provEl = document.getElementById('stat-providers-count');
+    const sessEl = document.getElementById('stat-sessions-count');
+    if (keysEl || provEl || sessEl) {
+        try {
+            const [keysRes, provRes, pinsRes] = await Promise.all([
+                fetch('/api/user/client-keys'),
+                fetch('/api/user/providers'),
+                fetch('/api/user/pins')
+            ]);
+            if (keysEl && keysRes.ok) {
+                const keys = await keysRes.json();
+                keysEl.textContent = String(Array.isArray(keys) ? keys.length : 0);
+            }
+            if (provEl && provRes.ok) {
+                const provs = await provRes.json();
+                provEl.textContent = String(Array.isArray(provs) ? provs.length : 0);
+            }
+            if (sessEl && pinsRes.ok) {
+                const pins = await pinsRes.json();
+                sessEl.textContent = String(Array.isArray(pins) ? pins.length : 0);
+            }
+        } catch (_e) {}
+    }
+
+    const container = document.getElementById('personal-usage-chart');
+    if (!container || typeof uPlot === 'undefined') return;
+    try {
+        const [summaryRes, seriesRes] = await Promise.all([
+            fetch('/api/user/usage/summary'),
+            fetch('/api/user/usage/timeseries')
+        ]);
+        const summary = summaryRes.ok ? await summaryRes.json() : {};
+        const seriesData = seriesRes.ok ? await seriesRes.json() : { series: [] };
+        const pts = seriesData.series || [];
+        let xs = pts.map(p => Math.floor(Number(p.bucket_ms || 0) / 1000));
+        let ys = pts.map(p => Number(p.cost_micro_usd || 0) / 1_000_000);
+        if (xs.length === 0) {
+            xs = [Math.floor(Date.now() / 1000)];
+            ys = [Number(summary.total_cost_micro_usd || 0) / 1_000_000];
+        }
+        const summaryEl = document.getElementById('personal-uplot-summary');
+        if (summaryEl) {
+            summaryEl.textContent = `${Number(summary.total_requests || 0).toLocaleString()} requests • $${(Number(summary.total_cost_micro_usd || 0) / 1_000_000).toFixed(4)} personal spend`;
+        }
+        if (personalUsageChart) {
+            personalUsageChart.destroy();
+            personalUsageChart = null;
+        }
+        container.innerHTML = '';
+        personalUsageChart = new uPlot({
+            width: container.clientWidth || 640,
+            height: 240,
+            scales: { x: { time: true } },
+            series: [{}, { label: 'USD', stroke: '#38bdf8', width: 2, fill: 'rgba(56, 189, 248, 0.12)' }],
+            axes: [
+                { stroke: '#94a3b8', grid: { stroke: 'rgba(148, 163, 184, 0.15)' } },
+                { stroke: '#94a3b8', grid: { stroke: 'rgba(148, 163, 184, 0.15)' } }
+            ]
+        }, [xs, ys], container);
+    } catch (err) {
+        container.innerHTML = `<span class="text-muted">Personal usage chart unavailable: ${escapeHtml(err)}</span>`;
+    }
+}
+
+async function handleSaveTraceabilityConfig(e) {
+    e.preventDefault();
+    const enabled = document.getElementById('trc-enabled').checked;
+    const retention_days = parseInt(document.getElementById('trc-retention-days').value || '14', 10);
+    try {
+        const res = await fetch('/admin/api/settings/traceability', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ enabled, retention_days })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await loadAdminSettings();
+        alert('Traceability capture policy saved.');
+    } catch (err) {
+        alert('Failed to update traceability config: ' + err);
+    }
+}
+
+async function handleChangePassword(e) {
+    e.preventDefault();
+    const current_password = document.getElementById('sec-current-password').value;
+    const new_password = document.getElementById('sec-new-password').value;
+    try {
+        const res = await fetch('/api/user/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ current_password, new_password })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        document.getElementById('form-change-password').reset();
+        alert('Password updated.');
+    } catch (err) {
+        alert('Password update failed: ' + err);
+    }
+}
+
+async function handleEnrollTotp() {
+    const box = document.getElementById('totp-enrollment-box');
+    if (!box) return;
+    try {
+        const res = await fetch('/api/user/totp/enroll', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: '{}'
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const codes = (data.recovery_codes || []).map(c => `<code>${escapeHtml(c)}</code>`).join(' ');
+        box.innerHTML = `<div class="code-block"><pre>${escapeHtml(data.otpauth_url || '')}</pre></div><p class="card-desc mt-2">Recovery Codes: ${codes}</p>`;
+    } catch (err) {
+        alert('TOTP enrollment failed: ' + err);
+    }
+}
+
+async function handleVerifyTotp(e) {
+    e.preventDefault();
+    const code = document.getElementById('sec-totp-code').value.trim();
+    try {
+        const res = await fetch('/api/user/totp/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ code })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        alert('Two-factor authentication verified and enabled.');
+    } catch (err) {
+        alert('TOTP verification failed: ' + err);
+    }
+}
+
+async function loadWebSessions() {
+    const tbody = document.getElementById('web-sessions-body');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/user/web-sessions');
+        if (!res.ok) return;
+        const sessions = await res.json();
+        if (!Array.isArray(sessions) || sessions.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No active web sessions.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = sessions.map(s => `<tr>
+            <td><code>${escapeHtml(s.id_prefix || '')}...</code> ${s.is_current ? '<span class="badge badge-success">Current</span>' : ''}</td>
+            <td>${escapeHtml(s.ip_addr || '-')}</td>
+            <td>${Number(s.last_seen_at || 0)}</td>
+            <td>${s.is_current ? '—' : `<button class="btn btn-xs btn-danger" data-action="revoke-web-session" data-id-prefix="${escapeHtml(s.id_prefix || '')}">Revoke</button>`}</td>
+        </tr>`).join('');
+    } catch (_e) {}
+}
+
+async function revokeWebSession(prefix) {
+    if (!prefix) return;
+    try {
+        await fetch(`/api/user/web-sessions/${encodeURIComponent(prefix)}`, {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
+        await loadWebSessions();
+    } catch (_e) {}
+}
+
+async function handleSaveUserPreferences(e) {
+    e.preventDefault();
+    const ui_theme = document.getElementById('pref-theme').value;
+    const ui_nav_layout = document.getElementById('pref-nav-layout').value;
+    const ui_locale = document.getElementById('pref-locale').value;
+    try {
+        const res = await fetch('/api/user/preferences', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ ui_theme, ui_nav_layout, ui_locale })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        window.location.reload();
+    } catch (err) {
+        alert('Failed to save preferences: ' + err);
+    }
+}
+
+async function loadServiceAccounts() {
+    const tbody = document.getElementById('service-accounts-body');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/user/service-accounts');
+        if (!res.ok) return;
+        const items = await res.json();
+        if (!Array.isArray(items) || items.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No service accounts created yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = items.map(sa => `<tr>
+            <td><strong>${escapeHtml(sa.name || '')}</strong></td>
+            <td>${escapeHtml(sa.description || '-')}</td>
+            <td><code>${escapeHtml((sa.allowed_cidrs || []).join(', ') || 'Any')}</code></td>
+            <td><span class="badge badge-${sa.disabled ? 'danger' : 'success'}">${sa.disabled ? 'Disabled' : 'Active'}</span></td>
+            <td><code>${escapeHtml(sa.id || '')}</code></td>
+        </tr>`).join('');
+    } catch (_e) {}
+}
+
+async function handleCreateServiceAccount(e) {
+    e.preventDefault();
+    const name = document.getElementById('sa-name').value.trim();
+    const description = document.getElementById('sa-desc').value.trim();
+    const cidrsRaw = document.getElementById('sa-cidrs').value.trim();
+    const allowed_cidrs = cidrsRaw ? cidrsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    try {
+        const res = await fetch('/api/user/service-accounts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ name, description, allowed_cidrs })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        closeModal('modal-new-service-account');
+        document.getElementById('form-new-service-account').reset();
+        await loadServiceAccounts();
+    } catch (err) {
+        alert('Failed to create service account: ' + err);
+    }
+}
+
+async function handleSaveBudgetWindow(e) {
+    e.preventDefault();
+    const upstream_key_id = document.getElementById('bw-upstream-key-id').value;
+    const window_kind = document.getElementById('bw-window-kind').value;
+    const hours = parseInt(document.getElementById('bw-period-hours').value || '5', 10);
+    const usd = parseFloat(document.getElementById('bw-limit-usd').value || '10');
+    const period_ms = window_kind === 'anchored_calendar_month' ? null : hours * 3600 * 1000;
+    const limit_micro_usd = Math.round(usd * 1_000_000);
+    try {
+        const res = await fetch(`/api/user/upstream-keys/${encodeURIComponent(upstream_key_id)}/budget-windows`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ scope_kind: 'upstream_key', window_kind, period_ms, limit_micro_usd })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        closeModal('modal-budget-window');
+    } catch (err) {
+        alert('Failed to save budget window: ' + err);
+    }
+}
+
+async function handleSavePriceEntry(e) {
+    e.preventDefault();
+    const upstream_model_id = document.getElementById('prc-model-id').value.trim();
+    const input_per_mtok_micro_usd = Math.round(parseFloat(document.getElementById('prc-input').value || '0') * 1_000_000);
+    const output_per_mtok_micro_usd = Math.round(parseFloat(document.getElementById('prc-output').value || '0') * 1_000_000);
+    try {
+        const res = await fetch('/admin/api/prices', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({
+                provider_id: '',
+                upstream_model_id,
+                input_per_mtok_micro_usd,
+                output_per_mtok_micro_usd,
+                cache_read_per_mtok_micro_usd: Math.round(input_per_mtok_micro_usd / 10),
+                cache_write_per_mtok_micro_usd: input_per_mtok_micro_usd
+            })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        closeModal('modal-new-price');
+        document.getElementById('form-new-price').reset();
+    } catch (err) {
+        alert('Failed to save price entry: ' + err);
     }
 }

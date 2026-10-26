@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "azure_openai_and_azure_cognitive_services_v1_and_deployments"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

@@ -298,3 +298,50 @@ fn test_session_id_256_char_boundary_and_recursive_canonical_block_stripping() {
         canonical_content(&tool_res_clean)
     );
 }
+
+// Spec: ./docs/srdd/11. SRDD - Session Identification and Hints.md#1111-inbound-session-precedence | Phase: ./docs/bigbang/big-bang-phases-3.md#33-sub-phase-33-inbound-session-precedence-step-8-fingerprint-outbound-affinity-and-21-slot-detector
+#[doc = "Spec: RTE-1, RTE-2, SEC-16"]
+#[test]
+fn test_observe_and_check_persists_flagged_state_across_subsequent_calls() {
+    let detector = ConstantSessionDetector::new();
+    let key_id = ClientKeyId::generate();
+    let session_hash = "sess_generic_const".to_string();
+    let now_ms = 1_776_000_000_000_i64;
+
+    for i in 0..20 {
+        let usr = format!("distinct prompt {i}");
+        let ctx = PromptContext {
+            sys: b"system",
+            usr: usr.as_bytes(),
+            has_claude_code_agent_id: false,
+            step: SessionPrecedenceStep::HeaderSessionId,
+        };
+        let (is_flagged, newly_flagged) =
+            detector.observe_and_check(key_id, session_hash.clone(), &ctx, now_ms);
+        assert!(!is_flagged);
+        assert!(!newly_flagged);
+    }
+
+    let ctx_21 = PromptContext {
+        sys: b"system",
+        usr: b"distinct prompt 20",
+        has_claude_code_agent_id: false,
+        step: SessionPrecedenceStep::HeaderSessionId,
+    };
+    let (is_flagged_21, newly_flagged_21) =
+        detector.observe_and_check(key_id, session_hash.clone(), &ctx_21, now_ms);
+    assert!(is_flagged_21);
+    assert!(newly_flagged_21);
+
+    // 22nd call remains flagged while newly_flagged is false
+    let ctx_22 = PromptContext {
+        sys: b"system",
+        usr: b"distinct prompt 21",
+        has_claude_code_agent_id: false,
+        step: SessionPrecedenceStep::HeaderSessionId,
+    };
+    let (is_flagged_22, newly_flagged_22) =
+        detector.observe_and_check(key_id, session_hash, &ctx_22, now_ms + 1_000);
+    assert!(is_flagged_22);
+    assert!(!newly_flagged_22);
+}

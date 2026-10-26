@@ -21,8 +21,7 @@ responses_compact = false
 chat_stream = "native"
 
 [add_headers]
-"HTTP-Referer" = "https://github.com/llmroller/llmroller"
-"X-Title" = "LLMRoller"
+"X-Title" = "{{caller_client_name}}"
 
 [session_profile]
 headers = ["x-session-id"]

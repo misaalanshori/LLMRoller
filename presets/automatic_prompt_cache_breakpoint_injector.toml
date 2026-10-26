@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "automatic_prompt_cache_breakpoint_injector"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

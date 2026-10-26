@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "iflow_cn_and_longcat_meituan"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

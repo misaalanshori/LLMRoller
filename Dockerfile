@@ -51,7 +51,8 @@ RUN case "${TARGETARCH:-amd64}" in \
     && rustup target add "$(cat /tmp/rust_target)"
 
 COPY --from=planner /src/recipe.json recipe.json
-RUN TARGET_TRIPLE="$(cat /tmp/rust_target)" \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    TARGET_TRIPLE="$(cat /tmp/rust_target)" \
     && cargo chef cook --release --locked --target "${TARGET_TRIPLE}" --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock deny.toml ./
@@ -62,7 +63,8 @@ COPY xtask ./xtask
 COPY crates ./crates
 
 ENV LLMROLLER_BUILD_GIT_SHA=${GIT_SHA}
-RUN TARGET_TRIPLE="$(cat /tmp/rust_target)" \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    TARGET_TRIPLE="$(cat /tmp/rust_target)" \
     && cargo build --release --locked --target "${TARGET_TRIPLE}" --bin llmroller \
     && cp "target/${TARGET_TRIPLE}/release/llmroller" /usr/local/bin/llmroller \
     && strip --strip-debug /usr/local/bin/llmroller \

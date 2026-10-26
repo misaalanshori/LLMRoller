@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "cerebras_wafer_scale_inference"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

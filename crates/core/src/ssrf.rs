@@ -242,6 +242,12 @@ pub fn validate_url(url_str: &str, allow_private_network: bool) -> Result<Url, S
 
     let parsed = Url::parse(url_str)?;
 
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SsrfError::Validation(
+            "URL userinfo (username/password) is forbidden in upstream URLs".to_owned(),
+        ));
+    }
+
     let scheme = parsed.scheme();
     if scheme != "https" && !(allow_private_network && scheme == "http") {
         return Err(SsrfError::InsecureScheme);
@@ -260,7 +266,18 @@ pub fn validate_url(url_str: &str, allow_private_network: bool) -> Result<Url, S
         }
         Some(url::Host::Domain(host_str)) => {
             let unbracketed = host_str.trim_start_matches('[').trim_end_matches(']');
-            if let Ok(ip) = IpAddr::from_str(unbracketed)
+            let normalized_domain = unbracketed.trim_end_matches('.').to_ascii_lowercase();
+            if normalized_domain.is_empty() {
+                return Err(SsrfError::Validation("empty domain host in URL".to_owned()));
+            }
+            if !allow_private_network
+                && (normalized_domain == "localhost"
+                    || normalized_domain.ends_with(".localhost")
+                    || normalized_domain.ends_with(".local"))
+            {
+                return Err(SsrfError::BlockedIp(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            }
+            if let Ok(ip) = IpAddr::from_str(&normalized_domain)
                 && is_ip_blocked(ip, allow_private_network)
             {
                 return Err(SsrfError::BlockedIp(ip));
@@ -276,14 +293,16 @@ pub fn validate_url(url_str: &str, allow_private_network: bool) -> Result<Url, S
 #[must_use]
 pub fn extract_raw_host(url_str: &str) -> Option<&str> {
     let after_scheme = url_str.split("://").nth(1)?;
-    let host_and_rest = after_scheme.split('/').next()?;
-    let host_and_port = host_and_rest.split('?').next()?;
-    let host = host_and_port.split('#').next()?;
+    let authority_and_rest = after_scheme.split('/').next()?;
+    let authority_and_query = authority_and_rest.split('?').next()?;
+    let authority = authority_and_query.split('#').next()?;
+    let host_and_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_and_port.trim_end_matches('.');
     if host.starts_with('[') {
         let end_bracket = host.find(']')?;
         return Some(&host[..=end_bracket]);
     }
-    Some(host.split(':').next().unwrap_or(host))
+    Some(host.split(':').next().unwrap_or(host).trim_end_matches('.'))
 }
 
 #[cfg(test)]
@@ -313,5 +332,28 @@ mod tests {
             validate_url("https://2130706433/v1", false),
             Err(SsrfError::NonStandardIpEncoding(_))
         ));
+    }
+
+    #[test]
+    #[doc = "Spec: SEC-7, PRV-7"]
+    fn rejects_userinfo_and_trailing_dot_localhost_in_upstream_urls() {
+        // Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec | Phase: ./docs/bigbang/big-bang-phases-2.md#21-sub-phase-21-socket-level-ssrf-guardedconnector-and-url-validation
+        assert!(matches!(
+            validate_url("https://user:pass@api.openai.com/v1", false),
+            Err(SsrfError::Validation(_))
+        ));
+        assert!(matches!(
+            validate_url("https://admin@127.1/v1", false),
+            Err(SsrfError::NonStandardIpEncoding(_))
+        ));
+        assert!(matches!(
+            validate_url("https://localhost./v1", false),
+            Err(SsrfError::BlockedIp(_))
+        ));
+        assert!(matches!(
+            validate_url("https://sub.localhost./v1", false),
+            Err(SsrfError::BlockedIp(_))
+        ));
+        assert!(validate_url("http://localhost.:11434/v1", true).is_ok());
     }
 }

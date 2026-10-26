@@ -391,6 +391,25 @@ pub fn synthesize_snapshot_invalidations(
         }
     }
 
+    for (uid, prev_shares) in previous.shares_by_grantee.iter() {
+        let changed = next
+            .shares_by_grantee
+            .get(uid)
+            .is_none_or(|next_shares| next_shares != prev_shares);
+        if changed && !invalidations.contains(&CacheInvalidationEvent::ShareChanged(*uid)) {
+            invalidations.push(CacheInvalidationEvent::ShareChanged(*uid));
+        }
+    }
+    for (uid, next_shares) in next.shares_by_grantee.iter() {
+        let changed = previous
+            .shares_by_grantee
+            .get(uid)
+            .is_none_or(|prev_shares| prev_shares != next_shares);
+        if changed && !invalidations.contains(&CacheInvalidationEvent::ShareChanged(*uid)) {
+            invalidations.push(CacheInvalidationEvent::ShareChanged(*uid));
+        }
+    }
+
     if previous.settings != next.settings
         && !invalidations.contains(&CacheInvalidationEvent::SettingsChanged)
     {
@@ -600,6 +619,9 @@ fn start_reloader_inner(
                                 | ConfigDomain::Prices
                                 | ConfigDomain::BudgetWindows
                                 | ConfigDomain::Traceability
+                                | ConfigDomain::Providers
+                                | ConfigDomain::UpstreamKeys
+                                | ConfigDomain::Users
                         )
                     });
 
@@ -733,6 +755,24 @@ fn start_reloader_inner(
 
                 // Apply CacheInvalidationEvents after arc_swap.store per REL-4
                 runtime_state.apply_invalidations(&invalidations, &new_snapshot, now_ms);
+                if reload_all || changed_domains.contains(&ConfigDomain::BudgetWindows) {
+                    for windows in new_snapshot.budget_windows.values() {
+                        for window in windows {
+                            let period = window.period_ms.unwrap_or(2_678_400_000);
+                            if let Ok(offset) = llmroller_store::budgets::active_manual_offset_for_window(
+                                &pool,
+                                &window.id,
+                                period,
+                                now_ms,
+                            )
+                            .await
+                                && let Some(counter) = runtime_state.window_counter(&window.id)
+                            {
+                                counter.set_manual_offset(offset);
+                            }
+                        }
+                    }
+                }
 
                 // Evict live pins that the published snapshot invalidated (PRV-8, CLK-4, SHR-5).
                 if let Some(store) = pin_store.as_deref() {

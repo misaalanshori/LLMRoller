@@ -169,19 +169,42 @@ pub(crate) async fn delete_user_share_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
     let now_ms = state.auth.clock.now_ms();
 
-    let mut tx = state
-        .auth
-        .pool
-        .begin()
+    let share_info = {
+        let mut tx = state
+            .auth
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let s = llmroller_store::shares::get_provider_share_tx(&mut tx, &id)
+            .await
+            .map_err(|e| map_price_error(StatusCode::NOT_FOUND, format!("{e:?}")))?;
+        llmroller_store::shares::revoke_provider_share_tx(&mut tx, &id, &user_id, now_ms)
+            .await
+            .map_err(|e| map_price_error(StatusCode::NOT_FOUND, format!("{e:?}")))?;
+        let _ = llmroller_store::writer::bump_config_version_tx(&mut tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        tx.commit()
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        s
+    };
+    if let Some(ref store) = state.pin_store {
+        let ckids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM client_keys WHERE owner_user_id = ?",
+        )
+        .bind(share_info.grantee_user_id.to_string())
+        .fetch_all(&state.auth.pool)
         .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    llmroller_store::shares::revoke_provider_share_tx(&mut tx, &id, &user_id, now_ms)
-        .await
-        .map_err(|e| map_price_error(StatusCode::NOT_FOUND, format!("{e:?}")))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .unwrap_or_default();
+        for ckid_str in ckids {
+            if let Ok(ckid) = llmroller_core::ids::ClientKeyId::parse(&ckid_str) {
+                store.invalidate_client_key(&ckid);
+            }
+        }
+    }
+    let _ = record_control_mutation(&state, vec![ConfigDomain::Shares]).await;
     if headers.contains_key("hx-request") {
         Ok(StatusCode::OK)
     } else {

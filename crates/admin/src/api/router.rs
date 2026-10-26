@@ -63,6 +63,8 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_partial_admin_ledger_handler),
         )
         // User endpoints
+        .route("/api/user/presets", get(get_provider_presets_handler))
+        .route("/admin/api/presets", get(get_provider_presets_handler))
         .route(
             "/api/user/providers",
             get(get_user_providers).post(post_user_provider),

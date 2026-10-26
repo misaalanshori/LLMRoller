@@ -22,8 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"http-referer" = "https://vercel.com"
-"x-title" = "LLMRoller"
+"x-title" = "{{caller_client_name}}"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

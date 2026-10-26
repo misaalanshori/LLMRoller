@@ -735,6 +735,7 @@ pub async fn reset_admin(
         .bind(existing.user.id.to_string())
         .execute(&mut *transaction)
         .await?;
+    let _ = crate::writer::bump_config_version_tx(&mut transaction).await?;
     let audit_id = RequestId::generate().to_string();
     let detail = r#"{"system_task":"cli:reset-admin"}"#;
     audit::append(

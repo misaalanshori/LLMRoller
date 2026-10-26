@@ -70,6 +70,7 @@ pub fn start_usage_poller_with_stop(
                     let key_states: Arc<DashMap<UpstreamKeyId, KeyPollerState>> =
                         Arc::new(DashMap::new());
                     let poller = UsagePoller::default();
+                    let token_manager = llmroller_proxy::token_manager::TokenManager::new();
                     while !*job_stop.borrow_and_update() {
                         tokio::select! {
                             _ = tokio::time::sleep(TICK) => {},
@@ -128,6 +129,9 @@ pub fn start_usage_poller_with_stop(
                                 Arc::new(llmroller_core::seams::OsEntropy),
                             );
                             let master_key_id = deps.master_key_id.clone();
+                            let master_key = deps.master_key.clone();
+                            let instance_id = deps.instance_id;
+                            let token_manager = token_manager.clone();
                             let key_states = key_states.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -135,6 +139,9 @@ pub fn start_usage_poller_with_stop(
                                     &writer,
                                     &runtime_state,
                                     &sealer,
+                                    &token_manager,
+                                    &master_key,
+                                    instance_id,
                                     &master_key_id,
                                     &key,
                                     provider.kind,
@@ -164,6 +171,9 @@ async fn poll_key(
     writer: &WriterHandle,
     runtime_state: &RuntimeState,
     sealer: &XChaCha20Poly1305Sealer,
+    token_manager: &llmroller_proxy::token_manager::TokenManager,
+    master_key: &MasterKey,
+    instance_id: [u8; 16],
     master_key_id: &str,
     key: &UpstreamKeyRecord,
     kind: llmroller_core::provider::ProviderKind,
@@ -183,12 +193,31 @@ async fn poll_key(
             &key.secret_enc,
         )
         .map_err(|_| "cannot unseal upstream key".to_string())?;
-    let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
+    let raw_secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
     llmroller_core::ssrf::validate_url(target, allow_private_network)
         .map_err(|_| "usage endpoint is not allowed".to_string())?;
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private_network)
         .map_err(|_| "cannot build guarded HTTP client".to_string())?;
+
+    let now_ms_token = llmroller_core::seams::SystemClock::new().now_ms();
+    let entropy: Arc<dyn llmroller_core::seams::EntropySource> =
+        Arc::new(llmroller_core::seams::OsEntropy);
+    let secret = token_manager
+        .resolve_and_persist_secret(
+            key.id,
+            key.provider_id,
+            &raw_secret,
+            &client,
+            allow_private_network,
+            now_ms_token,
+            Some(writer),
+            Some(master_key),
+            Some(&key.master_key_id),
+            Some(instance_id),
+            &entropy,
+        )
+        .await?;
 
     let provider_config = llmroller_core::provider::ProviderConfig::from_json(config_json);
     let scheme = provider_config

@@ -25,12 +25,12 @@ impl WireProtocol {
             "gemini" | "google_gemini" => Some(Self::GoogleGemini),
             "cloudcode" | "cloud_code_assist" | "antigravity" => Some(Self::CloudCodeAssist),
             "bedrock" | "bedrock_converse" => Some(Self::BedrockConverseStream),
-            "command_code_generate" | "alpha_generate" => Some(Self::CommandCodeGenerate),
+            "command_code_generate" | "alpha_generate" | "command_code" => Some(Self::CommandCodeGenerate),
             _ => None,
         }
     }
 
-    /// Canonical route protocol string (`"chat"`, `"responses"`, `"messages"`).
+    /// Canonical route protocol string (`"chat"`, `"responses"`, `"messages"`, etc.).
     #[must_use]
     pub const fn as_catalog_str(self) -> &'static str {
         match self {
@@ -43,6 +43,29 @@ impl WireProtocol {
             Self::CommandCodeGenerate => "command_code_generate",
         }
     }
+}
+
+/// Multimodal content part preserved across cross-protocol transcoding (`FND-010`, `F099`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CanonicalContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data_or_url: String,
+        is_url: bool,
+    },
+    Audio {
+        format: String,
+        data: String,
+    },
+    Document {
+        media_type: String,
+        data_or_url: String,
+        name: Option<String>,
+    },
 }
 
 /// Canonical normalized tool call representation (`F099`).
@@ -58,8 +81,12 @@ pub struct CanonicalToolCall {
 pub struct CanonicalMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<CanonicalContentPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<CanonicalToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +112,12 @@ pub struct CanonicalRequest {
     pub stream: bool,
     pub max_tokens: Option<i64>,
     pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
 }
 
 /// Canonical normalized response across all wire formats (`F099`).

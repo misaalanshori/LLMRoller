@@ -369,3 +369,67 @@ fn test_unterminated_eof_sse_frame_and_nested_responses_messages_usage() {
     assert_eq!(u_resp.output_tokens, 90);
     assert_eq!(u_resp.reasoning_tokens, 30);
 }
+
+// Spec: ./docs/srdd/13. SRDD - Usage Tracking, Quotas, and Cost Accounting.md#131-token-and-cost-accounting | Phase: ./docs/bigbang/big-bang-phases-2.md#25-sub-phase-25-unbuffered-sse-forwarder-64-kib-pre-first-frame-holding-buffer-single-frame-filter-and-requestlifecycle-guard
+#[doc = "Spec: USG-1, USG-2, SEC-8 - Gemini usageMetadata, Bedrock usage, Cohere billed_units, and >1MiB multimodal SSE frame support"]
+#[test]
+fn test_extended_provider_usage_extraction_and_large_multimodal_sse_frame() {
+    use crate::json_usage::extract_json_usage;
+    use crate::sse_frame::DEFAULT_MAX_FRAME_BYTES;
+
+    assert_eq!(DEFAULT_MAX_FRAME_BYTES, 16 * 1024 * 1024);
+
+    // 1. Gemini usageMetadata
+    let gemini_json = serde_json::json!({
+        "usageMetadata": {
+            "promptTokenCount": 500,
+            "cachedContentTokenCount": 200,
+            "candidatesTokenCount": 120,
+            "thoughtsTokenCount": 45
+        }
+    });
+    let u_gem = extract_json_usage(EndpointKind::Chat, &gemini_json).expect("gemini usage");
+    assert_eq!(u_gem.input_uncached_tokens, 300);
+    assert_eq!(u_gem.cache_read_tokens, 200);
+    assert_eq!(u_gem.output_tokens, 120);
+    assert_eq!(u_gem.reasoning_tokens, 45);
+
+    // 2. AWS Bedrock Converse usage
+    let bedrock_json = serde_json::json!({
+        "usage": {
+            "inputTokens": 180,
+            "outputTokens": 65,
+            "cacheReadInputTokens": 40,
+            "cacheWriteInputTokens": 10
+        }
+    });
+    let u_bed = extract_json_usage(EndpointKind::Chat, &bedrock_json).expect("bedrock usage");
+    assert_eq!(u_bed.input_uncached_tokens, 180);
+    assert_eq!(u_bed.output_tokens, 65);
+    assert_eq!(u_bed.cache_read_tokens, 40);
+    assert_eq!(u_bed.cache_write_tokens, 10);
+
+    // 3. Cohere meta.billed_units
+    let cohere_json = serde_json::json!({
+        "meta": {
+            "billed_units": {
+                "input_tokens": 95,
+                "output_tokens": 33
+            }
+        }
+    });
+    let u_coh = extract_json_usage(EndpointKind::Chat, &cohere_json).expect("cohere usage");
+    assert_eq!(u_coh.input_uncached_tokens, 95);
+    assert_eq!(u_coh.output_tokens, 33);
+
+    // 4. SseUsageTap handles > 1 MiB multimodal frame without dropping pending buffer
+    let mut tap = SseUsageTap::new(EndpointKind::Chat);
+    let large_b64 = "A".repeat(1_200_000);
+    let frame = format!(
+        "data: {{"choices":[{{"delta":{{"content":"{large_b64}"}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":20}}}}\n\n"
+    );
+    tap.feed_chunk(frame.as_bytes());
+    let u_stream = tap.finalize_usage();
+    assert_eq!(u_stream.input_uncached_tokens, 10);
+    assert_eq!(u_stream.output_tokens, 20);
+}

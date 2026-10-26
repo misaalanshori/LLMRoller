@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "abacus_ai_route_llm_and_aihubmix"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

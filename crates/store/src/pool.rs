@@ -137,11 +137,28 @@ fn writer_synchronous() -> SqliteSynchronous {
 /// connection cannot be established.
 pub async fn open_pool(path: &Path, role: Role) -> Result<SqlitePool, sqlx::Error> {
     let options = connect_options(role).filename(path);
-    SqlitePoolOptions::new()
+    let pool = SqlitePoolOptions::new()
         .max_connections(role.max_connections())
         .acquire_timeout(Duration::from_secs(5))
         .connect_with(options)
-        .await
+        .await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::Permissions::from_mode(0o600);
+        if path.exists() {
+            let _ = std::fs::set_permissions(path, mode.clone());
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar_path = std::path::PathBuf::from(sidecar);
+            if sidecar_path.exists() {
+                let _ = std::fs::set_permissions(&sidecar_path, mode.clone());
+            }
+        }
+    }
+    Ok(pool)
 }
 
 #[cfg(test)]

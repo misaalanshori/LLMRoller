@@ -93,6 +93,7 @@ pub enum DurableKey {
     ClientKeyTouch(String),
     ClientKeyConstantSessionFlag(String),
     AuthFailureCounter(i64, String, String),
+    UpstreamKeySecretUpdate(String),
 }
 
 /// Durable operation executed in SQLite with per-item SAVEPOINT.
@@ -155,6 +156,12 @@ pub enum DurableOp {
     },
     RouteProtocolBlockClear {
         upstream_key_id: String,
+    },
+    UpstreamKeySecretUpdate {
+        upstream_key_id: String,
+        secret_enc: Vec<u8>,
+        master_key_id: String,
+        secret_last4: String,
     },
 }
 
@@ -405,10 +412,11 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
         Err(_) => return,
     };
 
-    // 1. Drain and execute durable_state items with per-item SAVEPOINT
+    // 1. Drain and execute durable_state items bounded by BATCH_MAX_ITEMS with per-item SAVEPOINT (FND-017)
     let durable_items: Vec<(DurableKey, DurableOp)> = {
         let mut lock = queues.durable_state.lock();
-        std::mem::take(&mut *lock).into_iter().collect()
+        let drain_len = lock.len().min(BATCH_MAX_ITEMS);
+        lock.drain(..drain_len).collect()
     };
     let durable_backup = durable_items.clone();
 
@@ -586,6 +594,21 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
             .execute(&mut *transaction)
             .await
             .map(|_| ()),
+            DurableOp::UpstreamKeySecretUpdate {
+                upstream_key_id,
+                secret_enc,
+                master_key_id,
+                secret_last4,
+            } => sqlx::query(
+                "UPDATE upstream_keys SET secret_enc = ?, master_key_id = ?, secret_last4 = ? WHERE id = ?",
+            )
+            .bind(secret_enc)
+            .bind(master_key_id)
+            .bind(secret_last4)
+            .bind(upstream_key_id)
+            .execute(&mut *transaction)
+            .await
+            .map(|_| ()),
         };
 
         if res.is_ok() {
@@ -616,7 +639,17 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
     // event was dropped by the bounded queue is discarded in its own savepoint.
     let trace_items: Vec<SealedTurnResult> = {
         let mut lock = queues.sealed_traces.lock();
-        std::mem::take(&mut *lock).into_iter().collect()
+        let mut batch = Vec::new();
+        let mut bytes_acc = 0usize;
+        while batch.len() < BATCH_MAX_ITEMS && bytes_acc < BATCH_MAX_BYTES {
+            let Some(item) = lock.pop_front() else {
+                break;
+            };
+            bytes_acc += item.payload_enc.len()
+                + item.sealed_blocks.iter().map(|(_, b, _)| b.len()).sum::<usize>();
+            batch.push(item);
+        }
+        batch
     };
     let trace_backup = trace_items.clone();
     let mut deferred_traces: Vec<SealedTurnResult> = Vec::new();

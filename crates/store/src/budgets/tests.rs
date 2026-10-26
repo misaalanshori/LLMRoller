@@ -245,3 +245,69 @@ async fn test_route_scoped_rings_and_multi_day_windows_hydrate_across_restart() 
             .contains_key(&(key_id, "model-unrelated".to_string()))
     );
 }
+
+// Spec: ./docs/srdd/13. SRDD - Usage Tracking, Quotas, and Cost Accounting.md#132-budget-windows-and-monthly-accumulators | Phase: ./docs/bigbang/big-bang-phases-4.md#41-sub-phase-41-five-kind-windowcounter-monthly-accumulators-and-fast-startup-reconstruction
+#[tokio::test]
+#[doc = "Spec: LIM-1, Spec: PERF-4, Spec: SHR-2"]
+async fn test_active_manual_offset_preserves_effective_at_and_share_month_cutoff() {
+    let (_dir, pool) = setup_db().await;
+    let key_id = UpstreamKeyId::generate();
+    let share_id = ShareId::generate();
+    let client_key_id = ClientKeyId::generate();
+    let user_id = UserId::generate();
+
+    // Insert a manual adjustment at T0 = 1_000_000 with period = 3_600_000
+    insert_budget_adjustment(
+        &pool,
+        "adj_01",
+        "win_01",
+        None,
+        250_000,
+        1_000_000,
+        Some(1_000_000),
+        Some("calibrate"),
+        1_000_000,
+    )
+    .await
+    .expect("insert adjustment");
+
+    // Restart at T = 2_800_000 (halfway through the 1h period): effective_at_ms must remain 1_000_000!
+    let offset = active_manual_offset_for_window(&pool, "win_01", 3_600_000, 2_800_000)
+        .await
+        .expect("active offset")
+        .expect("some offset");
+    assert_eq!(offset.effective_at_ms, 1_000_000);
+    assert_eq!(offset.delta_micro_usd, 250_000);
+    assert_eq!(offset.value_at(2_800_000), 250_000);
+    assert_eq!(offset.value_at(4_600_001), 0);
+
+    // Verify full UTC calendar month reconstruction for ProviderShare even when max_window_period_ms is short (1h)
+    let month_start = UtcYearMonth::new(2026, 3).start_epoch_millis();
+    let day_2_ms = month_start + 2 * 86_400_000;
+    let day_28_ms = month_start + 28 * 86_400_000;
+    sqlx::query(
+        r#"INSERT INTO usage_rollups_5min (
+               bucket_ms, upstream_key_id, canonical_id, client_key_id,
+               owner_user_id, provider_scope, share_id, cost_micro_usd, requests
+           )
+           VALUES (?, ?, 'gpt-4o', ?, ?, 'shared', ?, 42000, 1)"#,
+    )
+    .bind(day_2_ms)
+    .bind(key_id.to_string())
+    .bind(client_key_id.to_string())
+    .bind(user_id.to_string())
+    .bind(share_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert share rollup");
+
+    let rebuilt = reconstruct_budgets_from_rollups(&pool, day_28_ms, 3_600_000)
+        .await
+        .expect("reconstruct");
+    assert_eq!(
+        rebuilt
+            .monthly_accumulators
+            .usage_for(&BudgetScopeId::ProviderShare(share_id), day_28_ms),
+        42_000
+    );
+}

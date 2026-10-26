@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "wandb_inference_coreweave_and_weights_and_biases"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

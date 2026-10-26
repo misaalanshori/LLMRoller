@@ -208,6 +208,12 @@ pub(crate) async fn post_admin_user_handler(
         _ => llmroller_core::rbac::Role::User,
     };
 
+    let _permit = state
+        .auth
+        .argon2_semaphore
+        .acquire()
+        .await
+        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
     let user = llmroller_store::users::create_user(
         &state.auth.pool,
         &actor,
@@ -336,6 +342,12 @@ pub(crate) async fn post_admin_reset_password_handler(
         format!("Temp-{}", &hex_suffix[..16])
     });
 
+    let _permit = state
+        .auth
+        .argon2_semaphore
+        .acquire()
+        .await
+        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
     let entropy = state.auth.entropy.clone();
     let pw_clone = temp_password.clone();
     let password_hash = tokio::task::spawn_blocking(move || {
@@ -406,6 +418,12 @@ pub(crate) async fn post_user_password_handler(
             .unwrap_or("");
     let id_hash = llmroller_store::crypto::sha256_hex(session_token.as_bytes());
 
+    let _permit = state
+        .auth
+        .argon2_semaphore
+        .acquire()
+        .await
+        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
     llmroller_store::users::change_password(
         &state.auth.pool,
         &actor,

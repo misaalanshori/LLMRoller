@@ -228,19 +228,33 @@ pub async fn revoke_provider_share_tx(
         return Err(ShareError::NotFound);
     }
 
-    // Delete grantee user_route_preferences per SHR-5
+    // Delete grantee user_route_preferences and active session pins per SHR-5 (FND-030)
     if let Some(ref key_id) = share.upstream_key_id {
         sqlx::query("DELETE FROM user_route_preferences WHERE user_id = ? AND upstream_key_id = ?")
             .bind(share.grantee_user_id.to_string())
             .bind(key_id.to_string())
             .execute(&mut **tx)
             .await?;
+        sqlx::query(
+            "DELETE FROM pins WHERE upstream_key_id = ? AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
+        )
+        .bind(key_id.to_string())
+        .bind(share.grantee_user_id.to_string())
+        .execute(&mut **tx)
+        .await?;
     } else {
         sqlx::query(
             "DELETE FROM user_route_preferences WHERE user_id = ? AND upstream_key_id IN (SELECT id FROM upstream_keys WHERE provider_id = ?)",
         )
         .bind(share.grantee_user_id.to_string())
         .bind(share.provider_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM pins WHERE upstream_key_id IN (SELECT id FROM upstream_keys WHERE provider_id = ?) AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
+        )
+        .bind(share.provider_id.to_string())
+        .bind(share.grantee_user_id.to_string())
         .execute(&mut **tx)
         .await?;
     }

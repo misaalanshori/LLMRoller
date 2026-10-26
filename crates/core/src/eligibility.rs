@@ -31,6 +31,26 @@ pub enum CandidatePoolTier {
     Blended = 3,
 }
 
+impl CandidatePoolTier {
+    /// Numeric database representation (`0..=3`, `FND-053`).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode the numeric database representation (`0..=3`, `FND-053`).
+    #[must_use]
+    pub const fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Own),
+            1 => Some(Self::Shared),
+            2 => Some(Self::Global),
+            3 => Some(Self::Blended),
+            _ => None,
+        }
+    }
+}
+
 /// Input candidate route being evaluated for eligibility.
 #[derive(Debug, Clone)]
 pub struct CandidateRoute {

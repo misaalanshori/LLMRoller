@@ -22,7 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "grok_cli_and_grok_web_sso_cookie_executor"
+"user-agent" = "grok-cli/0.1.0 ({{os}}/{{arch}})"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

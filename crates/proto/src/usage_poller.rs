@@ -747,8 +747,8 @@ mod tests {
     #[doc = "Spec: PRV-2, USG-7, F098 - OpenRouter attribution headers, /key usage extraction with null limit, and prompt cache injection"]
     fn regression_test_f098_openrouter_preset_missing_attribution_he() {
         let toml = ProviderKind::Openrouter.preset_toml();
-        assert!(toml.contains("\"HTTP-Referer\""));
-        assert!(toml.contains("\"X-Title\" = \"LLMRoller\""));
+        assert!(toml.contains("\"X-Title\" = \"{{caller_client_name}}\""));
+        assert!(!toml.contains("LLMRoller"));
 
         let raw = serde_json::json!({
             "data": {

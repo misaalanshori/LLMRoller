@@ -715,6 +715,8 @@ pub(crate) struct CreateProviderRequest {
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    #[serde(default)]
+    pub preset_id: Option<String>,
     #[serde(default = "default_config_json")]
     pub config_json: String,
     #[serde(default)]

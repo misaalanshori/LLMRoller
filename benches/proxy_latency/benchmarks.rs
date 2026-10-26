@@ -686,12 +686,10 @@ pub(crate) async fn bench_perf4(scale: &Scale) -> Perf4Result {
     drop(rebuilt);
     let pin_store = PinStore::new(scale.perf4_pins.max(1));
     for pin in &pins {
-        let tier = match pin.pool_tier {
-            0 => CandidatePoolTier::Own,
-            1 => CandidatePoolTier::Shared,
-            2 => CandidatePoolTier::Global,
-            _ => CandidatePoolTier::Blended,
-        };
+        let tier = u8::try_from(pin.pool_tier)
+            .ok()
+            .and_then(CandidatePoolTier::from_u8)
+            .unwrap_or(CandidatePoolTier::Blended);
         pin_store.insert_hydrated(
             PinKey {
                 client_key_id: pin.client_key_id,

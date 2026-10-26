@@ -142,6 +142,16 @@ impl std::fmt::Debug for SealerPool {
 
 impl SealerPool {
     pub fn new(sealer: Arc<XChaCha20Poly1305Sealer>) -> (Self, Receiver<SealedTurnResult>) {
+        Self::new_with_queues(sealer, None)
+    }
+
+    /// Create a [`SealerPool`] that pushes sealed turns directly into [`crate::writer::DataQueues`]
+    /// BEFORE decrementing `in_flight` (`FND-024`, `TRC-4`, `REL-2`), eliminating any race between
+    /// Step 4 sealer drain and Step 6 writer drain.
+    pub fn new_with_queues(
+        sealer: Arc<XChaCha20Poly1305Sealer>,
+        queues: Option<Arc<crate::writer::DataQueues>>,
+    ) -> (Self, Receiver<SealedTurnResult>) {
         let (job_tx, job_rx) = sync_channel::<SealJob>(64);
         let (res_tx, res_rx) = sync_channel::<SealedTurnResult>(64);
         let job_rx_arc = Arc::new(std::sync::Mutex::new(job_rx));
@@ -153,6 +163,7 @@ impl SealerPool {
             let sealer_clone = Arc::clone(&sealer);
             let res_tx_clone = res_tx.clone();
             let in_flight_clone = Arc::clone(&in_flight);
+            let queues_clone = queues.clone();
 
             std::thread::Builder::new()
                 .name("llmroller-sealer".to_string())
@@ -162,6 +173,9 @@ impl SealerPool {
                         rx_lock.recv()
                     } {
                         if let Ok(sealed_res) = seal_turn_sync(&job, &sealer_clone) {
+                            if let Some(ref q) = queues_clone {
+                                q.push_sealed_trace(sealed_res.clone());
+                            }
                             let _ = res_tx_clone.send(sealed_res);
                         }
                         in_flight_clone.fetch_sub(1, Ordering::AcqRel);

@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "morph_fast_apply_and_relace_instant_apply"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

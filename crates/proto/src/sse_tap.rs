@@ -5,10 +5,10 @@
 
 use crate::adapters::EndpointKind;
 use crate::json_usage::{
-    ExtractedUsage, extract_chat_json_usage, extract_json_stop_reason, extract_messages_json_usage,
-    extract_responses_json_usage,
+    ExtractedUsage, extract_chat_json_usage, extract_extended_provider_json_usage,
+    extract_json_stop_reason, extract_messages_json_usage, extract_responses_json_usage,
 };
-use crate::sse_frame::find_frame_delimiter;
+use crate::sse_frame::{DEFAULT_MAX_FRAME_BYTES, find_frame_delimiter};
 
 /// Streaming SSE usage tap that inspects SSE frames without delaying client forwarding.
 #[derive(Debug, Clone)]
@@ -54,8 +54,8 @@ impl SseUsageTap {
         if offset > 0 {
             self.pending.drain(..offset);
         }
-        // Cap pending buffer at 1 MiB to guard against malformed streams without delimiters
-        if self.pending.len() > 1024 * 1024 {
+        // Cap pending buffer at DEFAULT_MAX_FRAME_BYTES (16 MiB, SEC-8 / FND-016)
+        if self.pending.len() > DEFAULT_MAX_FRAME_BYTES {
             self.pending.clear();
         }
     }
@@ -127,6 +127,32 @@ impl SseUsageTap {
 
         if let Some(reason) = extract_json_stop_reason(self.endpoint, &json) {
             self.stop_reason = Some(reason);
+        }
+
+        // FND-014: Support Gemini usageMetadata, Bedrock metadata.usage, and Cohere billed_units in SSE/NDJSON frames
+        if let Some(ext_u) = extract_extended_provider_json_usage(&json) {
+            self.observed_usage = Some(merge_responses_usage(self.observed_usage, ext_u));
+            if ext_u.output_tokens > 0 {
+                self.has_terminal_output_usage = true;
+            }
+        }
+        if let Some(parts) = json
+            .pointer("/candidates/0/content/parts")
+            .or_else(|| json.pointer("/response/candidates/0/content/parts"))
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    self.accumulated_output_text_bytes += t.len();
+                }
+            }
+        }
+        if let Some(b_txt) = json
+            .pointer("/contentBlockDelta/delta/text")
+            .or_else(|| json.get("textDelta"))
+            .and_then(|v| v.as_str())
+        {
+            self.accumulated_output_text_bytes += b_txt.len();
         }
 
         match self.endpoint {

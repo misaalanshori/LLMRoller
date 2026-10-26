@@ -779,6 +779,13 @@ async fn post_login(
         return Err(AuthError::AccountDisabled);
     }
 
+    let _argon_permit = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.argon2_semaphore.acquire(),
+    )
+    .await
+    .map_err(|_| AuthError::LoginBusy)?
+    .map_err(|_| AuthError::Internal)?;
     let password = payload.password.clone();
     let password_hash = record.password_hash.clone();
     let verified = tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
@@ -1025,8 +1032,10 @@ pub async fn authenticate_session(
         return Err(AuthError::AccountDisabled);
     }
 
-    // 4. Update last_seen_at
-    let _ = touch_web_session(&state.pool, &id_hash, now_ms).await;
+    // 4. Throttle last_seen_at updates to at most once every 5 minutes (300_000 ms) to prevent SQLite write lock contention (FND-042)
+    if now_ms.saturating_sub(session.session.last_seen_at) >= 300_000 {
+        let _ = touch_web_session(&state.pool, &id_hash, now_ms).await;
+    }
 
     Ok(session)
 }
@@ -1068,10 +1077,38 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     response
 }
 
-/// Derives the verifiable per-session CSRF token from the session token.
+/// Derives a keyed HMAC-SHA256 CSRF token when a server secret is provided, or the
+/// domain-separated SHA-256 derivation used by default sessions (`FND-041`, `SEC-5`).
+#[must_use]
+pub fn derive_session_csrf_with_secret(secret: Option<&[u8]>, session_token: &str) -> String {
+    let key = secret.unwrap_or(b"llmroller.csrf.v1.default_hmac_key");
+    let mut ipad = [0x36_u8; 64];
+    let mut opad = [0x5c_u8; 64];
+    let key_bytes = if key.len() > 64 {
+        let hashed = sha256_hex(key);
+        hashed.into_bytes()
+    } else {
+        key.to_vec()
+    };
+    for (i, &b) in key_bytes.iter().take(64).enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+    let mut inner = Vec::with_capacity(64 + session_token.len() + 18);
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(b"llmroller.csrf.v1:");
+    inner.extend_from_slice(session_token.as_bytes());
+    let inner_hash = sha256_hex(&inner);
+    let mut outer = Vec::with_capacity(64 + inner_hash.len());
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(inner_hash.as_bytes());
+    sha256_hex(&outer)
+}
+
+/// Derives the verifiable per-session CSRF token from the session token (`SEC-5`, `FND-041`).
 #[must_use]
 pub fn derive_session_csrf(session_token: &str) -> String {
-    sha256_hex(format!("llmroller.csrf.v1:{session_token}").as_bytes())
+    derive_session_csrf_with_secret(None, session_token)
 }
 
 pub fn parse_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {

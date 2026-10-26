@@ -22,7 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "alibaba_qwen_oauth_portal_and_dashscope_coding_plan"
+"user-agent" = "qwen-code/0.1.0 ({{os}}/{{arch}})"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

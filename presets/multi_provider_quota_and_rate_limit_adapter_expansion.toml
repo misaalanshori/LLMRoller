@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "multi_provider_quota_and_rate_limit_adapter_expansion"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

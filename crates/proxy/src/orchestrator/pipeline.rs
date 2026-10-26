@@ -83,7 +83,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
 
     loop {
         if attempt_no >= MAX_UPSTREAM_ATTEMPTS
-            || (attempt_no >= 1 && now_ms().saturating_sub(now) >= 60_000)
+            || (attempt_no >= 1 && state.clock.now_ms().saturating_sub(now) >= 60_000)
         {
             break;
         }
@@ -141,12 +141,18 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         };
         let secret = match state
             .token_manager
-            .resolve_secret(
+            .resolve_and_persist_secret(
                 key.id,
+                key.provider_id,
                 &raw_secret,
                 state.select_http_client(candidate.allow_private_network),
                 candidate.allow_private_network,
                 now,
+                state.writer.as_ref(),
+                state.master_key.as_ref(),
+                state.master_key_id.as_deref(),
+                state.instance_id.or(Some(snapshot.instance_id)),
+                &state.entropy,
             )
             .await
         {
@@ -389,6 +395,25 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         {
             edited_body = (spec.normalize_request_body)(edited_body, &candidate.upstream_model_id);
         }
+        // F095 / FND-009: When targeting Command Code native /alpha/generate, wrap body in /alpha/generate envelope.
+        if candidate.provider_kind == ProviderKind::CommandCode
+            && target_url.ends_with("/alpha/generate")
+            && transcode_pair.is_none()
+            && let Some(src_wire) = llmroller_proto::transcode::WireProtocol::from_catalog_str(protocol)
+        {
+            let cc_thread = resolved_session
+                .as_ref()
+                .map(|s| s.outbound_token(candidate.pool_tier()))
+                .unwrap_or("thr_llmroller");
+            if let Ok(env) = llmroller_proto::providers::command_code::build_alpha_generate_envelope(
+                src_wire,
+                &edited_body,
+                &candidate.upstream_model_id,
+                cc_thread,
+            ) {
+                edited_body = Bytes::from(env);
+            }
+        }
         // F096: On OpenCode Go /v1/responses, force `store: false` and strip prior `reasoning` items.
         if candidate.provider_kind == ProviderKind::OpencodeGo
             && attempt_endpoint == EndpointKind::Responses
@@ -398,8 +423,14 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         }
         // F007, F024, F098: Apply provider OpenAI Chat Completions compatibility normalizations,
         // OpenRouter Anthropic prompt cache breakpoint injection, and declarative body_edits.
-        let has_compat =
-            attempt_endpoint == EndpointKind::Chat && candidate.config.openai_compat.is_some();
+        let preset_compat = candidate
+            .config
+            .preset_id
+            .as_deref()
+            .and_then(llmroller_proto::providers::lookup_provider_preset)
+            .and_then(|spec| (spec.default_provider_config)().openai_compat);
+        let effective_compat = candidate.config.openai_compat.as_ref().or(preset_compat.as_ref());
+        let has_compat = attempt_endpoint == EndpointKind::Chat && effective_compat.is_some();
         let has_or_cache = attempt_endpoint == EndpointKind::Chat
             && candidate.provider_kind == ProviderKind::Openrouter;
         let has_rules = !candidate.config.body_edits.is_empty();
@@ -407,7 +438,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             && let Ok(mut json_doc) = serde_json::from_slice::<serde_json::Value>(&edited_body)
         {
             let mut doc_changed = false;
-            if let Some(ref compat) = candidate.config.openai_compat
+            if let Some(compat) = effective_compat
                 && attempt_endpoint == EndpointKind::Chat
                 && llmroller_proto::body_edit::apply_openai_completions_compat(
                     &mut json_doc,
@@ -443,6 +474,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             &secret,
             attempt_endpoint,
             resolved_session.as_ref(),
+            now,
         ) {
             Ok(headers) => headers,
             Err(response) => return *response,
@@ -453,7 +485,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             request_builder = request_builder.header(name, value);
         }
 
-        let attempt_started = now_ms();
+        let attempt_started = state.clock.now_ms();
         // F003: Streaming requests use first_activity_timeout_ms (60s); non-streaming requests use nonstream_response_timeout_ms (600s).
         let send_timeout = if is_streaming {
             Duration::from_millis(candidate.config.first_activity_timeout_ms())
@@ -570,6 +602,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                     0,
                     "none",
                 ));
+                attempt_no += 1;
                 tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
 
                 let mut retry_builder = client.post(&target_url).body(edited_body.clone());
@@ -692,6 +725,11 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                     if class == ErrorClass::Unclassified403 {
                         crate::metrics::record_unclassified_403(&candidate.provider_id.to_string());
                     }
+                    // Host responded cleanly with a client/moderation 4xx: close any HalfOpen
+                    // origin breaker probe while keeping key health untouched (REL-5, FND-001).
+                    if let Some(breaker) = state.runtime_state.origin_breakers.get(&origin) {
+                        breaker.lock().record_success(now);
+                    }
                     // The upstream response is forwarded verbatim with zero health
                     // effect; moderation 403s must never quarantine or fail over.
                     let outcome =
@@ -753,7 +791,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                             CostSource::PriceBook,
                             None,
                             None,
-                            Some(now_ms() - attempt_started),
+                            Some(state.clock.now_ms() - attempt_started),
                         );
                         writer
                             .queues
@@ -1042,7 +1080,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                             CostSource::PriceBook,
                             None,
                             None,
-                            Some(now_ms() - attempt_started),
+                            Some(state.clock.now_ms() - attempt_started),
                         );
                         writer
                             .queues
@@ -1201,7 +1239,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             CostSource::EstimatedIncomplete,
             None,
             None,
-            Some(now_ms() - now),
+            Some(state.clock.now_ms() - now),
         );
         writer
             .queues

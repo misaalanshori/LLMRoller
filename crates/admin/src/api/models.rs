@@ -105,14 +105,28 @@ pub(crate) async fn post_admin_model_confirm_merge_handler(
     Path(id): Path<llmroller_core::ids::ModelPk>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
-    let res = sqlx::query("UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?")
-        .bind(id.to_string())
-        .execute(&state.auth.pool)
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if res.rows_affected() == 0 {
-        return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
-    }
+    let id_str = id.to_string();
+    execute_atomic_mutation(&state, vec![ConfigDomain::Models], move |tx| {
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?",
+            )
+            .bind(&id_str)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            if res.rows_affected() == 0 {
+                return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
+            }
+            sqlx::query("UPDATE model_aliases SET confirmed = 1 WHERE model_pk = ?")
+                .bind(&id_str)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
     Ok(StatusCode::OK)
 }
 

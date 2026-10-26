@@ -81,6 +81,14 @@ pub(crate) struct ServeArgs {
     /// Allow non-HTTPS cookies for local dev.
     #[arg(long, default_value_t = false)]
     pub(crate) dev_insecure_cookies: bool,
+
+    /// Structured log level filter (trace, debug, info, warn, error) (`FND-052`, `OBS-2`).
+    #[arg(long, env = "LLMROLLER_LOG_LEVEL", default_value = "info")]
+    pub(crate) log_level: String,
+
+    /// Structured log output format (json or pretty) (`FND-052`, `OBS-2`).
+    #[arg(long, env = "LLMROLLER_LOG_FORMAT", default_value = "json")]
+    pub(crate) log_format: String,
 }
 
 /// Arguments for `llmroller backup`.

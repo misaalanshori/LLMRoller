@@ -36,6 +36,7 @@ pub struct ShutdownSupervisor {
     pub drain_grace_duration: Duration,
     pub drain_timeout_duration: Duration,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
+    pub listener_stop: Option<watch::Sender<bool>>,
     pub background_stop: Option<watch::Sender<bool>>,
     pub sealer_pool: Option<Arc<llmroller_store::traces::SealerPool>>,
     pub runtime_state: Option<Arc<llmroller_core::runtime_state::RuntimeState>>,
@@ -60,6 +61,7 @@ impl ShutdownSupervisor {
             drain_grace_duration,
             drain_timeout_duration,
             writer: None,
+            listener_stop: None,
             background_stop: None,
             sealer_pool: None,
             runtime_state: None,
@@ -77,6 +79,13 @@ impl ShutdownSupervisor {
     #[must_use]
     pub fn with_writer(mut self, writer: llmroller_store::writer::WriterHandle) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Attach the TCP listener stop channel so step 2 immediately stops accepting new connections (`FND-054`).
+    #[must_use]
+    pub fn with_listener_stop(mut self, stop: watch::Sender<bool>) -> Self {
+        self.listener_stop = Some(stop);
         self
     }
 
@@ -117,7 +126,10 @@ impl ShutdownSupervisor {
             tokio::time::sleep(self.drain_grace_duration).await;
         }
 
-        // Step 2: Stop accepting new TCP connections (signaled via is_ready)
+        // Step 2: Stop accepting new TCP connections immediately before draining in-flight streams (FND-054)
+        if let Some(listener_stop) = &self.listener_stop {
+            let _ = listener_stop.send(true);
+        }
 
         // Step 3: Wait for in-flight streams to complete naturally up to drain_timeout
         let start = Instant::now();

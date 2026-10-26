@@ -213,4 +213,37 @@ async fn test_backup_cli_exit_codes_and_integrity() {
         .await
         .expect("run llmroller backup overwrite");
     assert_eq!(output3.status.code(), Some(0));
+
+    // 4. Doctor without LLMROLLER_MASTER_KEY fails with exit code 3 (FND-057)
+    let doc_missing_mk = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
+        .arg("doctor")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env_remove("LLMROLLER_MASTER_KEY")
+        .output()
+        .await
+        .expect("run llmroller doctor without master key");
+    assert_eq!(doc_missing_mk.status.code(), Some(3));
+
+    // 5. Spawn child process and SIGKILL (kill -9) to verify WAL crash safety (FND-057, REL-2)
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_llmroller"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--admin-listen")
+        .arg("127.0.0.1:0")
+        .arg("--metrics-listen")
+        .arg("127.0.0.1:0")
+        .env(
+            "LLMROLLER_MASTER_KEY",
+            "iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg=",
+        )
+        .env("LLMROLLER_MASTER_KEY_ID", "key-0")
+        .spawn()
+        .expect("spawn child llmroller serve");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }

@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "moonshot_ai_global_and_cn"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

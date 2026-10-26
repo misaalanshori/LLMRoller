@@ -1,3 +1,4 @@
+#![doc = "Spec: USG-9, Spec: TRC-6, Spec: UI-1, Spec: UI-2, Spec: UI-6, Spec: AUD-2, Spec: AUTH-4, Spec: USR-5, Spec: CLK-6, Spec: CLK-7, Spec: USG-10, Spec: TRC-9, Spec: UI-4, Spec: UI-5"]
 //! End-to-end integration tests for HTMX web UI, dashboards, key projection, and chat preview.
 //!
 //! Spec: Section 3.3 (A6), Section 6.10, Section 6.11, Section 8.2, Section 12.6, Section 14.3,

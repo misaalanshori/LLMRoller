@@ -164,7 +164,7 @@ pub(crate) async fn admit_inbound_request(
     }
     let is_streaming = scan.stream.as_ref().is_some_and(|(stream, _)| *stream);
     let store_flag = response_store_flag(&scan, &body);
-    let now = now_ms();
+    let now = state.clock.now_ms();
 
     let snapshot = state.snapshot.load();
     // 3. Canonical model resolution is a pure in-memory lookup (PERF-1).
@@ -562,7 +562,7 @@ pub(crate) async fn admit_inbound_request(
         .as_ref()
         .map(|session| session.pin_key.clone());
     let pin_ttl_ms = snapshot.settings.pin_ttl_secs.saturating_mul(1000);
-    let clock = SystemClock::new();
+    let clock = state.clock.as_ref();
     let mut pin_ticket: Option<PinTicket> = None;
     let mut ordered: Vec<RouteCandidate> = Vec::new();
 
@@ -580,7 +580,7 @@ pub(crate) async fn admit_inbound_request(
         if let (Some(pin_key), Some(candidate)) = (pin_key.as_ref(), tier_candidates.first()) {
             let ticket = state.pin_store.acquire(
                 pin_key,
-                &clock,
+                clock,
                 pin_ttl_ms,
                 false,
                 snapshot.settings.recovery_repin_min_idle_secs,
@@ -598,7 +598,7 @@ pub(crate) async fn admit_inbound_request(
     } else if let Some(pin_key) = &pin_key {
         let ticket = state.pin_store.acquire(
             pin_key,
-            &clock,
+            clock,
             pin_ttl_ms,
             snapshot.settings.repin_on_personal_recovery,
             snapshot.settings.recovery_repin_min_idle_secs,

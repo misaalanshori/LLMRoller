@@ -582,3 +582,128 @@ use llmroller_core::accumulators::MonthlyAccumulatorRegistry;
             Some(12_500)
         );
     }
+
+    #[tokio::test]
+    #[doc = "Spec: REL-5, SEC-8, USG-1"]
+    async fn route_health_bumps_version_and_cap_decompressed_stream_enforces_16mib() {
+        let (_dir, state, _user_id, _client_key_id) = setup_proxy_state().await;
+        let key_id = UpstreamKeyId::generate();
+        let model_pk = ModelPk::generate();
+
+        enqueue_route_health_update(
+            &state,
+            key_id,
+            model_pk,
+            "cooling_down",
+            Some(5_000),
+            Some("rate_limit".to_string()),
+        );
+        enqueue_route_health_update(
+            &state,
+            key_id,
+            model_pk,
+            "unavailable",
+            Some(9_000),
+            Some("404".to_string()),
+        );
+        assert!(
+            state.runtime_state.health.current_version() >= 2,
+            "enqueue_route_health_update must bump monotonic health_version (FND-033)"
+        );
+
+        // Verify 16 MiB stream decompression guard (FND-035)
+        let oversized = futures_util::stream::iter(vec![
+            Ok(Bytes::from(vec![b'a'; 10 * 1024 * 1024])),
+            Ok(Bytes::from(vec![b'b'; 7 * 1024 * 1024])),
+        ]);
+        let mut capped = super::streaming::cap_decompressed_stream(oversized);
+        let first = capped.next().await.expect("chunk 1");
+        assert!(first.is_ok());
+        let second = capped.next().await.expect("chunk 2");
+        assert!(second.is_err(), "chunk exceeding 16 MiB must return SEC-8 error");
+    }
+
+    #[test]
+    #[doc = "Spec: PRV-1, PRV-2, PRV-3, API-1, API-3, SEC-15 - verify transparent proxy caller header pass-through, caller client name translation, and all 80 provider presets (F101-F180)"]
+    fn transparent_proxy_headers_and_all_80_presets_verification() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            HeaderName::from_static("x-client-name"),
+            HeaderValue::from_static("cursor-agent"),
+        );
+        inbound.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.63 (external, cli)"),
+        );
+
+        // 1. Standard OpenAI-compatible preset preserves caller x-client-name and user-agent without self-identifying as llmroller
+        let mut candidate = sample_candidate(CandidatePoolTier::Own);
+        candidate.config.preset_id = Some("huggingface_inference_router".to_string());
+        let outbound = build_upstream_headers(
+            &inbound,
+            &candidate,
+            "sk-hf-secret",
+            EndpointKind::Chat,
+            None,
+            1_776_000_000_000,
+        )
+        .expect("build_upstream_headers");
+        assert_eq!(
+            outbound.get("x-client-name").and_then(|v| v.to_str().ok()),
+            Some("cursor-agent")
+        );
+        assert!(!outbound.contains_key("x-llmroller-preset"));
+
+        // 2. OpenRouter translates caller client name into x-title when absent, never sending LLMRoller
+        let mut or_candidate = sample_candidate(CandidatePoolTier::Own);
+        or_candidate.provider_kind = ProviderKind::Openrouter;
+        let or_outbound = build_upstream_headers(
+            &inbound,
+            &or_candidate,
+            "sk-or-secret",
+            EndpointKind::Chat,
+            None,
+            1_776_000_000_000,
+        )
+        .expect("openrouter headers");
+        assert_eq!(
+            or_outbound.get("x-title").and_then(|v| v.to_str().ok()),
+            Some("cursor-agent")
+        );
+
+        // 3. Specific CLI/SDK presets synthesize their mandatory upstream headers
+        let grok_spec = llmroller_proto::providers::lookup_provider_preset(
+            "grok_cli_and_grok_web_sso_cookie_executor",
+        )
+        .expect("grok preset");
+        let grok_headers = (grok_spec.synthesize_headers)("01JKEYTEST0000000000000000", "sess_1");
+        assert_eq!(
+            grok_headers.get("user-agent").map(String::as_str),
+            Some("grok-cli/0.1.0 (darwin/arm64)")
+        );
+
+        let genai_spec = llmroller_proto::providers::lookup_provider_preset(
+            "google_generative_ai_studio_and_vertex_ai",
+        )
+        .expect("genai preset");
+        let genai_headers =
+            (genai_spec.synthesize_headers)("01JKEYTEST0000000000000000", "sess_1");
+        assert_eq!(
+            genai_headers.get("x-goog-api-client").map(String::as_str),
+            Some("genai-rs/1.0.0")
+        );
+
+        // 4. Verify all 80 presets in ALL_PROVIDER_PRESET_SPECS
+        assert_eq!(
+            llmroller_proto::providers::ALL_PROVIDER_PRESET_SPECS.len(),
+            80
+        );
+        for spec in llmroller_proto::providers::ALL_PROVIDER_PRESET_SPECS {
+            let url = (spec.build_endpoint_url)(spec.default_base_url, EndpointKind::Chat);
+            assert!(url.starts_with("https://") || url.starts_with("http://"));
+            assert!(!url.contains("{model}"));
+            let synth = (spec.synthesize_headers)("01JKEYTEST0000000000000000", "sess_1");
+            assert!(!synth.contains_key("x-llmroller-preset"));
+        }
+    }
+

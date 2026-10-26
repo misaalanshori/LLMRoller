@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "cohere_v2_compatibility_api"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

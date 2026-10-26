@@ -166,7 +166,8 @@ h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.25rem; }
 .chat-tool-call pre { font-size: 0.75rem; color: #93c5fd; overflow-x: auto; margin-top: 0.25rem; }
 
 /* Inspection Drawer (SRDD 14.m) */
-.inspection-drawer { position: fixed; top: 0; right: 0; width: 480px; max-width: 90vw; height: 100vh; background: #0f172a; border-left: 1px solid var(--border); z-index: 1000; display: flex; flex-direction: column; box-shadow: -4px 0 24px rgba(0,0,0,0.5); }
+.inspection-drawer { position: fixed; top: 0; right: 0; width: 480px; max-width: 90vw; height: 100vh; background: #0f172a; border-left: 1px solid var(--border); z-index: 1000; display: none; flex-direction: column; box-shadow: -4px 0 24px rgba(0,0,0,0.5); }
+.inspection-drawer.open { display: flex; }
 .drawer-header { height: 52px; padding: 0 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
 .drawer-body { overflow-y: auto; flex: 1; padding: 1.25rem; display: flex; flex-direction: column; gap: 1.25rem; }
 .drawer-section { border-top: 1px solid var(--border); padding-top: 1rem; }
@@ -278,3 +279,30 @@ body.auth-page {
 .auth-card button[type="submit"]:hover {
     background: var(--primary-hover);
 }
+
+/* Strict CSP Utility Classes (FND-047, style-src 'self') */
+.hidden { display: none !important; }
+.stat-val-compact { font-size: 1.1rem; padding-top: 0.5rem; }
+.stat-val-md { font-size: 1.5rem; }
+.stat-desc-xs { font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem; }
+.uplot-box { min-height: 240px; display: flex; align-items: center; justify-content: center; background: #090d16; border-radius: 8px; border: 1px dashed #334155; }
+.mt-1 { margin-top: 0.25rem; }
+.mt-2 { margin-top: 0.5rem; }
+.mt-4 { margin-top: 1rem; }
+.mt-6 { margin-top: 1.5rem; }
+.mb-6 { margin-bottom: 1.5rem; }
+.p-6 { padding: 1.5rem; }
+.py-2-sm { font-size: 0.8125rem; padding: 0.5rem 0; }
+.table-sub { margin-top: 0.5rem; background: #080c18; }
+.prov-title { font-size: 1rem; margin-bottom: 0.25rem; }
+.prov-url-mono { font-size: 0.8125rem; font-family: monospace; color: var(--muted); }
+.cell-payload-mono { font-family: monospace; font-size: 0.75rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-clickable { cursor: pointer; }
+.list-compact { padding-left: 1.25rem; font-size: 0.8125rem; }
+.ledger-strip-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; text-align: center; }
+.ledger-strip-label { font-size: 0.75rem; text-transform: uppercase; }
+.ledger-strip-val { font-size: 1.5rem; font-weight: 700; }
+.ledger-strip-footer { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; font-size: 0.875rem; }
+.text-strike { text-decoration: line-through; }
+.text-xs { font-size: 0.75rem; }
+.alert.visible { display: block; }

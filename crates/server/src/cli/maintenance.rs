@@ -44,13 +44,25 @@ pub(crate) async fn run_restore_cmd(args: RestoreArgs) -> ExitCode {
         }
     };
     let target_db = data_dir.join("llmroller.db");
-    let master_key = load_master_key_from_env().ok();
-    let master_key_id = load_master_key_id_from_env().ok();
+    let master_key = match load_master_key_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+        }
+    };
+    let master_key_id = match load_master_key_id_from_env() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+        }
+    };
     match llmroller_server::backup::restore_backup(
         &args.from,
         &target_db,
-        master_key.as_ref(),
-        master_key_id.as_deref(),
+        Some(&master_key),
+        Some(master_key_id.as_str()),
     )
     .await
     {
@@ -97,7 +109,21 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
     for kind in llmroller_core::provider::ProviderKind::ALL {
         let _ = kind.preset_toml();
     }
-    if let (Ok(mk), Ok(mk_id)) = (load_master_key_from_env(), load_master_key_id_from_env()) {
+    let mk = match load_master_key_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: master key check failed: {e}");
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+        }
+    };
+    let mk_id = match load_master_key_id_from_env() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("error: master key id check failed: {e}");
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+        }
+    };
+    {
         let entropy = Arc::new(OsEntropy::new());
         let clock = SystemClock::new();
         let state = match load_or_initialize(&pool, &mk_id, &mk, entropy, clock.now_ms()).await {

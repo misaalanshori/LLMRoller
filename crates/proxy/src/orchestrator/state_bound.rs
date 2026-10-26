@@ -461,6 +461,7 @@ pub(crate) fn enqueue_route_health_update(
     let Some(writer) = &state.writer else {
         return;
     };
+    let next_ver = i64::try_from(state.runtime_state.health.bump_version()).unwrap_or(i64::MAX);
     writer.queues.durable_state.lock().insert(
         DurableKey::RouteHealth(key_id.to_string(), model_pk.to_string()),
         DurableOp::RouteHealthUpdate {
@@ -468,7 +469,7 @@ pub(crate) fn enqueue_route_health_update(
             model_pk: model_pk.to_string(),
             route_health: route_health.to_string(),
             route_health_until,
-            health_version: 1,
+            health_version: next_ver,
             last_error,
         },
     );
@@ -516,7 +517,7 @@ pub(crate) async fn forward_state_bound_response_op(
 ) -> Response {
     use crate::failover::{HardRouteDecision, evaluate_hard_route_decision};
 
-    let now = now_ms();
+    let now = state.clock.now_ms();
     let link = match load_response_link(state, response_id).await {
         Ok(Some(link)) => link,
         Ok(None) => return response_not_found(response_id),
@@ -566,9 +567,29 @@ pub(crate) async fn forward_state_bound_response_op(
         }
     }
 
-    let secret = match unseal_upstream_key(state, &snapshot, &key) {
+    let raw_secret = match unseal_upstream_key(state, &snapshot, &key) {
         Ok(secret) => secret,
         Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let secret = match state
+        .token_manager
+        .resolve_and_persist_secret(
+            key.id,
+            key.provider_id,
+            &raw_secret,
+            state.select_http_client(provider.allow_private_network),
+            provider.allow_private_network,
+            now,
+            state.writer.as_ref(),
+            state.master_key.as_ref(),
+            state.master_key_id.as_deref(),
+            state.instance_id.or(Some(snapshot.instance_id)),
+            &state.entropy,
+        )
+        .await
+    {
+        Ok(secret) => secret,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     let resp_base_path = provider
         .config
@@ -694,7 +715,7 @@ pub(crate) async fn forward_state_bound_response_op(
                     DurableKey::ResponseLink(response_id.to_string()),
                     DurableOp::ResponseLinkMarkIncomplete {
                         response_id: response_id.to_string(),
-                        updated_at: now_ms(),
+                        updated_at: state.clock.now_ms(),
                     },
                 );
             } else if sqlx::query(
@@ -733,7 +754,7 @@ pub(crate) async fn forward_state_bound_response_op(
 
     if let Some(writer) = &state.writer {
         let tier_str = match pool_tier {
-            PoolTier::Own => "own",
+            PoolTier::Own => "personal",
             PoolTier::Shared => "shared",
             PoolTier::Global | PoolTier::Blended => "global",
         };
@@ -770,7 +791,7 @@ pub(crate) async fn forward_state_bound_response_op(
                 reasoning_tokens: 0,
                 cost_micro_usd: 0,
                 cost_source: CostSource::PriceBook,
-                latency_ms: Some((now_ms() - now).max(0)),
+                latency_ms: Some((state.clock.now_ms() - now).max(0)),
                 ttfb_ms: None,
                 pin_outcome: None,
                 failovers: 0,
@@ -807,42 +828,56 @@ pub async fn post_messages_count_tokens(
     Extension(caller): Extension<ClientKeyRecord>,
     body: Bytes,
 ) -> Response {
-    let now = now_ms();
+    let now = state.clock.state.clock.now_ms();
+    let request_id_str = RequestId::generate().to_string();
     let scan = match scan_top_level(&body) {
         Ok(scan) => scan,
         Err(error) => {
-            return messages_error(
+            return protocol_error(
+                true,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 error.to_string(),
+                Some(&request_id_str),
+                None,
             );
         }
     };
     let Some((ref model_str, _)) = scan.model else {
-        return messages_error(
+        return protocol_error(
+            true,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "model is required in request body",
+            Some(&request_id_str),
+            None,
         );
     };
     let snapshot = state.snapshot.load();
     let model = match snapshot.resolve_model(model_str) {
         Ok(model) => model.clone(),
         Err(llmroller_core::snapshot::SnapshotResolveError::KillSwitched) => {
-            return messages_error(
+            return protocol_error(
+                true,
                 StatusCode::FORBIDDEN,
                 "model_disabled",
                 format!("model {model_str} is disabled"),
+                Some(&request_id_str),
+                None,
             );
         }
         Err(_) => {
-            return messages_error(
+            return protocol_error(
+                true,
                 StatusCode::NOT_FOUND,
                 "model_not_found",
                 format!("model {model_str} not found in catalog"),
+                Some(&request_id_str),
+                None,
             );
         }
     };
+    // Gate G6: client key model allow-list (CLK-2, FND-007)
     if let Some(ref allowed) = caller.allowed_models
         && !llmroller_core::client_key::is_model_allowed_by_patterns(
             allowed,
@@ -850,10 +885,30 @@ pub async fn post_messages_count_tokens(
             &model.canonical_id,
         )
     {
-        return messages_error(
+        return protocol_error(
+            true,
             StatusCode::FORBIDDEN,
             "permission_error",
             format!("model {} not permitted on this key", model.canonical_id),
+            Some(&request_id_str),
+            None,
+        );
+    }
+    // Gate G7: client key monthly budget preflight check (CLK-5, FND-007)
+    if state.runtime_state.accumulators.is_exhausted(
+        &llmroller_core::accumulators::BudgetScopeId::ClientKey(caller.id),
+        caller.budget_micro_usd_month,
+        now,
+    ) {
+        let month = llmroller_core::accumulators::UtcYearMonth::from_epoch_millis(now);
+        let retry_after = month.seconds_until_next_month(now);
+        return protocol_error(
+            true,
+            StatusCode::TOO_MANY_REQUESTS,
+            "client_key_budget_exhausted",
+            "client key monthly budget exhausted",
+            Some(&request_id_str),
+            Some(retry_after),
         );
     }
 
@@ -916,12 +971,18 @@ pub async fn post_messages_count_tokens(
         };
         let secret = match state
             .token_manager
-            .resolve_secret(
+            .resolve_and_persist_secret(
                 key.id,
+                key.provider_id,
                 &raw_secret,
                 state.select_http_client(candidate.allow_private_network),
                 candidate.allow_private_network,
                 now,
+                state.writer.as_ref(),
+                state.master_key.as_ref(),
+                state.master_key_id.as_deref(),
+                state.instance_id.or(Some(snapshot.instance_id)),
+                &state.entropy,
             )
             .await
         {
@@ -949,6 +1010,7 @@ pub async fn post_messages_count_tokens(
             &secret,
             EndpointKind::CountTokens,
             None,
+            now,
         ) {
             Ok(headers) => headers,
             Err(response) => return *response,

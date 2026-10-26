@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "preset_catalog_and_models_dev_bundled_registry"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

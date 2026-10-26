@@ -22,7 +22,7 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "roocode_cloud_and_kilocode_openrouter_compatible"
+"x-title" = "{{caller_client_name}}"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

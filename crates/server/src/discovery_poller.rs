@@ -130,22 +130,29 @@ pub fn start_discovery_poller_with_stop(
                     recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     recovery_ticker.tick().await;
 
+                    let token_manager = llmroller_proxy::token_manager::TokenManager::new();
                     let mut rx_guard = rx_arc.lock().await;
                     loop {
-                        let target = tokio::select! {
+                        let (target, recovery_only) = tokio::select! {
                             _ = job_stop.changed() => break,
-                            _ = ticker.tick() => DiscoveryTarget::AllEnabled,
-                            _ = recovery_ticker.tick() => DiscoveryTarget::AllEnabled,
-                            Some(target) = rx_guard.recv() => target,
+                            _ = ticker.tick() => (DiscoveryTarget::AllEnabled, false),
+                            _ = recovery_ticker.tick() => (DiscoveryTarget::AllEnabled, true),
+                            Some(target) = rx_guard.recv() => (target, false),
                             else => break,
                         };
 
-                        let keys = match load_discovery_keys(&deps.pool, target).await {
+                        let loaded_keys = match load_discovery_keys(&deps.pool, target).await {
                             Ok(keys) => keys,
                             Err(error) => {
                                 tracing::warn!(?target, "cannot load upstream keys for discovery: {error}");
                                 continue;
                             }
+                        };
+                        let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+                        let keys = if recovery_only {
+                            select_recovery_probe_keys(loaded_keys, &deps.runtime_state, now_ms, 3)
+                        } else {
+                            loaded_keys
                         };
 
                         let mut tasks = JoinSet::new();
@@ -159,10 +166,21 @@ pub fn start_discovery_poller_with_stop(
                             let writer = deps.writer.clone();
                             let runtime_state = deps.runtime_state.clone();
                             let sealer = sealer.clone();
+                            let token_manager = token_manager.clone();
+                            let master_key = deps.master_key.clone();
+                            let instance_id = deps.instance_id;
                             let in_flight = in_flight.clone();
                             let key_id = key.id;
                             tasks.spawn(async move {
-                                if let Err(error) = discover_key(&writer, &runtime_state, &sealer, &key).await {
+                                if let Err(error) = discover_key(
+                                    &writer,
+                                    &runtime_state,
+                                    &sealer,
+                                    &token_manager,
+                                    &master_key,
+                                    instance_id,
+                                    &key,
+                                ).await {
                                     tracing::warn!(key = %key.id, "model discovery failed: {error}");
                                 }
                                 in_flight.remove(&key_id);
@@ -242,10 +260,36 @@ fn discovery_key_from_row(row: &sqlx::sqlite::SqliteRow) -> Option<DiscoveryKey>
     })
 }
 
+/// Filters discovery keys during the 15-minute health recovery pass to only those keys
+/// currently marked unhealthy/quarantined/cooling_down/exhausted, capped at `max_per_provider` (`FND-056`, SRDD 10 §7).
+fn select_recovery_probe_keys(
+    keys: Vec<DiscoveryKey>,
+    runtime_state: &RuntimeState,
+    now_ms: i64,
+    max_per_provider: usize,
+) -> Vec<DiscoveryKey> {
+    let mut per_provider: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut selected = Vec::new();
+    for key in keys {
+        if runtime_state.is_key_routable(key.id, now_ms) {
+            continue;
+        }
+        let count = per_provider.entry(key.provider_id.clone()).or_insert(0);
+        if *count < max_per_provider {
+            *count += 1;
+            selected.push(key);
+        }
+    }
+    selected
+}
+
 async fn discover_key(
     writer: &WriterHandle,
     runtime_state: &RuntimeState,
     sealer: &XChaCha20Poly1305Sealer,
+    token_manager: &llmroller_proxy::token_manager::TokenManager,
+    master_key: &MasterKey,
+    instance_id: [u8; 16],
     key: &DiscoveryKey,
 ) -> Result<(), String> {
     // The AEAD associated data includes the provider id.
@@ -261,13 +305,34 @@ async fn discover_key(
             &key.secret_enc,
         )
         .map_err(|_| "cannot unseal upstream key".to_string())?;
-    let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
+    let raw_secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
     let url = discovery_endpoint(key.kind, &key.base_url, &key.config);
     llmroller_core::ssrf::validate_url(&url, key.allow_private_network)
         .map_err(|_| "discovery URL is not allowed".to_string())?;
     let client = llmroller_proxy::ssrf::create_guarded_client(key.allow_private_network)
         .map_err(|_| "cannot build guarded HTTP client".to_string())?;
+
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let entropy: Arc<dyn llmroller_core::seams::EntropySource> =
+        Arc::new(llmroller_core::seams::OsEntropy);
+    let parsed_provider_id = llmroller_core::ids::ProviderId::parse(provider_id)
+        .unwrap_or_else(|_| llmroller_core::ids::ProviderId::generate());
+    let secret = token_manager
+        .resolve_and_persist_secret(
+            key.id,
+            parsed_provider_id,
+            &raw_secret,
+            &client,
+            key.allow_private_network,
+            now_ms,
+            Some(writer),
+            Some(master_key),
+            Some(&key.master_key_id),
+            Some(instance_id),
+            &entropy,
+        )
+        .await?;
 
     let mut response = client
         .get(&url)
@@ -467,5 +532,33 @@ mod tests {
             &runtime, None, key_id
         ));
         assert!(runtime.is_key_routable(key_id, 1_000));
+    }
+
+    #[test]
+    #[doc = "Spec: REL-5, MDL-1"]
+    fn recovery_probe_filter_skips_healthy_keys_and_caps_at_3_per_provider() {
+        let runtime = RuntimeState::new();
+        let mut keys = Vec::new();
+        for idx in 0..5 {
+            let id = UpstreamKeyId::generate();
+            if idx > 0 {
+                runtime.quarantine_key(id, "credential_rejected");
+            }
+            keys.push(DiscoveryKey {
+                id,
+                secret_enc: Vec::new(),
+                master_key_id: "key-0".to_string(),
+                provider_id: "prov-1".to_string(),
+                owner_user_id: None,
+                kind: ProviderKind::Custom,
+                base_url: "https://api.example.com".to_string(),
+                config: ProviderConfig::default(),
+                is_global: true,
+                allow_private_network: false,
+            });
+        }
+        let selected = select_recovery_probe_keys(keys.clone(), &runtime, 1_000, 3);
+        assert_eq!(selected.len(), 3);
+        assert!(!selected.iter().any(|k| k.id == keys[0].id));
     }
 }

@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-llmroller-preset" = "github_models_inference_azure_ai"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

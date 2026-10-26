@@ -129,10 +129,11 @@ pub(crate) fn resolve_session(
         ))
     };
 
+    let mut detector_flagged = false;
     if let (Some(session_hash), true, Some((sys, usr))) =
         (raw_hash.as_ref(), step.is_generic(), canonical.as_ref())
     {
-        let newly_flagged = runtime_state.constant_session_detector.record_and_evaluate(
+        let (is_flagged, newly_flagged) = runtime_state.constant_session_detector.observe_and_check(
             client_key.id,
             session_hash.clone(),
             &llmroller_core::session::PromptContext {
@@ -143,6 +144,7 @@ pub(crate) fn resolve_session(
             },
             now_ms,
         );
+        detector_flagged = is_flagged;
         if newly_flagged {
             crate::metrics::record_constant_session_suspected();
             if let Some(writer) = writer {
@@ -186,7 +188,9 @@ pub(crate) fn resolve_session(
     }
 
     let use_step8 = raw_session.is_empty()
-        || (step.is_generic() && client_key.constant_session_mode == "fingerprint_generic_ids");
+        || (step.is_generic()
+            && (client_key.constant_session_mode == "fingerprint_generic_ids"
+                || (detector_flagged && client_key.constant_session_mode != "allow_constant")));
     let (session_hash, fallback_id_opt) = if use_step8 {
         let (sys, usr) = canonical.as_ref()?;
         // F038: Requests with no user message (only a system prompt or empty messages)

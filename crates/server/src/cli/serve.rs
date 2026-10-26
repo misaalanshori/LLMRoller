@@ -18,7 +18,30 @@ use llmroller_store::writer::start_writer;
 use super::args::ServeArgs;
 use super::helpers::{CliFailure, acquire_lock, resolve_data_dir};
 
+/// Initializes global `tracing_subscriber` formatting (JSON or compact pretty) and level filtering (`FND-052`, `OBS-2`).
+pub(crate) fn init_tracing(log_level: &str, log_format: &str) {
+    let filter_directive = std::env::var("LLMROLLER_LOG")
+        .unwrap_or_else(|_| format!("{log_level},llmroller={log_level}"));
+    let env_filter = tracing_subscriber::EnvFilter::try_new(&filter_directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if log_format.eq_ignore_ascii_case("pretty") || log_format.eq_ignore_ascii_case("text") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .compact()
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .json()
+            .try_init();
+    }
+}
+
 pub(crate) async fn run_serve(args: ServeArgs) -> ExitCode {
+    init_tracing(&args.log_level, &args.log_format);
     match serve_command(args).await {
         Ok(code) => ExitCode::from(code),
         Err(failure) => {
@@ -190,21 +213,17 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 key_ring
             };
             runtime_state.hydrate_window_counter_from_ring(window, source_ring, clock.now_ms());
-            if let Ok(delta) = llmroller_store::budgets::sum_budget_adjustments_for_window(
+            let period = window.period_ms.unwrap_or(2_678_400_000);
+            if let Ok(offset) = llmroller_store::budgets::active_manual_offset_for_window(
                 &pool,
                 &window.id,
+                period,
                 clock.now_ms(),
             )
             .await
-                && delta != 0
                 && let Some(counter) = runtime_state.window_counter(&window.id)
             {
-                let period = window.period_ms.unwrap_or(2_678_400_000);
-                counter.set_manual_offset(Some(llmroller_core::windows::ManualOffset {
-                    effective_at_ms: clock.now_ms(),
-                    delta_micro_usd: delta,
-                    period_ms: period,
-                }));
+                counter.set_manual_offset(offset);
             }
         }
     }
@@ -295,12 +314,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     {
         for pin in active_pins {
             use llmroller_core::eligibility::CandidatePoolTier;
-            let tier = match pin.pool_tier {
-                0 => CandidatePoolTier::Own,
-                1 => CandidatePoolTier::Shared,
-                2 => CandidatePoolTier::Global,
-                _ => CandidatePoolTier::Blended,
-            };
+            let tier = u8::try_from(pin.pool_tier)
+                .ok()
+                .and_then(CandidatePoolTier::from_u8)
+                .unwrap_or(CandidatePoolTier::Blended);
             pin_store.insert_hydrated(
                 llmroller_core::pins::PinKey {
                     client_key_id: pin.client_key_id,
@@ -344,7 +361,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         instance_state.instance_id,
         entropy.clone(),
     ));
-    let (sealer_pool, sealed_trace_rx) = llmroller_store::traces::SealerPool::new(trace_sealer);
+    let (sealer_pool, _sealed_trace_rx) = llmroller_store::traces::SealerPool::new_with_queues(
+        trace_sealer,
+        Some(writer_handle.queues.clone()),
+    );
     let sealer_pool = std::sync::Arc::new(sealer_pool);
 
     let mut proxy_auth_state = llmroller_proxy::auth::ProxyAuthState::new(
@@ -426,15 +446,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     // Sealing happens on the dedicated OS pool. This bridge only moves the
     // sealed payload into the single writer's queue; it never opens SQLite
     // (F09, PERF-1).
-    let trace_writer = writer_handle.clone();
-    std::thread::Builder::new()
-        .name("llmroller-trace-enqueue".to_string())
-        .spawn(move || {
-            while let Ok(sealed) = sealed_trace_rx.recv() {
-                trace_writer.queues.push_sealed_trace(sealed);
-            }
-        })
-        .expect("spawn trace enqueue thread");
+    // FND-024: SealerPool workers now push directly into writer_handle.queues before decrementing in_flight.
 
     let _usage_poller_task = llmroller_server::usage_poller::start_usage_poller_with_stop(
         llmroller_server::usage_poller::UsagePollerDeps {
@@ -478,9 +490,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     is_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     eprintln!("LLMRoller server ready on {}", args.listen);
 
-    let mut stop_rx1 = stop_rx_init;
-    let mut stop_rx2 = stop_tx.subscribe();
-    let mut stop_rx3 = stop_tx.subscribe();
+    let (listener_stop_tx, mut stop_rx1) = tokio::sync::watch::channel(false);
+    let mut stop_rx2 = listener_stop_tx.subscribe();
+    let mut stop_rx3 = listener_stop_tx.subscribe();
+    let _bg_stop_rx_unused = stop_rx_init;
 
     let data_server = tokio::spawn(async move {
         let _ = axum::serve(
@@ -570,6 +583,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
                                 bg_pin_store.sweep(now_ms);
                                 bg_runtime_state.constant_session_detector.sweep_idle(now_ms);
+                                bg_runtime_state.accumulators.prune_old_months(now_ms);
                                 let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
                                 let snapshot = bg_snapshot.load();
                                 let retention_days = snapshot.settings.usage_events_retention_days.max(1);
@@ -630,11 +644,13 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     )
     .with_writer(writer_handle.clone())
     .with_shutdown_cut(shutdown_cut.clone())
+    .with_listener_stop(listener_stop_tx.clone())
     .with_background_stop(stop_tx.clone())
     .with_sealer_pool(sealer_pool.clone())
     .with_runtime_state(runtime_state.clone());
     let exit_code = shutdown_sup.execute_graceful_shutdown().await;
 
+    let _ = listener_stop_tx.send(true);
     let _ = stop_tx.send(true);
     let _ = tokio::join!(data_server, admin_server, metrics_server);
     let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
