@@ -126,9 +126,14 @@ pub(crate) async fn put_admin_traceability_handler(
     })))
 }
 
+fn default_price_provider_kind() -> String {
+    "custom".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpsertPricePayload {
     pub provider_id: Option<String>,
+    #[serde(default = "default_price_provider_kind")]
     pub provider_kind: String,
     pub upstream_model_id: String,
     pub input_per_mtok_micro_usd: i64,
@@ -139,6 +144,37 @@ pub(crate) struct UpsertPricePayload {
     pub tiers: Vec<llmroller_core::pricing::ContextTier>,
     #[serde(default)]
     pub schedules: Vec<llmroller_core::pricing::Schedule>,
+}
+
+pub(crate) async fn get_admin_prices_handler(
+    State(state): State<ApiAppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
+    let _actor = authenticate_admin(&state, &headers, false).await?;
+    let rows = sqlx::query(
+        "SELECT provider_id, provider_kind, upstream_model_id, input_per_mtok_micro_usd,
+                output_per_mtok_micro_usd, cache_read_per_mtok_micro_usd,
+                cache_write_per_mtok_micro_usd, source
+         FROM prices ORDER BY upstream_model_id ASC, provider_id ASC",
+    )
+    .fetch_all(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(serde_json::json!({
+            "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
+            "provider_kind": r.try_get::<String, _>("provider_kind").unwrap_or_default(),
+            "upstream_model_id": r.try_get::<String, _>("upstream_model_id").unwrap_or_default(),
+            "input_per_mtok_micro_usd": r.try_get::<i64, _>("input_per_mtok_micro_usd").unwrap_or(0),
+            "output_per_mtok_micro_usd": r.try_get::<i64, _>("output_per_mtok_micro_usd").unwrap_or(0),
+            "cache_read_per_mtok_micro_usd": r.try_get::<Option<i64>, _>("cache_read_per_mtok_micro_usd").unwrap_or_default().unwrap_or(0),
+            "cache_write_per_mtok_micro_usd": r.try_get::<Option<i64>, _>("cache_write_per_mtok_micro_usd").unwrap_or_default().unwrap_or(0),
+            "source": r.try_get::<String, _>("source").unwrap_or_default(),
+        }));
+    }
+    Ok(Json(out))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

@@ -120,8 +120,11 @@ pub(crate) async fn get_partial_client_keys_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let rows = sqlx::query(
-        "SELECT id, prefix, label, routing_scope, rate_limit_rpm, budget_micro_usd_month, created_at
-         FROM client_keys WHERE owner_user_id = ? ORDER BY created_at DESC",
+        "SELECT id, prefix, label, routing_scope, rate_limit_rpm, budget_micro_usd_month,
+                disabled, paused_at, created_at
+         FROM client_keys
+         WHERE owner_user_id = ? AND revoked_at IS NULL
+         ORDER BY created_at DESC",
     )
     .bind(user_id.to_string())
     .fetch_all(&state.auth.pool)
@@ -151,6 +154,33 @@ pub(crate) async fn get_partial_client_keys_handler(
             || "No Cap".to_string(),
             |b| format!("${:.2}", b as f64 / 1_000_000.0),
         );
+        let disabled: bool = r.try_get::<i64, _>("disabled").unwrap_or(0) != 0;
+        let paused: bool = r
+            .try_get::<Option<i64>, _>("paused_at")
+            .unwrap_or_default()
+            .is_some();
+        let (status_badge, pause_btn) = if paused {
+            (
+                "<span class=\"badge badge-warning\">● Paused</span>",
+                format!(
+                    "<button class=\"btn btn-xs btn-secondary\" data-action=\"resume-client-key\" data-id=\"{id}\">Resume</button> "
+                ),
+            )
+        } else if disabled {
+            (
+                "<span class=\"badge badge-danger\">● Disabled</span>",
+                format!(
+                    "<button class=\"btn btn-xs btn-secondary\" data-action=\"resume-client-key\" data-id=\"{id}\">Resume</button> "
+                ),
+            )
+        } else {
+            (
+                "<span class=\"badge badge-success\">● Active</span>",
+                format!(
+                    "<button class=\"btn btn-xs btn-outline\" data-action=\"pause-client-key\" data-id=\"{id}\">Pause</button> "
+                ),
+            )
+        };
 
         html.push_str(&format!(
             "<tr>\
@@ -159,8 +189,10 @@ pub(crate) async fn get_partial_client_keys_handler(
                 <td><span class=\"badge badge-info\">{scope}</span></td>\
                 <td>{rpm_str}</td>\
                 <td>{budget_str}</td>\
-                <td>Active</td>\
+                <td>{status_badge}</td>\
                 <td>\
+                    {pause_btn}\
+                    <button class=\"btn btn-xs btn-outline\" data-action=\"rotate-client-key\" data-id=\"{id}\">Rotate</button> \
                     <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/client-keys/{id}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Revoke this client key?\">Revoke</button>\
                 </td>\
             </tr>"
@@ -180,7 +212,7 @@ pub(crate) async fn get_partial_providers_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let prov_rows = sqlx::query(
-        "SELECT id, name, kind, base_url, enabled FROM providers WHERE owner_user_id = ? ORDER BY created_at ASC",
+        "SELECT id, name, kind, base_url, config_json, enabled FROM providers WHERE owner_user_id = ? ORDER BY created_at ASC",
     )
     .bind(user_id.to_string())
     .fetch_all(&state.auth.pool)
@@ -199,6 +231,17 @@ pub(crate) async fn get_partial_providers_handler(
         let name: String = p.try_get("name").unwrap_or_default();
         let kind: String = p.try_get("kind").unwrap_or_default();
         let base_url: String = p.try_get("base_url").unwrap_or_default();
+        let config_json: String = p.try_get("config_json").unwrap_or_default();
+        let preset_badge = ProviderConfig::from_json(&config_json)
+            .preset_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                format!(
+                    " <span class=\"badge badge-info\">{}</span>",
+                    escape_html(&s)
+                )
+            })
+            .unwrap_or_default();
         let pid = escape_html(&pid);
         let name = escape_html(&name);
         let kind = escape_html(&kind);
@@ -251,7 +294,7 @@ pub(crate) async fn get_partial_providers_handler(
             "<div class=\"provider-box\">\
                 <div class=\"provider-header\">\
                     <div>\
-                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span>{preset_badge}</h4>\
                         <div class=\"prov-url-mono\">{base_url}</div>\
                     </div>\
                     <div>\
@@ -384,7 +427,7 @@ pub(crate) async fn get_partial_shares_incoming_handler(
             "<span class=\"text-muted\">Active</span>".to_string()
         } else {
             format!(
-                "<button class=\"btn btn-xs btn-primary\" hx-post=\"/api/user/shares/{id}/accept\" hx-vals='{{\"fingerprint\": \"{current_fp}\"}}' hx-target=\"closest tr\" hx-swap=\"outerHTML\">Accept Share</button>"
+                "<button class=\"btn btn-xs btn-primary\" data-action=\"accept-share\" data-id=\"{id}\" data-fingerprint=\"{current_fp}\">Accept Share</button>"
             )
         };
 
@@ -626,7 +669,7 @@ pub(crate) async fn get_partial_admin_providers_handler(
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
     let prov_rows = sqlx::query(
-        "SELECT id, name, kind, base_url, enabled FROM providers WHERE ownership_scope = 'global' ORDER BY created_at ASC",
+        "SELECT id, name, kind, base_url, config_json, enabled FROM providers WHERE ownership_scope = 'global' ORDER BY created_at ASC",
     )
     .fetch_all(&state.auth.pool)
     .await
@@ -644,6 +687,17 @@ pub(crate) async fn get_partial_admin_providers_handler(
         let name: String = p.try_get("name").unwrap_or_default();
         let kind: String = p.try_get("kind").unwrap_or_default();
         let base_url: String = p.try_get("base_url").unwrap_or_default();
+        let config_json: String = p.try_get("config_json").unwrap_or_default();
+        let preset_badge = ProviderConfig::from_json(&config_json)
+            .preset_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                format!(
+                    " <span class=\"badge badge-info\">{}</span>",
+                    escape_html(&s)
+                )
+            })
+            .unwrap_or_default();
         let pid = escape_html(&pid);
         let name = escape_html(&name);
         let kind = escape_html(&kind);
@@ -683,6 +737,8 @@ pub(crate) async fn get_partial_admin_providers_handler(
                         <td>Tier {tier}</td>\
                         <td><span class=\"badge badge-{}\">{}</span></td>\
                         <td>\
+                            <button class=\"btn btn-xs btn-ghost\" data-action=\"test-key\" data-key-id=\"{kid}\">Test</button>\
+                            <button class=\"btn btn-xs btn-outline\" data-modal-open=\"modal-budget-window\" data-key-id=\"{kid}\">Budget</button>\
                             <button class=\"btn btn-xs btn-danger\" hx-delete=\"/api/user/upstream-keys/{kid}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-confirm=\"Remove this upstream key?\">Remove</button>\
                         </td>\
                     </tr>",
@@ -697,7 +753,7 @@ pub(crate) async fn get_partial_admin_providers_handler(
             "<div class=\"provider-box\">\
                 <div class=\"provider-header\">\
                     <div>\
-                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span></h4>\
+                        <h4 class=\"prov-title\">{name} <span class=\"badge badge-info\">{kind}</span>{preset_badge}</h4>\
                         <div class=\"prov-url-mono\">{base_url}</div>\
                     </div>\
                     <div>\
@@ -750,7 +806,7 @@ pub(crate) async fn get_partial_admin_catalog_handler(
 
         let confirm_btn = if merge_state == "pending_review" {
             format!(
-                "<button class=\"btn btn-xs btn-primary\" hx-post=\"/admin/api/models/{pk}/confirm-merge\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Confirm Merge</button> "
+                "<button class=\"btn btn-xs btn-primary\" data-action=\"confirm-merge\" data-id=\"{pk}\">Confirm Merge</button> "
             )
         } else {
             String::new()

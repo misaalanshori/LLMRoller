@@ -19,7 +19,104 @@ function switchTab(tabId, btn) {
     container.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     const target = document.getElementById(tabId);
-    if (target) target.classList.add('active');
+    if (target) {
+        target.classList.add('active');
+        target.querySelectorAll('[hx-get]').forEach(el => {
+            if (el.id) refreshPartial(el.id);
+        });
+    }
+    if (tabId === 'tab-adm-settings' || tabId === 'tab-adm-traceability') loadAdminSettings();
+    else if (tabId === 'tab-adm-catalog') loadAdminAliases();
+    else if (tabId === 'tab-adm-price-book') loadAdminPrices();
+    else if (tabId === 'tab-adm-overview') loadUsageChart();
+    else if (tabId === 'tab-overview') loadPersonalOverviewAndChart();
+    else if (tabId === 'tab-service-accounts') loadServiceAccounts();
+    else if (tabId === 'tab-account-security') {
+        syncUserPreferenceInputs();
+        loadWebSessions();
+    }
+}
+
+async function refreshPartial(id) {
+    const el = typeof id === 'string' ? document.getElementById(id) : id;
+    if (!el) return;
+    const url = el.getAttribute('hx-get');
+    if (!url) return;
+    try {
+        const res = await fetch(url, {
+            headers: {
+                'HX-Request': 'true',
+                'Cache-Control': 'no-cache'
+            }
+        });
+        if (!res.ok) return;
+        const html = await res.text();
+        el.innerHTML = html;
+        if (typeof htmx !== 'undefined' && htmx.process) {
+            htmx.process(el);
+        }
+    } catch (_e) {}
+}
+
+async function invalidateAndRefetch(scope) {
+    const tasks = [];
+    if (!scope || scope === 'all' || scope === 'providers' || scope === 'keys') {
+        tasks.push(
+            refreshPartial('providers-list'),
+            refreshPartial('adm-providers-list'),
+            refreshPartial('matrix-body'),
+            refreshPartial('adm-models-body'),
+            refreshPartial('admin-overview-container'),
+            refreshPartial('user-audit-body'),
+            refreshPartial('adm-audit-body'),
+            loadPersonalOverviewAndChart(),
+            loadAdminAliases()
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'client-keys') {
+        tasks.push(
+            refreshPartial('client-keys-body'),
+            refreshPartial('user-audit-body'),
+            loadPersonalOverviewAndChart()
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'users') {
+        tasks.push(
+            refreshPartial('adm-users-body'),
+            refreshPartial('admin-overview-container'),
+            refreshPartial('adm-audit-body')
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'shares') {
+        tasks.push(
+            refreshPartial('outgoing-shares-body'),
+            refreshPartial('incoming-shares-body'),
+            refreshPartial('matrix-body'),
+            refreshPartial('user-audit-body')
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'catalog') {
+        tasks.push(
+            refreshPartial('adm-models-body'),
+            refreshPartial('matrix-body'),
+            refreshPartial('adm-audit-body'),
+            loadAdminAliases()
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'prices') {
+        tasks.push(
+            loadAdminPrices(),
+            refreshPartial('admin-overview-container'),
+            refreshPartial('adm-audit-body')
+        );
+    }
+    if (!scope || scope === 'all' || scope === 'pins') {
+        tasks.push(
+            refreshPartial('active-pins-body'),
+            loadPersonalOverviewAndChart()
+        );
+    }
+    await Promise.allSettled(tasks);
 }
 
 function openModal(id) {
@@ -56,6 +153,20 @@ function onProviderKindChange(kind, selectId) {
     const isGlobal = selectId === 'gp-kind';
     const urlInput = document.getElementById(isGlobal ? 'gp-url' : 'prov-url');
     if (!urlInput) return;
+    const selectEl = document.getElementById(selectId);
+    const selectedOpt = selectEl && selectEl.selectedOptions ? selectEl.selectedOptions[0] : null;
+    const dataUrl = selectedOpt ? selectedOpt.getAttribute('data-base-url') : null;
+    if (!isGlobal && selectId === 'prov-kind') {
+        const presetSelect = document.getElementById('prov-preset-id');
+        if (presetSelect) {
+            const presetAttr = selectedOpt ? selectedOpt.getAttribute('data-preset-id') : null;
+            presetSelect.value = presetAttr || '';
+        }
+    }
+    if (dataUrl !== null && dataUrl !== undefined && (dataUrl !== '' || kind === 'custom')) {
+        urlInput.value = dataUrl;
+        return;
+    }
     if (kind === 'openrouter') urlInput.value = 'https://openrouter.ai/api/v1';
     else if (kind === 'opencode_go') urlInput.value = 'https://opencode.ai/zen/go/v1';
     else if (kind === 'command_code') urlInput.value = 'https://api.commandcode.ai/provider/v1';
@@ -189,6 +300,71 @@ document.addEventListener('click', function(e) {
         revokeWebSession(prefix);
         return;
     }
+
+    // 13. Client Key Pause / Resume / Rotate
+    const pauseKeyBtn = e.target.closest('[data-action="pause-client-key"]');
+    if (pauseKeyBtn) {
+        toggleClientKeyPause(pauseKeyBtn.getAttribute('data-id'), true);
+        return;
+    }
+    const resumeKeyBtn = e.target.closest('[data-action="resume-client-key"]');
+    if (resumeKeyBtn) {
+        toggleClientKeyPause(resumeKeyBtn.getAttribute('data-id'), false);
+        return;
+    }
+    const rotateKeyBtn = e.target.closest('[data-action="rotate-client-key"]');
+    if (rotateKeyBtn) {
+        rotateClientKey(rotateKeyBtn.getAttribute('data-id'));
+        return;
+    }
+
+    // 14. Accept Incoming Share
+    const acceptShareBtn = e.target.closest('[data-action="accept-share"]');
+    if (acceptShareBtn) {
+        acceptShare(
+            acceptShareBtn.getAttribute('data-id'),
+            acceptShareBtn.getAttribute('data-fingerprint')
+        );
+        return;
+    }
+
+    // 15. Confirm Model Merge
+    const confirmMergeBtn = e.target.closest('[data-action="confirm-merge"]');
+    if (confirmMergeBtn) {
+        confirmModelMerge(confirmMergeBtn.getAttribute('data-id'));
+        return;
+    }
+
+    // 16. Delete Price Book Entry
+    const deletePriceBtn = e.target.closest('[data-action="delete-price"]');
+    if (deletePriceBtn) {
+        deletePriceEntry(
+            deletePriceBtn.getAttribute('data-provider-id') || '',
+            deletePriceBtn.getAttribute('data-model-id') || ''
+        );
+        return;
+    }
+
+    // 17. Delete Service Account
+    const deleteSaBtn = e.target.closest('[data-action="delete-service-account"]');
+    if (deleteSaBtn) {
+        deleteServiceAccount(deleteSaBtn.getAttribute('data-id'));
+        return;
+    }
+
+    // 18. Segmented Pill Active Button Toggle
+    const segBtn = e.target.closest('.segmented-pill .btn');
+    if (segBtn) {
+        const pill = segBtn.closest('.segmented-pill');
+        if (pill) {
+            pill.querySelectorAll('.btn').forEach(b => {
+                b.classList.remove('btn-primary');
+                b.classList.add('btn-outline');
+            });
+            segBtn.classList.remove('btn-outline');
+            segBtn.classList.add('btn-primary');
+        }
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -234,7 +410,12 @@ document.addEventListener('submit', function(e) {
 // Global Change Listeners
 // ---------------------------------------------------------------------------
 document.addEventListener('change', function(e) {
-    if (e.target.id === 'prov-kind' || e.target.id === 'gp-kind' || e.target.id === 'provider-kind-select') {
+    if (
+        e.target.id === 'prov-kind' ||
+        e.target.id === 'gp-kind' ||
+        e.target.id === 'prov-preset-id' ||
+        e.target.id === 'provider-kind-select'
+    ) {
         onProviderKindChange(e.target.value, e.target.id);
     }
 });
@@ -242,6 +423,11 @@ document.addEventListener('change', function(e) {
 // ---------------------------------------------------------------------------
 // Async Handlers
 // ---------------------------------------------------------------------------
+async function extractApiError(res) {
+    const body = await res.json().catch(() => ({}));
+    return body.error?.message || body.error || `HTTP ${res.status}`;
+}
+
 async function handleCreateClientKey(e) {
     e.preventDefault();
     const label = document.getElementById('key-label').value.trim();
@@ -262,13 +448,11 @@ async function handleCreateClientKey(e) {
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify(payload)
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         const data = await res.json();
         closeModal('modal-new-key');
         document.getElementById('form-new-key').reset();
-
-        // Refresh HTMX client keys table
-        const tbody = document.getElementById('client-keys-body');
-        if (tbody) htmx.trigger(tbody, 'load');
+        await invalidateAndRefetch('client-keys');
 
         const revealedToken = data.raw_token || data.token;
         if (revealedToken) {
@@ -280,24 +464,44 @@ async function handleCreateClientKey(e) {
     }
 }
 
+const CORE_PROVIDER_KINDS = new Set([
+    'openrouter',
+    'opencode_go',
+    'command_code',
+    'open_design_amr',
+    'custom'
+]);
+
 async function handleCreateProvider(e) {
     e.preventDefault();
     const name = document.getElementById('prov-name').value.trim();
-    const kind = document.getElementById('prov-kind').value;
+    const selectedKind = document.getElementById('prov-kind').value;
+    const presetOverride = document.getElementById('prov-preset-id')?.value || '';
     const base_url = document.getElementById('prov-url').value.trim();
     const allow_private_network = document.getElementById('prov-private-net').checked;
 
+    const isCore = CORE_PROVIDER_KINDS.has(selectedKind);
+    const preset_id = presetOverride || (!isCore ? selectedKind : null);
+    const kind = preset_id ? 'custom' : selectedKind;
+
     try {
-        await fetch('/api/user/providers', {
+        const res = await fetch('/api/user/providers', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
-            body: JSON.stringify({ name, kind, base_url, config_json: '{}', allow_private_network })
+            body: JSON.stringify({
+                name,
+                kind,
+                preset_id,
+                base_url,
+                config_json: '{}',
+                allow_private_network
+            })
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-provider');
         document.getElementById('form-new-provider').reset();
-
-        const list = document.getElementById('providers-list');
-        if (list) htmx.trigger(list, 'load');
+        onProviderKindChange(document.getElementById('prov-kind').value, 'prov-kind');
+        await invalidateAndRefetch('providers');
     } catch (err) {
         alert('Failed to add provider: ' + err);
     }
@@ -320,18 +524,15 @@ async function handleCreateUpstreamKey(e) {
 
     const apiBase = window.location.pathname.startsWith('/admin') ? '/admin/api' : '/api/user';
     try {
-        await fetch(`${apiBase}/providers/${provider_id}/keys`, {
+        const res = await fetch(`${apiBase}/providers/${provider_id}/keys`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify(payload)
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-upstream-key');
         document.getElementById('form-new-upstream-key').reset();
-
-        const list = document.getElementById('providers-list');
-        if (list) htmx.trigger(list, 'load');
-        const gList = document.getElementById('adm-providers-list');
-        if (gList) htmx.trigger(gList, 'load');
+        await invalidateAndRefetch('keys');
     } catch (err) {
         alert('Failed to add upstream key: ' + err);
     }
@@ -395,12 +596,10 @@ async function handleCreateShare(e) {
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify(payload)
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-share');
         document.getElementById('form-new-share').reset();
-
-        const outBody = document.getElementById('outgoing-shares-body');
-        if (outBody) htmx.trigger(outBody, 'load');
+        await invalidateAndRefetch('shares');
     } catch (err) {
         alert('Failed to grant share: ' + err);
     }
@@ -413,16 +612,15 @@ async function handleCreateUser(e) {
     const role = document.getElementById('usr-role').value;
 
     try {
-        await fetch('/admin/api/users', {
+        const res = await fetch('/admin/api/users', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ username, password, role })
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-user');
         document.getElementById('form-new-user').reset();
-
-        const uBody = document.getElementById('adm-users-body');
-        if (uBody) htmx.trigger(uBody, 'load');
+        await invalidateAndRefetch('users');
     } catch (err) {
         alert('Failed to create user: ' + err);
     }
@@ -431,21 +629,32 @@ async function handleCreateUser(e) {
 async function handleCreateGlobalProvider(e) {
     e.preventDefault();
     const name = document.getElementById('gp-name').value.trim();
-    const kind = document.getElementById('gp-kind').value;
+    const selectedKind = document.getElementById('gp-kind').value;
     const base_url = document.getElementById('gp-url').value.trim();
     const allow_private_network = document.getElementById('gp-private-net').checked;
 
+    const isCore = CORE_PROVIDER_KINDS.has(selectedKind);
+    const preset_id = !isCore ? selectedKind : null;
+    const kind = preset_id ? 'custom' : selectedKind;
+
     try {
-        await fetch('/admin/api/providers', {
+        const res = await fetch('/admin/api/providers', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
-            body: JSON.stringify({ name, kind, base_url, config_json: '{}', allow_private_network })
+            body: JSON.stringify({
+                name,
+                kind,
+                preset_id,
+                base_url,
+                config_json: '{}',
+                allow_private_network
+            })
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-global-prov');
         document.getElementById('form-new-global-prov').reset();
-
-        const gList = document.getElementById('adm-providers-list');
-        if (gList) htmx.trigger(gList, 'load');
+        onProviderKindChange(document.getElementById('gp-kind').value, 'gp-kind');
+        await invalidateAndRefetch('providers');
     } catch (err) {
         alert('Failed to create global provider: ' + err);
     }
@@ -457,17 +666,15 @@ async function handleAddAlias(e) {
     const target = document.getElementById('alias-target-select').value;
 
     try {
-        await fetch(`/admin/api/models/${target}/aliases`, {
+        const res = await fetch(`/admin/api/models/${target}/aliases`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ alias })
         });
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-alias');
         document.getElementById('form-new-alias').reset();
-
-        const mBody = document.getElementById('adm-models-body');
-        if (mBody) htmx.trigger(mBody, 'load');
-        await loadAdminAliases();
+        await invalidateAndRefetch('catalog');
     } catch (err) {
         alert('Failed to add alias: ' + err);
     }
@@ -482,13 +689,8 @@ async function deleteAlias(alias) {
             method: 'DELETE',
             headers: { 'X-CSRF-Token': getCsrfToken() }
         });
-        if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
-            throw new Error(body.error?.message || `HTTP ${res.status}`);
-        }
-        await loadAdminAliases();
-        const mBody = document.getElementById('adm-models-body');
-        if (mBody) htmx.trigger(mBody, 'load');
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('catalog');
     } catch (err) {
         alert('Failed to delete alias: ' + err);
     }
@@ -529,14 +731,17 @@ async function loadAdminAliases() {
 }
 
 async function testUpstreamKey(keyId) {
+    const apiBase = window.location.pathname.startsWith('/admin') ? '/admin/api' : '/api/user';
     try {
-        const res = await fetch(`/api/user/upstream-keys/${keyId}/test`, {
+        const res = await fetch(`${apiBase}/upstream-keys/${keyId}/test`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: '{}'
         });
-        const data = await res.json();
-        alert(data.message || 'Key test completed!');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        alert(data.message || `Key probe succeeded (${data.discovered_models ?? 0} models discovered).`);
+        await invalidateAndRefetch('keys');
     } catch (e) {
         alert('Key test failed: ' + e);
     }
@@ -544,13 +749,13 @@ async function testUpstreamKey(keyId) {
 
 async function toggleUser(id, disabled) {
     try {
-        await fetch(`/admin/api/users/${id}`, {
+        const res = await fetch(`/admin/api/users/${id}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ disabled })
         });
-        const uBody = document.getElementById('adm-users-body');
-        if (uBody) htmx.trigger(uBody, 'load');
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('users');
     } catch (e) {
         alert('Error: ' + e);
     }
@@ -558,17 +763,26 @@ async function toggleUser(id, disabled) {
 
 async function toggleModelExposed(modelPk, exposed) {
     try {
-        await fetch(`/admin/api/models/${modelPk}`, {
+        const res = await fetch(`/admin/api/models/${modelPk}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ exposed })
         });
-        const mBody = document.getElementById('adm-models-body');
-        if (mBody) htmx.trigger(mBody, 'load');
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('catalog');
     } catch (e) {
         alert('Error: ' + e);
     }
 }
+
+const ROUTING_STRATEGIES = [
+    'smooth_weighted_rr',
+    'naive_rr',
+    'weighted_rr',
+    'uniform_random',
+    'weighted_random',
+    'power_of_two_choices'
+];
 
 async function loadAdminSettings() {
     const grid = document.getElementById('adm-settings-grid');
@@ -577,6 +791,13 @@ async function loadAdminSettings() {
         const res = await fetch('/admin/api/settings');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const settings = await res.json();
+        const tc = settings.traceability_config;
+        if (tc && typeof tc === 'object') {
+            const trcEnabled = document.getElementById('trc-enabled');
+            const trcDays = document.getElementById('trc-retention-days');
+            if (trcEnabled) trcEnabled.checked = Boolean(tc.enabled);
+            if (trcDays && tc.retention_days != null) trcDays.value = String(tc.retention_days);
+        }
         const keys = Object.keys(settings).sort();
         grid.innerHTML = keys.map(key => {
             const id = `setting-${key}`;
@@ -585,8 +806,13 @@ async function loadAdminSettings() {
             let input;
             if (key === 'traceability_config') {
                 input = `<textarea id="${id}" rows="5" disabled>${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
+            } else if (key === 'default_routing_strategy') {
+                const opts = ROUTING_STRATEGIES.map(s =>
+                    `<option value="${s}" ${value === s ? 'selected' : ''}>${s}</option>`
+                ).join('');
+                input = `<select id="${id}">${opts}</select>`;
             } else if (typeof value === 'boolean') {
-                input = `<input type="checkbox" id="${id}" ${value ? 'checked' : ''}>`;
+                input = `<label class="checkbox-group" for="${id}"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}><span>${value ? 'Enabled' : 'Disabled'}</span></label>`;
             } else if (typeof value === 'number') {
                 input = `<input type="number" id="${id}" value="${value}">`;
             } else if (typeof value === 'string') {
@@ -598,10 +824,12 @@ async function loadAdminSettings() {
                 ? '<span class="text-muted text-xs">Use the Traceability tab to change this setting.</span>'
                 : `<button class="btn btn-xs btn-primary" data-action="save-setting" data-key="${escapeHtml(key)}">Save</button>`;
             return `<div class="setting-item">
-                <div class="setting-key">${escapeHtml(key)}</div>
-                <div class="setting-desc">${escapeHtml(label)}</div>
-                ${input}
-                <div class="mt-2">${save}</div>
+                <div>
+                    <div class="setting-key">${escapeHtml(key)}</div>
+                    <div class="setting-desc">${escapeHtml(label)}</div>
+                </div>
+                <div class="setting-control">${input}</div>
+                <div class="setting-footer">${save}</div>
             </div>`;
         }).join('');
     } catch (err) {
@@ -716,10 +944,31 @@ window.addEventListener('resize', () => {
 document.addEventListener('DOMContentLoaded', () => {
     loadAdminSettings();
     loadAdminAliases();
+    loadAdminPrices();
     loadUsageChart();
     loadPersonalOverviewAndChart();
     loadServiceAccounts();
+    syncUserPreferenceInputs();
     loadWebSessions();
+
+    document.body.addEventListener('htmx:afterRequest', e => {
+        const verb = (e.detail?.requestConfig?.verb || '').toLowerCase();
+        if (!verb || verb === 'get') return;
+        const path = e.detail?.pathInfo?.requestPath || '';
+        if (path.includes('/providers') || path.includes('/upstream-keys')) {
+            invalidateAndRefetch('providers');
+        } else if (path.includes('/client-keys')) {
+            invalidateAndRefetch('client-keys');
+        } else if (path.includes('/users')) {
+            invalidateAndRefetch('users');
+        } else if (path.includes('/shares')) {
+            invalidateAndRefetch('shares');
+        } else if (path.includes('/models')) {
+            invalidateAndRefetch('catalog');
+        } else if (path.includes('/pins') || path.includes('/sessions')) {
+            invalidateAndRefetch('pins');
+        }
+    });
 });
 
 async function openChatPreview(sessionHash) {
@@ -947,13 +1196,26 @@ async function handleSaveTraceabilityConfig(e) {
     const enabled = document.getElementById('trc-enabled').checked;
     const retention_days = parseInt(document.getElementById('trc-retention-days').value || '14', 10);
     try {
-        const res = await fetch('/admin/api/settings/traceability', {
+        let res = await fetch('/admin/api/settings/traceability', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ enabled, retention_days })
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (res.status === 409) {
+            const body = await res.json().catch(() => ({}));
+            const affected = body.error?.affected_rows ?? 0;
+            if (!confirm(`Lowering retention to ${retention_days} days will purge ${affected} older trace record(s). Confirm?`)) {
+                return;
+            }
+            res = await fetch('/admin/api/settings/traceability', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+                body: JSON.stringify({ enabled, retention_days, confirm_purge: true })
+            });
+        }
+        if (!res.ok) throw new Error(await extractApiError(res));
         await loadAdminSettings();
+        await refreshPartial('adm-audit-body');
         alert('Traceability capture policy saved.');
     } catch (err) {
         alert('Failed to update traceability config: ' + err);
@@ -1043,6 +1305,16 @@ async function revokeWebSession(prefix) {
     } catch (_e) {}
 }
 
+function syncUserPreferenceInputs() {
+    const htmlEl = document.documentElement;
+    const themeSel = document.getElementById('pref-theme');
+    const navSel = document.getElementById('pref-nav-layout');
+    const locSel = document.getElementById('pref-locale');
+    if (themeSel && htmlEl.dataset.theme) themeSel.value = htmlEl.dataset.theme;
+    if (navSel && htmlEl.dataset.navLayout) navSel.value = htmlEl.dataset.navLayout;
+    if (locSel && htmlEl.lang) locSel.value = htmlEl.lang;
+}
+
 async function handleSaveUserPreferences(e) {
     e.preventDefault();
     const ui_theme = document.getElementById('pref-theme').value;
@@ -1054,7 +1326,10 @@ async function handleSaveUserPreferences(e) {
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ ui_theme, ui_nav_layout, ui_locale })
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) throw new Error(await extractApiError(res));
+        document.documentElement.dataset.theme = ui_theme;
+        document.documentElement.dataset.navLayout = ui_nav_layout;
+        document.documentElement.lang = ui_locale;
         window.location.reload();
     } catch (err) {
         alert('Failed to save preferences: ' + err);
@@ -1077,7 +1352,7 @@ async function loadServiceAccounts() {
             <td>${escapeHtml(sa.description || '-')}</td>
             <td><code>${escapeHtml((sa.allowed_cidrs || []).join(', ') || 'Any')}</code></td>
             <td><span class="badge badge-${sa.disabled ? 'danger' : 'success'}">${sa.disabled ? 'Disabled' : 'Active'}</span></td>
-            <td><code>${escapeHtml(sa.id || '')}</code></td>
+            <td><button class="btn btn-xs btn-danger" data-action="delete-service-account" data-id="${escapeHtml(sa.id || '')}">Delete</button></td>
         </tr>`).join('');
     } catch (_e) {}
 }
@@ -1094,12 +1369,28 @@ async function handleCreateServiceAccount(e) {
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ name, description, allowed_cidrs })
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-service-account');
         document.getElementById('form-new-service-account').reset();
         await loadServiceAccounts();
+        await refreshPartial('user-audit-body');
     } catch (err) {
         alert('Failed to create service account: ' + err);
+    }
+}
+
+async function deleteServiceAccount(id) {
+    if (!id || !confirm('Delete this service account and revoke its child keys?')) return;
+    try {
+        const res = await fetch(`/api/user/service-accounts/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await loadServiceAccounts();
+        await invalidateAndRefetch('client-keys');
+    } catch (err) {
+        alert('Failed to delete service account: ' + err);
     }
 }
 
@@ -1111,16 +1402,49 @@ async function handleSaveBudgetWindow(e) {
     const usd = parseFloat(document.getElementById('bw-limit-usd').value || '10');
     const period_ms = window_kind === 'anchored_calendar_month' ? null : hours * 3600 * 1000;
     const limit_micro_usd = Math.round(usd * 1_000_000);
+    const apiBase = window.location.pathname.startsWith('/admin') ? '/admin/api' : '/api/user';
     try {
-        const res = await fetch(`/api/user/upstream-keys/${encodeURIComponent(upstream_key_id)}/budget-windows`, {
+        const res = await fetch(`${apiBase}/upstream-keys/${encodeURIComponent(upstream_key_id)}/windows`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({ scope_kind: 'upstream_key', window_kind, period_ms, limit_micro_usd })
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-budget-window');
+        await invalidateAndRefetch('keys');
     } catch (err) {
         alert('Failed to save budget window: ' + err);
+    }
+}
+
+async function loadAdminPrices() {
+    const tbody = document.getElementById('adm-prices-body');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/admin/api/prices');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const prices = await res.json();
+        if (!Array.isArray(prices) || prices.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No price entries configured.</td></tr>';
+            return;
+        }
+        const fmtRate = v => `$${(Number(v || 0) / 1_000_000).toFixed(4)}`;
+        tbody.innerHTML = prices.map(p => {
+            const pid = p.provider_id || '';
+            const mid = p.upstream_model_id || '';
+            const src = p.source || 'admin';
+            return `<tr>
+                <td><strong>${escapeHtml(mid)}</strong></td>
+                <td>${fmtRate(p.input_per_mtok_micro_usd)}</td>
+                <td>${fmtRate(p.output_per_mtok_micro_usd)}</td>
+                <td>${fmtRate(p.cache_read_per_mtok_micro_usd)}</td>
+                <td>${fmtRate(p.cache_write_per_mtok_micro_usd)}</td>
+                <td><span class="badge badge-info">${escapeHtml(src)}</span></td>
+                <td><button class="btn btn-xs btn-danger" data-action="delete-price" data-provider-id="${escapeHtml(pid)}" data-model-id="${escapeHtml(mid)}">Delete</button></td>
+            </tr>`;
+        }).join('');
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center text-danger">Failed to load prices: ${escapeHtml(err)}</td></tr>`;
     }
 }
 
@@ -1131,10 +1455,11 @@ async function handleSavePriceEntry(e) {
     const output_per_mtok_micro_usd = Math.round(parseFloat(document.getElementById('prc-output').value || '0') * 1_000_000);
     try {
         const res = await fetch('/admin/api/prices', {
-            method: 'POST',
+            method: 'PUT',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
             body: JSON.stringify({
                 provider_id: '',
+                provider_kind: 'custom',
                 upstream_model_id,
                 input_per_mtok_micro_usd,
                 output_per_mtok_micro_usd,
@@ -1142,10 +1467,93 @@ async function handleSavePriceEntry(e) {
                 cache_write_per_mtok_micro_usd: input_per_mtok_micro_usd
             })
         });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (!res.ok) throw new Error(await extractApiError(res));
         closeModal('modal-new-price');
         document.getElementById('form-new-price').reset();
+        await invalidateAndRefetch('prices');
     } catch (err) {
         alert('Failed to save price entry: ' + err);
+    }
+}
+
+async function deletePriceEntry(providerId, modelId) {
+    if (!modelId || !confirm(`Delete price entry for "${modelId}"?`)) return;
+    try {
+        const url = `/admin/api/prices?provider_id=${encodeURIComponent(providerId)}&upstream_model_id=${encodeURIComponent(modelId)}`;
+        const res = await fetch(url, {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('prices');
+    } catch (err) {
+        alert('Failed to delete price entry: ' + err);
+    }
+}
+
+async function toggleClientKeyPause(id, pause) {
+    if (!id) return;
+    const action = pause ? 'pause' : 'resume';
+    try {
+        const res = await fetch(`/api/user/client-keys/${encodeURIComponent(id)}/${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: '{}'
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('client-keys');
+    } catch (err) {
+        alert(`Failed to ${action} client key: ` + err);
+    }
+}
+
+async function rotateClientKey(id) {
+    if (!id || !confirm('Rotate this client key? The previous token will remain valid for the 5-minute grace window.')) return;
+    try {
+        const res = await fetch(`/api/user/client-keys/${encodeURIComponent(id)}/rotate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ grace_period_secs: 300 })
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        const data = await res.json();
+        await invalidateAndRefetch('client-keys');
+        const revealedToken = data.raw_token || data.token;
+        if (revealedToken) {
+            document.getElementById('revealed-token-text').textContent = revealedToken;
+            openModal('modal-token-reveal');
+        }
+    } catch (err) {
+        alert('Failed to rotate client key: ' + err);
+    }
+}
+
+async function acceptShare(id, fingerprint) {
+    if (!id) return;
+    try {
+        const res = await fetch(`/api/user/shares/${encodeURIComponent(id)}/accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify({ config_fingerprint: fingerprint, fingerprint })
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('shares');
+    } catch (err) {
+        alert('Failed to accept share: ' + err);
+    }
+}
+
+async function confirmModelMerge(modelPk) {
+    if (!modelPk) return;
+    try {
+        const res = await fetch(`/admin/api/models/${encodeURIComponent(modelPk)}/confirm-merge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: '{}'
+        });
+        if (!res.ok) throw new Error(await extractApiError(res));
+        await invalidateAndRefetch('catalog');
+    } catch (err) {
+        alert('Failed to confirm model merge: ' + err);
     }
 }

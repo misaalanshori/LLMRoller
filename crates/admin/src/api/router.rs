@@ -98,6 +98,10 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_user_budget_windows_handler).post(post_user_budget_window_handler),
         )
         .route(
+            "/api/user/upstream-keys/{id}/budget-windows",
+            get(get_user_budget_windows_handler).post(post_user_budget_window_handler),
+        )
+        .route(
             "/api/user/budget-windows/{id}",
             patch(patch_user_budget_window_handler).delete(delete_user_budget_window_handler),
         )
@@ -263,6 +267,10 @@ pub fn router(state: ApiAppState) -> Router {
             get(get_admin_budget_windows_handler).post(post_admin_budget_window_handler),
         )
         .route(
+            "/admin/api/upstream-keys/{id}/budget-windows",
+            get(get_admin_budget_windows_handler).post(post_admin_budget_window_handler),
+        )
+        .route(
             "/admin/api/budget-windows/{id}",
             patch(patch_admin_budget_window_handler).delete(delete_admin_budget_window_handler),
         )
@@ -418,7 +426,10 @@ pub fn router(state: ApiAppState) -> Router {
         )
         .route(
             "/admin/api/prices",
-            put(put_admin_price_handler).delete(delete_admin_price_handler),
+            get(get_admin_prices_handler)
+                .put(put_admin_price_handler)
+                .post(put_admin_price_handler)
+                .delete(delete_admin_price_handler),
         )
         .route(
             "/admin/api/prices/sync",

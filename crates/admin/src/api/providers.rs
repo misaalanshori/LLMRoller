@@ -70,15 +70,16 @@ pub(crate) async fn post_user_provider(
     let actor = authenticate_actor(&state, &headers, true).await?;
     validate_provider_config_json(&payload.config_json)?;
     let owner_user_id = actor.user_id();
-    let (base_url, config_json) = apply_preset_defaults(
-        payload.base_url,
-        payload.config_json,
-        payload.preset_id.as_deref(),
-    );
+    let effective_preset_id = payload
+        .preset_id
+        .as_deref()
+        .or(payload.kind.preset_id.as_deref());
+    let (base_url, config_json) =
+        apply_preset_defaults(payload.base_url, payload.config_json, effective_preset_id);
 
     let new_provider = NewProvider {
         name: payload.name,
-        kind: payload.kind,
+        kind: payload.kind.kind,
         base_url,
         config_json,
         ownership_scope: OwnershipScope::Personal,
@@ -264,14 +265,15 @@ pub(crate) async fn post_admin_provider(
 ) -> Result<(StatusCode, Json<Provider>), (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_admin(&state, &headers, true).await?;
     validate_provider_config_json(&payload.config_json)?;
-    let (base_url, config_json) = apply_preset_defaults(
-        payload.base_url,
-        payload.config_json,
-        payload.preset_id.as_deref(),
-    );
+    let effective_preset_id = payload
+        .preset_id
+        .as_deref()
+        .or(payload.kind.preset_id.as_deref());
+    let (base_url, config_json) =
+        apply_preset_defaults(payload.base_url, payload.config_json, effective_preset_id);
     let new_provider = NewProvider {
         name: payload.name,
-        kind: payload.kind,
+        kind: payload.kind.kind,
         base_url,
         config_json,
         ownership_scope: OwnershipScope::Global,

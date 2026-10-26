@@ -619,3 +619,122 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     assert!(adm_ov_html.contains("Projected Disk Usage:"));
     assert!(adm_ov_html.contains("disk-meter"));
 }
+
+#[doc = "Spec: PRV-1, PRV-2, UI-1, UI-2, UI-5 — full provider preset catalog in UI selectors, preset-slug creation, partial refetch, and dual-theme form styling"]
+#[tokio::test]
+async fn test_provider_preset_creation_partial_refetch_and_light_mode_styles() {
+    use axum::http::header;
+
+    let app_html = include_str!("../../../../crates/admin/templates/app.html");
+    let admin_html = include_str!("../../../../crates/admin/templates/admin.html");
+    let app_js = include_str!("../../../../crates/admin/static/app.js");
+    let app_css = include_str!("../../../../crates/admin/static/app.css");
+
+    for preset in [
+        "anthropic_claude_code_stealth_oauth",
+        "openai_codex_chatgpt_backend_oauth_and_websocket",
+        "antigravity_google_cloud_code_assist",
+        "groq_cloud_lpu_inference",
+        "deepseek_api_and_interleaved_reasoning_content",
+        "together_ai_cloud",
+        "fireworks_ai_inference",
+    ] {
+        assert!(
+            admin_html.contains(&format!("value=\"{preset}\"")),
+            "admin #gp-kind must include preset {preset}"
+        );
+        assert!(
+            app_html.contains(&format!("value=\"{preset}\"")),
+            "personal #prov-kind must include preset {preset}"
+        );
+    }
+    assert!(app_js.contains("invalidateAndRefetch"));
+    assert!(app_js.contains("refreshPartial"));
+    assert!(app_css.contains("--input-bg:"));
+    assert!(app_css.contains(".btn-outline"));
+    assert!(app_css.contains(".setting-control"));
+
+    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
+    let auth_config = AuthConfig {
+        dev_insecure_cookies: true,
+        require_tls: false,
+        trusted_proxies: vec![],
+    };
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let setup_state = SetupAppState {
+        pool: pool.clone(),
+        expected_token: Some("mock_token".to_string()),
+        data_dir: dir.path().to_path_buf(),
+        clock: Arc::new(llmroller_core::seams::SystemClock::new()),
+        entropy: Arc::new(OsEntropy),
+        audit_hmac_key: None,
+    };
+    let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let app = control_plane_router_full(setup_state, auth_state, api_state);
+
+    let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
+    let raw_admin = "admin_preset_session_token_123456789";
+    let admin_id_hash = llmroller_store::crypto::sha256_hex(raw_admin.as_bytes());
+    let admin_csrf = llmroller_admin::auth::derive_session_csrf(raw_admin);
+    let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
+    llmroller_store::users::insert_web_session(
+        &pool,
+        llmroller_store::users::NewWebSession {
+            id_hash: &admin_id_hash,
+            user_id: admin_id,
+            csrf_hash: &admin_csrf_hash,
+            ip_addr: Some("127.0.0.1"),
+            user_agent: Some("admin-agent"),
+            created_at: now_ms,
+            expires_at: now_ms + 86400 * 1000,
+        },
+    )
+    .await
+    .expect("insert admin session");
+    let admin_cookie = format!("llmroller_session={raw_admin}");
+
+    // Create a global provider by passing a preset slug directly in `kind`
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/providers")
+        .header(header::COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"name":"Global Groq Pool","kind":"groq_cloud_lpu_inference","base_url":""}"#,
+        ))
+        .expect("req");
+    let create_res = app.clone().oneshot(create_req).await.expect("res");
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+
+    // Refetch /admin/partials/providers and verify the new provider and preset badge render immediately
+    let partial_req = Request::builder()
+        .method("GET")
+        .uri("/admin/partials/providers")
+        .header(header::COOKIE, &admin_cookie)
+        .header("hx-request", "true")
+        .body(Body::empty())
+        .expect("req");
+    let partial_res = app.clone().oneshot(partial_req).await.expect("res");
+    assert_eq!(partial_res.status(), StatusCode::OK);
+    let partial_bytes = partial_res
+        .into_body()
+        .collect()
+        .await
+        .expect("b")
+        .to_bytes();
+    let partial_html = std::str::from_utf8(&partial_bytes).expect("utf8");
+    assert!(partial_html.contains("Global Groq Pool"));
+    assert!(partial_html.contains("groq_cloud_lpu_inference"));
+    assert!(partial_html.contains("https://api.groq.com/openai/v1"));
+
+    // Verify GET /admin/api/prices works for the Price Book tab
+    let prices_req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/prices")
+        .header(header::COOKIE, &admin_cookie)
+        .body(Body::empty())
+        .expect("req");
+    let prices_res = app.oneshot(prices_req).await.expect("res");
+    assert_eq!(prices_res.status(), StatusCode::OK);
+}

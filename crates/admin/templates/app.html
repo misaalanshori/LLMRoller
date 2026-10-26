@@ -103,7 +103,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                             <th>Actions</th>
                         </tr>
                     </thead>
-                    <tbody id="client-keys-body" hx-get="/app/partials/client-keys" hx-trigger="load" hx-swap="innerHTML">
+                    <tbody id="client-keys-body" hx-get="/app/partials/client-keys" hx-trigger="load, refresh" hx-swap="innerHTML">
                         <tr><td colspan="7" class="text-center text-muted">Loading client keys...</td></tr>
                     </tbody>
                 </table>
@@ -121,7 +121,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                 </div>
                 <button class="btn btn-sm btn-primary" data-modal-open="modal-new-provider">+ Add Provider</button>
             </div>
-            <div id="providers-list" class="providers-stack" hx-get="/app/partials/providers" hx-trigger="load" hx-swap="innerHTML">
+            <div id="providers-list" class="providers-stack" hx-get="/app/partials/providers" hx-trigger="load, refresh" hx-swap="innerHTML">
                 <p class="text-muted">Loading personal providers...</p>
             </div>
         </div>
@@ -149,7 +149,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                                 <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="outgoing-shares-body" hx-get="/app/partials/shares/outgoing" hx-trigger="load" hx-swap="innerHTML">
+                        <tbody id="outgoing-shares-body" hx-get="/app/partials/shares/outgoing" hx-trigger="load, refresh" hx-swap="innerHTML">
                             <tr><td colspan="5" class="text-center text-muted">Loading outgoing shares...</td></tr>
                         </tbody>
                     </table>
@@ -170,7 +170,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                                 <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="incoming-shares-body" hx-get="/app/partials/shares/incoming" hx-trigger="load" hx-swap="innerHTML">
+                        <tbody id="incoming-shares-body" hx-get="/app/partials/shares/incoming" hx-trigger="load, refresh" hx-swap="innerHTML">
                             <tr><td colspan="5" class="text-center text-muted">Loading incoming shares...</td></tr>
                         </tbody>
                     </table>
@@ -200,7 +200,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                             <th>Global Pool</th>
                         </tr>
                     </thead>
-                    <tbody id="matrix-body" hx-get="/app/partials/matrix" hx-trigger="load" hx-swap="innerHTML">
+                    <tbody id="matrix-body" hx-get="/app/partials/matrix" hx-trigger="load, refresh" hx-swap="innerHTML">
                         <tr>
                             <td><strong>claude-sonnet-4.6</strong></td>
                             <td><span class="badge badge-info">smooth_weighted_rr</span></td>
@@ -237,7 +237,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                             <th>Action</th>
                         </tr>
                     </thead>
-                    <tbody id="active-pins-body" hx-get="/app/partials/pins" hx-trigger="load, every 10s" hx-swap="innerHTML">
+                    <tbody id="active-pins-body" hx-get="/app/partials/pins" hx-trigger="load, refresh, every 10s" hx-swap="innerHTML">
                         <tr><td colspan="7" class="text-center text-muted">Loading active pinned sessions...</td></tr>
                     </tbody>
                 </table>
@@ -261,7 +261,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                     <a href="/api/user/logs/export.csv" class="btn btn-sm btn-outline">Export CSV</a>
                 </div>
             </div>
-            <div id="logs-table-container" hx-get="/app/partials/logs?stream=inference" hx-trigger="load">
+            <div id="logs-table-container" hx-get="/app/partials/logs?stream=inference" hx-trigger="load, refresh">
                 <p class="text-muted text-center p-6">Loading logs...</p>
             </div>
         </div>
@@ -276,7 +276,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                     <p class="card-desc">Review token composition, plan coverage multipliers, and credit charges.</p>
                 </div>
             </div>
-            <div id="ledger-content" hx-get="/app/partials/ledger" hx-trigger="load">
+            <div id="ledger-content" hx-get="/app/partials/ledger" hx-trigger="load, refresh">
                 <p class="text-muted text-center p-6">Loading usage ledger...</p>
             </div>
         </div>
@@ -302,7 +302,7 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
                             <th>Details</th>
                         </tr>
                     </thead>
-                    <tbody id="user-audit-body" hx-get="/app/partials/audit-log" hx-trigger="load" hx-swap="innerHTML">
+                    <tbody id="user-audit-body" hx-get="/app/partials/audit-log" hx-trigger="load, refresh" hx-swap="innerHTML">
                         <tr><td colspan="5" class="text-center text-muted">Loading audit log entries...</td></tr>
                     </tbody>
                 </table>
@@ -501,39 +501,163 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             <div class="form-group">
                 <label for="prov-kind">Provider Kind</label>
                 <select id="prov-kind" name="provider_kind">
-                    <option value="openrouter" selected>OpenRouter</option>
-                    <option value="opencode_go">OpenCode Go</option>
-                    <option value="command_code">Command Code</option>
-                    <option value="open_design_amr">Open Design AMR</option>
-                    <option value="custom">Custom / Preset Upstream (80 Built-In Presets)</option>
+                    <option value="openrouter" data-base-url="https://openrouter.ai/api/v1" selected>OpenRouter</option>
+                    <option value="opencode_go" data-base-url="https://opencode.ai/zen/go/v1">OpenCode Go</option>
+                    <option value="command_code" data-base-url="https://api.commandcode.ai/provider/v1">Command Code</option>
+                    <option value="open_design_amr" data-base-url="https://amr-link.open-design.ai/v1">Open Design AMR</option>
+                    <option value="abacus_ai_route_llm_and_aihubmix" data-preset-id="abacus_ai_route_llm_and_aihubmix" data-base-url="https://routellm.abacus.ai/v1">Abacus.AI RouteLLM &amp; AIHubMix</option>
+                    <option value="alibaba_qwen_oauth_portal_and_dashscope_coding_plan" data-preset-id="alibaba_qwen_oauth_portal_and_dashscope_coding_plan" data-base-url="https://portal.qwen.ai/v1/chat/completions">Alibaba Qwen Code OAuth &amp; DashScope Coding Plan</option>
+                    <option value="amazon_bedrock_sigv4_and_bearer_converse_stream" data-preset-id="amazon_bedrock_sigv4_and_bearer_converse_stream" data-base-url="https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream">Amazon Bedrock</option>
+                    <option value="nova_amazon_direct_api" data-preset-id="nova_amazon_direct_api" data-base-url="https://api.nova.amazon.com/v1">Amazon Nova Direct API</option>
+                    <option value="anthropic_claude_code_stealth_oauth" data-preset-id="anthropic_claude_code_stealth_oauth" data-base-url="https://api.anthropic.com/v1/messages?beta=true">Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header &amp; Tool Prefixing)</option>
+                    <option value="anthropic_official_direct_api_preset" data-preset-id="anthropic_official_direct_api_preset" data-base-url="https://api.anthropic.com/v1">Anthropic Official API</option>
+                    <option value="aws_kiro_codewhisperer_eventstream" data-preset-id="aws_kiro_codewhisperer_eventstream" data-base-url="https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse">AWS Kiro (CodeWhisperer Social/IDC/BuilderID OAuth &amp; AWS EventStream Binary Framing)</option>
+                    <option value="azure_openai_and_azure_cognitive_services_v1_and_deployments" data-preset-id="azure_openai_and_azure_cognitive_services_v1_and_deployments" data-base-url="https://{resource}.openai.azure.com/openai/v1/responses">Azure OpenAI &amp; Azure AI Foundry</option>
+                    <option value="baidu_qianfan_ernie_and_modelscope" data-preset-id="baidu_qianfan_ernie_and_modelscope" data-base-url="https://qianfan.baidubce.com/v2">Baidu Qianfan &amp; Alibaba ModelScope</option>
+                    <option value="baseten_model_apis" data-preset-id="baseten_model_apis" data-base-url="https://inference.baseten.co/v1">Baseten Model APIs</option>
+                    <option value="volcengine_ark_and_byteplus_coding_plan" data-preset-id="volcengine_ark_and_byteplus_coding_plan" data-base-url="https://ark.cn-beijing.volces.com/api/v3">ByteDance Volcengine Ark &amp; BytePlus Ark</option>
+                    <option value="cerebras_wafer_scale_inference" data-preset-id="cerebras_wafer_scale_inference" data-base-url="https://api.cerebras.ai/v1">Cerebras Inference</option>
+                    <option value="chutes_ai_decentralized_inference" data-preset-id="chutes_ai_decentralized_inference" data-base-url="https://llm.chutes.ai/v1">Chutes AI</option>
+                    <option value="cloudferro_sherlock_and_evroc_sovereign" data-preset-id="cloudferro_sherlock_and_evroc_sovereign" data-base-url="https://api-sherlock.cloudferro.com/openai/v1">CloudFerro Sherlock &amp; Evroc Think</option>
+                    <option value="cloudflare_workers_ai_and_ai_gateway_unified" data-preset-id="cloudflare_workers_ai_and_ai_gateway_unified" data-base-url="https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat/chat/completions">Cloudflare Workers AI &amp; Cloudflare AI Gateway</option>
+                    <option value="cohere_v2_compatibility_api" data-preset-id="cohere_v2_compatibility_api" data-base-url="https://api.cohere.com/compatibility/v1">Cohere v2 OpenAI Compatibility API</option>
+                    <option value="cursor_ide_connect_protobuf_and_cursor_agent_cli" data-preset-id="cursor_ide_connect_protobuf_and_cursor_agent_cli" data-base-url="https://api2.cursor.sh/aiserver.v1.ChatService/StreamChat">Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat &amp; cursor-agent CLI Bridge)</option>
+                    <option value="deepinfra_inference_api" data-preset-id="deepinfra_inference_api" data-base-url="https://api.deepinfra.com/v1/openai">DeepInfra</option>
+                    <option value="deepseek_api_and_interleaved_reasoning_content" data-preset-id="deepseek_api_and_interleaved_reasoning_content" data-base-url="https://api.deepseek.com/v1">DeepSeek Official API</option>
+                    <option value="fireworks_ai_inference" data-preset-id="fireworks_ai_inference" data-base-url="https://api.fireworks.ai/inference/v1">Fireworks AI</option>
+                    <option value="friendli_ai_and_Inception_mercury_diffusion" data-preset-id="friendli_ai_and_Inception_mercury_diffusion" data-base-url="https://api.friendli.ai/serverless/v1">FriendliAI &amp; Inception Labs Mercury Diffusion</option>
+                    <option value="github_copilot_dual_surface_and_token_exchange" data-preset-id="github_copilot_dual_surface_and_token_exchange" data-base-url="https://api.githubcopilot.com">GitHub Copilot (OAuth Device Flow, Copilot Token Exchange, and Multi-Protocol Chat/Responses/Messages Routing)</option>
+                    <option value="github_models_inference_azure_ai" data-preset-id="github_models_inference_azure_ai" data-base-url="https://models.github.ai/inference">GitHub Models</option>
+                    <option value="gitlab_duo_agent_platform_and_direct_access" data-preset-id="gitlab_duo_agent_platform_and_direct_access" data-base-url="https://cloud.gitlab.com/ai/v1/proxy/anthropic/v1/messages">GitLab Duo Agent Platform</option>
+                    <option value="antigravity_google_cloud_code_assist" data-preset-id="antigravity_google_cloud_code_assist" data-base-url="https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse">Google Antigravity (Cloud Code Assist v1internal Sandbox &amp; Prod Dual-Endpoint)</option>
+                    <option value="google_gemini_cli_cloud_code_assist" data-preset-id="google_gemini_cli_cloud_code_assist" data-base-url="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse">Google Gemini CLI (Cloud Code Assist OAuth Provider)</option>
+                    <option value="google_generative_ai_studio_and_vertex_ai" data-preset-id="google_generative_ai_studio_and_vertex_ai" data-base-url="https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse">Google Generative AI Studio &amp; Google Cloud Vertex AI</option>
+                    <option value="groq_cloud_lpu_inference" data-preset-id="groq_cloud_lpu_inference" data-base-url="https://api.groq.com/openai/v1">Groq Cloud</option>
+                    <option value="helicone_ai_gateway_and_portkey" data-preset-id="helicone_ai_gateway_and_portkey" data-base-url="https://ai-gateway.helicone.ai/v1">Helicone AI Gateway &amp; ZenMux</option>
+                    <option value="huggingface_inference_router" data-preset-id="huggingface_inference_router" data-base-url="https://router.huggingface.co/v1">Hugging Face Inference Router</option>
+                    <option value="hyperbolic_ai_inference" data-preset-id="hyperbolic_ai_inference" data-base-url="https://api.hyperbolic.xyz/v1">Hyperbolic</option>
+                    <option value="iflow_cn_and_longcat_meituan" data-preset-id="iflow_cn_and_longcat_meituan" data-base-url="https://apis.iflow.cn/v1">iFlow &amp; Meituan LongCat</option>
+                    <option value="kilo_code_and_cline_gateway" data-preset-id="kilo_code_and_cline_gateway" data-base-url="https://api.kilo.ai/api/gateway">Kilo Code &amp; Cline Gateway</option>
+                    <option value="kimi_coding_cli_oauth_and_msh_fingerprint" data-preset-id="kimi_coding_cli_oauth_and_msh_fingerprint" data-base-url="https://api.kimi.com/coding/v1/messages">Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers)</option>
+                    <option value="kuae_cloud_and_stackit_rag" data-preset-id="kuae_cloud_and_stackit_rag" data-base-url="https://coding-plan-endpoint.kuaecloud.net/v1">KUAE Cloud &amp; STACKIT</option>
+                    <option value="lmstudio_vllm_and_llamacpp_local_servers" data-preset-id="lmstudio_vllm_and_llamacpp_local_servers" data-base-url="http://127.0.0.1:1234/v1">LM Studio, vLLM, and llama.cpp Server</option>
+                    <option value="llama_meta_api_and_Clarifai" data-preset-id="llama_meta_api_and_Clarifai" data-base-url="https://api.llama.com/compat/v1">Meta Llama API &amp; Clarifai</option>
+                    <option value="minimax_and_minimax_coding_plan_dual_region" data-preset-id="minimax_and_minimax_coding_plan_dual_region" data-base-url="https://api.minimax.io/anthropic/v1/messages">MiniMax &amp; MiniMax Coding Plan</option>
+                    <option value="mistral_and_codestral_api_compat" data-preset-id="mistral_and_codestral_api_compat" data-base-url="https://api.mistral.ai/v1">Mistral AI &amp; Codestral with Strict 9-Char Tool IDs</option>
+                    <option value="moonshot_ai_global_and_cn" data-preset-id="moonshot_ai_global_and_cn" data-base-url="https://api.moonshot.ai/v1">Moonshot AI</option>
+                    <option value="morph_fast_apply_and_relace_instant_apply" data-preset-id="morph_fast_apply_and_relace_instant_apply" data-base-url="https://api.morphllm.com/v1">Morph Fast Apply &amp; Cortecs</option>
+                    <option value="inference_net_and_nano_gpt" data-preset-id="inference_net_and_nano_gpt" data-base-url="https://nano-gpt.com/api/v1">NanoGPT &amp; Inference.net</option>
+                    <option value="nebius_ai_studio_token_factory" data-preset-id="nebius_ai_studio_token_factory" data-base-url="https://api.tokenfactory.nebius.com/v1">Nebius AI Studio</option>
+                    <option value="novita_ai_openai_api" data-preset-id="novita_ai_openai_api" data-base-url="https://api.novita.ai/openai">Novita AI</option>
+                    <option value="nvidia_nim_integrate_api" data-preset-id="nvidia_nim_integrate_api" data-base-url="https://integrate.api.nvidia.com/v1">NVIDIA NIM</option>
+                    <option value="ollama_cloud_and_local_ollama_v1" data-preset-id="ollama_cloud_and_local_ollama_v1" data-base-url="https://ollama.com/v1">Ollama Cloud &amp; Local Ollama</option>
+                    <option value="openai_codex_chatgpt_backend_oauth_and_websocket" data-preset-id="openai_codex_chatgpt_backend_oauth_and_websocket" data-base-url="https://chatgpt.com/backend-api/codex/responses">OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE &amp; WebSocket v2 with Zstd)</option>
+                    <option value="openai_official_direct_platform_preset" data-preset-id="openai_official_direct_platform_preset" data-base-url="https://api.openai.com/v1">OpenAI Official Platform</option>
+                    <option value="opencode_zen_and_console_multi_protocol_gateway" data-preset-id="opencode_zen_and_console_multi_protocol_gateway" data-base-url="https://opencode.ai/zen/v1">OpenCode Zen</option>
+                    <option value="ovhcloud_ai_endpoints_and_scaleway" data-preset-id="ovhcloud_ai_endpoints_and_scaleway" data-base-url="https://oai.endpoints.kepler.ai.cloud.ovh.net/v1">OVHcloud AI Endpoints &amp; Scaleway Generative APIs</option>
+                    <option value="perplexity_sonar_api" data-preset-id="perplexity_sonar_api" data-base-url="https://api.perplexity.ai">Perplexity Sonar API</option>
+                    <option value="poe_api_and_requesty_router" data-preset-id="poe_api_and_requesty_router" data-base-url="https://api.poe.com/v1">Poe API &amp; Requesty Router</option>
+                    <option value="pollinations_ai_and_puters_free_gateways" data-preset-id="pollinations_ai_and_puters_free_gateways" data-base-url="https://text.pollinations.ai/openai">Pollinations AI &amp; Puter AI</option>
+                    <option value="privatemode_ai_confidential_and_io_net" data-preset-id="privatemode_ai_confidential_and_io_net" data-base-url="https://api.intelligence.io.solutions/api/v1">Privatemode AI &amp; IO.NET</option>
+                    <option value="roocode_cloud_and_kilocode_openrouter_compatible" data-preset-id="roocode_cloud_and_kilocode_openrouter_compatible" data-base-url="https://api.roocode.com/v1">RooCode Cloud &amp; Blackbox AI</option>
+                    <option value="sambanova_cloud_api" data-preset-id="sambanova_cloud_api" data-base-url="https://api.sambanova.ai/v1">SambaNova Cloud</option>
+                    <option value="sap_ai_core_orchestration_and_berget_ai" data-preset-id="sap_ai_core_orchestration_and_berget_ai" data-base-url="https://api.ai.prod.{region}.aws.ml.hana.ondemand.com/v2/inference/deployments/{id}">SAP AI Core &amp; Berget AI</option>
+                    <option value="siliconflow_global_and_cn" data-preset-id="siliconflow_global_and_cn" data-base-url="https://api.siliconflow.com/v1">SiliconFlow</option>
+                    <option value="stepfun_and_yi_lingyiwanwu" data-preset-id="stepfun_and_yi_lingyiwanwu" data-base-url="https://api.stepfun.com/v1">StepFun &amp; 01.AI Yi</option>
+                    <option value="submodel_instagen_and_moark_gitee" data-preset-id="submodel_instagen_and_moark_gitee" data-base-url="https://llm.submodel.ai/v1">Submodel &amp; Moark / Gitee AI</option>
+                    <option value="synthetic_new_glhf_openai_and_anthropic" data-preset-id="synthetic_new_glhf_openai_and_anthropic" data-base-url="https://api.synthetic.new/openai/v1">Synthetic</option>
+                    <option value="together_ai_cloud" data-preset-id="together_ai_cloud" data-base-url="https://api.together.xyz/v1">Together AI</option>
+                    <option value="typesafe_system_one_and_agent_gateway" data-preset-id="typesafe_system_one_and_agent_gateway" data-base-url="https://app.typesafe.ai/api/v2/agent">TypeSafe System One</option>
+                    <option value="upstage_solar_and_302ai_gateway" data-preset-id="upstage_solar_and_302ai_gateway" data-base-url="https://api.upstage.ai/v1/solar">Upstage Solar &amp; 302.AI</option>
+                    <option value="venice_ai_privacy_inference" data-preset-id="venice_ai_privacy_inference" data-base-url="https://api.venice.ai/api/v1">Venice AI</option>
+                    <option value="vercel_ai_gateway_and_oidc_headers" data-preset-id="vercel_ai_gateway_and_oidc_headers" data-base-url="https://ai-gateway.vercel.sh">Vercel AI Gateway</option>
+                    <option value="vivgrid_and_fastrouter" data-preset-id="vivgrid_and_fastrouter" data-base-url="https://api.vivgrid.com/v1">Vivgrid &amp; FastRouter</option>
+                    <option value="vultr_serverless_inference_and_digitalocean" data-preset-id="vultr_serverless_inference_and_digitalocean" data-base-url="https://api.vultrinference.com/v1">Vultr Serverless Inference &amp; Firmware AI</option>
+                    <option value="wandb_inference_coreweave_and_weights_and_biases" data-preset-id="wandb_inference_coreweave_and_weights_and_biases" data-base-url="https://api.inference.wandb.ai/v1">Weights &amp; Biases Inference</option>
+                    <option value="windsurf_codeium_and_qoder_coding_agents" data-preset-id="windsurf_codeium_and_qoder_coding_agents" data-base-url="https://server.codeium.com">Windsurf / Codeium &amp; Qoder Coding Agent Gateways</option>
+                    <option value="grok_cli_and_grok_web_sso_cookie_executor" data-preset-id="grok_cli_and_grok_web_sso_cookie_executor" data-base-url="https://api.x.ai/v1">xAI Grok CLI (api.x.ai OpenAI/Anthropic Dual Surface) &amp; Grok Web (grok.com SSO Cookie NDJSON Executor)</option>
+                    <option value="xiaomi_mimo_openai_and_anthropic" data-preset-id="xiaomi_mimo_openai_and_anthropic" data-base-url="https://api.xiaomimimo.com/v1">Xiaomi MiMo</option>
+                    <option value="zai_zhipu_glm_coding_plan_multi_region" data-preset-id="zai_zhipu_glm_coding_plan_multi_region" data-base-url="https://api.z.ai/api/coding/paas/v4">Z.AI / Zhipu GLM Coding Plan</option>
+                    <option value="custom" data-base-url="">Custom Upstream URL</option>
                 </select>
             </div>
             <div class="form-group">
-                <label for="prov-preset-id">Provider Preset Catalog (80 Presets)</label>
+                <label for="prov-preset-id">Provider Preset Override (Optional)</label>
                 <select id="prov-preset-id">
-                    <option value="">None (Standard Kind)</option>
-                    <option value="anthropic">Anthropic Messages API</option>
-                    <option value="openai">OpenAI Platform</option>
-                    <option value="google_gemini">Google Gemini API</option>
-                    <option value="google_vertex">Google Vertex AI</option>
-                    <option value="aws_bedrock">AWS Bedrock Converse</option>
-                    <option value="azure_openai">Azure OpenAI</option>
-                    <option value="deepseek">DeepSeek API</option>
-                    <option value="groq">Groq Cloud</option>
-                    <option value="together_ai">Together AI</option>
-                    <option value="fireworks_ai">Fireworks AI</option>
-                    <option value="mistral">Mistral AI</option>
-                    <option value="cohere">Cohere v2</option>
-                    <option value="xai">xAI Grok</option>
-                    <option value="perplexity">Perplexity Sonar</option>
-                    <option value="cerebras">Cerebras Inference</option>
-                    <option value="sambanova">SambaNova Cloud</option>
-                    <option value="github_copilot">GitHub Copilot</option>
-                    <option value="claude_code_oauth">Claude Code OAuth</option>
-                    <option value="openai_codex_oauth">OpenAI Codex CLI OAuth</option>
-                    <option value="ollama_local">Ollama Local</option>
-                    <option value="vllm_local">vLLM Local</option>
-                    <option value="lmstudio_local">LM Studio Local</option>
+                    <option value="">None (Use Provider Kind Above)</option>
+                    <option value="abacus_ai_route_llm_and_aihubmix" data-base-url="https://routellm.abacus.ai/v1">Abacus.AI RouteLLM &amp; AIHubMix</option>
+                    <option value="alibaba_qwen_oauth_portal_and_dashscope_coding_plan" data-base-url="https://portal.qwen.ai/v1/chat/completions">Alibaba Qwen Code OAuth &amp; DashScope Coding Plan</option>
+                    <option value="amazon_bedrock_sigv4_and_bearer_converse_stream" data-base-url="https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse-stream">Amazon Bedrock</option>
+                    <option value="nova_amazon_direct_api" data-base-url="https://api.nova.amazon.com/v1">Amazon Nova Direct API</option>
+                    <option value="anthropic_claude_code_stealth_oauth" data-base-url="https://api.anthropic.com/v1/messages?beta=true">Anthropic Claude Code (Stealth OAuth Mode with cch Billing Header &amp; Tool Prefixing)</option>
+                    <option value="anthropic_official_direct_api_preset" data-base-url="https://api.anthropic.com/v1">Anthropic Official API</option>
+                    <option value="aws_kiro_codewhisperer_eventstream" data-base-url="https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse">AWS Kiro (CodeWhisperer Social/IDC/BuilderID OAuth &amp; AWS EventStream Binary Framing)</option>
+                    <option value="azure_openai_and_azure_cognitive_services_v1_and_deployments" data-base-url="https://{resource}.openai.azure.com/openai/v1/responses">Azure OpenAI &amp; Azure AI Foundry</option>
+                    <option value="baidu_qianfan_ernie_and_modelscope" data-base-url="https://qianfan.baidubce.com/v2">Baidu Qianfan &amp; Alibaba ModelScope</option>
+                    <option value="baseten_model_apis" data-base-url="https://inference.baseten.co/v1">Baseten Model APIs</option>
+                    <option value="volcengine_ark_and_byteplus_coding_plan" data-base-url="https://ark.cn-beijing.volces.com/api/v3">ByteDance Volcengine Ark &amp; BytePlus Ark</option>
+                    <option value="cerebras_wafer_scale_inference" data-base-url="https://api.cerebras.ai/v1">Cerebras Inference</option>
+                    <option value="chutes_ai_decentralized_inference" data-base-url="https://llm.chutes.ai/v1">Chutes AI</option>
+                    <option value="cloudferro_sherlock_and_evroc_sovereign" data-base-url="https://api-sherlock.cloudferro.com/openai/v1">CloudFerro Sherlock &amp; Evroc Think</option>
+                    <option value="cloudflare_workers_ai_and_ai_gateway_unified" data-base-url="https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat/chat/completions">Cloudflare Workers AI &amp; Cloudflare AI Gateway</option>
+                    <option value="cohere_v2_compatibility_api" data-base-url="https://api.cohere.com/compatibility/v1">Cohere v2 OpenAI Compatibility API</option>
+                    <option value="cursor_ide_connect_protobuf_and_cursor_agent_cli" data-base-url="https://api2.cursor.sh/aiserver.v1.ChatService/StreamChat">Cursor IDE (Connect-RPC Protobuf HTTP/2 StreamChat &amp; cursor-agent CLI Bridge)</option>
+                    <option value="deepinfra_inference_api" data-base-url="https://api.deepinfra.com/v1/openai">DeepInfra</option>
+                    <option value="deepseek_api_and_interleaved_reasoning_content" data-base-url="https://api.deepseek.com/v1">DeepSeek Official API</option>
+                    <option value="fireworks_ai_inference" data-base-url="https://api.fireworks.ai/inference/v1">Fireworks AI</option>
+                    <option value="friendli_ai_and_Inception_mercury_diffusion" data-base-url="https://api.friendli.ai/serverless/v1">FriendliAI &amp; Inception Labs Mercury Diffusion</option>
+                    <option value="github_copilot_dual_surface_and_token_exchange" data-base-url="https://api.githubcopilot.com">GitHub Copilot (OAuth Device Flow, Copilot Token Exchange, and Multi-Protocol Chat/Responses/Messages Routing)</option>
+                    <option value="github_models_inference_azure_ai" data-base-url="https://models.github.ai/inference">GitHub Models</option>
+                    <option value="gitlab_duo_agent_platform_and_direct_access" data-base-url="https://cloud.gitlab.com/ai/v1/proxy/anthropic/v1/messages">GitLab Duo Agent Platform</option>
+                    <option value="antigravity_google_cloud_code_assist" data-base-url="https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse">Google Antigravity (Cloud Code Assist v1internal Sandbox &amp; Prod Dual-Endpoint)</option>
+                    <option value="google_gemini_cli_cloud_code_assist" data-base-url="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse">Google Gemini CLI (Cloud Code Assist OAuth Provider)</option>
+                    <option value="google_generative_ai_studio_and_vertex_ai" data-base-url="https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse">Google Generative AI Studio &amp; Google Cloud Vertex AI</option>
+                    <option value="groq_cloud_lpu_inference" data-base-url="https://api.groq.com/openai/v1">Groq Cloud</option>
+                    <option value="helicone_ai_gateway_and_portkey" data-base-url="https://ai-gateway.helicone.ai/v1">Helicone AI Gateway &amp; ZenMux</option>
+                    <option value="huggingface_inference_router" data-base-url="https://router.huggingface.co/v1">Hugging Face Inference Router</option>
+                    <option value="hyperbolic_ai_inference" data-base-url="https://api.hyperbolic.xyz/v1">Hyperbolic</option>
+                    <option value="iflow_cn_and_longcat_meituan" data-base-url="https://apis.iflow.cn/v1">iFlow &amp; Meituan LongCat</option>
+                    <option value="kilo_code_and_cline_gateway" data-base-url="https://api.kilo.ai/api/gateway">Kilo Code &amp; Cline Gateway</option>
+                    <option value="kimi_coding_cli_oauth_and_msh_fingerprint" data-base-url="https://api.kimi.com/coding/v1/messages">Kimi Coding (Moonshot Kimi CLI Coding Plan with X-Msh-* Hardware Telemetry Headers)</option>
+                    <option value="kuae_cloud_and_stackit_rag" data-base-url="https://coding-plan-endpoint.kuaecloud.net/v1">KUAE Cloud &amp; STACKIT</option>
+                    <option value="lmstudio_vllm_and_llamacpp_local_servers" data-base-url="http://127.0.0.1:1234/v1">LM Studio, vLLM, and llama.cpp Server</option>
+                    <option value="llama_meta_api_and_Clarifai" data-base-url="https://api.llama.com/compat/v1">Meta Llama API &amp; Clarifai</option>
+                    <option value="minimax_and_minimax_coding_plan_dual_region" data-base-url="https://api.minimax.io/anthropic/v1/messages">MiniMax &amp; MiniMax Coding Plan</option>
+                    <option value="mistral_and_codestral_api_compat" data-base-url="https://api.mistral.ai/v1">Mistral AI &amp; Codestral with Strict 9-Char Tool IDs</option>
+                    <option value="moonshot_ai_global_and_cn" data-base-url="https://api.moonshot.ai/v1">Moonshot AI</option>
+                    <option value="morph_fast_apply_and_relace_instant_apply" data-base-url="https://api.morphllm.com/v1">Morph Fast Apply &amp; Cortecs</option>
+                    <option value="inference_net_and_nano_gpt" data-base-url="https://nano-gpt.com/api/v1">NanoGPT &amp; Inference.net</option>
+                    <option value="nebius_ai_studio_token_factory" data-base-url="https://api.tokenfactory.nebius.com/v1">Nebius AI Studio</option>
+                    <option value="novita_ai_openai_api" data-base-url="https://api.novita.ai/openai">Novita AI</option>
+                    <option value="nvidia_nim_integrate_api" data-base-url="https://integrate.api.nvidia.com/v1">NVIDIA NIM</option>
+                    <option value="ollama_cloud_and_local_ollama_v1" data-base-url="https://ollama.com/v1">Ollama Cloud &amp; Local Ollama</option>
+                    <option value="openai_codex_chatgpt_backend_oauth_and_websocket" data-base-url="https://chatgpt.com/backend-api/codex/responses">OpenAI Codex (ChatGPT Plus/Pro Backend API via HTTP SSE &amp; WebSocket v2 with Zstd)</option>
+                    <option value="openai_official_direct_platform_preset" data-base-url="https://api.openai.com/v1">OpenAI Official Platform</option>
+                    <option value="opencode_zen_and_console_multi_protocol_gateway" data-base-url="https://opencode.ai/zen/v1">OpenCode Zen</option>
+                    <option value="ovhcloud_ai_endpoints_and_scaleway" data-base-url="https://oai.endpoints.kepler.ai.cloud.ovh.net/v1">OVHcloud AI Endpoints &amp; Scaleway Generative APIs</option>
+                    <option value="perplexity_sonar_api" data-base-url="https://api.perplexity.ai">Perplexity Sonar API</option>
+                    <option value="poe_api_and_requesty_router" data-base-url="https://api.poe.com/v1">Poe API &amp; Requesty Router</option>
+                    <option value="pollinations_ai_and_puters_free_gateways" data-base-url="https://text.pollinations.ai/openai">Pollinations AI &amp; Puter AI</option>
+                    <option value="privatemode_ai_confidential_and_io_net" data-base-url="https://api.intelligence.io.solutions/api/v1">Privatemode AI &amp; IO.NET</option>
+                    <option value="roocode_cloud_and_kilocode_openrouter_compatible" data-base-url="https://api.roocode.com/v1">RooCode Cloud &amp; Blackbox AI</option>
+                    <option value="sambanova_cloud_api" data-base-url="https://api.sambanova.ai/v1">SambaNova Cloud</option>
+                    <option value="sap_ai_core_orchestration_and_berget_ai" data-base-url="https://api.ai.prod.{region}.aws.ml.hana.ondemand.com/v2/inference/deployments/{id}">SAP AI Core &amp; Berget AI</option>
+                    <option value="siliconflow_global_and_cn" data-base-url="https://api.siliconflow.com/v1">SiliconFlow</option>
+                    <option value="stepfun_and_yi_lingyiwanwu" data-base-url="https://api.stepfun.com/v1">StepFun &amp; 01.AI Yi</option>
+                    <option value="submodel_instagen_and_moark_gitee" data-base-url="https://llm.submodel.ai/v1">Submodel &amp; Moark / Gitee AI</option>
+                    <option value="synthetic_new_glhf_openai_and_anthropic" data-base-url="https://api.synthetic.new/openai/v1">Synthetic</option>
+                    <option value="together_ai_cloud" data-base-url="https://api.together.xyz/v1">Together AI</option>
+                    <option value="typesafe_system_one_and_agent_gateway" data-base-url="https://app.typesafe.ai/api/v2/agent">TypeSafe System One</option>
+                    <option value="upstage_solar_and_302ai_gateway" data-base-url="https://api.upstage.ai/v1/solar">Upstage Solar &amp; 302.AI</option>
+                    <option value="venice_ai_privacy_inference" data-base-url="https://api.venice.ai/api/v1">Venice AI</option>
+                    <option value="vercel_ai_gateway_and_oidc_headers" data-base-url="https://ai-gateway.vercel.sh">Vercel AI Gateway</option>
+                    <option value="vivgrid_and_fastrouter" data-base-url="https://api.vivgrid.com/v1">Vivgrid &amp; FastRouter</option>
+                    <option value="vultr_serverless_inference_and_digitalocean" data-base-url="https://api.vultrinference.com/v1">Vultr Serverless Inference &amp; Firmware AI</option>
+                    <option value="wandb_inference_coreweave_and_weights_and_biases" data-base-url="https://api.inference.wandb.ai/v1">Weights &amp; Biases Inference</option>
+                    <option value="windsurf_codeium_and_qoder_coding_agents" data-base-url="https://server.codeium.com">Windsurf / Codeium &amp; Qoder Coding Agent Gateways</option>
+                    <option value="grok_cli_and_grok_web_sso_cookie_executor" data-base-url="https://api.x.ai/v1">xAI Grok CLI (api.x.ai OpenAI/Anthropic Dual Surface) &amp; Grok Web (grok.com SSO Cookie NDJSON Executor)</option>
+                    <option value="xiaomi_mimo_openai_and_anthropic" data-base-url="https://api.xiaomimimo.com/v1">Xiaomi MiMo</option>
+                    <option value="zai_zhipu_glm_coding_plan_multi_region" data-base-url="https://api.z.ai/api/coding/paas/v4">Z.AI / Zhipu GLM Coding Plan</option>
                 </select>
             </div>
             <div class="form-group">

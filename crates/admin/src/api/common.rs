@@ -716,10 +716,45 @@ pub(crate) fn map_settings_error(err: SettingsError) -> (StatusCode, Json<serde_
 // Request/Response DTOs
 // ---------------------------------------------------------------------------
 
+/// Provider kind or preset slug submitted in `CreateProviderRequest.kind`.
+///
+/// Accepts the 5 core `ProviderKind` values or any of the 80 compiled-in preset slugs
+/// (`F101`–`F180`), resolving a preset slug to `kind = ProviderKind::Custom` plus `preset_id`.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderKindOrPreset {
+    pub kind: ProviderKind,
+    pub preset_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ProviderKindOrPreset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if let Ok(kind) = raw.parse::<ProviderKind>() {
+            return Ok(Self {
+                kind,
+                preset_id: None,
+            });
+        }
+        if let Some(spec) = llmroller_proto::providers::lookup_provider_preset(&raw) {
+            return Ok(Self {
+                kind: ProviderKind::Custom,
+                preset_id: Some(spec.preset_id.to_string()),
+            });
+        }
+        Err(serde::de::Error::custom(format!(
+            "invalid provider kind or preset {raw:?}"
+        )))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateProviderRequest {
     pub name: String,
-    pub kind: ProviderKind,
+    pub kind: ProviderKindOrPreset,
+    #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub preset_id: Option<String>,
