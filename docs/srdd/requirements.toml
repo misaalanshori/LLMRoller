@@ -677,6 +677,12 @@ milestone = "M6"
 delivering_subphase = "7.3"
 tests = ["crates/server/tests/e2e_kill9_recovery.rs"]
 
+[requirements.TRN-0]
+priority = "P0"
+milestone = "M1"
+delivering_subphase = "2.3"
+tests = ["crates/proto/src/headers/tests.rs", "crates/server/tests/integration_wire_transparency.rs"]
+
 [requirements.TRN-1]
 priority = "P0"
 milestone = "M1"
