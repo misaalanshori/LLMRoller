@@ -329,7 +329,8 @@ pub(crate) fn build_upstream_headers(
     now_ms: i64,
 ) -> Result<HeaderMap, Box<Response>> {
     use llmroller_proto::headers::{
-        HeaderPipelineError, UaPolicy, apply_request_header_pipeline, resolve_user_agent,
+        HeaderPipelineError, UaPolicy, apply_provider_header, apply_request_header_pipeline,
+        resolve_user_agent,
     };
 
     // Native Anthropic endpoints default to `x-api-key`; all other protocols use
@@ -412,6 +413,7 @@ pub(crate) fn build_upstream_headers(
         .map(|s| s.outbound_token(candidate.pool_tier()))
         .unwrap_or("");
     let caller_client_name = llmroller_proto::headers::extract_caller_client_name(inbound);
+    let client_mode = candidate.config.effective_client_mode();
     let now_unix_secs = u64::try_from((now_ms / 1000).max(0)).unwrap_or(0);
     for (name, value) in &candidate.config.add_headers {
         let lower = name.to_ascii_lowercase();
@@ -443,14 +445,9 @@ pub(crate) fn build_upstream_headers(
             tracing::warn!(header = %name, "ignoring invalid provider add_headers value");
             continue;
         };
-        // Transparent proxy invariant (SRDD 12.1): preserve caller-supplied headers (such as
-        // x-client-name, x-title, http-referer, anthropic-beta) unless add_headers explicitly
-        // overrides User-Agent for a CLI harness or the caller did not supply the header.
-        if lower == "user-agent" || !inbound.contains_key(&h_name) {
-            outbound.insert(h_name, h_val);
-        } else {
-            outbound.entry(h_name).or_insert(h_val);
-        }
+        // TRN-0: transparent providers only fill headers the caller did not send; required-client
+        // providers (Claude Code, Codex, Antigravity, ...) replace them (SRDD 12.1.2, 23.3).
+        apply_provider_header(&mut outbound, h_name, h_val, client_mode);
     }
 
     // F095, F096, F097, F098, F101-F180: Synthesize built-in provider compatibility headers when absent
@@ -479,11 +476,7 @@ pub(crate) fn build_upstream_headers(
                 HeaderName::from_bytes(hk.as_bytes()),
                 HeaderValue::from_str(&expanded),
             ) {
-                if hk.eq_ignore_ascii_case("user-agent") && incoming_ua.is_none() {
-                    outbound.insert(h_name, h_val);
-                } else {
-                    outbound.entry(h_name).or_insert(h_val);
-                }
+                apply_provider_header(&mut outbound, h_name, h_val, client_mode);
             }
         }
     }

@@ -7,7 +7,7 @@
 
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
-use llmroller_core::provider::StripHeaderTokens;
+use llmroller_core::provider::{ClientMode, StripHeaderTokens};
 use llmroller_core::rbac::PoolTier;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,10 +46,9 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
 ];
 
 /// Internal and forwarding headers stripped from outbound requests (SEC-15, F011, F023).
-const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 21] = [
+const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 20] = [
     "host",
     "content-length",
-    "accept-encoding",
     "cookie",
     "set-cookie",
     "referer",
@@ -219,12 +218,6 @@ pub fn apply_request_header_pipeline(
         out.append(name.clone(), val.clone());
     }
 
-    // Force outbound accept-encoding to identity
-    out.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
-
     // Rule 3: Replace credentials with decrypted upstream key
     if let Some((auth_name, auth_val)) = auth_header {
         let name = HeaderName::from_bytes(auth_name.as_bytes())
@@ -235,6 +228,61 @@ pub fn apply_request_header_pipeline(
     }
 
     Ok(out)
+}
+
+/// Comma-separated token headers that required-client mode merges instead of replacing, so the
+/// provider's mandatory flags are present while the caller's own flags survive.
+const MERGED_TOKEN_HEADERS: [&str; 1] = ["anthropic-beta"];
+
+/// Apply one provider-configured header (`add_headers` or a preset's synthesized header) per the
+/// provider's [`ClientMode`] (`TRN-0`, Sections 12.1.2 and 23.3).
+///
+/// `Transparent` only fills a header the caller did not send. `Required` replaces the caller's
+/// values, except [`MERGED_TOKEN_HEADERS`], whose tokens are merged without duplicates.
+pub fn apply_provider_header(
+    out: &mut HeaderMap,
+    name: HeaderName,
+    value: HeaderValue,
+    mode: ClientMode,
+) {
+    match mode {
+        ClientMode::Transparent => {
+            if !out.contains_key(&name) {
+                out.insert(name, value);
+            }
+        }
+        ClientMode::Required => {
+            if MERGED_TOKEN_HEADERS.contains(&name.as_str())
+                && out.contains_key(&name)
+                && let Some(merged) = merge_header_tokens(out, &name, &value)
+            {
+                out.insert(name, merged);
+            } else {
+                out.insert(name, value);
+            }
+        }
+    }
+}
+
+/// Union of the caller's and the provider's comma-separated tokens (case-insensitive, first
+/// spelling and order kept). `None` when a value is not valid text, in which case the caller falls
+/// back to replacing.
+fn merge_header_tokens(
+    out: &HeaderMap,
+    name: &HeaderName,
+    required: &HeaderValue,
+) -> Option<HeaderValue> {
+    let mut tokens: Vec<String> = Vec::new();
+    let values = out.get_all(name).iter().chain(std::iter::once(required));
+    for value in values {
+        for token in value.to_str().ok()?.split(',') {
+            let token = token.trim();
+            if !token.is_empty() && !tokens.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+                tokens.push(token.to_string());
+            }
+        }
+    }
+    HeaderValue::from_str(&tokens.join(",")).ok()
 }
 
 /// Case-insensitive provider deny-list glob match (`strip_headers`).

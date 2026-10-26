@@ -4,14 +4,15 @@
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
 
+use http::header::HeaderName;
 use http::{HeaderMap, HeaderValue, header};
-use llmroller_core::provider::StripHeaderTokens;
+use llmroller_core::provider::{ClientMode, StripHeaderTokens};
 use llmroller_core::rbac::PoolTier;
 
 use crate::headers::{
-    SmugglingError, UaPolicy, apply_request_header_pipeline, apply_response_header_pipeline,
-    resolve_user_agent, sanitize_csv_cell, scrub_canary_tokens, ua_profile_by_name,
-    validate_header_value_bytes, validate_request_smuggling,
+    SmugglingError, UaPolicy, apply_provider_header, apply_request_header_pipeline,
+    apply_response_header_pipeline, resolve_user_agent, sanitize_csv_cell, scrub_canary_tokens,
+    ua_profile_by_name, validate_header_value_bytes, validate_request_smuggling,
 };
 
 /// Spec: API-2, API-3, SEC-8, SEC-15
@@ -61,7 +62,7 @@ fn test_http_smuggling_guards() {
 /// 2. Multiple anthropic-beta headers preserve their per-name relative order.
 /// 3. strip_header_tokens removes configured comma-separated tokens.
 /// 4. Hop-by-hop and org headers are stripped.
-/// 5. accept-encoding is forced to identity.
+/// 5. accept-encoding is not injected when the client sent none (TRN-0).
 #[doc = "Spec: API-2, API-3, SEC-8, SEC-15"]
 #[test]
 fn test_request_header_pipeline() {
@@ -111,13 +112,8 @@ fn test_request_header_pipeline() {
     assert!(out_own.get(header::COOKIE).is_none());
     assert!(out_own.get("openai-organization").is_none());
 
-    // accept-encoding forced to identity
-    assert_eq!(
-        out_own
-            .get(header::ACCEPT_ENCODING)
-            .expect("accept-encoding header"),
-        "identity"
-    );
+    // The client sent no accept-encoding, so none is sent upstream (TRN-0).
+    assert!(out_own.get(header::ACCEPT_ENCODING).is_none());
 
     // Authorization replaced with upstream credential
     assert_eq!(
@@ -457,9 +453,9 @@ fn test_scrub_secret_prefixes_oc_sk_and_safe_diagnostic_headers() {
     assert_eq!(out.get("x-custom-upstream").expect("allowed header"), "ok");
 }
 
-#[doc = "Spec: SEC-15, F011, F023 - strips x-forwarded-*, cf-*, org headers, custom auth headers, and replaces accept-encoding with identity"]
+#[doc = "Spec: SEC-15, F011, F023 - strips x-forwarded-*, cf-*, org headers, custom auth headers, and forwards the client's accept-encoding unchanged (TRN-0)"]
 #[test]
-fn test_request_header_pipeline_strips_proxy_forwarding_org_and_accept_encoding() {
+fn test_request_header_pipeline_strips_proxy_forwarding_org_and_forwards_accept_encoding() {
     let mut inbound = HeaderMap::new();
     inbound.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
     inbound.insert("x-forwarded-proto", HeaderValue::from_static("https"));
@@ -497,7 +493,7 @@ fn test_request_header_pipeline_strips_proxy_forwarding_org_and_accept_encoding(
     assert!(!out.contains_key("x-goog-api-key"));
     assert_eq!(
         out.get("accept-encoding").and_then(|v| v.to_str().ok()),
-        Some("identity")
+        Some("gzip, br, zstd")
     );
 }
 
@@ -562,4 +558,77 @@ fn test_trn0_real_client_headers_pass_through_without_proxy_markers() {
             "via" | "forwarded" | "x-forwarded-for"
         ));
     }
+}
+
+/// Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#121-request-and-response-header-policies | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+/// Transparent mode only fills in headers the caller did not send; required mode replaces them and
+/// merges `anthropic-beta` tokens.
+#[doc = "Spec: TRN-0, API-3"]
+#[test]
+fn test_apply_provider_header_transparent_vs_required() {
+    let name = |n: &'static str| HeaderName::from_static(n);
+    let val = |v: &str| HeaderValue::from_str(v).expect("header value");
+
+    // Transparent: caller wins, absent headers are filled.
+    let mut out = HeaderMap::new();
+    out.insert("x-app", val("caller"));
+    apply_provider_header(
+        &mut out,
+        name("x-app"),
+        val("provider"),
+        ClientMode::Transparent,
+    );
+    apply_provider_header(
+        &mut out,
+        name("anthropic-version"),
+        val("2023-06-01"),
+        ClientMode::Transparent,
+    );
+    assert_eq!(out.get("x-app").expect("x-app"), "caller");
+    assert_eq!(out.get("anthropic-version").expect("version"), "2023-06-01");
+
+    // Required: provider value replaces every caller value, including User-Agent.
+    let mut out = HeaderMap::new();
+    out.insert("user-agent", val("opencode/1.2.15"));
+    out.append("x-app", val("caller"));
+    out.append("x-app", val("caller-2"));
+    apply_provider_header(
+        &mut out,
+        name("user-agent"),
+        val("claude-cli/2.1.63"),
+        ClientMode::Required,
+    );
+    apply_provider_header(&mut out, name("x-app"), val("cli"), ClientMode::Required);
+    assert_eq!(out.get("user-agent").expect("ua"), "claude-cli/2.1.63");
+    assert_eq!(out.get_all("x-app").iter().count(), 1);
+    assert_eq!(out.get("x-app").expect("x-app"), "cli");
+
+    // Required: anthropic-beta tokens merge (caller tokens kept, required added, no duplicates).
+    let mut out = HeaderMap::new();
+    out.append(
+        "anthropic-beta",
+        val("prompt-caching-2024-07-31, OAUTH-2025-04-20"),
+    );
+    out.append("anthropic-beta", val("computer-use-2024-10-22"));
+    apply_provider_header(
+        &mut out,
+        name("anthropic-beta"),
+        val("claude-code-20250219,oauth-2025-04-20"),
+        ClientMode::Required,
+    );
+    assert_eq!(out.get_all("anthropic-beta").iter().count(), 1);
+    assert_eq!(
+        out.get("anthropic-beta").expect("beta"),
+        "prompt-caching-2024-07-31,OAUTH-2025-04-20,computer-use-2024-10-22,claude-code-20250219"
+    );
+
+    // Required with no caller anthropic-beta simply sets it.
+    let mut out = HeaderMap::new();
+    apply_provider_header(
+        &mut out,
+        name("anthropic-beta"),
+        val("a,b"),
+        ClientMode::Required,
+    );
+    assert_eq!(out.get("anthropic-beta").expect("beta"), "a,b");
 }

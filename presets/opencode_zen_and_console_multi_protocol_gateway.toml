@@ -5,7 +5,8 @@ kind = "custom"
 preset_id = "opencode_zen_and_console_multi_protocol_gateway"
 name = "OpenCode Zen (`/zen/v1` Multi-Protocol Gateway for OpenAI Responses, Anthropic Messages, Google Gemini, and Chat Completions)"
 base_url = "https://opencode.ai/zen/v1"
-ua_policy = "pass"
+ua_policy = "profile"
+ua_profile = "opencode_go"
 supported_protocols = ["chat", "responses", "messages"]
 
 [paths]
@@ -23,7 +24,6 @@ chat_stream = "inject"
 
 [add_headers]
 "x-opencode-client" = "app"
-"user-agent" = "opencode/1.2.15"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

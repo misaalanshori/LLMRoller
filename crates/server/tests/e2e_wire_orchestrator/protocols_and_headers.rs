@@ -224,6 +224,114 @@ async fn test_trn0_upstream_sees_real_client_without_llmroller_markers() {
     }
 }
 
+// Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#121-request-and-response-header-policies | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+#[tokio::test]
+#[doc = "Spec: TRN-0, API-3 — the client's accept-encoding reaches the upstream unchanged"]
+async fn test_trn0_accept_encoding_is_forwarded() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("trn0_ae.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE6; 32]);
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, "{}").await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded = latest_request(&mock_state, "/chat/completions");
+    assert_eq!(
+        recorded
+            .headers
+            .get(header::ACCEPT_ENCODING)
+            .map(|v| v.as_bytes()),
+        Some(&b"gzip, deflate, br, zstd"[..]),
+        "accept-encoding must not be rewritten to identity"
+    );
+}
+
+// Spec: ./docs/srdd/23. SRDD - Multi-Provider Access Layer, OAuth Token Exchange, and Hardware Fingerprinting.md#233-deterministic-per-key-hardware--cli-fingerprinting-cratesprotosrcfingerprintrs | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+#[tokio::test]
+#[doc = "Spec: TRN-0, API-3, PRV-3 — transparent providers let the caller win, required-client providers override and merge"]
+async fn test_client_mode_transparent_fills_required_overrides() {
+    let provider_headers = r#""add_headers": {
+            "user-agent": "claude-cli/2.1.63 (external, cli)",
+            "x-app": "cli",
+            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+            "anthropic-version": "2023-06-01"
+        }"#;
+    for (mode, seed_byte) in [("transparent", 0xE7_u8), ("required", 0xE8_u8)] {
+        let (mock_addr, mock_state) = spawn_mock_upstream().await;
+        let dir = tempdir().expect("temp dir");
+        let pool = open_pool(&dir.path().join("client_mode.db"), PoolRole::Writer)
+            .await
+            .expect("writer pool");
+        migrate(&pool).await.expect("migrate");
+        let master_key = MasterKey::from_bytes([seed_byte; 32]);
+        let config = format!(r#"{{"client_mode": "{mode}", {provider_headers}}}"#);
+        let token = seed_single_global_route(&pool, &master_key, mock_addr, &config).await;
+        let app = build_wire_app(&pool, &master_key).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::USER_AGENT, "opencode/1.2.15")
+            .header("x-app", "opencode")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{mode}");
+        let recorded = latest_request(&mock_state, "/chat/completions");
+        let get = |name: &str| {
+            recorded
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // A header the caller did not send is always provided by the provider.
+        assert_eq!(
+            get("anthropic-version").as_deref(),
+            Some("2023-06-01"),
+            "{mode}"
+        );
+        if mode == "transparent" {
+            assert_eq!(get("user-agent").as_deref(), Some("opencode/1.2.15"));
+            assert_eq!(get("x-app").as_deref(), Some("opencode"));
+            assert_eq!(
+                get("anthropic-beta").as_deref(),
+                Some("prompt-caching-2024-07-31")
+            );
+        } else {
+            assert_eq!(
+                get("user-agent").as_deref(),
+                Some("claude-cli/2.1.63 (external, cli)")
+            );
+            assert_eq!(get("x-app").as_deref(), Some("cli"));
+            assert_eq!(
+                get("anthropic-beta").as_deref(),
+                Some("prompt-caching-2024-07-31,claude-code-20250219,oauth-2025-04-20")
+            );
+        }
+    }
+}
+
 #[tokio::test]
 #[doc = "Spec: API-2, PRV-3 — F03 supports per-protocol x-api-key authentication"]
 async fn test_messages_auth_scheme_uses_configured_x_api_key() {

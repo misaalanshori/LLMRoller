@@ -422,6 +422,35 @@ pub enum UaPolicySetting {
     Reject,
 }
 
+/// How a provider relates to the calling client's wire identity (`TRN-0`, SRDD 12.1.2 and 23.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientMode {
+    /// Default. The upstream sees the caller's own headers. `add_headers` entries only fill in
+    /// headers the caller did not send (a provider requirement or a translation).
+    #[default]
+    Transparent,
+    /// The provider only accepts one specific client identity (Claude Code, Codex, Antigravity,
+    /// and similar). `add_headers` entries replace the caller's values, and comma-separated token
+    /// headers such as `anthropic-beta` are merged instead of replaced.
+    Required,
+}
+
+/// Built-in presets that mandate a specific client identity and therefore default to
+/// [`ClientMode::Required`] (SRDD 23.3).
+pub const REQUIRED_CLIENT_PRESET_IDS: [&str; 10] = [
+    "antigravity_google_cloud_code_assist",
+    "google_gemini_cli_cloud_code_assist",
+    "anthropic_claude_code_stealth_oauth",
+    "openai_codex_chatgpt_backend_oauth_and_websocket",
+    "kimi_coding_cli_oauth_and_msh_fingerprint",
+    "grok_cli_and_grok_web_sso_cookie_executor",
+    "alibaba_qwen_oauth_portal_and_dashscope_coding_plan",
+    "github_copilot_dual_surface_and_token_exchange",
+    "cursor_ide_connect_protobuf_and_cursor_agent_cli",
+    "aws_kiro_codewhisperer_eventstream",
+];
+
 /// Per-provider error-classification overrides configured in `providers.config_json`
 /// (`PRV-3`, `API-8`).
 ///
@@ -574,6 +603,10 @@ pub struct ProviderConfig {
     /// Required-client profile name used by `ua_policy = profile` (SRDD 12.2, 23.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ua_profile: Option<String>,
+    /// Transparent (default) or required-client header handling (SRDD 12.1.2, 23.3). When unset,
+    /// built-in required-client presets resolve to `required` via `preset_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_mode: Option<ClientMode>,
     #[serde(default)]
     pub session_profile: Option<SessionProfile>,
     #[serde(default)]
@@ -586,6 +619,25 @@ pub struct ProviderConfig {
     pub body_edits: Vec<BodyEditRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_compat: Option<OpenAiCompatConfig>,
+}
+
+impl ProviderConfig {
+    /// Effective client mode: the explicit `client_mode`, else `required` for built-in
+    /// required-client presets, else `transparent`.
+    #[must_use]
+    pub fn effective_client_mode(&self) -> ClientMode {
+        self.client_mode
+            .unwrap_or_else(|| match self.preset_id.as_deref().map(str::trim) {
+                Some(id)
+                    if REQUIRED_CLIENT_PRESET_IDS
+                        .iter()
+                        .any(|required| required.eq_ignore_ascii_case(id)) =>
+                {
+                    ClientMode::Required
+                }
+                _ => ClientMode::Transparent,
+            })
+    }
 }
 
 impl Default for ProviderConfig {
@@ -605,6 +657,7 @@ impl Default for ProviderConfig {
             response_header_allow: Vec::new(),
             ua_policy: None,
             ua_profile: None,
+            client_mode: None,
             session_profile: None,
             usage_profile: None,
             error_classifiers: ErrorClassifiers::default(),
@@ -782,6 +835,32 @@ mod tests {
         "model_not_found_substrings": ["model_not_found", "does not exist", "unknown model"]
       }
     }"#;
+
+    #[doc = "Spec: TRN-0, PRV-3 - client_mode defaults to transparent; built-in required-client presets and explicit settings resolve to required"]
+    #[test]
+    fn effective_client_mode_resolves_preset_and_explicit_settings() {
+        assert_eq!(
+            ProviderConfig::default().effective_client_mode(),
+            ClientMode::Transparent
+        );
+        for id in REQUIRED_CLIENT_PRESET_IDS {
+            let config = ProviderConfig {
+                preset_id: Some(id.to_string()),
+                ..ProviderConfig::default()
+            };
+            assert_eq!(config.effective_client_mode(), ClientMode::Required, "{id}");
+        }
+        let groq = ProviderConfig {
+            preset_id: Some("groq_cloud_lpu_inference".to_string()),
+            ..ProviderConfig::default()
+        };
+        assert_eq!(groq.effective_client_mode(), ClientMode::Transparent);
+        let explicit = ProviderConfig::try_from_json(
+            r#"{"preset_id":"anthropic_claude_code_stealth_oauth","client_mode":"transparent"}"#,
+        )
+        .expect("explicit client_mode");
+        assert_eq!(explicit.effective_client_mode(), ClientMode::Transparent);
+    }
 
     #[doc = "Spec: PRV-3, API-2, API-3, RTE-1, RTE-9, TRN-1 - canonical SRDD Section 9.3.1 JSON parses without silent wipeout"]
     #[test]

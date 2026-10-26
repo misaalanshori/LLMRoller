@@ -167,6 +167,7 @@ pub fn compute_share_config_fingerprint(
         "add_headers",
         "ua_policy",
         "ua_profile",
+        "client_mode",
         "session_profile",
         "usage_profile",
         "response_header_allow",

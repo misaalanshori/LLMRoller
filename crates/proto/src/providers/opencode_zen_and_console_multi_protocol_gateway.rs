@@ -125,7 +125,6 @@ pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, St
     let now_secs = crate::fingerprint::current_unix_timestamp_secs();
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     map.insert("x-opencode-client".to_string(), "app".to_string());
-    map.insert("user-agent".to_string(), "opencode/1.2.15".to_string());
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(val, &profile, &profile.device_id, session_id, now_secs);
@@ -165,6 +164,10 @@ pub fn default_provider_config() -> ProviderConfig {
             .map(|s| (*s).to_string())
             .collect(),
         add_headers: synthesize_headers(PRESET_ID, "default-session"),
+        // Zen wants an opencode client identity: real opencode-family UAs pass through, any other
+        // UA is replaced by the profile (SRDD 12.2, 23.3).
+        ua_policy: Some(llmroller_core::provider::UaPolicySetting::Profile),
+        ua_profile: Some("opencode_go".to_string()),
         openai_compat: default_openai_compat(),
         ..ProviderConfig::default()
     }
