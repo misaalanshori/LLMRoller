@@ -518,6 +518,8 @@ pub fn parse_raw_usage_to_sanitized(
             let plan = raw_json
                 .get("plan")
                 .or_else(|| raw_json.get("plan_name"))
+                .or_else(|| raw_json.get("plan_type"))
+                .or_else(|| raw_json.get("copilot_plan"))
                 .or_else(|| raw_json.get("account").and_then(|a| a.get("plan")))
                 .or_else(|| raw_json.get("user").and_then(|u| u.get("tier")))
                 .and_then(serde_json::Value::as_str)
@@ -546,6 +548,120 @@ pub fn parse_raw_usage_to_sanitized(
                         windows.push(parse_window_obj(label, window, now_ms));
                     }
                 }
+            }
+            // F179 / FND-139: Codex /wham/usage rate_limit.primary_window & secondary_window
+            if let Some(rl) = raw_json
+                .get("rate_limit")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (field, label) in [("primary_window", "5h"), ("secondary_window", "7d")] {
+                    if let Some(w) = rl.get(field) {
+                        windows.push(parse_window_obj(label, w, now_ms));
+                    }
+                }
+            }
+            // F179 / FND-139: Claude OAuth /api/oauth/usage five_hour & seven_day
+            for (field, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
+                if let Some(w) = raw_json.get(field) {
+                    let pct = w
+                        .get("utilization")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                    let mut obj = w.clone();
+                    if let Some(map) = obj.as_object_mut() {
+                        map.entry("used_percent".to_string())
+                            .or_insert_with(|| serde_json::json!(pct));
+                    }
+                    windows.push(parse_window_obj(label, &obj, now_ms));
+                }
+            }
+            // F179 / FND-139: Antigravity / Gemini CLI retrieveUserQuota buckets
+            if let Some(buckets) = raw_json
+                .get("buckets")
+                .and_then(serde_json::Value::as_array)
+                && let Some(first) = buckets.first()
+            {
+                let rem_frac = first
+                    .get("remainingFraction")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0);
+                let used_pct = ((1.0 - rem_frac) * 100.0).clamp(0.0, 100.0);
+                windows.push(parse_window_obj(
+                    "5h",
+                    &serde_json::json!({
+                        "used_percent": used_pct,
+                        "resetsAt": first.get("resetTime"),
+                    }),
+                    now_ms,
+                ));
+            }
+            // F179 / FND-139: GitHub Copilot /copilot_internal/user quota_snapshots
+            if let Some(prem) = raw_json.pointer("/quota_snapshots/premium_interactions") {
+                let rem_pct = prem
+                    .get("percent_remaining")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(100.0);
+                let used_pct = (100.0 - rem_pct).clamp(0.0, 100.0);
+                windows.push(parse_window_obj(
+                    "1mo",
+                    &serde_json::json!({
+                        "used_percent": used_pct,
+                        "remaining_requests": prem.get("remaining"),
+                        "resetsAt": raw_json.get("quota_reset_date"),
+                    }),
+                    now_ms,
+                ));
+            }
+            // F179 / FND-139: MiniMax model_remains & Kimi Coding usages
+            if let Some(mr) = raw_json
+                .get("model_remains")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+            {
+                let total = mr
+                    .get("current_interval_total_count")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let used = mr
+                    .get("current_interval_usage_count")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let pct = if total > 0.0 {
+                    ((used / total) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+                windows.push(parse_window_obj(
+                    "5h",
+                    &serde_json::json!({ "used_percent": pct }),
+                    now_ms,
+                ));
+            }
+            if let Some(usages) = raw_json.get("usages").and_then(serde_json::Value::as_array)
+                && let Some(first) = usages.first()
+            {
+                let detail = first.get("detail").unwrap_or(first);
+                let limit = detail
+                    .get("limit")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let used = detail
+                    .get("used")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let pct = if limit > 0.0 {
+                    ((used / limit) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+                windows.push(parse_window_obj(
+                    "5h",
+                    &serde_json::json!({
+                        "used_percent": pct,
+                        "resetsAt": detail.get("resetTime"),
+                    }),
+                    now_ms,
+                ));
             }
             if windows.is_empty()
                 && let Some(arr) = raw_json.get("windows").and_then(|w| w.as_array())
@@ -768,5 +884,53 @@ mod tests {
         let sanitized =
             parse_raw_usage_to_sanitized(ProviderKind::Openrouter, &raw).expect("sanitized");
         assert_eq!(sanitized.balance_micro_usd, Some(45_750_000));
+    }
+
+    #[test]
+    #[doc = "Spec: USG-4, USG-5, F179 - parses Codex, Claude OAuth, Copilot, Antigravity, MiniMax, Kimi, and DeepSeek usage on Custom kind"]
+    fn parses_expanded_multi_provider_quota_schemas_on_custom_kind() {
+        let codex = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 30.0},
+                "secondary_window": {"used_percent": 60.0}
+            }
+        });
+        let s_codex = parse_raw_usage_to_sanitized(ProviderKind::Custom, &codex).expect("codex");
+        assert_eq!(s_codex.plan_name.as_deref(), Some("pro"));
+        assert_eq!(s_codex.windows.len(), 2);
+
+        let claude = serde_json::json!({
+            "five_hour": {"utilization": 45.0},
+            "seven_day": {"utilization": 85.0}
+        });
+        let s_claude = parse_raw_usage_to_sanitized(ProviderKind::Custom, &claude).expect("claude");
+        assert_eq!(s_claude.windows.len(), 2);
+        assert_eq!(s_claude.windows[1].status, "warning");
+
+        let copilot = serde_json::json!({
+            "copilot_plan": "individual_pro",
+            "quota_snapshots": {
+                "premium_interactions": {"percent_remaining": 75.0, "remaining": 225}
+            }
+        });
+        let s_copilot =
+            parse_raw_usage_to_sanitized(ProviderKind::Custom, &copilot).expect("copilot");
+        assert_eq!(s_copilot.plan_name.as_deref(), Some("individual_pro"));
+        assert_eq!(s_copilot.windows[0].used_percent, 25.0);
+        assert_eq!(s_copilot.windows[0].remaining_requests, Some(225));
+
+        let antigravity = serde_json::json!({
+            "buckets": [{"remainingFraction": 0.4, "resetTime": "2026-10-26T00:00:00Z"}]
+        });
+        let s_ag =
+            parse_raw_usage_to_sanitized(ProviderKind::Custom, &antigravity).expect("antigravity");
+        assert!((s_ag.windows[0].used_percent - 60.0).abs() < 1e-6);
+
+        let deepseek = serde_json::json!({
+            "balance_infos": [{"currency": "USD", "total_balance": "18.50"}]
+        });
+        let s_ds = parse_raw_usage_to_sanitized(ProviderKind::Custom, &deepseek).expect("deepseek");
+        assert_eq!(s_ds.balance_micro_usd, Some(18_500_000));
     }
 }
