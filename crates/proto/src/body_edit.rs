@@ -414,7 +414,7 @@ pub fn edit_body(
 /// below this byte count without re-serializing the rest of the payload.
 pub fn edit_body_with_session_limit(
     original: Bytes,
-    tier: PoolTier,
+    _tier: PoolTier,
     target_model: Option<&str>,
     chat_stream_mode: ChatStreamMode,
     session_field: Option<(&str, &str)>,
@@ -464,32 +464,15 @@ pub fn edit_body_with_session_limit(
         None
     };
 
-    let session_edits_needed = match tier {
-        PoolTier::Own => {
-            if let Some((field_name, ref val_json)) = encoded_session_field {
-                match scan.fields.iter().find(|f| f.key == field_name) {
-                    None => true,
-                    Some(existing) => {
-                        &original[existing.val_start..existing.val_end] != val_json.as_bytes()
-                    }
-                }
-            } else {
-                false
+    let session_edits_needed = if let Some((field_name, ref val_json)) = encoded_session_field {
+        match scan.fields.iter().find(|f| f.key == field_name) {
+            None => true,
+            Some(existing) => {
+                &original[existing.val_start..existing.val_end] != val_json.as_bytes()
             }
         }
-        _ => {
-            let has_top_session = scan
-                .fields
-                .iter()
-                .any(|f| is_removed_session_key(&f.key, session_field));
-            let has_meta_session = scan.metadata_span.as_ref().is_some_and(|range| {
-                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
-                    &original[range.clone()],
-                )
-                .is_ok_and(|m| m.contains_key("session_id") || m.contains_key("user_id"))
-            });
-            has_top_session || has_meta_session || session_field.is_some()
-        }
+    } else {
+        false
     };
 
     // TRN-1 check: If no edits apply, return the original buffer with identical pointer identity
@@ -503,19 +486,7 @@ pub fn edit_body_with_session_limit(
     // Apply edits
     let mut buf = Vec::with_capacity(original.len() + 128);
     let orig_bytes = &original[..];
-
-    let session_fields_to_remove_count = if tier != PoolTier::Own {
-        scan.fields
-            .iter()
-            .filter(|f| is_removed_session_key(&f.key, session_field))
-            .count()
-    } else {
-        0
-    };
-    let remaining_fields_count = scan
-        .fields
-        .len()
-        .saturating_sub(session_fields_to_remove_count);
+    let remaining_fields_count = scan.fields.len();
 
     // 1. Copy up to opening brace + 1
     buf.extend_from_slice(&orig_bytes[..scan.opening_brace + 1]);
@@ -529,19 +500,15 @@ pub fn edit_body_with_session_limit(
         inserted_something = true;
     }
 
-    // (b) Insert session field if needed
-    if let Some((field_name, ref val_json)) = encoded_session_field {
-        let should_insert = match tier {
-            PoolTier::Own => !scan.fields.iter().any(|f| f.key == field_name),
-            _ => true,
-        };
-        if should_insert {
-            if inserted_something {
-                buf.push(b',');
-            }
-            buf.extend_from_slice(format!("\"{field_name}\":{val_json}").as_bytes());
-            inserted_something = true;
+    // (b) Insert session field if absent
+    if let Some((field_name, ref val_json)) = encoded_session_field
+        && !scan.fields.iter().any(|f| f.key == field_name)
+    {
+        if inserted_something {
+            buf.push(b',');
         }
+        buf.extend_from_slice(format!("\"{field_name}\":{val_json}").as_bytes());
+        inserted_something = true;
     }
 
     if inserted_something && remaining_fields_count > 0 {
@@ -558,9 +525,8 @@ pub fn edit_body_with_session_limit(
         replacements.push((span.clone(), escaped.into_bytes()));
     }
 
-    // Own-tier session field value override when higher-precedence header resolved a different session ID (F-016)
-    if tier == PoolTier::Own
-        && let Some((field_name, ref val_json)) = encoded_session_field
+    // Session field value override when higher-precedence header or Step 8 resolved a different session ID (F-016)
+    if let Some((field_name, ref val_json)) = encoded_session_field
         && let Some(existing) = scan.fields.iter().find(|f| f.key == field_name)
         && &orig_bytes[existing.val_start..existing.val_end] != val_json.as_bytes()
     {
@@ -598,54 +564,6 @@ pub fn edit_body_with_session_limit(
         _ => {}
     }
 
-    // Metadata sanitization on Shared/Global tier
-    if tier != PoolTier::Own
-        && let Some(meta_range) = &scan.metadata_span
-        && let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
-            &orig_bytes[meta_range.clone()],
-        )
-    {
-        let removed_session = map.remove("session_id").is_some();
-        let removed_user = map.remove("user_id").is_some();
-        if removed_session || removed_user {
-            let new_meta_bytes = serde_json::to_vec(&map).unwrap_or_else(|_| b"{}".to_vec());
-            replacements.push((meta_range.clone(), new_meta_bytes));
-        }
-    }
-
-    // Remove top-level session spans on Shared/Global tier (including custom session_field key, F-008)
-    if tier != PoolTier::Own {
-        let mut i = 0;
-        while i < scan.fields.len() {
-            if is_removed_session_key(&scan.fields[i].key, session_field) {
-                let start_idx = i;
-                while i < scan.fields.len()
-                    && is_removed_session_key(&scan.fields[i].key, session_field)
-                {
-                    i += 1;
-                }
-                let end_idx = i - 1;
-                let first = &scan.fields[start_idx];
-                let last = &scan.fields[end_idx];
-
-                let range_to_remove = if let Some(comma_pos) = first.leading_comma {
-                    comma_pos..last.val_end
-                } else if let Some(comma_pos) = last.trailing_comma {
-                    let mut end = comma_pos + 1;
-                    while end < scan.closing_brace && orig_bytes[end].is_ascii_whitespace() {
-                        end += 1;
-                    }
-                    first.key_start..end
-                } else {
-                    first.key_start..last.val_end
-                };
-                replacements.push((range_to_remove, Vec::new()));
-            } else {
-                i += 1;
-            }
-        }
-    }
-
     // Sort replacements by start index
     replacements.sort_by_key(|r| r.0.start);
 
@@ -674,10 +592,6 @@ enum StreamOptionsAction {
 
 fn is_session_key(key: &str) -> bool {
     matches!(key, "session_id" | "prompt_cache_key" | "promptCacheKey")
-}
-
-fn is_removed_session_key(key: &str, session_field: Option<(&str, &str)>) -> bool {
-    is_session_key(key) || session_field.is_some_and(|(field_name, _)| key == field_name)
 }
 
 fn skip_ws(bytes: &[u8], cursor: &mut usize) {

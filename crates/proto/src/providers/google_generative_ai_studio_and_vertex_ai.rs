@@ -122,10 +122,6 @@ pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, St
     let profile = DeviceProfile::from_key_id(key_id);
     let now_secs = crate::fingerprint::current_unix_timestamp_secs();
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    map.insert(
-        "x-goog-api-client".to_string(),
-        "genai-rs/1.0.0".to_string(),
-    );
     for val in map.values_mut() {
         if val.contains("{{") {
             *val = expand_header_template(val, &profile, &profile.device_id, session_id, now_secs);

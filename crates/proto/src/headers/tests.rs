@@ -139,7 +139,7 @@ fn test_request_header_pipeline() {
     assert_eq!(betas[0], "prompt-caching-2024-07-31");
     assert_eq!(betas[1], "computer-use-2024-10-22");
 
-    // Case B: Global tier: session headers stripped per SEC-16
+    // Case B: Global tier: client session headers also pass through unchanged (TRN-0)
     let out_global = apply_request_header_pipeline(
         &headers,
         PoolTier::Global,
@@ -149,7 +149,12 @@ fn test_request_header_pipeline() {
     )
     .expect("apply pipeline global");
 
-    assert!(out_global.get("x-claude-code-session-id").is_none());
+    assert_eq!(
+        out_global
+            .get("x-claude-code-session-id")
+            .expect("session header preserved on Global tier"),
+        "sess-abc-456"
+    );
 }
 
 /// Spec: API-3, TRN-1

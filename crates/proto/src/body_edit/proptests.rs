@@ -207,81 +207,74 @@ fn test_stream_options_chat_stream_injection_cases() {
     assert_eq!(out6.as_ptr(), c6.as_ptr());
 }
 
-#[doc = "Spec: API-4, TRN-2, SEC-16"]
+#[doc = "Spec: API-4, TRN-0, TRN-1, TRN-2, SEC-16"]
 #[test]
-fn test_edit_body_strips_session_keys_without_comma_corruption() {
-    // 1. Session id at start
+fn test_edit_body_preserves_and_translates_session_keys_across_tiers() {
+    // 1. Session id at start on Global tier is preserved byte-identically when no edit applies
     let raw1 = Bytes::from_static(br#"{"session_id":"s1","model":"gpt-4o"}"#);
     let (out1, _) = edit_body(
-        raw1,
+        raw1.clone(),
         PoolTier::Global,
         Some("gpt-4o"),
         ChatStreamMode::Native,
         None,
     )
     .expect("edit");
-    let parsed1: serde_json::Value =
-        serde_json::from_slice(&out1).expect("valid json when session_id at start");
-    assert_eq!(parsed1["model"], "gpt-4o");
-    assert!(parsed1.get("session_id").is_none());
+    assert_eq!(
+        out1.as_ptr(),
+        raw1.as_ptr(),
+        "TRN-1 pointer identity on Global tier"
+    );
 
-    // 2. Session id in middle
+    // 2. Session id in middle is translated/synchronized when session_field is configured
     let raw2 = Bytes::from_static(br#"{"a":1,"session_id":"s1","model":"gpt-4o"}"#);
     let (out2, _) = edit_body(
         raw2,
         PoolTier::Global,
         Some("gpt-4o"),
         ChatStreamMode::Native,
-        None,
+        Some(("prompt_cache_key", "s1")),
     )
     .expect("edit");
     let parsed2: serde_json::Value =
-        serde_json::from_slice(&out2).expect("valid json when session_id in middle");
+        serde_json::from_slice(&out2).expect("valid json when prompt_cache_key added");
     assert_eq!(parsed2["a"], 1);
     assert_eq!(parsed2["model"], "gpt-4o");
-    assert!(parsed2.get("session_id").is_none());
+    assert_eq!(parsed2["session_id"], "s1");
+    assert_eq!(parsed2["prompt_cache_key"], "s1");
 
-    // 3. Session id at end
+    // 3. Existing session_id at end is updated in place when higher-precedence header overrides it
     let raw3 = Bytes::from_static(br#"{"model":"gpt-4o","session_id":"s1"}"#);
     let (out3, _) = edit_body(
         raw3,
         PoolTier::Global,
         Some("gpt-4o"),
         ChatStreamMode::Native,
-        None,
+        Some(("session_id", "s2")),
     )
     .expect("edit");
     let parsed3: serde_json::Value =
-        serde_json::from_slice(&out3).expect("valid json when session_id at end");
+        serde_json::from_slice(&out3).expect("valid json when session_id updated");
     assert_eq!(parsed3["model"], "gpt-4o");
-    assert!(parsed3.get("session_id").is_none());
+    assert_eq!(parsed3["session_id"], "s2");
 
-    // 4. Session id as sole key
-    let raw4 = Bytes::from_static(br#"{"session_id":"s1"}"#);
-    let (out4, _) =
-        edit_body(raw4, PoolTier::Global, None, ChatStreamMode::Native, None).expect("edit");
-    let parsed4: serde_json::Value =
-        serde_json::from_slice(&out4).expect("valid json when session_id sole key");
-    assert!(parsed4.get("session_id").is_none());
-
-    // 5. Metadata containing session_id and custom field
+    // 4. Metadata on Shared tier is preserved untouched
     let raw5 = Bytes::from_static(
         br#"{"metadata":{"session_id":"s1","user_id":"u1","custom":"keep_me"},"model":"gpt-4o"}"#,
     );
     let (out5, _) = edit_body(
-        raw5,
+        raw5.clone(),
         PoolTier::Shared,
         Some("gpt-4o"),
         ChatStreamMode::Native,
         None,
     )
     .expect("edit");
-    let parsed5: serde_json::Value =
-        serde_json::from_slice(&out5).expect("valid json when metadata stripped");
-    assert_eq!(parsed5["model"], "gpt-4o");
-    assert_eq!(parsed5["metadata"]["custom"], "keep_me");
-    assert!(parsed5["metadata"].get("session_id").is_none());
-    assert!(parsed5["metadata"].get("user_id").is_none());
+    assert_eq!(
+        out5.as_ptr(),
+        raw5.as_ptr(),
+        "TRN-1 pointer identity on Shared tier"
+    );
 }
 
 proptest! {
@@ -338,18 +331,21 @@ fn test_stream_options_sibling_fields_and_session_override_edge_cases() {
         BodyEditError::DuplicateKey(_)
     ));
 
-    // F-008: custom session_field on Shared/Global strips any matching top-level key before inserting
+    // F-008: custom session_field synchronizes any matching top-level key in place
     let raw_custom = Bytes::from_static(br#"{"custom_session":"client-1","model":"gpt-4o"}"#);
     let (out_custom, _) = edit_body(
         raw_custom,
         PoolTier::Shared,
         None,
         ChatStreamMode::Native,
-        Some(("custom_session", "llr_salted123")),
+        Some(("custom_session", "derived26charbase32token23")),
     )
     .expect("custom session field edit");
     let parsed_custom: serde_json::Value = serde_json::from_slice(&out_custom).expect("valid json");
-    assert_eq!(parsed_custom["custom_session"], "llr_salted123");
+    assert_eq!(
+        parsed_custom["custom_session"],
+        "derived26charbase32token23"
+    );
     assert!(scan_top_level(&out_custom).is_ok());
 
     // F-016: on Own tier, a higher-precedence header session ID overrides a conflicting body session_id

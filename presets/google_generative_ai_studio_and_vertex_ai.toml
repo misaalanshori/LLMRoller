@@ -22,7 +22,6 @@ responses_compact = false
 chat_stream = "inject"
 
 [add_headers]
-"x-goog-api-client" = "genai-rs/1.0.0"
 
 [session_profile]
 headers = ["x-session-id", "x-session-affinity"]

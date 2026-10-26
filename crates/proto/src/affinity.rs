@@ -37,7 +37,9 @@ pub fn encode_base32_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// Computes the tenant-salted affinity token `llr_<base32(HMAC)[0..26]>` per Section 11.2.
+/// Computes the tenant-salted 26-char lowercase RFC 4648 base32 affinity token per Section 11.2.
+///
+/// Never prefixes the token with `llr_` or any other proxy marker (`TRN-0`).
 pub fn compute_salted_affinity_token(
     session_hmac_secret: &[u8],
     owner_user_id: &UserId,
@@ -51,23 +53,12 @@ pub fn compute_salted_affinity_token(
     mac.update(raw_session_id.as_bytes());
     let result = mac.finalize().into_bytes();
     let b32 = encode_base32_lower(&result);
-    let token_26 = if b32.len() >= 26 { &b32[..26] } else { &b32 };
-    format!("llr_{token_26}")
+    if b32.len() >= 26 {
+        b32[..26].to_string()
+    } else {
+        b32
+    }
 }
-
-const SESSION_HEADERS_TO_STRIP: [&str; 11] = [
-    "x-session-affinity",
-    "x-session-id",
-    "session-id",
-    "session_id",
-    "conversation-id",
-    "x-bf-session-id",
-    "x-opencode-session",
-    "x-parent-session-id",
-    "prompt-cache-key",
-    "promptcachekey",
-    "x-claude-code-session-id",
-];
 
 fn truncate_session_value(s: &str, max_len: usize) -> &str {
     let limit = if max_len == 0 {
@@ -88,47 +79,30 @@ fn truncate_session_value(s: &str, max_len: usize) -> &str {
     &s[..boundary]
 }
 
-/// Applies outbound session headers based on key tier and provider profile (SEC-16).
+/// Applies outbound session headers for the provider profile (`TRN-0`, Section 11.2).
+///
+/// Across all tiers (`Own`, `Shared`, `Global`), client session headers are preserved and the
+/// resolved session ID (`raw_session_id` when supplied by the client, or `salted_token` when
+/// derived at Step 8 / `fingerprint_generic_ids`) is translated into `profile.headers`.
 pub fn apply_outbound_session_affinity(
     headers: &mut HeaderMap,
-    tier: PoolTier,
+    _tier: PoolTier,
     profile: &SessionProfile,
     salted_token: &str,
     raw_session_id: &str,
 ) {
-    if tier == PoolTier::Own {
-        // Own tier: forward client session headers verbatim; synchronize profile headers
-        // with the resolved session ID (or salted_token when Step 8 was used).
-        let raw_token = if raw_session_id.is_empty() {
-            salted_token
-        } else {
-            raw_session_id
-        };
-        let token = truncate_session_value(raw_token, profile.max_len);
-        for h_name in &profile.headers {
-            if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes())
-                && (!headers.contains_key(&name) || !raw_session_id.is_empty())
-                && let Ok(val) = HeaderValue::from_str(token)
-            {
-                headers.insert(name, val);
-            }
-        }
+    let raw_token = if raw_session_id.is_empty() {
+        salted_token
     } else {
-        // Shared or Global tier: strip recognized session headers
-        // (x-claude-code-agent-id and x-claude-code-parent-agent-id are preserved per Section 11.2)
-        for h_name in SESSION_HEADERS_TO_STRIP {
-            if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes()) {
-                headers.remove(name);
-            }
-        }
-        let token = truncate_session_value(salted_token, profile.max_len);
-        // Always write salted affinity token
-        for h_name in &profile.headers {
-            if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes())
-                && let Ok(val) = HeaderValue::from_str(token)
-            {
-                headers.insert(name, val);
-            }
+        raw_session_id
+    };
+    let token = truncate_session_value(raw_token, profile.max_len);
+    for h_name in &profile.headers {
+        if let Ok(name) = HeaderName::from_bytes(h_name.as_bytes())
+            && (!headers.contains_key(&name) || !raw_session_id.is_empty())
+            && let Ok(val) = HeaderValue::from_str(token)
+        {
+            headers.insert(name, val);
         }
     }
 }
@@ -137,7 +111,7 @@ pub fn apply_outbound_session_affinity(
 mod tests {
     use super::*;
 
-    #[doc = "Spec: RTE-1, SEC-16"]
+    #[doc = "Spec: RTE-1, SEC-16, TRN-0"]
     #[test]
     fn test_salted_affinity_token_format_and_tier_stripping() {
         let secret = [0x42u8; 32];
@@ -145,10 +119,10 @@ mod tests {
         let raw_sess = "client-session-12345";
 
         let token = compute_salted_affinity_token(&secret, &user_id, raw_sess);
-        assert!(token.starts_with("llr_"));
-        assert_eq!(token.len(), 30); // "llr_" (4) + 26 chars = 30 chars
+        assert!(!token.starts_with("llr_"), "no proxy prefix on the wire");
+        assert_eq!(token.len(), 26);
         assert!(
-            token[4..]
+            token
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c))
         );
@@ -185,7 +159,8 @@ mod tests {
             raw_sess
         );
 
-        // 2. Shared/Global tier: client session header stripped, salted token injected
+        // 2. Shared/Global tier: client session headers preserved and translated to profile header;
+        // when raw_session_id is empty (Step 8 fallback), the 26-char derived token is used.
         let mut shared_headers = HeaderMap::new();
         shared_headers.insert(
             HeaderName::from_static("x-claude-code-session-id"),
@@ -202,19 +177,31 @@ mod tests {
             &token,
             raw_sess,
         );
-        assert!(!shared_headers.contains_key("x-claude-code-session-id"));
-        // Subagent header is preserved
+        assert_eq!(
+            shared_headers
+                .get("x-claude-code-session-id")
+                .expect("claude header preserved on Shared tier"),
+            "claude-native-id"
+        );
         assert_eq!(
             shared_headers
                 .get("x-claude-code-agent-id")
                 .expect("agent sub header"),
             "agent-sub-1"
         );
-        // Salted affinity header written
         assert_eq!(
             shared_headers
                 .get("x-opencode-session")
-                .expect("salted header"),
+                .expect("translated profile header"),
+            raw_sess
+        );
+
+        let mut step8_headers = HeaderMap::new();
+        apply_outbound_session_affinity(&mut step8_headers, PoolTier::Global, &profile, &token, "");
+        assert_eq!(
+            step8_headers
+                .get("x-opencode-session")
+                .expect("step8 derived header"),
             token.as_str()
         );
     }

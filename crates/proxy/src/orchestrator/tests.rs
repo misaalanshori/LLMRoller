@@ -287,8 +287,8 @@ fn fingerprint_generic_ids_uses_salted_affinity_not_the_raw_client_id() {
         "a Step 8 affinity must not forward the raw generic client ID"
     );
     assert!(
-        resolved.salted_token.starts_with("llr_"),
-        "Step 8 must always write the tenant-salted token"
+        !resolved.salted_token.starts_with("llr_") && resolved.salted_token.len() == 26,
+        "Step 8 must write the 26-char derived token without an llr_ proxy prefix"
     );
     assert_eq!(
         resolved.outbound_token(PoolTier::Own),
@@ -710,9 +710,9 @@ fn transparent_proxy_headers_and_all_80_presets_verification() {
     )
     .expect("genai preset");
     let genai_headers = (genai_spec.synthesize_headers)("01JKEYTEST0000000000000000", "sess_1");
-    assert_eq!(
-        genai_headers.get("x-goog-api-client").map(String::as_str),
-        Some("genai-rs/1.0.0")
+    assert!(
+        !genai_headers.contains_key("x-goog-api-client"),
+        "transparent Google AI Studio preset must not inject a synthetic genai-rs SDK header"
     );
 
     // 4. Verify all 80 presets in ALL_PROVIDER_PRESET_SPECS

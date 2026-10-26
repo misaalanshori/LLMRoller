@@ -69,21 +69,6 @@ const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 20] = [
     "true-client-ip",
 ];
 
-/// Session-affinity headers stripped when routing to Shared or Global tiers per SEC-16.
-const SESSION_HEADERS_STRIP_ON_POOLED: [&str; 11] = [
-    "x-session-affinity",
-    "x-session-id",
-    "session-id",
-    "session_id",
-    "conversation-id",
-    "x-bf-session-id",
-    "x-opencode-session",
-    "x-parent-session-id",
-    "prompt-cache-key",
-    "promptcachekey",
-    "x-claude-code-session-id",
-];
-
 /// Base allowlisted headers preserved in response pipeline R3.
 const RESPONSE_BASE_ALLOWLIST: [&str; 7] = [
     "content-type",
@@ -130,7 +115,7 @@ pub fn validate_request_smuggling(headers: &HeaderMap) -> Result<(), SmugglingEr
 /// Apply the deterministic 4-rule request header pipeline to outbound requests per Section 12.1.
 pub fn apply_request_header_pipeline(
     inbound: &HeaderMap,
-    tier: PoolTier,
+    _tier: PoolTier,
     auth_header: Option<(&str, &str)>,
     strip_headers: &[String],
     strip_header_tokens: &StripHeaderTokens,
@@ -164,11 +149,6 @@ pub fn apply_request_header_pipeline(
             || name_lower.starts_with("x-forwarded-")
             || name_lower.starts_with("cf-")
         {
-            continue;
-        }
-
-        // On Shared or Global tiers: strip recognized session headers per SEC-16
-        if tier != PoolTier::Own && SESSION_HEADERS_STRIP_ON_POOLED.contains(&name_lower.as_str()) {
             continue;
         }
 

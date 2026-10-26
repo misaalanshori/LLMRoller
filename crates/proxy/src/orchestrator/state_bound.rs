@@ -520,6 +520,7 @@ pub(crate) async fn forward_state_bound_response_op(
     method: Method,
     subpath: &str,
     query_str: Option<&str>,
+    inbound: &HeaderMap,
 ) -> Response {
     use crate::failover::{HardRouteDecision, evaluate_hard_route_decision};
 
@@ -620,28 +621,27 @@ pub(crate) async fn forward_state_bound_response_op(
             "the linked upstream origin is not permitted",
         );
     }
-    let auth_scheme = provider
-        .config
-        .auth
-        .for_endpoint(ProviderEndpoint::Responses);
-    let (auth_header, auth_prefix) = auth_scheme
-        .as_ref()
-        .map_or(("authorization", "Bearer "), |scheme| {
-            (scheme.header.as_str(), scheme.prefix.as_str())
-        });
     let client = state.select_http_client(provider.allow_private_network);
     let request_id = RequestId::generate().to_string();
-    let mut req_builder = client
-        .request(method.clone(), &url)
-        .header(auth_header, format!("{auth_prefix}{secret}"))
-        .header("x-request-id", &request_id)
-        .header(header::ACCEPT_ENCODING, "identity");
-    for (h_name, h_val) in &provider.config.add_headers {
-        let lower = h_name.to_ascii_lowercase();
-        if lower != "host" && lower != "content-length" && lower != auth_header {
-            req_builder = req_builder.header(h_name.as_str(), h_val.as_str());
-        }
-    }
+    // TRN-0: the linked upstream sees the same client headers as any other call to that provider
+    // (client mode, User-Agent policy, credential), not a bare LLMRoller-built request.
+    let Some(candidate) = linked_candidate(&snapshot, &link, caller) else {
+        return permission_error(
+            "the upstream key that holds this response is no longer available",
+        );
+    };
+    let outbound = match build_upstream_headers(
+        inbound,
+        &candidate,
+        &secret,
+        EndpointKind::Responses,
+        None,
+        now,
+    ) {
+        Ok(headers) => headers,
+        Err(response) => return *response,
+    };
+    let req_builder = client.request(method.clone(), &url).headers(outbound);
     let send_timeout = Duration::from_millis(provider.config.first_activity_timeout_ms());
     let upstream = match tokio::time::timeout(send_timeout, req_builder.send()).await {
         Ok(Ok(response)) => response,
@@ -1111,26 +1111,47 @@ pub async fn post_responses_compact(
 pub async fn get_response_by_id(
     State(state): State<ProxyAuthState>,
     uri: axum::http::Uri,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::GET, "", uri.query()).await
+    forward_state_bound_response_op(
+        &state,
+        &client_key,
+        &id,
+        Method::GET,
+        "",
+        uri.query(),
+        &headers,
+    )
+    .await
 }
 
 /// Handler for DELETE /v1/responses/{id}.
 pub async fn delete_response_by_id(
     State(state): State<ProxyAuthState>,
     uri: axum::http::Uri,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
-    forward_state_bound_response_op(&state, &client_key, &id, Method::DELETE, "", uri.query()).await
+    forward_state_bound_response_op(
+        &state,
+        &client_key,
+        &id,
+        Method::DELETE,
+        "",
+        uri.query(),
+        &headers,
+    )
+    .await
 }
 
 /// Handler for GET /v1/responses/{id}/input_items.
 pub async fn get_response_input_items(
     State(state): State<ProxyAuthState>,
     uri: axum::http::Uri,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
@@ -1141,6 +1162,7 @@ pub async fn get_response_input_items(
         Method::GET,
         "/input_items",
         uri.query(),
+        &headers,
     )
     .await
 }
@@ -1149,6 +1171,7 @@ pub async fn get_response_input_items(
 pub async fn post_response_cancel(
     State(state): State<ProxyAuthState>,
     uri: axum::http::Uri,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Extension(client_key): Extension<ClientKeyRecord>,
 ) -> Response {
@@ -1159,6 +1182,7 @@ pub async fn post_response_cancel(
         Method::POST,
         "/cancel",
         uri.query(),
+        &headers,
     )
     .await
 }

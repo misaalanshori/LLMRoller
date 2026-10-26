@@ -190,6 +190,37 @@ pub fn normalize_request_body(body: Bytes, target_model: &str) -> Bytes {
             }
             _ => {}
         }
+        const CANONICAL_TOOLS: [&str; 17] = [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Grep",
+            "Glob",
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "KillShell",
+            "NotebookEdit",
+            "Skill",
+            "Task",
+            "TaskOutput",
+            "TodoWrite",
+            "WebFetch",
+            "WebSearch",
+        ];
+        if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+            for tool in tools {
+                if let Some(name) = tool.get("name").and_then(Value::as_str)
+                    && let Some(&canon) = CANONICAL_TOOLS
+                        .iter()
+                        .find(|c| c.eq_ignore_ascii_case(name))
+                    && let Some(t_obj) = tool.as_object_mut()
+                {
+                    t_obj.insert("name".to_string(), Value::String(canon.to_string()));
+                }
+            }
+        }
         if let Ok(vec) = serde_json::to_vec(&doc) {
             return Bytes::from(vec);
         }

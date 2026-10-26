@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-#[doc = "Spec: SEC-16, RTE-1, TRN-1 — F02 pooled keys receive only the tenant-salted affinity token"]
+#[doc = "Spec: SEC-16, RTE-1, TRN-0, TRN-1 — pooled keys pass through client session carriers and translate to the provider profile without any llr_ marker"]
 async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
     let (mock_addr, mock_state) = spawn_mock_upstream().await;
     let dir = tempdir().expect("temp dir");
@@ -14,7 +14,7 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
 
     let entropy = OsEntropy;
     let mut tx = pool.begin().await.expect("begin");
-    let (user_id, token) =
+    let (_user_id, token) =
         seed_user_with_client_key(&mut tx, "f02_global_user", None, &entropy).await;
     let config = r#"{"session_profile":{"headers":["x-session-id"],"body_field":"session_id"}}"#;
     seed_provider_route(
@@ -30,11 +30,6 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
     tx.commit().await.expect("commit");
 
     let raw_session = "client-claude-session";
-    let expected_token = llmroller_proto::affinity::compute_salted_affinity_token(
-        &[0x5A; 32],
-        &user_id,
-        raw_session,
-    );
 
     let app = build_wire_app(&pool, &master_key).await;
     let request = Request::builder()
@@ -51,7 +46,7 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
             r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"session_id":"body-session","prompt_cache_key":"body-cache-key"}"#,
         ))
         .expect("request");
-    let response = app.oneshot(request).await.expect("response");
+    let response = app.clone().oneshot(request).await.expect("response");
     assert_eq!(response.status(), StatusCode::OK);
 
     let recorded = latest_request(&mock_state, "/chat/completions");
@@ -60,19 +55,25 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
             .headers
             .get("x-session-id")
             .and_then(|value| value.to_str().ok()),
-        Some(expected_token.as_str()),
-        "pooled keys must receive the tenant-salted affinity token"
+        Some(raw_session),
+        "profile header must receive the resolved client session ID"
     );
-    for stripped in [
-        "x-claude-code-session-id",
-        "x-opencode-session",
-        "x-session-affinity",
-    ] {
-        assert!(
-            !recorded.headers.contains_key(stripped),
-            "recognized client session header {stripped} must be stripped on pooled keys"
-        );
-    }
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-claude-code-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(raw_session),
+        "client session header must pass through unchanged"
+    );
+    assert_eq!(
+        recorded
+            .headers
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok()),
+        Some("client-opencode-session"),
+        "other client session headers must pass through unchanged"
+    );
     assert_eq!(
         recorded
             .headers
@@ -94,21 +95,38 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
         serde_json::from_str(&recorded.body).expect("recorded body is JSON");
     assert_eq!(
         body.get("session_id").and_then(|value| value.as_str()),
-        Some(expected_token.as_str()),
-        "the configured body affinity field must carry the salted token"
+        Some(raw_session),
+        "the configured body affinity field must be synchronized to the resolved client session"
     );
-    assert!(
-        body.get("prompt_cache_key").is_none(),
-        "every recognized client body session carrier must be removed on pooled keys"
+    assert_eq!(
+        body.get("prompt_cache_key")
+            .and_then(|value| value.as_str()),
+        Some("body-cache-key"),
+        "other client body session fields must pass through unchanged"
     );
-    assert!(!recorded.body.contains("body-session"));
-    assert!(!recorded.body.contains("body-cache-key"));
-    assert!(
-        !recorded.body.contains(raw_session),
-        "the raw client session must never reach a pooled upstream"
-    );
-    assert!(!recorded.body.contains("lower-precedence-session"));
-    assert!(!recorded.body.contains("client-opencode-session"));
+    assert!(!recorded.body.contains("llr_"));
+
+    // When the client sends no session carrier at all (Step 8 fallback), the derived 26-char
+    // token is emitted with no llr_ prefix.
+    let step8_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"stateless question"}]}"#,
+        ))
+        .expect("step8 request");
+    let step8_resp = app.oneshot(step8_req).await.expect("step8 response");
+    assert_eq!(step8_resp.status(), StatusCode::OK);
+    let step8_rec = latest_request(&mock_state, "/chat/completions");
+    let step8_hdr = step8_rec
+        .headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("step8 x-session-id");
+    assert_eq!(step8_hdr.len(), 26);
+    assert!(!step8_hdr.starts_with("llr_"));
 }
 
 #[tokio::test]

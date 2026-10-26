@@ -63,9 +63,10 @@ pub(crate) struct ResolvedSession {
 }
 
 impl ResolvedSession {
-    /// The token written to provider affinity fields for the chosen tier.
-    pub(crate) fn outbound_token(&self, tier: PoolTier) -> &str {
-        if tier == PoolTier::Own && !self.raw_session.is_empty() {
+    /// The token written to provider affinity fields (`TRN-0`, Section 11.2): the client's raw
+    /// session ID when supplied, or the derived 26-char token when Step 8 was used.
+    pub(crate) fn outbound_token(&self, _tier: PoolTier) -> &str {
+        if !self.raw_session.is_empty() {
             &self.raw_session
         } else {
             &self.salted_token

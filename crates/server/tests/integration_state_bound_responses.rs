@@ -53,6 +53,7 @@ struct RecordedRequest {
     authorization: Option<String>,
     api_key: Option<String>,
     anthropic_version: Option<String>,
+    headers: axum::http::HeaderMap,
     body: String,
 }
 
@@ -94,6 +95,7 @@ async fn record(state: &MockState, request: &mut Request<Body>) -> String {
         .get("anthropic-version")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let headers = request.headers().clone();
     let body = std::mem::replace(request.body_mut(), Body::empty());
     let bytes = to_bytes(body, usize::MAX).await.expect("mock body");
     let body = String::from_utf8_lossy(&bytes).to_string();
@@ -107,6 +109,7 @@ async fn record(state: &MockState, request: &mut Request<Body>) -> String {
             authorization,
             api_key,
             anthropic_version,
+            headers,
             body: body.clone(),
         });
     body
@@ -476,6 +479,59 @@ async fn test_state_bound_get_forwards_to_bound_upstream_key_verbatim() {
         events_count >= 1,
         "state-bound response operation must emit a usage_events row"
     );
+}
+
+// Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#121-request-and-response-header-policies | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+#[tokio::test]
+#[doc = "Spec: TRN-0, API-3 - state-bound GET/DELETE forward the client's headers and add no proxy marker"]
+async fn test_state_bound_calls_forward_client_headers_without_proxy_markers() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "state-bound-headers").await;
+    let token = create_client_key(&harness, user, "bound-headers-key").await;
+    let (_created, mock) = create_link(&harness, &token).await;
+    let app = build_app(&harness).await;
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/responses/resp_up_1")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::USER_AGENT, "opencode/1.2.15")
+        .header(header::ACCEPT_ENCODING, "gzip, br")
+        .header("x-future-agent-header", "kept")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("get response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = mock.calls.lock().expect("calls");
+    let get_call = calls
+        .iter()
+        .find(|call| call.method == "GET" && call.path == "/responses/resp_up_1")
+        .expect("upstream GET");
+    let headers = &get_call.headers;
+    assert_eq!(
+        headers.get(header::USER_AGENT).map(|v| v.as_bytes()),
+        Some(&b"opencode/1.2.15"[..])
+    );
+    assert_eq!(
+        headers.get(header::ACCEPT_ENCODING).map(|v| v.as_bytes()),
+        Some(&b"gzip, br"[..])
+    );
+    assert_eq!(
+        headers.get("x-future-agent-header").map(|v| v.as_bytes()),
+        Some(&b"kept"[..])
+    );
+    assert!(
+        !headers.contains_key("x-request-id"),
+        "LLMRoller must not add its own request id upstream"
+    );
+    for (name, value) in headers {
+        let line = format!("{name}: {}", value.to_str().unwrap_or_default()).to_ascii_lowercase();
+        assert!(
+            !line.contains("llmroller"),
+            "proxy marker leaked upstream: {line}"
+        );
+    }
 }
 
 #[tokio::test]

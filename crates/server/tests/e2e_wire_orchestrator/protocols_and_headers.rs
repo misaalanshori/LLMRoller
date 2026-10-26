@@ -332,6 +332,70 @@ async fn test_client_mode_transparent_fills_required_overrides() {
     }
 }
 
+// Spec: ./docs/srdd/23. SRDD - Multi-Provider Access Layer, OAuth Token Exchange, and Hardware Fingerprinting.md#233-deterministic-per-key-hardware--cli-fingerprinting-cratesprotosrcfingerprintrs | Phase: ./docs/bigbang/big-bang-phases-2.md#23-sub-phase-23-request-and-response-header-pipelines-smuggling-guards-user-agent-policy-and-header-fuzzer
+#[tokio::test]
+#[doc = "Spec: TRN-0, API-3, API-4, F104 — Claude Code preset overrides headers, injects billing system block, and canonicalizes tool names"]
+async fn test_claude_code_preset_applies_required_headers_billing_block_and_tool_casing() {
+    let (mock_addr, mock_state) = spawn_mock_upstream().await;
+    let dir = tempdir().expect("temp dir");
+    let pool = open_pool(&dir.path().join("cc_preset.db"), PoolRole::Writer)
+        .await
+        .expect("writer pool");
+    migrate(&pool).await.expect("migrate");
+    let master_key = MasterKey::from_bytes([0xE9; 32]);
+    let config = r#"{"preset_id":"anthropic_claude_code_stealth_oauth"}"#;
+    let token = seed_single_global_route(&pool, &master_key, mock_addr, config).await;
+    let app = build_wire_app(&pool, &master_key).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "opencode/1.2.15")
+        .header("x-app", "opencode")
+        .header("anthropic-beta", "prompt-caching-2024-07-31")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","system":"You are helpful.","tools":[{"name":"bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = latest_request(&mock_state, "/messages");
+    assert_eq!(
+        recorded
+            .headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok()),
+        Some("claude-cli/2.1.63 (external, cli)")
+    );
+    assert_eq!(
+        recorded.headers.get("x-app").and_then(|v| v.to_str().ok()),
+        Some("cli")
+    );
+    let beta = recorded
+        .headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .expect("anthropic-beta");
+    assert!(beta.contains("prompt-caching-2024-07-31"));
+    assert!(beta.contains("claude-code-20250219"));
+    assert!(beta.contains("oauth-2025-04-20"));
+
+    let body: serde_json::Value = serde_json::from_str(&recorded.body).expect("json body");
+    let system_str = body["system"].as_str().expect("system string");
+    assert!(
+        system_str.starts_with("x-anthropic-billing-header: cc_version=2.1.63."),
+        "Claude Code billing block must be prepended: {system_str}"
+    );
+    assert_eq!(
+        body["tools"][0]["name"].as_str(),
+        Some("Bash"),
+        "Claude Code preset must canonicalize built-in tool name casing"
+    );
+}
+
 #[tokio::test]
 #[doc = "Spec: API-2, PRV-3 — F03 supports per-protocol x-api-key authentication"]
 async fn test_messages_auth_scheme_uses_configured_x_api_key() {
