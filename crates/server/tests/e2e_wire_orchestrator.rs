@@ -37,9 +37,10 @@ use llmroller_store::providers::{
 use llmroller_store::settings::seed_defaults;
 use llmroller_store::writer::{WriterHandle, flush_data_queues, start_writer};
 
-
 #[path = "e2e_wire_orchestrator/common.rs"]
 pub(crate) mod common;
+#[path = "e2e_wire_orchestrator/failover_and_errors.rs"]
+mod failover_and_errors;
 #[path = "e2e_wire_orchestrator/forwarding.rs"]
 mod forwarding;
 #[path = "e2e_wire_orchestrator/limits_and_quotas.rs"]
@@ -48,7 +49,5 @@ mod limits_and_quotas;
 mod protocols_and_headers;
 #[path = "e2e_wire_orchestrator/sessions_and_pins.rs"]
 mod sessions_and_pins;
-#[path = "e2e_wire_orchestrator/failover_and_errors.rs"]
-mod failover_and_errors;
 
 pub(crate) use common::*;

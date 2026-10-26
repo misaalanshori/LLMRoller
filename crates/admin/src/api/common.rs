@@ -336,7 +336,9 @@ pub(crate) fn domains_for_path(path: &str) -> Vec<ConfigDomain> {
     }
 }
 
-pub(crate) fn invalidations_for_path(path: &str) -> Vec<llmroller_core::snapshot::CacheInvalidationEvent> {
+pub(crate) fn invalidations_for_path(
+    path: &str,
+) -> Vec<llmroller_core::snapshot::CacheInvalidationEvent> {
     use llmroller_core::snapshot::CacheInvalidationEvent;
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::new();
@@ -415,7 +417,11 @@ pub(crate) fn method_verb(method: &Method) -> &'static str {
     }
 }
 
-pub(crate) fn mutation_target_id(segments: &[&str], resource_index: usize, resource: &str) -> Option<String> {
+pub(crate) fn mutation_target_id(
+    segments: &[&str],
+    resource_index: usize,
+    resource: &str,
+) -> Option<String> {
     let candidate = *segments.get(resource_index + 1)?;
     if matches!(
         candidate,
@@ -807,4 +813,3 @@ pub(crate) struct ClientKeyCreationResponse {
 // ---------------------------------------------------------------------------
 // Personal Provider Endpoints (/api/user/providers)
 // ---------------------------------------------------------------------------
-

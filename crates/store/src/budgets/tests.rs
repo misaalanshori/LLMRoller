@@ -250,11 +250,40 @@ async fn test_route_scoped_rings_and_multi_day_windows_hydrate_across_restart() 
 #[tokio::test]
 #[doc = "Spec: LIM-1, Spec: PERF-4, Spec: SHR-2"]
 async fn test_active_manual_offset_preserves_effective_at_and_share_month_cutoff() {
-    let (_dir, pool) = setup_db().await;
+    let (_dir, pool) = setup_budgets_test_db().await;
     let key_id = UpstreamKeyId::generate();
     let share_id = ShareId::generate();
     let client_key_id = ClientKeyId::generate();
     let user_id = UserId::generate();
+
+    let provider_id = llmroller_core::ids::ProviderId::generate();
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, share_config_fingerprint, created_at)
+         VALUES (?, 'P', 'openrouter', 'https://api.com', '{}', 'global', 'fp', 1000)"
+    )
+    .bind(provider_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert provider");
+
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, label, secret_enc, secret_last4, priority, master_key_id, created_at)
+         VALUES (?, ?, 'K', X'00', '1234', 100, 'key-0', 1000)"
+    )
+    .bind(key_id.to_string())
+    .bind(provider_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert key");
+
+    sqlx::query(
+        "INSERT INTO budget_windows (id, scope_kind, upstream_key_id, window_kind, period_ms, limit_micro_usd, reserve_pct)
+         VALUES ('win_01', 'upstream_key', ?, 'anchored_fixed', 3600000, 1000000, 2)"
+    )
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert window");
 
     // Insert a manual adjustment at T0 = 1_000_000 with period = 3_600_000
     insert_budget_adjustment(

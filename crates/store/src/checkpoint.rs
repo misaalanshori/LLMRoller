@@ -43,10 +43,6 @@ impl WalCheckpointSupervisor {
             sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
                 .execute(pool)
                 .await?;
-            // Once emergency TRUNCATE checkpoint succeeds and disk is not full, restore readiness (FND-028).
-            if !self.storage_full.load(Ordering::SeqCst) {
-                self.is_ready.store(true, Ordering::SeqCst);
-            }
         } else if wal_bytes >= WAL_RESTART_THRESHOLD_BYTES {
             sqlx::query("PRAGMA wal_checkpoint(RESTART);")
                 .execute(pool)
@@ -58,6 +54,23 @@ impl WalCheckpointSupervisor {
         }
 
         Ok(())
+    }
+
+    /// Re-evaluates WAL file size on disk after an emergency checkpoint and restores readiness
+    /// once the WAL file drops below `WAL_SATURATION_THRESHOLD_BYTES` (`FND-028`).
+    pub async fn run_checkpoint_for_path(
+        &self,
+        pool: &SqlitePool,
+        wal_path: &std::path::Path,
+    ) -> Result<u64, sqlx::Error> {
+        let pre_bytes = std::fs::metadata(wal_path).map_or(0, |m| m.len());
+        self.run_checkpoint(pool, pre_bytes).await?;
+        let post_bytes = std::fs::metadata(wal_path).map_or(0, |m| m.len());
+        if post_bytes < WAL_SATURATION_THRESHOLD_BYTES && !self.storage_full.load(Ordering::SeqCst)
+        {
+            self.is_ready.store(true, Ordering::SeqCst);
+        }
+        Ok(post_bytes)
     }
 
     /// Handles simulated or actual SQLITE_FULL (code 13).

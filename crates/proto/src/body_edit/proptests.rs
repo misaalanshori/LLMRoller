@@ -8,7 +8,9 @@ use bytes::Bytes;
 use llmroller_core::rbac::PoolTier;
 use proptest::prelude::*;
 
-use crate::body_edit::{BodyEditError, ChatStreamMode, edit_body, scan_top_level};
+use crate::body_edit::{
+    BodyEditError, ChatStreamMode, edit_body, scan_top_level, scan_top_level_with_fallback,
+};
 
 /// Spec: API-4, TRN-1, TRN-2
 /// Envelope validation: Non-UTF8, BOM, non-object, and trailing bytes are rejected with 400.
@@ -476,7 +478,8 @@ fn test_scan_top_level_with_fallback_extracts_gemini_path_and_nested_models() {
     );
     assert_eq!(scan.stream.map(|(s, _)| s), Some(true));
 
-    let cca_body = br#"{"project":"p1","request":{"model":"gemini-2.5-flash","stream":true,"contents":[]}}"#;
+    let cca_body =
+        br#"{"project":"p1","request":{"model":"gemini-2.5-flash","stream":true,"contents":[]}}"#;
     let scan_cca = scan_top_level_with_fallback(cca_body, None).expect("scan cca");
     assert_eq!(
         scan_cca.model.as_ref().map(|(m, _)| m.as_str()),
@@ -485,9 +488,11 @@ fn test_scan_top_level_with_fallback_extracts_gemini_path_and_nested_models() {
     assert_eq!(scan_cca.stream.map(|(s, _)| s), Some(true));
 
     let bedrock_body = br#"{"modelId":"anthropic.claude-sonnet-4-6-v1:0","messages":[]}"#;
-    let scan_bed =
-        scan_top_level_with_fallback(bedrock_body, Some("/model/anthropic.claude-sonnet-4-6-v1:0/converse-stream"))
-            .expect("scan bedrock");
+    let scan_bed = scan_top_level_with_fallback(
+        bedrock_body,
+        Some("/model/anthropic.claude-sonnet-4-6-v1:0/converse-stream"),
+    )
+    .expect("scan bedrock");
     assert_eq!(
         scan_bed.model.as_ref().map(|(m, _)| m.as_str()),
         Some("anthropic.claude-sonnet-4-6-v1:0")

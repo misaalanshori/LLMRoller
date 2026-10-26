@@ -5,9 +5,7 @@ use llmroller_core::rbac::ActorScope;
 use sqlx::{Row, SqlitePool, Transaction};
 
 use super::crud::get_user_by_id;
-use super::types::{
-    NewWebSession, SessionWithUser, UserError, WebSession, ensure_self_or_admin,
-};
+use super::types::{NewWebSession, SessionWithUser, UserError, WebSession, ensure_self_or_admin};
 
 /// Insert a newly issued web session.
 ///

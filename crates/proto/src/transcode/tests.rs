@@ -151,12 +151,9 @@ fn test_all_seven_protocols_canonical_request_response_and_incremental_stream() 
     custom_req.project = Some("my-gcp-project".to_string());
     custom_req.thread_id = Some("thr_custom_99".to_string());
 
-    let cca_bytes = encode_canonical_request(
-        WireProtocol::CloudCodeAssist,
-        &custom_req,
-        "gemini-2.5-pro",
-    )
-    .expect("encode cloud code assist");
+    let cca_bytes =
+        encode_canonical_request(WireProtocol::CloudCodeAssist, &custom_req, "gemini-2.5-pro")
+            .expect("encode cloud code assist");
     let cca_val: Value = serde_json::from_slice(&cca_bytes).expect("cca json");
     assert_eq!(cca_val["project"], "my-gcp-project");
     assert_eq!(
@@ -206,8 +203,9 @@ fn test_all_seven_protocols_canonical_request_response_and_incremental_stream() 
     assert_eq!(bedrock_resp_parsed.input_tokens, 25);
     assert_eq!(bedrock_resp_parsed.output_tokens, 14);
 
-    let gemini_encoded = encode_canonical_response(WireProtocol::GoogleGemini, &bedrock_resp_parsed)
-        .expect("encode gemini response");
+    let gemini_encoded =
+        encode_canonical_response(WireProtocol::GoogleGemini, &bedrock_resp_parsed)
+            .expect("encode gemini response");
     let gemini_val: Value = serde_json::from_slice(&gemini_encoded).expect("gemini resp json");
     assert_eq!(gemini_val["usageMetadata"]["promptTokenCount"], 25);
     assert_eq!(gemini_val["usageMetadata"]["candidatesTokenCount"], 14);
@@ -223,41 +221,26 @@ fn test_all_seven_protocols_canonical_request_response_and_incremental_stream() 
         "claude-sonnet-4.6",
     );
     let f1 = stream_tc.push_chunk(
-        b"event: message_start
-data: {"type":"message_start","message":{"usage":{"input_tokens":18,"output_tokens":0}}}
-
-",
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}}\n\n",
     );
     assert!(f1.is_empty());
     let f2 = stream_tc.push_chunk(
-        b"event: content_block_start
-data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_abc","name":"run_bash","input":{}}}
-
-",
+        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_abc\",\"name\":\"run_bash\",\"input\":{}}}\n\n",
     );
     assert_eq!(f2.len(), 1);
     let f2_str = String::from_utf8_lossy(&f2[0]);
-    assert!(f2_str.contains(""name":"run_bash""));
+    assert!(f2_str.contains("\"name\":\"run_bash\""));
     let f3 = stream_tc.push_chunk(
-        b"event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}
-
-",
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n\n",
     );
     assert_eq!(f3.len(), 1);
     let f3_str = String::from_utf8_lossy(&f3[0]);
     assert!(f3_str.contains("arguments"));
     let f4 = stream_tc.push_chunk(
-        b"event: message_delta
-data: {"type":"message_delta","usage":{"output_tokens":9}}
-
-event: message_stop
-data: {"type":"message_stop"}
-
-",
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     );
     assert!(!f4.is_empty());
     let f4_str = String::from_utf8_lossy(&f4[0]);
-    assert!(f4_str.contains(""finish_reason":"tool_calls""));
+    assert!(f4_str.contains("\"finish_reason\":\"tool_calls\""));
     assert!(f4_str.contains("data: [DONE]"));
 }

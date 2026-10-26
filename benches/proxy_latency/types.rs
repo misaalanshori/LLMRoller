@@ -194,4 +194,3 @@ pub(crate) struct Harness {
     pub(crate) upstream_key_id: UpstreamKeyId,
     pub(crate) canonical_id: String,
 }
-

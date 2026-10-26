@@ -351,7 +351,8 @@ pub fn expand_header_template_with_caller(
     caller_client_name: Option<&str>,
     caller_ua: Option<&str>,
 ) -> String {
-    let mut out = expand_header_template(template, profile, request_uuid, session_id, timestamp_secs);
+    let mut out =
+        expand_header_template(template, profile, request_uuid, session_id, timestamp_secs);
     if out.contains("{{caller_client_name}}") {
         out = out.replace("{{caller_client_name}}", caller_client_name.unwrap_or(""));
     }

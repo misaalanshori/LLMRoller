@@ -1,7 +1,6 @@
 use super::*;
 use sqlx::Row as _;
 
-
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct UpdatePreferencesRequest {
     pub ui_theme: Option<String>,
@@ -20,7 +19,7 @@ pub(crate) async fn get_user_preferences_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let row = sqlx::query(
+    let row = sqlx::query(
         "SELECT ui_theme, ui_nav_layout, ui_locale, default_routing_scope FROM users WHERE id = ?",
     )
     .bind(user_id.to_string())
@@ -130,7 +129,7 @@ pub(crate) async fn get_user_web_sessions_handler(
             .unwrap_or("");
     let current_hash = llmroller_store::crypto::sha256_hex(current_token.as_bytes());
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id_hash, ip_addr, user_agent, created_at, last_seen_at, expires_at
          FROM web_sessions WHERE user_id = ? AND expires_at > ?
          ORDER BY last_seen_at DESC LIMIT 100",
@@ -542,7 +541,7 @@ pub(crate) async fn post_user_totp_disable_handler(
                 "current password is required to disable TOTP",
             )
         })?;
-        let password_hash: Option<String> = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
+    let password_hash: Option<String> = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
         .bind(user_id.to_string())
         .fetch_optional(&state.auth.reader_pool)
         .await

@@ -43,7 +43,6 @@ async fn test_moderation_403_does_not_fail_over_or_forward_as_credential_error()
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: API-8 — F03 moderation 403 leaves key health untouched"]
 async fn test_moderation_403_does_not_quarantine_key() {
@@ -77,7 +76,6 @@ async fn test_moderation_403_does_not_quarantine_key() {
     );
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
 }
-
 
 #[tokio::test]
 #[doc = "Spec: API-8 — F03 PlanRestricted blocks only that key/model/protocol route"]
@@ -132,7 +130,6 @@ async fn test_plan_restricted_blocks_route_until_next_discovery() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: API-8 — F03 terminal selector is used for mixed failures"]
 async fn test_mixed_quota_and_server_failure_returns_terminal_502() {
@@ -165,7 +162,6 @@ async fn test_mixed_quota_and_server_failure_returns_terminal_502() {
     assert_eq!(json["error"]["code"], "upstream_unreachable");
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 2);
 }
-
 
 #[tokio::test]
 #[doc = "Spec: REL-1 - key health transitions are written behind the durable queue"]
@@ -225,7 +221,6 @@ async fn test_key_health_transition_is_persisted() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: RTE-8 - F022 Short Retry-After (<=2s) on attempt 1 sleeps and retries candidate successfully"]
 async fn test_retry_after_short_sleep_retries_candidate_successfully() {
@@ -255,4 +250,3 @@ async fn test_retry_after_short_sleep_retries_candidate_successfully() {
         "upstream must have been called twice (initial 429 + retry 200)"
     );
 }
-

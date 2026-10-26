@@ -10,7 +10,7 @@ pub(crate) async fn get_partial_pins_handler(
     let uid = actor.user_id().map(|u| u.to_string()).unwrap_or_default();
     let now_ms = state.auth.clock.now_ms();
 
-        let query_str = if is_admin {
+    let query_str = if is_admin {
         "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
          FROM pins p
          LEFT JOIN models m ON p.model_pk = m.model_pk
@@ -119,7 +119,7 @@ pub(crate) async fn get_partial_client_keys_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, prefix, label, routing_scope, rate_limit_rpm, budget_micro_usd_month, created_at
          FROM client_keys WHERE owner_user_id = ? ORDER BY created_at DESC",
     )
@@ -179,7 +179,7 @@ pub(crate) async fn get_partial_providers_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let prov_rows = sqlx::query(
+    let prov_rows = sqlx::query(
         "SELECT id, name, kind, base_url, enabled FROM providers WHERE owner_user_id = ? ORDER BY created_at ASC",
     )
     .bind(user_id.to_string())
@@ -276,7 +276,7 @@ pub(crate) async fn get_partial_shares_outgoing_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, grantee_user_id, allowed_models, max_monthly_micro_usd, enabled
          FROM provider_shares WHERE owner_user_id = ? ORDER BY created_at DESC",
     )
@@ -339,7 +339,7 @@ pub(crate) async fn get_partial_shares_incoming_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT s.id, s.owner_user_id, s.allowed_models, s.accepted_config_fingerprint, p.name as provider_name, p.kind as provider_kind, p.share_config_fingerprint as current_fingerprint
          FROM provider_shares s
          JOIN providers p ON s.provider_id = p.id
@@ -515,9 +515,7 @@ pub(crate) async fn get_partial_admin_overview_handler(
     .unwrap_or(0);
 
     let unpriced_badge = if unpriced > 0 {
-        format!(
-            "<span class=\"badge badge-warning\" >{unpriced} unpriced models</span>"
-        )
+        format!("<span class=\"badge badge-warning\" >{unpriced} unpriced models</span>")
     } else {
         String::new()
     };
@@ -562,7 +560,7 @@ pub(crate) async fn get_partial_admin_users_handler(
 ) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, username, role, can_use_global_providers, global_budget_micro_usd_month, disabled
          FROM users ORDER BY created_at ASC LIMIT 200",
     )
@@ -627,7 +625,7 @@ pub(crate) async fn get_partial_admin_providers_handler(
 ) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let prov_rows = sqlx::query(
+    let prov_rows = sqlx::query(
         "SELECT id, name, kind, base_url, enabled FROM providers WHERE ownership_scope = 'global' ORDER BY created_at ASC",
     )
     .fetch_all(&state.auth.pool)
@@ -661,7 +659,9 @@ pub(crate) async fn get_partial_admin_providers_handler(
 
         let mut keys_html = String::new();
         if key_rows.is_empty() {
-            keys_html = "<p class=\"text-muted py-2-sm\">No upstream keys under this global provider.</p>".to_string();
+            keys_html =
+                "<p class=\"text-muted py-2-sm\">No upstream keys under this global provider.</p>"
+                    .to_string();
         } else {
             keys_html.push_str("<table class=\"data-table table-sub\"><thead><tr><th>Label</th><th>Priority</th><th>Strict Tier</th><th>Health</th><th>Action</th></tr></thead><tbody>");
             for k in key_rows {
@@ -719,7 +719,7 @@ pub(crate) async fn get_partial_admin_catalog_handler(
 ) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let model_rows = sqlx::query(
+    let model_rows = sqlx::query(
         "SELECT m.model_pk, m.canonical_id, m.origin, m.exposed, m.merge_state,
                 (SELECT COUNT(*) FROM model_routes r WHERE r.model_pk = m.model_pk) as route_count
          FROM models m ORDER BY m.canonical_id ASC",
@@ -791,7 +791,7 @@ pub(crate) async fn get_partial_user_audit_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT seq, ts, action, target_type, target_id, detail_json
          FROM audit_log
          WHERE (actor_user_id = ?
@@ -870,7 +870,7 @@ pub(crate) async fn get_partial_admin_audit_handler(
 ) -> Result<Html<String>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT seq, ts, actor_user_id, action, target_type, target_id, detail_json
          FROM audit_log ORDER BY seq DESC LIMIT 100",
     )
@@ -927,7 +927,11 @@ pub(crate) async fn get_partial_admin_audit_handler(
     Ok(Html(html))
 }
 
-pub(crate) fn render_logs_table_html(json: &serde_json::Value, is_api: bool, detail_base: &str) -> String {
+pub(crate) fn render_logs_table_html(
+    json: &serde_json::Value,
+    is_api: bool,
+    detail_base: &str,
+) -> String {
     let mut out =
         String::from("<div class=\"table-container\"><table class=\"data-table\"><thead><tr>");
     if is_api {
@@ -1459,4 +1463,3 @@ pub(crate) async fn get_partial_admin_ledger_handler(
     let html = render_usage_ledger_html(&json_res.0);
     Ok(Html(html))
 }
-

@@ -779,13 +779,11 @@ async fn post_login(
         return Err(AuthError::AccountDisabled);
     }
 
-    let _argon_permit = tokio::time::timeout(
-        Duration::from_secs(2),
-        state.argon2_semaphore.acquire(),
-    )
-    .await
-    .map_err(|_| AuthError::LoginBusy)?
-    .map_err(|_| AuthError::Internal)?;
+    let _argon_permit =
+        tokio::time::timeout(Duration::from_secs(2), state.argon2_semaphore.acquire())
+            .await
+            .map_err(|_| AuthError::LoginBusy)?
+            .map_err(|_| AuthError::Internal)?;
     let password = payload.password.clone();
     let password_hash = record.password_hash.clone();
     let verified = tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))

@@ -48,7 +48,6 @@ async fn test_data_plane_body_limit_matches_configured_maximum() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: USR-5 — F05 own-tier requests bypass a zero user-global budget"]
 async fn test_own_tier_bypasses_zero_user_global_budget() {
@@ -85,7 +84,6 @@ async fn test_own_tier_bypasses_zero_user_global_budget() {
     );
     assert_eq!(mock_state.chat_calls.load(Ordering::SeqCst), 1);
 }
-
 
 #[tokio::test]
 #[doc = "Spec: SHR-1 — F05 shared-tier requests enforce the grantor's zero share cap before egress"]
@@ -154,7 +152,6 @@ async fn test_shared_tier_zero_cap_returns_429_without_upstream_call() {
         "no upstream request may be issued when the share cap is exhausted"
     );
 }
-
 
 #[tokio::test]
 #[doc = "Spec: API-8 - F03 all-quota failures select 429 with Retry-After"]

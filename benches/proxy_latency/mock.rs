@@ -5,7 +5,11 @@ pub(crate) struct MockState {
     pub(crate) calls: Arc<AtomicUsize>,
 }
 
-pub(crate) async fn mock_chat(State(state): State<MockState>, headers: HeaderMap, body: Bytes) -> Response {
+pub(crate) async fn mock_chat(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     state.calls.fetch_add(1, Ordering::Relaxed);
 
     let delay_ms = headers
@@ -77,4 +81,3 @@ pub(crate) async fn spawn_mock_upstream() -> SocketAddr {
     });
     address
 }
-

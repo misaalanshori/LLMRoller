@@ -230,7 +230,10 @@ pub(crate) fn is_conflict_minority(model: &SnapshotModel, route: &SnapshotModelR
 }
 
 /// Whether every enabled global provider with a usable key serves the model (MDL-3).
-pub(crate) fn present_on_all_global_providers(snapshot: &ConfigSnapshot, model: &SnapshotModel) -> bool {
+pub(crate) fn present_on_all_global_providers(
+    snapshot: &ConfigSnapshot,
+    model: &SnapshotModel,
+) -> bool {
     let usable_global_providers: HashSet<ProviderId> = snapshot
         .providers
         .values()
@@ -310,7 +313,10 @@ pub(crate) fn linked_candidate(
 }
 
 /// Whether the Responses body opted into upstream storage (`store` defaults to true).
-pub(crate) fn response_store_flag(scan: &llmroller_proto::body_edit::TopLevelScan, body: &[u8]) -> bool {
+pub(crate) fn response_store_flag(
+    scan: &llmroller_proto::body_edit::TopLevelScan,
+    body: &[u8],
+) -> bool {
     scan.fields
         .iter()
         .find(|field| field.key == "store")
@@ -828,7 +834,7 @@ pub async fn post_messages_count_tokens(
     Extension(caller): Extension<ClientKeyRecord>,
     body: Bytes,
 ) -> Response {
-    let now = state.clock.state.clock.now_ms();
+    let now = state.clock.now_ms();
     let request_id_str = RequestId::generate().to_string();
     let scan = match scan_top_level(&body) {
         Ok(scan) => scan,
@@ -1209,4 +1215,3 @@ impl RouteCandidate {
             .unwrap_or_else(|| get_adapter(self.provider_kind).default_session_profile())
     }
 }
-

@@ -637,7 +637,6 @@ pub(crate) async fn admit_inbound_request(
         }
     }
 
-
     let snapshot_arc = Arc::clone(&snapshot);
     Ok(AdmittedRequest {
         state,

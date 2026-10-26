@@ -74,7 +74,9 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
         return match endpoint {
             EndpointKind::Models => format!("{root}/v1beta/models"),
             EndpointKind::Usage => format!("{root}/v1beta/usage"),
-            EndpointKind::Embeddings => format!("{root}/v1beta/models/{default_model}:embedContent"),
+            EndpointKind::Embeddings => {
+                format!("{root}/v1beta/models/{default_model}:embedContent")
+            }
             _ => trimmed.to_string(),
         };
     }
@@ -121,16 +123,10 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let now_secs = crate::fingerprint::current_unix_timestamp_secs();
-    let mut map = BTreeMap::new();
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
     for val in map.values_mut() {
         if val.contains("{{") {
-            *val = expand_header_template(
-                val,
-                &profile,
-                &profile.device_id,
-                session_id,
-                now_secs,
-            );
+            *val = expand_header_template(val, &profile, &profile.device_id, session_id, now_secs);
         }
     }
     let _ = (&profile, session_id, now_secs);
@@ -143,12 +139,18 @@ pub fn normalize_request_body(body: Bytes, target_model: &str) -> Bytes {
     if let Ok(mut doc) = serde_json::from_slice::<Value>(&body)
         && let Some(obj) = doc.as_object_mut()
     {
-        if let Some(verifier) = obj.get("code_verifier").and_then(|v| v.as_str()).map(str::to_string)
+        if let Some(verifier) = obj
+            .get("code_verifier")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
             && !obj.contains_key("code_challenge")
         {
             let digest = crate::trace_tap::hex_sha256(verifier.as_bytes());
             obj.insert("code_challenge".to_string(), Value::String(digest));
-            obj.insert("code_challenge_method".to_string(), Value::String("S256".to_string()));
+            obj.insert(
+                "code_challenge_method".to_string(),
+                Value::String("S256".to_string()),
+            );
         }
         if !target_model.is_empty() && obj.contains_key("messages") {
             obj.insert("model".to_string(), Value::String(target_model.to_string()));

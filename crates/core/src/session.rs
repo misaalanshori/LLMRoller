@@ -424,15 +424,11 @@ impl ConstantSessionDetector {
         &self,
         client_key_id: ClientKeyId,
         session_hash: String,
-        ctx: &PromptContext<'_'>,
+        ctx: &PromptContext<'_>,
         now_ms: i64,
     ) -> (bool, bool) {
-        let newly_flagged = self.record_and_evaluate(
-            client_key_id,
-            session_hash.clone(),
-            ctx,
-            now_ms,
-        );
+        let newly_flagged =
+            self.record_and_evaluate(client_key_id, session_hash.clone(), ctx, now_ms);
         let currently_flagged = newly_flagged || self.is_flagged(client_key_id, &session_hash);
         (currently_flagged, newly_flagged)
     }

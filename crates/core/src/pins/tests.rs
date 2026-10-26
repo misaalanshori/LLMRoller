@@ -686,7 +686,13 @@ fn test_admin_move_with_tier_updates_pool_tier_and_generation() {
         canonical_id: "claude-sonnet-4.6".to_string(),
         session_hash: "sess_move_tier".to_string(),
     };
-    store.upsert_confirmed(pk.clone(), k_global, CandidatePoolTier::Global, 1_000, 60_000);
+    store.upsert_confirmed(
+        pk.clone(),
+        k_global,
+        CandidatePoolTier::Global,
+        1_000,
+        60_000,
+    );
     store.admin_move_with_tier(&pk, k_own, Some(CandidatePoolTier::Own), 2_000);
 
     let clock = crate::seams::FakeClock::new(2_500);

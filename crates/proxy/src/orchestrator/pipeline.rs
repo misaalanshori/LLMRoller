@@ -79,7 +79,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
     let mut last_retry_after_ms: Option<i64> = None;
     let mut last_cap_error: Option<GateG7Error> = None;
     let mut failovers = 0_i64;
-        let mut attempt_no: usize = 0;
+    let mut attempt_no: usize = 0;
 
     loop {
         if attempt_no >= MAX_UPSTREAM_ATTEMPTS
@@ -399,7 +399,8 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         if candidate.provider_kind == ProviderKind::CommandCode
             && target_url.ends_with("/alpha/generate")
             && transcode_pair.is_none()
-            && let Some(src_wire) = llmroller_proto::transcode::WireProtocol::from_catalog_str(protocol)
+            && let Some(src_wire) =
+                llmroller_proto::transcode::WireProtocol::from_catalog_str(protocol)
         {
             let cc_thread = resolved_session
                 .as_ref()
@@ -429,7 +430,11 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             .as_deref()
             .and_then(llmroller_proto::providers::lookup_provider_preset)
             .and_then(|spec| (spec.default_provider_config)().openai_compat);
-        let effective_compat = candidate.config.openai_compat.as_ref().or(preset_compat.as_ref());
+        let effective_compat = candidate
+            .config
+            .openai_compat
+            .as_ref()
+            .or(preset_compat.as_ref());
         let has_compat = attempt_endpoint == EndpointKind::Chat && effective_compat.is_some();
         let has_or_cache = attempt_endpoint == EndpointKind::Chat
             && candidate.provider_kind == ProviderKind::Openrouter;
@@ -1125,7 +1130,6 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             continue;
         }
 
-
         let exec_ctx = AttemptExecutionContext {
             state: &state,
             snapshot: &snapshot,
@@ -1278,4 +1282,3 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
     }
     response
 }
-

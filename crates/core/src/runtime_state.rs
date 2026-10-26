@@ -171,11 +171,18 @@ impl LoadTracker {
     /// Release one in-flight request, saturating at zero for defensive safety.
     pub fn end(&self, route: RouteId) {
         if let Some(entry) = self.routes.get(&route) {
-            let _ = entry
-                .in_flight
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(1))
-                });
+            let mut current = entry.in_flight.load(Ordering::Relaxed);
+            while current > 0 {
+                match entry.in_flight.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
         }
     }
 

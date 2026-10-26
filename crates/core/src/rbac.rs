@@ -212,7 +212,6 @@ impl PoolTier {
 
     /// Decode the numeric database representation.
     #[must_use]
-    #[must_use]
     pub const fn from_u8(code: u8) -> Option<Self> {
         Self::from_code(code)
     }

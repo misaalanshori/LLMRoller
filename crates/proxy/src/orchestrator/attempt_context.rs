@@ -40,7 +40,10 @@ pub(crate) struct AttemptExecutionContext<'a> {
     pub(crate) cand_mult_bps: i64,
     pub(crate) in_flight: &'a mut Option<InFlightGuard>,
     pub(crate) attempt_endpoint: EndpointKind,
-    pub(crate) transcode_pair: Option<(llmroller_proto::transcode::WireProtocol, llmroller_proto::transcode::WireProtocol)>,
+    pub(crate) transcode_pair: Option<(
+        llmroller_proto::transcode::WireProtocol,
+        llmroller_proto::transcode::WireProtocol,
+    )>,
     pub(crate) strip_injected_usage: bool,
     pub(crate) pinned_order: &'a mut Vec<RouteCandidate>,
     pub(crate) live_pin_ticket: &'a mut Option<PinTicket>,

@@ -174,7 +174,6 @@ async fn test_usage_explorer_summary_events_and_formula_safe_csv_export() {
     assert!(csv_str.contains("claude-sonnet-4.6"));
 }
 
-
 #[doc = "Spec: USG-10 — Usage Ledger, 5-Token Summary Strip, and Plan Coverage Multipliers"]
 #[tokio::test]
 async fn test_usage_ledger_token_strip_and_plan_coverage() {
@@ -391,4 +390,3 @@ async fn test_usage_ledger_token_strip_and_plan_coverage() {
     let p_adm_ledger_html = std::str::from_utf8(&p_adm_ledger_bytes).expect("utf8");
     assert!(p_adm_ledger_html.contains("Total tokens"));
 }
-

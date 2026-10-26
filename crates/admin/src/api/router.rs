@@ -434,4 +434,3 @@ pub fn router(state: ApiAppState) -> Router {
         ))
         .with_state(state)
 }
-

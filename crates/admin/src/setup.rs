@@ -312,11 +312,10 @@ async fn post_setup(
     let username = validate_username(&payload.username)?;
     let pw_clone = payload.password.clone();
     let entropy_clone = Arc::clone(&state.entropy);
-    let password_hash = tokio::task::spawn_blocking(move || {
-        hash_password(&pw_clone, entropy_clone.as_ref())
-    })
-    .await
-    .map_err(|_| SetupError::InvalidPayload("password hashing failed".to_string()))??;
+    let password_hash =
+        tokio::task::spawn_blocking(move || hash_password(&pw_clone, entropy_clone.as_ref()))
+            .await
+            .map_err(|_| SetupError::InvalidPayload("password hashing failed".to_string()))??;
     let id = UserId::generate();
     let now_ms = state.clock.now_ms();
 

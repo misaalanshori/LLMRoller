@@ -268,7 +268,8 @@ fn select_recovery_probe_keys(
     now_ms: i64,
     max_per_provider: usize,
 ) -> Vec<DiscoveryKey> {
-    let mut per_provider: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut per_provider: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut selected = Vec::new();
     for key in keys {
         if runtime_state.is_key_routable(key.id, now_ms) {

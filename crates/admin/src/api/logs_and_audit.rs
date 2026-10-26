@@ -16,7 +16,7 @@ pub(crate) async fn get_user_audit_log_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT seq, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json
          FROM audit_log
          WHERE (actor_user_id = ?
@@ -78,7 +78,7 @@ pub(crate) async fn get_admin_audit_log_handler(
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let rows = sqlx::query(
+    let rows = sqlx::query(
         "SELECT seq, ts, actor_user_id, action, target_type, target_id, detail_json, hash AS hash_hex FROM audit_log ORDER BY seq DESC LIMIT 100"
     )
     .fetch_all(&state.auth.pool)
@@ -132,7 +132,7 @@ pub(crate) async fn get_logs_internal(
     actor_user_id: Option<String>,
     query: LogsQuery,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let is_api = query.stream.as_deref() == Some("api");
+    let is_api = query.stream.as_deref() == Some("api");
     let limit = query.limit.unwrap_or(50).clamp(1, 1000);
 
     if is_api {
@@ -367,7 +367,7 @@ pub(crate) async fn get_log_detail_internal(
     actor: &ActorScope,
     request_id: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let is_admin = actor.is_admin() || actor.is_system();
+    let is_admin = actor.is_admin() || actor.is_system();
     let uid = actor.user_id().map(|u| u.to_string());
 
     let sql = if !is_admin {
@@ -513,7 +513,7 @@ pub(crate) async fn export_logs_csv_internal(
     query: LogsQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use llmroller_proto::headers::sanitize_csv_cell;
-    
+
     let is_api = query.stream.as_deref() == Some("api");
     if is_api {
         let sql = if owner_user_id.is_some() {
@@ -651,4 +651,3 @@ pub(crate) struct LedgerQuery {
     pub initiator: Option<String>,
     pub limit: Option<i64>,
 }
-

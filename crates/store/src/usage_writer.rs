@@ -311,6 +311,16 @@ impl ThreeQueueUsageWriter {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
     ) -> Result<usize, sqlx::Error> {
+        self.flush_bounded_to_db(tx, usize::MAX, usize::MAX).await
+    }
+
+    /// Flushes all enqueued rollups and up to `(max_items, max_bytes)` raw events into SQLite (`FND-017`).
+    pub async fn flush_bounded_to_db(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<usize, sqlx::Error> {
         let r5_items: HashMap<Rollup5MinKey, RollupDelta> = {
             let mut lock = self.rollups_5min.lock();
             std::mem::take(&mut *lock)
@@ -323,19 +333,23 @@ impl ThreeQueueUsageWriter {
 
         let raw_items: VecDeque<(UsageEventRecord, Vec<UsageAttemptRecord>)> = {
             let mut lock = self.raw_events.lock();
-            let mut batch = VecDeque::new();
-            let mut bytes_acc = 0usize;
-            while batch.len() < crate::writer::BATCH_MAX_ITEMS && bytes_acc < crate::writer::BATCH_MAX_BYTES {
-                let Some(item) = lock.pop_front() else {
-                    break;
-                };
-                bytes_acc += 512
-                    + item.0.request_headers_json.as_ref().map_or(0, String::len)
-                    + item.0.metadata_json.as_ref().map_or(0, String::len)
-                    + item.1.len() * 128;
-                batch.push_back(item);
+            if max_items == usize::MAX && max_bytes == usize::MAX {
+                std::mem::take(&mut *lock)
+            } else {
+                let mut batch = VecDeque::new();
+                let mut bytes_acc = 0usize;
+                while batch.len() < max_items && bytes_acc < max_bytes {
+                    let Some(item) = lock.pop_front() else {
+                        break;
+                    };
+                    bytes_acc += 512
+                        + item.0.request_headers_json.as_ref().map_or(0, String::len)
+                        + item.0.metadata_json.as_ref().map_or(0, String::len)
+                        + item.1.len() * 128;
+                    batch.push_back(item);
+                }
+                batch
             }
-            batch
         };
 
         let r5_backup = r5_items.clone();

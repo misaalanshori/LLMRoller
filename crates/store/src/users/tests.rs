@@ -474,16 +474,21 @@ async fn totp_recovery_optimistic_concurrency_and_reset_admin_bump_config_versio
     let reused = verify_login_totp(&pool, admin.id, &recovery, &seal, "key-1", NOW + 61_000).await;
     assert!(matches!(reused, Err(UserError::InvalidTotp)));
 
-    let v_before: i64 = sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
-        .fetch_one(&pool)
-        .await
-        .expect("v_before");
-    let _reset = reset_admin(&pool, None, entropy.as_ref(), NOW + 70_000, AUDIT_KEY)
+    let v_before: i64 =
+        sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("v_before");
+    let _reset = reset_admin(&pool, "admin", entropy.as_ref(), AUDIT_KEY, NOW + 70_000)
         .await
         .expect("reset_admin");
-    let v_after: i64 = sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
-        .fetch_one(&pool)
-        .await
-        .expect("v_after");
-    assert!(v_after > v_before, "reset_admin must bump instance_meta.config_version (FND-020)");
+    let v_after: i64 =
+        sqlx::query_scalar("SELECT config_version FROM instance_meta WHERE singleton = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("v_after");
+    assert!(
+        v_after > v_before,
+        "reset_admin must bump instance_meta.config_version (FND-020)"
+    );
 }

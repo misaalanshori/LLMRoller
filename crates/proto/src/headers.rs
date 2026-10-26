@@ -410,7 +410,10 @@ pub fn extract_caller_client_name(inbound: &HeaderMap) -> Option<String> {
             }
         }
     }
-    if let Some(ua) = inbound.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
+    if let Some(ua) = inbound
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = ua.trim();
         if !trimmed.is_empty() {
             let first_token = trimmed.split_whitespace().next().unwrap_or(trimmed);

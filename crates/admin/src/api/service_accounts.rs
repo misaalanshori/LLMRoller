@@ -108,7 +108,7 @@ pub(crate) async fn collect_service_account_client_keys_tx(
     tx: &mut Transaction<'_, Sqlite>,
     service_account_id: &str,
 ) -> Vec<ClientKeyId> {
-        let rows = sqlx::query("SELECT id FROM client_keys WHERE service_account_id = ?")
+    let rows = sqlx::query("SELECT id FROM client_keys WHERE service_account_id = ?")
         .bind(service_account_id)
         .fetch_all(&mut **tx)
         .await

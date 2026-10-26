@@ -89,34 +89,33 @@ const PROTOCOL_BLOCK_MS: i64 = 6 * 60 * 60 * 1_000;
 /// How long an auxiliary endpoint probe result is cached (API-8).
 const AUX_UNSUPPORTED_TTL_MS: i64 = 60 * 60 * 1_000;
 
-
-pub(crate) mod preflight;
-pub(crate) mod entrypoints;
-pub(crate) mod errors;
-pub(crate) mod state_bound;
-pub(crate) mod routes;
-pub(crate) mod session;
-pub(crate) mod trace;
-pub(crate) mod streaming;
 pub(crate) mod admission;
 pub(crate) mod attempt_context;
-pub(crate) mod attempt_streaming;
 pub(crate) mod attempt_non_streaming;
+pub(crate) mod attempt_streaming;
+pub(crate) mod entrypoints;
+pub(crate) mod errors;
 pub(crate) mod pipeline;
+pub(crate) mod preflight;
+pub(crate) mod routes;
+pub(crate) mod session;
+pub(crate) mod state_bound;
+pub(crate) mod streaming;
+pub(crate) mod trace;
 
-pub use preflight::*;
-pub use entrypoints::*;
-pub use errors::*;
-pub use state_bound::*;
-pub(crate) use routes::*;
-pub(crate) use session::*;
-pub use trace::*;
-pub(crate) use streaming::*;
 pub(crate) use admission::*;
 pub(crate) use attempt_context::*;
-pub(crate) use attempt_streaming::*;
 pub(crate) use attempt_non_streaming::*;
+pub(crate) use attempt_streaming::*;
+pub use entrypoints::*;
+pub use errors::*;
 pub use pipeline::*;
+pub use preflight::*;
+pub(crate) use routes::*;
+pub(crate) use session::*;
+pub use state_bound::*;
+pub(crate) use streaming::*;
+pub use trace::*;
 
 #[cfg(test)]
 mod tests;

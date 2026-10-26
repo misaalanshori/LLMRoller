@@ -294,7 +294,8 @@ pub async fn run_retention_pass(
     policy: &RetentionPolicy,
 ) -> Result<(), sqlx::Error> {
     let raw_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days * 86_400_000);
-    let rollup_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days.max(31) * 86_400_000);
+    let rollup_cutoff =
+        now_ms.saturating_sub(policy.usage_events_retention_days.max(31) * 86_400_000);
     let seven_days_cutoff = now_ms.saturating_sub(7 * 86_400_000);
     let ninety_days_cutoff = now_ms.saturating_sub(90 * 86_400_000);
 

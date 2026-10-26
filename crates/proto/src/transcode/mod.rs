@@ -5,10 +5,12 @@
 //! Spec: ./docs/srdd/12. SRDD - Protocol Handling and Transparent Proxying.md#123-surgical-json-body-validation-and-edits
 
 mod request;
+mod request_encode;
 mod response;
 mod types;
 
 pub use request::*;
+pub use request_encode::*;
 pub use response::*;
 pub use types::*;
 

@@ -477,7 +477,11 @@ async fn writer_enforces_batch_max_items_and_auth_failure_increment() {
 
     for i in 0..(super::BATCH_MAX_ITEMS + 5) {
         queues.durable_state.lock().insert(
-            DurableKey::AuthFailureCounter(1_000, "invalid_key".to_string(), format!("198.51.100.{i}")),
+            DurableKey::AuthFailureCounter(
+                1_000,
+                "invalid_key".to_string(),
+                format!("198.51.100.{i}"),
+            ),
             DurableOp::AuthFailureCounterIncrement {
                 minute_ms: 1_000,
                 reason: "invalid_key".to_string(),

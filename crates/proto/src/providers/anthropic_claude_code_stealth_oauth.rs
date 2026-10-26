@@ -71,7 +71,9 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
         return match endpoint {
             EndpointKind::Models => format!("{root}/v1beta/models"),
             EndpointKind::Usage => format!("{root}/v1beta/usage"),
-            EndpointKind::Embeddings => format!("{root}/v1beta/models/{default_model}:embedContent"),
+            EndpointKind::Embeddings => {
+                format!("{root}/v1beta/models/{default_model}:embedContent")
+            }
             _ => trimmed.to_string(),
         };
     }
@@ -118,26 +120,32 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let now_secs = crate::fingerprint::current_unix_timestamp_secs();
-    let mut map = BTreeMap::new();
-    map.insert("user-agent".to_string(), "claude-cli/2.1.63 (external, cli)".to_string());
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    map.insert(
+        "user-agent".to_string(),
+        "claude-cli/2.1.63 (external, cli)".to_string(),
+    );
     map.insert("x-app".to_string(), "cli".to_string());
-    map.insert("anthropic-dangerous-direct-browser-access".to_string(), "true".to_string());
+    map.insert(
+        "anthropic-dangerous-direct-browser-access".to_string(),
+        "true".to_string(),
+    );
     map.insert("anthropic-beta".to_string(), "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05".to_string());
     map.insert("x-stainless-lang".to_string(), "js".to_string());
-    map.insert("x-stainless-package-version".to_string(), "0.74.0".to_string());
+    map.insert(
+        "x-stainless-package-version".to_string(),
+        "0.74.0".to_string(),
+    );
     map.insert("x-stainless-os".to_string(), "MacOS".to_string());
     map.insert("x-stainless-arch".to_string(), "arm64".to_string());
     map.insert("x-stainless-runtime".to_string(), "node".to_string());
-    map.insert("x-stainless-runtime-version".to_string(), "v24.3.0".to_string());
+    map.insert(
+        "x-stainless-runtime-version".to_string(),
+        "v24.3.0".to_string(),
+    );
     for val in map.values_mut() {
         if val.contains("{{") {
-            *val = expand_header_template(
-                val,
-                &profile,
-                &profile.device_id,
-                session_id,
-                now_secs,
-            );
+            *val = expand_header_template(val, &profile, &profile.device_id, session_id, now_secs);
         }
     }
     let _ = (&profile, session_id, now_secs);
@@ -158,8 +166,10 @@ pub fn normalize_request_body(body: Bytes, target_model: &str) -> Bytes {
         match obj.get_mut("system") {
             Some(Value::String(s)) => {
                 if !s.contains("x-anthropic-billing-header:") {
-                    *s = format!("{billing_line}
-{s}");
+                    *s = format!(
+                        "{billing_line}
+{s}"
+                    );
                 }
             }
             Some(Value::Array(arr)) => {

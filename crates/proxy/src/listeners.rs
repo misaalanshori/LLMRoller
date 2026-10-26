@@ -17,7 +17,6 @@ use axum::{Json, Router};
 use crate::auth::{ProxyAuthState, client_key_auth_middleware};
 use crate::metrics::metrics_handler;
 use llmroller_core::client_key::ClientKeyRecord;
-use llmroller_core::seams::Clock as _;
 
 /// Build the data plane router serving `/v1/*`, `/healthz`, and `/readyz`.
 pub fn data_plane_router(state: ProxyAuthState) -> Router {

@@ -7,9 +7,7 @@ use sqlx::{SqlitePool, Transaction};
 use totp_rs::{Algorithm as TotpAlgorithm, Builder as TotpBuilder, Totp};
 
 use super::crud::{find_login_record_by_id, find_login_record_by_id_tx};
-use super::types::{
-    TotpEnrollment, TotpVerification, UserError, actor_user, ensure_admin,
-};
+use super::types::{TotpEnrollment, TotpVerification, UserError, actor_user, ensure_admin};
 use crate::crypto::{SecretSealer, XChaCha20Poly1305Sealer, sha256_hex};
 
 /// Number of one-time TOTP recovery codes issued at enrollment.
@@ -249,13 +247,12 @@ pub async fn verify_login_totp(
 
     let code_hash = recovery_hash(code);
     let mut tx = pool.begin().await?;
-    let current_json: String = sqlx::query_scalar(
-        "SELECT totp_recovery_hashes_json FROM users WHERE id = ?",
-    )
-    .bind(user_id.to_string())
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(UserError::NotFound)?;
+    let current_json: String =
+        sqlx::query_scalar("SELECT totp_recovery_hashes_json FROM users WHERE id = ?")
+            .bind(user_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(UserError::NotFound)?;
     let current_hashes: Vec<String> = serde_json::from_str(&current_json).unwrap_or_default();
     if !current_hashes.contains(&code_hash) {
         return Err(UserError::InvalidTotp);

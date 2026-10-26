@@ -7,7 +7,7 @@ pub(crate) async fn get_admin_models_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-        let model_rows = sqlx::query(
+    let model_rows = sqlx::query(
         "SELECT m.model_pk, m.canonical_id, m.origin, m.exposed, m.merge_state,
                 (SELECT COUNT(*) FROM model_routes r WHERE r.model_pk = m.model_pk) as route_count
          FROM models m ORDER BY m.canonical_id ASC",
@@ -108,13 +108,11 @@ pub(crate) async fn post_admin_model_confirm_merge_handler(
     let id_str = id.to_string();
     execute_atomic_mutation(&state, vec![ConfigDomain::Models], move |tx| {
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?",
-            )
-            .bind(&id_str)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let res = sqlx::query("UPDATE models SET merge_state = 'confirmed' WHERE model_pk = ?")
+                .bind(&id_str)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             if res.rows_affected() == 0 {
                 return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
             }
@@ -164,7 +162,7 @@ pub(crate) async fn get_user_routes_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let model_rows = sqlx::query(
+    let model_rows = sqlx::query(
         "SELECT model_pk, canonical_id, origin, exposed, merge_state, distribution, routing_strategy
          FROM models WHERE (exposed IS NULL OR exposed != 0) ORDER BY canonical_id ASC",
     )
@@ -324,7 +322,7 @@ pub(crate) async fn put_user_route_preference_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let key_info = sqlx::query(
+    let key_info = sqlx::query(
         "SELECT k.owner_user_id, p.id as provider_id, p.ownership_scope,
                 p.share_config_fingerprint
          FROM upstream_keys k
@@ -479,4 +477,3 @@ pub(crate) struct VerifyTotpRequest {
 pub(crate) struct DisableTotpRequest {
     pub password: Option<String>,
 }
-

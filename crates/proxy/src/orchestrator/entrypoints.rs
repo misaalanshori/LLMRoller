@@ -67,4 +67,3 @@ pub async fn post_embeddings(
     )
     .await
 }
-

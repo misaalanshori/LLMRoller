@@ -68,15 +68,14 @@ use sysinfo::{ProcessesToUpdate, System};
 use tokio::task::JoinSet;
 use tower::ServiceExt as _;
 
-
-#[path = "proxy_latency/types.rs"]
-pub(crate) mod types;
-#[path = "proxy_latency/mock.rs"]
-pub(crate) mod mock;
-#[path = "proxy_latency/harness.rs"]
-pub(crate) mod harness;
 #[path = "proxy_latency/benchmarks.rs"]
 pub(crate) mod benchmarks;
+#[path = "proxy_latency/harness.rs"]
+pub(crate) mod harness;
+#[path = "proxy_latency/mock.rs"]
+pub(crate) mod mock;
+#[path = "proxy_latency/types.rs"]
+pub(crate) mod types;
 
 pub(crate) use benchmarks::*;
 pub(crate) use harness::*;

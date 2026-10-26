@@ -27,13 +27,13 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
 pub(crate) use llmroller_store::users::{NewUser, create_user};
 
-#[path = "e2e_dashboard_htmx/setup.rs"]
-pub(crate) mod setup;
 #[path = "e2e_dashboard_htmx/dashboards_and_partials.rs"]
 mod dashboards_and_partials;
-#[path = "e2e_dashboard_htmx/usage_ledger_and_csv.rs"]
-mod usage_ledger_and_csv;
 #[path = "e2e_dashboard_htmx/logs_and_analytics.rs"]
 mod logs_and_analytics;
+#[path = "e2e_dashboard_htmx/setup.rs"]
+pub(crate) mod setup;
+#[path = "e2e_dashboard_htmx/usage_ledger_and_csv.rs"]
+mod usage_ledger_and_csv;
 
 pub(crate) use setup::*;

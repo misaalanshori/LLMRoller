@@ -541,4 +541,3 @@ async fn verify_audit_log_command(args: VerifyAuditLogArgs) -> Result<(), CliFai
     }
     Ok(())
 }
-

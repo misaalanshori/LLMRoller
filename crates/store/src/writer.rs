@@ -382,13 +382,14 @@ pub async fn bump_config_version_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
 
-    sqlx::query_scalar(
+    let res = sqlx::query_scalar(
         "UPDATE instance_meta SET config_version = config_version + 1, updated_at = ?
          RETURNING config_version",
     )
     .bind(now)
-    .fetch_one(&mut **tx)
-    .await
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(res.unwrap_or(1))
 }
 
 pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
@@ -631,8 +632,11 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
     let rh_backup = queues.usage_writer.rollups_hourly.lock().clone();
     let raw_backup = queues.usage_writer.raw_events.lock().clone();
 
-    // 2. Flush usage rollups, usage_events, and usage_attempts
-    let usage_res = queues.usage_writer.flush_to_db(&mut transaction).await;
+    // 2. Flush usage rollups, usage_events, and usage_attempts bounded by BATCH_MAX_ITEMS/BYTES (FND-017)
+    let usage_res = queues
+        .usage_writer
+        .flush_bounded_to_db(&mut transaction, BATCH_MAX_ITEMS, BATCH_MAX_BYTES)
+        .await;
 
     // 2b. Persist sealed traces immediately after their `usage_events` rows so
     // the foreign key is satisfied without a retry loop (F09). A trace whose
@@ -646,7 +650,11 @@ pub async fn flush_data_queues(pool: &SqlitePool, queues: &DataQueues) {
                 break;
             };
             bytes_acc += item.payload_enc.len()
-                + item.sealed_blocks.iter().map(|(_, b, _)| b.len()).sum::<usize>();
+                + item
+                    .sealed_blocks
+                    .iter()
+                    .map(|(_, b, _)| b.len())
+                    .sum::<usize>();
             batch.push(item);
         }
         batch

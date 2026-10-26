@@ -97,7 +97,7 @@ pub(crate) async fn authorize_budget_window_key(
     actor: &llmroller_core::rbac::ActorScope,
     upstream_key_id: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-        let row = sqlx::query(
+    let row = sqlx::query(
         "SELECT k.owner_user_id, p.ownership_scope
          FROM upstream_keys k JOIN providers p ON p.id = k.provider_id
          WHERE k.id = ?",
@@ -127,7 +127,7 @@ pub(crate) async fn list_budget_windows_internal(
     actor: &llmroller_core::rbac::ActorScope,
     upstream_key_id: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        authorize_budget_window_key(state, actor, upstream_key_id).await?;
+    authorize_budget_window_key(state, actor, upstream_key_id).await?;
     let rows = sqlx::query(
         "SELECT id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms,
                 anchor_at, upstream_window_kind, limit_micro_usd, reserve_pct
@@ -296,7 +296,7 @@ pub(crate) async fn patch_budget_window_internal(
     id: String,
     payload: PatchBudgetWindowRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let row = sqlx::query(
+    let row = sqlx::query(
         "SELECT scope_kind, upstream_key_id, model_pk, window_kind, period_ms, anchor_at,
                 upstream_window_kind, limit_micro_usd, reserve_pct
          FROM budget_windows WHERE id = ?",
@@ -414,7 +414,7 @@ pub(crate) async fn get_budget_window_adjustments_internal(
     actor: &llmroller_core::rbac::ActorScope,
     id: String,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
+    let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.auth.reader_pool)
         .await
@@ -454,7 +454,7 @@ pub(crate) async fn post_budget_window_adjustment_internal(
     id: String,
     payload: CreateBudgetAdjustmentRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
+    let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.auth.reader_pool)
         .await
@@ -547,4 +547,3 @@ pub(crate) async fn post_admin_budget_window_adjustment_handler(
     let actor = authenticate_admin(&state, &headers, true).await?;
     post_budget_window_adjustment_internal(&state, &actor, id, payload).await
 }
-

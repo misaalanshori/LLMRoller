@@ -126,7 +126,9 @@ pub(crate) async fn post_resume_client_key_handler(
     Ok(Json(key))
 }
 
-pub(crate) fn map_service_account_error(err: ServiceAccountError) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn map_service_account_error(
+    err: ServiceAccountError,
+) -> (StatusCode, Json<serde_json::Value>) {
     let (status, code) = match &err {
         ServiceAccountError::Forbidden => (StatusCode::FORBIDDEN, "permission_denied"),
         ServiceAccountError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
@@ -190,4 +192,3 @@ pub(crate) struct CreateShareRequest {
 pub(crate) struct AcceptShareRequest {
     pub fingerprint: String,
 }
-

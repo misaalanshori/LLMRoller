@@ -379,7 +379,7 @@ pub(crate) async fn post_test_upstream_key_handler(
 
     use llmroller_core::seams::ExposeSecret as _;
     use llmroller_store::crypto::SecretSealer as _;
-        let key = sqlx::query(
+    let key = sqlx::query(
         "SELECT k.id, k.owner_user_id, k.secret_enc, k.master_key_id, p.id AS provider_id,
                 p.ownership_scope, p.base_url, p.kind, p.config_json, p.allow_private_network
          FROM upstream_keys k

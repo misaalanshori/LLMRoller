@@ -1,9 +1,7 @@
 use bytes::Bytes;
 use serde_json::{Value, json};
 
-use super::types::{
-    CanonicalResponse, CanonicalToolCall, WireProtocol, extract_text_from_value,
-};
+use super::types::{CanonicalResponse, CanonicalToolCall, WireProtocol, extract_text_from_value};
 
 /// Parse an upstream non-streaming JSON response from `upstream_proto` into [`CanonicalResponse`] (`F099`, `FND-012`).
 pub fn parse_canonical_response(
@@ -196,10 +194,7 @@ pub fn parse_canonical_response(
             {
                 if let Some(parts) = cand.pointer("/content/parts").and_then(Value::as_array) {
                     for p in parts {
-                        let is_thought = p
-                            .get("thought")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
+                        let is_thought = p.get("thought").and_then(Value::as_bool).unwrap_or(false);
                         if let Some(t) = p.get("text").and_then(Value::as_str) {
                             if is_thought {
                                 reasoning = Some(t.to_string());
@@ -302,7 +297,11 @@ pub fn parse_canonical_response(
             if let Some(rc) = val.get("reasoning").and_then(Value::as_str) {
                 reasoning = Some(rc.to_string());
             }
-            if let Some(tcs) = val.get("toolCalls").or_else(|| val.get("tool_calls")).and_then(Value::as_array) {
+            if let Some(tcs) = val
+                .get("toolCalls")
+                .or_else(|| val.get("tool_calls"))
+                .and_then(Value::as_array)
+            {
                 for tc in tcs {
                     let id = tc
                         .get("toolCallId")
@@ -319,8 +318,18 @@ pub fn parse_canonical_response(
                         .to_string();
                     let args = tc
                         .get("args")
-                        .map(|v| if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() })
-                        .or_else(|| tc.pointer("/function/arguments").and_then(Value::as_str).map(str::to_string))
+                        .map(|v| {
+                            if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else {
+                                v.to_string()
+                            }
+                        })
+                        .or_else(|| {
+                            tc.pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
                         .unwrap_or_else(|| "{}".to_string());
                     tool_calls.push(CanonicalToolCall {
                         id,
@@ -329,7 +338,10 @@ pub fn parse_canonical_response(
                     });
                 }
             }
-            if let Some(u) = val.get("usage").or_else(|| val.pointer("/meta/billed_units")) {
+            if let Some(u) = val
+                .get("usage")
+                .or_else(|| val.pointer("/meta/billed_units"))
+            {
                 input_tokens = u
                     .get("promptTokens")
                     .or_else(|| u.get("input_tokens"))
@@ -777,7 +789,10 @@ impl SseStreamTranscoder {
 
         // Extract text delta
         let mut text_delta: Option<String> = None;
-        if let Some(d) = val.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+        if let Some(d) = val
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
             if !d.is_empty() {
                 text_delta = Some(d.to_string());
             }
@@ -791,7 +806,9 @@ impl SseStreamTranscoder {
         {
             text_delta = Some(d.to_string());
         } else if matches!(
-            val.get("type").or_else(|| val.get("event_type")).and_then(Value::as_str),
+            val.get("type")
+                .or_else(|| val.get("event_type"))
+                .and_then(Value::as_str),
             Some("text-delta" | "text-generation")
         ) && let Some(d) = val
             .get("textDelta")
@@ -1147,9 +1164,7 @@ impl SseStreamTranscoder {
                             "input": {},
                         }
                     });
-                    out.push_str(&format!(
-                        "event: content_block_start\ndata: {start_ev}\n\n"
-                    ));
+                    out.push_str(&format!("event: content_block_start\ndata: {start_ev}\n\n"));
                 }
                 if !tc.arguments_json.is_empty() {
                     let delta_ev = json!({
@@ -1160,15 +1175,13 @@ impl SseStreamTranscoder {
                             "partial_json": tc.arguments_json,
                         }
                     });
-                    out.push_str(&format!(
-                        "event: content_block_delta\ndata: {delta_ev}\n\n"
-                    ));
+                    out.push_str(&format!("event: content_block_delta\ndata: {delta_ev}\n\n"));
                 }
                 out
             }
             WireProtocol::GoogleGemini | WireProtocol::CloudCodeAssist => {
-                let args_val = serde_json::from_str::<Value>(&tc.arguments_json)
-                    .unwrap_or_else(|_| json!({}));
+                let args_val =
+                    serde_json::from_str::<Value>(&tc.arguments_json).unwrap_or_else(|_| json!({}));
                 let g = json!({
                     "candidates": [{
                         "index": 0,
@@ -1249,9 +1262,7 @@ impl SseStreamTranscoder {
                         }
                     }
                 });
-                out.push(format!(
-                    "event: response.completed\ndata: {completed}\n\n"
-                ));
+                out.push(format!("event: response.completed\ndata: {completed}\n\n"));
             }
             WireProtocol::Messages => {
                 let stop_reason = if has_tool_calls || self.next_tool_index > 0 {

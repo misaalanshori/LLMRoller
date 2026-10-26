@@ -2,7 +2,8 @@ use super::*;
 
 use llmroller_store::users::{NewUser, create_user};
 
-pub(crate) async fn setup_dashboard_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey, UserId) {
+pub(crate) async fn setup_dashboard_test_db()
+-> (tempfile::TempDir, sqlx::SqlitePool, MasterKey, UserId) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("dashboard_test.db");
 
@@ -51,4 +52,3 @@ pub(crate) fn assert_no_raw_user_markup(body: &str, context: &str) {
         "{context} did not render the payload escaped"
     );
 }
-

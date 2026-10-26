@@ -12,8 +12,8 @@ pub(crate) use args::*;
 pub(crate) use maintenance::*;
 pub(crate) use serve::*;
 
-use std::process::ExitCode;
 use clap::Parser;
+use std::process::ExitCode;
 
 /// Parse arguments and dispatch one command.
 pub(crate) async fn main() -> ExitCode {

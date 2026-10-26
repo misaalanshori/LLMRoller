@@ -115,7 +115,6 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
     assert!(csv_str.contains("/api/user/client-keys"));
 }
 
-
 #[doc = "Spec: USG-9 — Dual-Stream Logs Explorer, Request Detail Inspection Drawer, and CSV export"]
 #[tokio::test]
 async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
@@ -367,7 +366,6 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
     assert!(admin_html.contains("id=\"tab-adm-logs\""));
     assert!(admin_html.contains("id=\"right-inspection-drawer\""));
 }
-
 
 #[doc = "Spec: UI-6 — Overview Analytics Dashboard KPI summary cards, time series, and model breakdown"]
 #[tokio::test]

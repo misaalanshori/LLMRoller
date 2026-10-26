@@ -426,7 +426,8 @@ fn test_extended_provider_usage_extraction_and_large_multimodal_sse_frame() {
     let mut tap = SseUsageTap::new(EndpointKind::Chat);
     let large_b64 = "A".repeat(1_200_000);
     let frame = format!(
-        "data: {{"choices":[{{"delta":{{"content":"{large_b64}"}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":20}}}}\n\n"
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":20}}}}\n\n",
+        large_b64
     );
     tap.feed_chunk(frame.as_bytes());
     let u_stream = tap.finalize_usage();

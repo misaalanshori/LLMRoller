@@ -71,7 +71,9 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
         return match endpoint {
             EndpointKind::Models => format!("{root}/v1beta/models"),
             EndpointKind::Usage => format!("{root}/v1beta/usage"),
-            EndpointKind::Embeddings => format!("{root}/v1beta/models/{default_model}:embedContent"),
+            EndpointKind::Embeddings => {
+                format!("{root}/v1beta/models/{default_model}:embedContent")
+            }
             _ => trimmed.to_string(),
         };
     }
@@ -118,18 +120,12 @@ pub fn build_endpoint_url(base_url: &str, endpoint: EndpointKind) -> String {
 pub fn synthesize_headers(key_id: &str, session_id: &str) -> BTreeMap<String, String> {
     let profile = DeviceProfile::from_key_id(key_id);
     let now_secs = crate::fingerprint::current_unix_timestamp_secs();
-    let mut map = BTreeMap::new();
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
     map.insert("x-amzn-kiro-agent-mode".to_string(), "vibe".to_string());
     map.insert("amz-sdk-invocation-id".to_string(), "{{uuid}}".to_string());
     for val in map.values_mut() {
         if val.contains("{{") {
-            *val = expand_header_template(
-                val,
-                &profile,
-                &profile.device_id,
-                session_id,
-                now_secs,
-            );
+            *val = expand_header_template(val, &profile, &profile.device_id, session_id, now_secs);
         }
     }
     let _ = (&profile, session_id, now_secs);

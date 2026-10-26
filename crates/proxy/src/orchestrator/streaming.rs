@@ -7,7 +7,10 @@ pub(crate) struct InFlightGuard {
 }
 
 impl InFlightGuard {
-    pub(crate) fn new(tracker: Arc<llmroller_core::runtime_state::LoadTracker>, route: RouteId) -> Self {
+    pub(crate) fn new(
+        tracker: Arc<llmroller_core::runtime_state::LoadTracker>,
+        route: RouteId,
+    ) -> Self {
         tracker.begin(route);
         Self { tracker, route }
     }
@@ -28,7 +31,10 @@ pub(crate) fn upstream_content_encoding(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn decode_upstream_body(encoding: Option<&str>, body: Bytes) -> Result<Bytes, ForwardError> {
+pub(crate) fn decode_upstream_body(
+    encoding: Option<&str>,
+    body: Bytes,
+) -> Result<Bytes, ForwardError> {
     match encoding {
         Some(encoding) => decompress_chunk(encoding, &body).map(Bytes::from),
         None => Ok(body),
@@ -128,4 +134,3 @@ pub(crate) enum StreamStep {
     Idle,
     Shutdown,
 }
-

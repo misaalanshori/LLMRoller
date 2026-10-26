@@ -546,10 +546,9 @@ fn start_reloader_inner(
     let supervisor = crate::shutdown::JobSupervisor::new("reloader");
     let (stop_tx, stop_rx) = watch::channel(false);
 
-    let join_handle =
-        tokio::spawn(async move {
-            let _keep_alive = stop_tx;
-            supervisor
+    let join_handle = tokio::spawn(async move {
+        let _keep_alive = stop_tx;
+        supervisor
             .run_supervised(stop_rx, move |mut job_stop| {
                 let rx_arc = rx_arc.clone();
                 let pool = pool.clone();
@@ -791,7 +790,7 @@ fn start_reloader_inner(
                 }
             })
             .await;
-        });
+    });
 
     (handle, join_handle)
 }

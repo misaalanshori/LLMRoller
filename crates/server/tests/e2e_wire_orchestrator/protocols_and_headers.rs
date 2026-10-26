@@ -44,7 +44,6 @@ async fn test_non_chat_streaming_does_not_inject_chat_stream_options() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: API-4 — F03 provider-native chat_stream mode suppresses injection"]
 async fn test_provider_native_chat_stream_mode_preserves_body() {
@@ -74,7 +73,6 @@ async fn test_provider_native_chat_stream_mode_preserves_body() {
 
     let _ = mock_state;
 }
-
 
 #[tokio::test]
 #[doc = "Spec: API-2, API-3, PRV-3 — F03 honors provider header, UA, auth and response profiles"]
@@ -156,7 +154,6 @@ async fn test_provider_profile_applies_headers_ua_auth_and_response_allowlist() 
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: API-2, PRV-3 — F03 supports per-protocol x-api-key authentication"]
 async fn test_messages_auth_scheme_uses_configured_x_api_key() {
@@ -202,4 +199,3 @@ async fn test_messages_auth_scheme_uses_configured_x_api_key() {
         "native Anthropic Messages requests require anthropic-version"
     );
 }
-

@@ -154,7 +154,11 @@ pub(crate) fn json_error(status: StatusCode, code: &str, message: impl Into<Stri
 
 /// Anthropic errors always carry a concrete `request_id`, so generate one when
 /// the caller has not created it yet (schema requires the field).
-pub(crate) fn messages_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn messages_error(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Response {
     let request_id = RequestId::generate().to_string();
     protocol_error(true, status, code, message, Some(&request_id), None)
 }
@@ -427,4 +431,3 @@ pub(crate) fn gate_error_response(
     }
     response
 }
-

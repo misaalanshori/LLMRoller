@@ -447,10 +447,9 @@ pub(crate) fn build_upstream_headers(
     if let Some(ref preset_id) = candidate.config.preset_id
         && let Some(spec) = llmroller_proto::providers::lookup_provider_preset(preset_id)
     {
-        for (hk, hv) in (spec.synthesize_headers)(
-            &candidate.upstream_key_id.to_string(),
-            sess_token_for_tpl,
-        ) {
+        for (hk, hv) in
+            (spec.synthesize_headers)(&candidate.upstream_key_id.to_string(), sess_token_for_tpl)
+        {
             if hk.to_ascii_lowercase().starts_with("x-llmroller-") {
                 continue;
             }
@@ -850,7 +849,10 @@ pub(crate) struct PinFailureContext<'a> {
 }
 
 impl PinFailureContext<'_> {
-    pub(crate) fn select(&self, tried: &[UpstreamKeyId]) -> Option<(UpstreamKeyId, CandidatePoolTier)> {
+    pub(crate) fn select(
+        &self,
+        tried: &[UpstreamKeyId],
+    ) -> Option<(UpstreamKeyId, CandidatePoolTier)> {
         select_next_candidate(
             self.runtime,
             self.snapshot,
@@ -975,4 +977,3 @@ pub(crate) fn unseal_upstream_key(
         }
     }
 }
-

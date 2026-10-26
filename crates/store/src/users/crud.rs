@@ -10,9 +10,8 @@ use sqlx::{Connection as _, Row, SqlitePool, Transaction};
 
 use super::password::{generate_temporary_password, hash_password, verify_password};
 use super::types::{
-    NewUser, ResetAdminResult, User, UserError, UserLoginRecord, UserPatch,
-    actor_user, ensure_admin, ensure_self_or_admin, role_from_str, user_from_row,
-    validate_username,
+    NewUser, ResetAdminResult, User, UserError, UserLoginRecord, UserPatch, actor_user,
+    ensure_admin, ensure_self_or_admin, role_from_str, user_from_row, validate_username,
 };
 use crate::audit::{self, AuditEntry};
 

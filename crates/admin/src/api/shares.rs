@@ -10,7 +10,7 @@ pub(crate) async fn get_user_shares_handler(
         .user_id()
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
-        let outgoing_rows = sqlx::query(
+    let outgoing_rows = sqlx::query(
         "SELECT id, provider_id, upstream_key_id, grantee_user_id, allowed_models, max_monthly_micro_usd, accepted_config_fingerprint, admin_approved_at, enabled, created_at, revoked_at FROM provider_shares WHERE owner_user_id = ? ORDER BY created_at DESC"
     )
     .bind(user_id.to_string())
@@ -191,13 +191,12 @@ pub(crate) async fn delete_user_share_handler(
         s
     };
     if let Some(ref store) = state.pin_store {
-        let ckids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM client_keys WHERE owner_user_id = ?",
-        )
-        .bind(share_info.grantee_user_id.to_string())
-        .fetch_all(&state.auth.pool)
-        .await
-        .unwrap_or_default();
+        let ckids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM client_keys WHERE owner_user_id = ?")
+                .bind(share_info.grantee_user_id.to_string())
+                .fetch_all(&state.auth.pool)
+                .await
+                .unwrap_or_default();
         for ckid_str in ckids {
             if let Ok(ckid) = llmroller_core::ids::ClientKeyId::parse(&ckid_str) {
                 store.invalidate_client_key(&ckid);
@@ -264,4 +263,3 @@ pub(crate) async fn post_admin_share_approve_handler(
 
     Ok(StatusCode::OK)
 }
-

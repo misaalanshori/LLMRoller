@@ -185,7 +185,12 @@ pub(crate) fn body_for_size(size: usize) -> Bytes {
     Bytes::from(body)
 }
 
-pub(crate) fn build_request(token: &str, body: Bytes, hold: bool, delay_ms: Option<u64>) -> Request<Body> {
+pub(crate) fn build_request(
+    token: &str,
+    body: Bytes,
+    hold: bool,
+    delay_ms: Option<u64>,
+) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -371,4 +376,3 @@ pub(crate) fn deterministic_lognormal_delay_ms(state: &mut u64) -> u64 {
     let delay = 2_000.0 * (0.842_7 * z).exp();
     delay.clamp(50.0, 30_000.0) as u64
 }
-

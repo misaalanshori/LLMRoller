@@ -20,7 +20,10 @@ pub fn router() -> Router {
 }
 
 fn asset_response(headers: &HeaderMap, content_type: &'static str, body: &'static str) -> Response {
-    let etag = format!(""{}"", &llmroller_store::crypto::sha256_hex(body.as_bytes())[..16]);
+    let etag = format!(
+        "\"{}\"",
+        &llmroller_store::crypto::sha256_hex(body.as_bytes())[..16]
+    );
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())

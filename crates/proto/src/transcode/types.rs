@@ -25,7 +25,9 @@ impl WireProtocol {
             "gemini" | "google_gemini" => Some(Self::GoogleGemini),
             "cloudcode" | "cloud_code_assist" | "antigravity" => Some(Self::CloudCodeAssist),
             "bedrock" | "bedrock_converse" => Some(Self::BedrockConverseStream),
-            "command_code_generate" | "alpha_generate" | "command_code" => Some(Self::CommandCodeGenerate),
+            "command_code_generate" | "alpha_generate" | "command_code" => {
+                Some(Self::CommandCodeGenerate)
+            }
             _ => None,
         }
     }

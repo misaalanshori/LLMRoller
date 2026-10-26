@@ -34,7 +34,7 @@ pub(crate) async fn list_client_key_sessions_internal(
     actor: &ActorScope,
     client_key_id: &ClientKeyId,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let is_admin = actor.is_admin() || actor.is_system();
+    let is_admin = actor.is_admin() || actor.is_system();
     let rows = sqlx::query(
         r#"SELECT session_hash, MAX(ts) as last_active_at, COUNT(*) as traced_turn_count
            FROM trace_records
@@ -240,7 +240,7 @@ pub(crate) async fn get_session_preview_internal(
     use llmroller_core::seams::ExposeSecret as _;
     use llmroller_store::crypto::SecretSealer as _;
     use llmroller_store::traces::StoredTurnTraceV2;
-    
+
     let query_str = if owner_user_id.is_some() {
         "SELECT usage_event_id, request_id, ts, owner_user_id, client_key_id, session_hash,
                 thread_id, canonical_id, protocol, truncated_content, payload_enc, master_key_id
@@ -607,7 +607,7 @@ pub(crate) async fn get_trace_record_internal(
     use llmroller_core::seams::ExposeSecret as _;
     use llmroller_store::crypto::SecretSealer as _;
     use llmroller_store::traces::StoredTurnTraceV2;
-    
+
     let row = sqlx::query(
         "SELECT request_id, owner_user_id, session_hash, payload_enc, master_key_id
          FROM trace_records
@@ -677,7 +677,7 @@ pub(crate) async fn delete_admin_session_trace_handler(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
 
-        let rows =
+    let rows =
         sqlx::query("SELECT DISTINCT owner_user_id FROM trace_records WHERE session_hash = ?")
             .bind(&session_hash)
             .fetch_all(&state.auth.pool)
@@ -828,7 +828,7 @@ pub(crate) async fn get_active_pins_handler(
     let now_ms = state.auth.clock.now_ms();
     let uid_opt = actor.user_id().map(|u| u.to_string());
 
-        let query_str = if actor.is_admin() {
+    let query_str = if actor.is_admin() {
         "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
          FROM pins p
          LEFT JOIN models m ON p.model_pk = m.model_pk
@@ -1033,7 +1033,10 @@ pub(crate) async fn post_admin_move_session_pin_handler(
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let Some((key_owner_uid, key_scope)) = key_meta else {
-        return Err(map_price_error(StatusCode::NOT_FOUND, "upstream key not found"));
+        return Err(map_price_error(
+            StatusCode::NOT_FOUND,
+            "upstream key not found",
+        ));
     };
 
     if let Some(ref cid) = payload.canonical_id {
@@ -1204,4 +1207,3 @@ pub(crate) struct PutRoutePreferenceRequest {
     pub priority_override: Option<u32>,
     pub enabled: Option<bool>,
 }
-

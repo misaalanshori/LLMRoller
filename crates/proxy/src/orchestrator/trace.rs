@@ -18,7 +18,11 @@ pub(crate) struct TraceCapture {
 }
 
 impl TraceCapture {
-    pub(crate) fn new(request_body: Bytes, retention_days: i64, first_chunk: Option<&Bytes>) -> Self {
+    pub(crate) fn new(
+        request_body: Bytes,
+        retention_days: i64,
+        first_chunk: Option<&Bytes>,
+    ) -> Self {
         let (mut tap, _receiver) = TraceTap::new();
         // F013 & F014: Account captured request_body against the 256 MiB GLOBAL_TRACE_BYTES budget.
         let retained_body = if tap.reserve_global_bytes(request_body.len()) {
@@ -353,7 +357,8 @@ impl StreamFinalizer {
                 llmroller_core::usage::AttemptOutcome::WriteStalled
             }
         };
-        let final_charge_basis = if termination.is_incomplete() && self.tap.observed_usage.is_none() {
+        let final_charge_basis = if termination.is_incomplete() && self.tap.observed_usage.is_none()
+        {
             "estimated_incomplete"
         } else {
             "actual"
@@ -567,4 +572,3 @@ impl Drop for ActiveStreamGuard {
         crate::metrics::record_active_streams(prev.saturating_sub(1));
     }
 }
-

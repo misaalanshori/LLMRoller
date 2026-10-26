@@ -15,7 +15,12 @@ pub(crate) struct MockUpstreamState {
     pub recorded: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
-pub(crate) fn record_request(state: &MockUpstreamState, path: &'static str, headers: &HeaderMap, body: &[u8]) {
+pub(crate) fn record_request(
+    state: &MockUpstreamState,
+    path: &'static str,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
     state
         .recorded
         .lock()
@@ -547,7 +552,11 @@ pub(crate) fn streaming_request(uri: &str, token: &str, body: &str) -> Request<B
         .expect("request")
 }
 
-pub(crate) fn chat_request_with_header(token: &str, name: &'static str, value: &'static str) -> Request<Body> {
+pub(crate) fn chat_request_with_header(
+    token: &str,
+    name: &'static str,
+    value: &'static str,
+) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -585,4 +594,3 @@ pub(crate) fn recorded_authorizations(state: &MockUpstreamState) -> Vec<String> 
         })
         .collect()
 }
-

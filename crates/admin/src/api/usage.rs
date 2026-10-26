@@ -28,7 +28,8 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
             .unwrap_or(0);
 
     let projected_bytes =
-        ((projected_daily_requests as f64) * (retention_days as f64) * 600.0 * 1.3) + (trace_bytes as f64);
+        ((projected_daily_requests as f64) * (retention_days as f64) * 600.0 * 1.3)
+            + (trace_bytes as f64);
     let projected_disk_mb = (projected_bytes / (1024.0 * 1024.0) * 10.0).round() / 10.0;
 
     let unpriced_count: i64 = sqlx::query_scalar::<_, i64>(
@@ -131,7 +132,7 @@ pub(crate) async fn get_usage_summary_internal(
     owner_user_id: Option<String>,
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        // USG-1/USG-2: aggregate from the hourly rollups instead of scanning raw
+    // USG-1/USG-2: aggregate from the hourly rollups instead of scanning raw
     // `usage_events`; the rollups carry the same token/cost columns and are
     // written in the same transaction batch as the raw rows (`REL-3`).
     let rollup_sql = if owner_user_id.is_some() {
@@ -270,7 +271,7 @@ pub(crate) async fn get_usage_timeseries_internal(
     owner_user_id: Option<String>,
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        // Hourly buckets keep the payload small enough for the uPlot consumer while
+    // Hourly buckets keep the payload small enough for the uPlot consumer while
     // still covering multi-week ranges (`USG-1`, `REL-3`).
     let sql = if owner_user_id.is_some() {
         "SELECT hour_ms AS bucket_ms,
@@ -361,7 +362,7 @@ pub(crate) async fn get_usage_breakdown_internal(
     owner_user_id: Option<String>,
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let sql = if owner_user_id.is_some() {
+    let sql = if owner_user_id.is_some() {
         "SELECT canonical_id,
                 COALESCE(SUM(requests), 0) AS requests,
                 COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
@@ -452,7 +453,7 @@ pub(crate) async fn get_usage_event_breakdown_internal(
     event_id_or_request_id: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use llmroller_core::pricing::{ContextTier, Rates, Schedule, TokenUsage, div_ceil_i128};
-    
+
     let sql = if owner_user_id.is_some() {
         "SELECT id, ts, request_id, canonical_id, upstream_key_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
@@ -669,7 +670,7 @@ pub(crate) async fn get_usage_events_internal(
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50).clamp(1, 5000);
-    
+
     let query_str = if owner_user_id.is_some() {
         "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
                 input_uncached_tokens, cache_read_tokens, output_tokens, error_code
@@ -760,7 +761,7 @@ pub(crate) async fn export_csv_internal(
     params: UsageFilterParams,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     use llmroller_proto::headers::sanitize_csv_cell;
-    
+
     let query_str = if owner_user_id.is_some() {
         "SELECT id, ts, canonical_id, status, cost_micro_usd,
                 input_uncached_tokens, cache_read_tokens, output_tokens, error_code
@@ -944,7 +945,7 @@ pub(crate) async fn get_usage_ledger_internal(
     owner_user_id: Option<String>,
     query: LedgerQuery,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-        let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
 
     let agg_sql = if owner_user_id.is_some() {
         "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
@@ -1127,7 +1128,7 @@ pub(crate) async fn get_overview_internal(
     owner_user_id: Option<String>,
     query: OverviewQuery,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-        let now_ms = state.auth.clock.now_ms();
+    let now_ms = state.auth.clock.now_ms();
     let since_ms = if let Some(s) = query.since {
         s
     } else {
@@ -1374,4 +1375,3 @@ pub(crate) async fn control_plane_logging_middleware(
 // ---------------------------------------------------------------------------
 // HTMX Partial Endpoints (SRDD Section 14.3)
 // ---------------------------------------------------------------------------
-

@@ -133,17 +133,18 @@ pub(crate) fn resolve_session(
     if let (Some(session_hash), true, Some((sys, usr))) =
         (raw_hash.as_ref(), step.is_generic(), canonical.as_ref())
     {
-        let (is_flagged, newly_flagged) = runtime_state.constant_session_detector.observe_and_check(
-            client_key.id,
-            session_hash.clone(),
-            &llmroller_core::session::PromptContext {
-                sys,
-                usr,
-                has_claude_code_agent_id: headers.contains_key("x-claude-code-agent-id"),
-                step,
-            },
-            now_ms,
-        );
+        let (is_flagged, newly_flagged) =
+            runtime_state.constant_session_detector.observe_and_check(
+                client_key.id,
+                session_hash.clone(),
+                &llmroller_core::session::PromptContext {
+                    sys,
+                    usr,
+                    has_claude_code_agent_id: headers.contains_key("x-claude-code-agent-id"),
+                    step,
+                },
+                now_ms,
+            );
         detector_flagged = is_flagged;
         if newly_flagged {
             crate::metrics::record_constant_session_suspected();
@@ -274,4 +275,3 @@ pub(crate) async fn read_bounded_error_body(response: reqwest::Response) -> Byte
     }
     Bytes::from(buffer)
 }
-

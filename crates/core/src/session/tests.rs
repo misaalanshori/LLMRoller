@@ -314,7 +314,7 @@ fn test_observe_and_check_persists_flagged_state_across_subsequent_calls() {
             sys: b"system",
             usr: usr.as_bytes(),
             has_claude_code_agent_id: false,
-            step: SessionPrecedenceStep::HeaderSessionId,
+            step: SessionPrecedenceStep::Step6GenericHeaders,
         };
         let (is_flagged, newly_flagged) =
             detector.observe_and_check(key_id, session_hash.clone(), &ctx, now_ms);
@@ -326,7 +326,7 @@ fn test_observe_and_check_persists_flagged_state_across_subsequent_calls() {
         sys: b"system",
         usr: b"distinct prompt 20",
         has_claude_code_agent_id: false,
-        step: SessionPrecedenceStep::HeaderSessionId,
+        step: SessionPrecedenceStep::Step6GenericHeaders,
     };
     let (is_flagged_21, newly_flagged_21) =
         detector.observe_and_check(key_id, session_hash.clone(), &ctx_21, now_ms);
@@ -338,7 +338,7 @@ fn test_observe_and_check_persists_flagged_state_across_subsequent_calls() {
         sys: b"system",
         usr: b"distinct prompt 21",
         has_claude_code_agent_id: false,
-        step: SessionPrecedenceStep::HeaderSessionId,
+        step: SessionPrecedenceStep::Step6GenericHeaders,
     };
     let (is_flagged_22, newly_flagged_22) =
         detector.observe_and_check(key_id, session_hash, &ctx_22, now_ms + 1_000);

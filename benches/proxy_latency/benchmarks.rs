@@ -1,7 +1,11 @@
 use super::*;
 
 #[doc = "Spec: PERF-1"]
-pub(crate) async fn bench_perf1(harness: &Harness, scale: &Scale, mock_address: SocketAddr) -> LoadResult {
+pub(crate) async fn bench_perf1(
+    harness: &Harness,
+    scale: &Scale,
+    mock_address: SocketAddr,
+) -> LoadResult {
     warm_up(harness, 20, 64 * 1024).await;
     let body_64k = body_for_size(64 * 1024);
     let direct_64k = run_direct_load(mock_address, body_64k.clone(), 20, 100.0).await;
@@ -188,7 +192,11 @@ pub(crate) fn bench_perf2(frames: usize) -> Perf2Result {
     }
 }
 
-pub(crate) async fn open_held_stream(app: Router, token: String, body: Bytes) -> Result<Body, String> {
+pub(crate) async fn open_held_stream(
+    app: Router,
+    token: String,
+    body: Bytes,
+) -> Result<Body, String> {
     let request = build_request(&token, body, true, None);
     let response = app
         .oneshot(request)
@@ -205,7 +213,12 @@ pub(crate) async fn open_held_stream(app: Router, token: String, body: Bytes) ->
     }
 }
 
-pub(crate) async fn bench_perf3(harness: &Harness, scale: &Scale, rss_limit: u64, label: &str) -> SoakResult {
+pub(crate) async fn bench_perf3(
+    harness: &Harness,
+    scale: &Scale,
+    rss_limit: u64,
+    label: &str,
+) -> SoakResult {
     let baseline_rss = rss_bytes();
     let stream_body_bytes = PERF3_STREAM_BODY_BYTES;
     warm_up(harness, 10, 64 * 1024).await;
@@ -824,4 +837,3 @@ pub(crate) async fn bench_perf5(scale: &Scale, mock_address: SocketAddr) -> (Sta
 
     (plain_stats, trace_stats)
 }
-

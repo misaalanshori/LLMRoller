@@ -181,7 +181,6 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     assert!(admin_html_rendered.contains("Projected Disk Usage"));
 }
 
-
 #[doc = "Spec: SHR-3, MDL-3, MDL-4, UI-2, Section 3.3 (A6)"]
 #[tokio::test]
 async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
@@ -340,7 +339,6 @@ async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
     assert!(overview_json["projected_disk_mb"].is_number());
     assert!(overview_json["unpriced_models_count"].is_number());
 }
-
 
 #[doc = "Spec: UI-1, UI-2, UI-3, UI-4, SEC-5, SEC-6, SHR-3, RTE-7"]
 #[tokio::test]
@@ -621,4 +619,3 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
     assert!(adm_ov_html.contains("Projected Disk Usage:"));
     assert!(adm_ov_html.contains("disk-meter"));
 }
-

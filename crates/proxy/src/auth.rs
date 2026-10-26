@@ -522,7 +522,9 @@ pub async fn client_key_auth_middleware(
                     )
                 }
                 GateFailure::G4CidrForbidden => {
-                    state.record_failure(client_ip, "cidr_forbidden", now_ms).await;
+                    state
+                        .record_failure(client_ip, "cidr_forbidden", now_ms)
+                        .await;
                     record_gate_usage_event(403, "permission_error");
                     crate::orchestrator::build_protocol_error_response(
                         is_messages_path,

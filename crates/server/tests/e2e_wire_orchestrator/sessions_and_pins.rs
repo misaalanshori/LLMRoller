@@ -111,7 +111,6 @@ async fn test_pooled_outbound_session_affinity_strips_client_carriers() {
     assert!(!recorded.body.contains("client-opencode-session"));
 }
 
-
 #[tokio::test]
 #[doc = "Spec: SEC-16, RTE-1, TRN-1 — F02 Own keys preserve the client raw session"]
 async fn test_own_outbound_session_affinity_forwards_raw_session() {
@@ -186,7 +185,6 @@ async fn test_own_outbound_session_affinity_forwards_raw_session() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: RTE-1 - F06 Step 7 body session fields pin the same upstream key"]
 async fn test_body_session_fields_pin_across_distinct_openings() {
@@ -244,7 +242,6 @@ async fn test_body_session_fields_pin_across_distinct_openings() {
         "metadata.session_id must pin distinct openings to one upstream key"
     );
 }
-
 
 #[tokio::test]
 #[doc = "Spec: RTE-10, REL-1 - a confirmed session pin is written behind the durable queue"]
@@ -332,7 +329,6 @@ async fn test_confirmed_pin_is_persisted_without_manual_sql() {
     );
 }
 
-
 #[tokio::test]
 #[doc = "Spec: RTE-1 - F06 Step 8 fingerprint pins matching opening prompts"]
 async fn test_step8_fingerprint_pins_matching_openings() {
@@ -372,7 +368,6 @@ async fn test_step8_fingerprint_pins_matching_openings() {
         "matching SYS and USER1 must produce one Step 8 pin"
     );
 }
-
 
 #[tokio::test]
 #[doc = "Spec: RTE-1 - F06 fingerprint_generic_ids replaces generic IDs with Step 8"]
@@ -421,4 +416,3 @@ async fn test_constant_session_mode_fingerprint_generic_ids_uses_step8() {
         "the same opening must return to its Step 8 pin"
     );
 }
-

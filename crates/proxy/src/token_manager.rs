@@ -353,33 +353,32 @@ impl TokenManager {
             );
             let key_str = key_id.to_string();
             let prov_str = provider_id.to_string();
-            if let Ok(sealed) = sealer.seal(
+            let sealed = sealer.seal(
                 "upstream_key",
                 &[mk_id.as_bytes(), key_str.as_bytes(), prov_str.as_bytes()],
                 updated_json.as_bytes(),
-            ) {
-                let last4: String = access_token
-                    .chars()
-                    .rev()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                writer.queues.durable_state.lock().insert(
-                    llmroller_store::writer::DurableKey::UpstreamKeySecretUpdate(key_str.clone()),
-                    llmroller_store::writer::DurableOp::UpstreamKeySecretUpdate {
-                        upstream_key_id: key_str,
-                        secret_enc: sealed,
-                        master_key_id: mk_id.to_string(),
-                        secret_last4: if last4.is_empty() {
-                            "oath".to_string()
-                        } else {
-                            last4
-                        },
+            );
+            let last4: String = access_token
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            writer.queues.durable_state.lock().insert(
+                llmroller_store::writer::DurableKey::UpstreamKeySecretUpdate(key_str.clone()),
+                llmroller_store::writer::DurableOp::UpstreamKeySecretUpdate {
+                    upstream_key_id: key_str,
+                    secret_enc: sealed,
+                    master_key_id: mk_id.to_string(),
+                    secret_last4: if last4.is_empty() {
+                        "oath".to_string()
+                    } else {
+                        last4
                     },
-                );
-            }
+                },
+            );
         }
 
         Ok(access_token)

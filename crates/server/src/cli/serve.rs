@@ -569,9 +569,11 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                     while !*stop_rx.borrow_and_update() {
                         tokio::select! {
                             _ = interval.tick() => {
-                                let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+                                let wal_bytes = wal_supervisor
+                                    .run_checkpoint_for_path(&bg_pool, std::path::Path::new(&wal_path))
+                                    .await
+                                    .unwrap_or_else(|_| std::fs::metadata(&wal_path).map_or(0, |m| m.len()));
                                 llmroller_proxy::metrics::record_wal_bytes(wal_bytes);
-                                let _ = wal_supervisor.run_checkpoint(&bg_pool, wal_bytes).await;
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map_or(0, |d| d.as_millis() as i64);
@@ -748,5 +750,3 @@ pub(crate) async fn auto_disable_expired_traceability(
     }
     Ok(true)
 }
-
-

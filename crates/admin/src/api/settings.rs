@@ -491,7 +491,7 @@ pub(crate) async fn post_admin_prices_sync_handler(
 
     let (model_costs, catalog_aliases) = parse_catalog_prices(&catalog);
 
-        let routes = sqlx::query(
+    let routes = sqlx::query(
         "SELECT k.provider_id, p.kind, r.upstream_model_id, r.model_pk
          FROM model_routes r
          JOIN upstream_keys k ON r.upstream_key_id = k.id
@@ -599,4 +599,3 @@ pub(crate) fn chrono_like_now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
-
