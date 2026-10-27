@@ -49,6 +49,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Changed (internal structure)
+
+- **`orchestrator/pipeline.rs` decomposed ahead of the MNT-3 ceiling (ISSUE-0225).**
+  The file had grown from 1,284 to 1,476 lines over three cycles, leaving 124 of the
+  1,600-line gate's headroom — and the next three accounting issues (#152/#153/#154) all
+  target it. Two pure moves, no behaviour change: terminal usage accounting
+  (`TerminalUsageFacts`, `enqueue_terminal_usage`, `provider_billing`) to
+  `terminal_accounting.rs`, and the 151-line outbound body/header preparation block to
+  `attempt_body.rs`. `pipeline.rs` is now 1,245 lines with 355 lines of headroom, and the
+  highest-churn region is out of the file that is under pressure. `orchestrator/mod.rs`
+  re-exports both, so no caller changed and the test count stayed at 703.
+
 ### Fixed (dropped ledger rows)
 
 - **An embedded 200 rejection never reached the ledger (ISSUE-0150).** When an upstream
