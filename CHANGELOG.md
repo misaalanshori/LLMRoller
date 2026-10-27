@@ -49,6 +49,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (auxiliary endpoint gates)
+
+- **`/v1/messages/count_tokens` skipped three pre-candidate gates (ISSUE-0145).**
+  The handler was a hand-rolled miniature of the inference path: it scanned the
+  envelope, resolved the model and enforced G6, but never reserved the preflight
+  memory budget, never decompressed a compressed body, and never consumed
+  client-key TPM. A compressed body was therefore forwarded **still compressed**, so
+  the upstream received gzip bytes instead of JSON — an interop bug as well as a
+  missing control. The contiguous pre-candidate prefix of `admit_inbound_request` is
+  now extracted into a shared `gate_inbound_request` used by both handlers, so the
+  two lists cannot drift apart again. Three of the seven controls the issue listed
+  (`is_ip_rate_limited`, the RPM limiter, diagnostic-header extraction) were already
+  applied by `client_key_auth_middleware`; they stay there and are deliberately not
+  duplicated into the helper.
+
 ### Fixed (routing signal)
 
 - **Non-streaming latency was always recorded as 0 ms (ISSUE-0148).**
