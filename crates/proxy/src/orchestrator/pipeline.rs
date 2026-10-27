@@ -14,6 +14,96 @@ pub async fn handle_inference_request(
     run_inference_attempt_loop(admitted).await
 }
 
+/// Everything needed to enqueue one terminal usage event plus its attempt rows.
+///
+/// Introduced so the terminal all-attempts-failed path and the charged-timeout abort
+/// share one emitter instead of each building a `UsageContext` literal. Six copies of
+/// that literal already exist in this crate, and the duplication is how the
+/// `timeout_failover == false` branch came to charge money and then emit nothing
+/// (`USG-1`, `USG-3`, `ISSUE-0149`).
+pub(crate) struct TerminalUsageFacts<'a> {
+    pub(crate) request_id: RequestId,
+    pub(crate) caller: &'a ClientKeyRecord,
+    pub(crate) canonical_model: &'a str,
+    /// `None` only when no attempt reached any upstream key (true exhaustion).
+    pub(crate) upstream_key_id: Option<String>,
+    pub(crate) provider_id: Option<String>,
+    /// `None` only when no attempt reached a key; otherwise the real tier label.
+    pub(crate) provider_scope: Option<String>,
+    pub(crate) share_id: Option<String>,
+    pub(crate) upstream_model_id: String,
+    pub(crate) endpoint_str: &'a str,
+    pub(crate) session_hash: Option<String>,
+    pub(crate) pin_outcome: Option<String>,
+    pub(crate) failovers: i64,
+    pub(crate) error_code: Option<String>,
+    pub(crate) billing_coverage_mode: String,
+    pub(crate) plan_multiplier_bps: i64,
+    pub(crate) request_headers_json: Option<String>,
+    /// HTTP status recorded on the event.
+    pub(crate) status: StatusCode,
+    pub(crate) is_streaming: bool,
+    /// `Termination` label; see [`Termination::as_str`].
+    pub(crate) termination: &'a str,
+    /// Amount actually charged, in micro-USD.
+    pub(crate) cost_micro_usd: i64,
+    pub(crate) cost_source: CostSource,
+    pub(crate) now: i64,
+    pub(crate) latency_ms: Option<i64>,
+}
+
+/// Enqueue one terminal usage event together with all attempt rows for the request.
+///
+/// A no-op when no writer is attached (CLI and unit-test paths), which is the same
+/// contract the inline blocks had.
+pub(crate) fn enqueue_terminal_usage(
+    state: &ProxyAuthState,
+    facts: TerminalUsageFacts<'_>,
+    attempts: Vec<UsageAttemptRecord>,
+) {
+    let Some(writer) = &state.writer else {
+        return;
+    };
+    let usage = UsageContext {
+        request_id: facts.request_id,
+        client_key_id: facts.caller.id,
+        owner_user_id: facts.caller.owner_user_id,
+        canonical_model: facts.canonical_model.to_string(),
+        upstream_key_id: facts.upstream_key_id,
+        provider_id: facts.provider_id,
+        provider_scope: facts.provider_scope,
+        share_id: facts.share_id,
+        upstream_model_id: facts.upstream_model_id,
+        endpoint_str: facts.endpoint_str.to_string(),
+        session_hash: facts.session_hash,
+        pin_outcome: facts.pin_outcome,
+        failovers: facts.failovers,
+        error_code: facts.error_code,
+        billing_coverage_mode: facts.billing_coverage_mode,
+        plan_multiplier_bps: facts.plan_multiplier_bps,
+        service_account_id: facts
+            .caller
+            .service_account_id
+            .as_ref()
+            .map(ToString::to_string),
+        request_headers_json: facts.request_headers_json,
+    };
+    let event = usage.event(
+        facts.now,
+        facts.status.as_u16(),
+        facts.is_streaming,
+        true,
+        facts.termination,
+        &llmroller_proto::json_usage::ExtractedUsage::default(),
+        facts.cost_micro_usd,
+        facts.cost_source,
+        None,
+        None,
+        facts.latency_ms,
+    );
+    writer.queues.usage_writer.enqueue(event, attempts);
+}
+
 pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Response {
     let AdmittedRequest {
         state,
@@ -557,6 +647,51 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                     }
                     cap_guards.commit(charged_micro_usd);
                     crate::metrics::record_request_metric(endpoint_str, "5xx", "timeout");
+                    // The charge above must reach the ledger. Without this the money is
+                    // committed to the client-key and cap guards while `usage_events`
+                    // holds no row, so `/usage` under-reports and the per-key spend view
+                    // diverges permanently from what was charged (`USG-1`, `USG-3`,
+                    // `ISSUE-0149`).
+                    //
+                    // Attribution differs from the terminal all-failed path: this
+                    // attempt *did* reach a real upstream key, so the charge is
+                    // attributed to that key and provider rather than to `"none"`.
+                    let (billing_coverage_mode, plan_multiplier_bps) = snapshot
+                        .providers
+                        .get(&candidate.provider_id)
+                        .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+                        .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000));
+                    enqueue_terminal_usage(
+                        &state,
+                        TerminalUsageFacts {
+                            request_id,
+                            caller: &caller,
+                            canonical_model: &model.canonical_id,
+                            upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                            provider_id: Some(candidate.provider_id.to_string()),
+                            provider_scope: Some(provider_scope_label(&candidate).to_string()),
+                            share_id: candidate.share_id.map(|share| share.to_string()),
+                            upstream_model_id: candidate.upstream_model_id.clone(),
+                            endpoint_str,
+                            session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                            pin_outcome: pin_ticket
+                                .as_ref()
+                                .map(|ticket| ticket.outcome.as_str().to_string()),
+                            failovers,
+                            error_code: Some("timeout_error".to_string()),
+                            billing_coverage_mode,
+                            plan_multiplier_bps,
+                            request_headers_json: request_headers_json.clone(),
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            is_streaming,
+                            termination: Termination::IdleTimeout.as_str(),
+                            cost_micro_usd: charged_micro_usd,
+                            cost_source: CostSource::EstimatedIncomplete,
+                            now,
+                            latency_ms: Some(state.clock.now_ms() - attempt_started),
+                        },
+                        std::mem::take(&mut attempts),
+                    );
                     return protocol_error(
                         is_messages,
                         StatusCode::GATEWAY_TIMEOUT,
@@ -1211,45 +1346,39 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         "5xx"
     };
     crate::metrics::record_request_metric(endpoint_str, status_class, "error");
-    if let Some(writer) = &state.writer {
-        let usage = UsageContext {
+    // Nothing reached a usable upstream key on this path, so the event carries no key
+    // or provider attribution and no cost. The charged-timeout abort uses the same
+    // emitter with the opposite attribution (see the `timeout_failover == false`
+    // branch) — one builder, two call sites.
+    enqueue_terminal_usage(
+        &state,
+        TerminalUsageFacts {
             request_id,
-            client_key_id: caller.id,
-            owner_user_id: caller.owner_user_id,
-            canonical_model: model.canonical_id.clone(),
+            caller: &caller,
+            canonical_model: &model.canonical_id,
             upstream_key_id: None,
             provider_id: None,
             provider_scope: Some("none".to_string()),
             share_id: None,
             upstream_model_id: model.canonical_id.clone(),
-            endpoint_str: endpoint_str.to_string(),
+            endpoint_str,
             session_hash: None,
             pin_outcome: None,
             failovers,
             error_code: Some(terminal_code.to_string()),
             billing_coverage_mode: "pay_as_you_go".to_string(),
             plan_multiplier_bps: 10_000,
-            service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
             request_headers_json: request_headers_json.clone(),
-        };
-        let event = usage.event(
-            now,
-            terminal_status.as_u16(),
+            status: terminal_status,
             is_streaming,
-            true,
-            Termination::UpstreamTruncated.as_str(),
-            &llmroller_proto::json_usage::ExtractedUsage::default(),
-            0,
-            CostSource::EstimatedIncomplete,
-            None,
-            None,
-            Some(state.clock.now_ms() - now),
-        );
-        writer
-            .queues
-            .usage_writer
-            .enqueue(event, std::mem::take(&mut attempts));
-    }
+            termination: Termination::UpstreamTruncated.as_str(),
+            cost_micro_usd: 0,
+            cost_source: CostSource::EstimatedIncomplete,
+            now,
+            latency_ms: Some(state.clock.now_ms() - now),
+        },
+        std::mem::take(&mut attempts),
+    );
 
     let mut response = terminal_body.map_or_else(
         || {

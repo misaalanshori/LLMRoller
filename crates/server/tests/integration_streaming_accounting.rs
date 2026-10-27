@@ -1477,3 +1477,8 @@ fn p2c_avoids_the_route_that_reports_high_latency() {
 // Keep the writer handle reachable for the duration of each test.
 #[allow(dead_code)]
 fn _writer_handle(_writer: &WriterHandle) {}
+
+// Charged-timeout ledger coverage lives in its own module to keep this file under the
+// 1,600-line ceiling (`MNT-3`); it reuses the harness defined above.
+#[path = "integration_streaming_accounting/charged_timeout_ledger.rs"]
+mod charged_timeout_ledger;

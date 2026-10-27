@@ -49,6 +49,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (billing integrity)
+
+- **A charged timeout never reached the usage ledger (ISSUE-0149).** On the
+  `timeout_failover == false` branch the handler committed `charged_micro_usd` to the
+  client-key accumulator and the share/global cap guards and then returned `504` —
+  without enqueuing a usage event or its attempt rows. Spend therefore existed with no
+  ledger entry, so `/usage` under-reported, budget rollups lost the money, and the
+  per-key spend view diverged permanently from what was charged. The terminal
+  all-attempts-failed emitter is now extracted into `enqueue_terminal_usage` and called
+  from both sites. The timeout path attributes the charge to the upstream key and
+  provider that were actually called, rather than to `"none"` — attributing real spend
+  to no provider would satisfy "a row exists" while breaking the per-provider
+  breakdown.
+
 ### Fixed (auxiliary endpoint gates)
 
 - **`/v1/messages/count_tokens` skipped three pre-candidate gates (ISSUE-0145).**
