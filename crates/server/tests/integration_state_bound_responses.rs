@@ -1221,3 +1221,8 @@ async fn count_tokens_is_still_rpm_limited() {
 // (`ISSUE-0146`). Kept in a submodule so this file stays under the MNT-3 ceiling.
 #[path = "integration_state_bound_responses/count_tokens_failover.rs"]
 mod count_tokens_failover;
+
+// `forward_state_bound_response_op`: decode failure must not fake a 200 (`ISSUE-0156`),
+// and the body controls #155 names are not applicable to a bodyless op (`ISSUE-0155`).
+#[path = "integration_state_bound_responses/state_bound_decode.rs"]
+mod state_bound_decode;
