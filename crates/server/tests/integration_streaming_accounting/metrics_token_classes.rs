@@ -13,6 +13,29 @@ use super::*;
 // so), so it is acquired and released around each *phase*: the pre-read, the request, the
 // post-read. The test then asserts on the recorded deltas.
 
+/// Read the summed value of `name`, keeping only series that carry every one of
+/// `label_pairs`.
+///
+/// **Label-scoped by construction.** An unscoped read (filtering on the metric name alone)
+/// is satisfied by *any* test in the same binary emitting that metric, which makes an
+/// assertion like "the delta is greater than zero" pass whether or not the code under test
+/// did the right thing. Every value assertion in this module goes through here with the
+/// labels that make the series belong to one test.
+fn read_metric_by_label(name: &str, label_pairs: &[(&str, &str)]) -> f64 {
+    llmroller_proxy::metrics::get_or_init_prometheus_recorder()
+        .render()
+        .lines()
+        .filter(|line| line.starts_with(name))
+        .filter(|line| {
+            label_pairs
+                .iter()
+                .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+        })
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .sum()
+}
+
 /// A completion whose extracted usage carries cache-write and reasoning tokens must
 /// produce `llmroller_tokens_total` series for both classes.
 ///
@@ -33,7 +56,13 @@ async fn cache_write_and_reasoning_tokens_reach_the_metric() {
     )
     .await;
     let key = create_upstream_key(&harness, provider, "t154-tok", 100).await;
-    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    // A model id no other test uses, so `model_bucket` scopes the series to this test and
+    // a parallel test cannot satisfy the assertion.
+    const MODEL: &str = "t154-tok-unique-model";
+    let model_pk = insert_model(&harness, MODEL, Some("smooth_weighted_rr")).await;
+    // The route's `upstream_model_id` stays `gpt-4o` because that is the price-book key
+    // `seed_price` seeds; `model_bucket` is derived from the *canonical* id, which is what
+    // needs to be unique for the metric series to belong to this test alone.
     insert_route(&harness, key, model_pk, "gpt-4o").await;
     seed_price(&harness).await;
     let token = create_client_key(&harness, user, "t154-tok-key").await;
@@ -51,48 +80,33 @@ async fn cache_write_and_reasoning_tokens_reach_the_metric() {
     // the reason passes the closed set, which is the part the call sites depend on. The
     // call sites themselves are covered by `token_class_emission_is_wired_into_both_paths`
     // below.
+    // The mock's usage block carries no cache-write/reasoning fields, so drive the
+    // emitter directly for those two classes. The assertion is scoped to *this test's*
+    // model bucket, so it cannot be satisfied by another test's series.
     for reason in ["cache_write", "reasoning"] {
-        llmroller_proxy::metrics::record_tokens(
-            "t154-direct",
-            "2xx",
-            "completed",
-            "gpt-4o",
-            reason,
-            7,
-        );
+        llmroller_proxy::metrics::record_tokens("chat", "2xx", "completed", MODEL, reason, 7);
     }
-    let after_direct = llmroller_proxy::metrics::get_or_init_prometheus_recorder().render();
     for reason in ["cache_write", "reasoning"] {
-        assert!(
-            after_direct.contains(&format!("reason=\"{reason}\"")),
-            "the {reason} class must be emittable through the closed set; rendered:\n{after_direct}"
+        let observed = read_metric_by_label(
+            "llmroller_tokens_total",
+            &[("reason", reason), ("model_bucket", MODEL)],
+        );
+        assert_eq!(
+            observed, 7.0,
+            "the {reason} class must be emittable through the closed set for this model"
         );
     }
 
-    // The series set is closed and the classes are now present in the emitter's input;
-    let rendered = llmroller_proxy::metrics::get_or_init_prometheus_recorder().render();
+    // And the real completion emitted its input/output classes for this model.
     for reason in ["input", "output"] {
-        assert!(
-            rendered.contains(&format!("reason=\"{reason}\"")),
-            "the {reason} token series must be emitted; rendered:\n{rendered}"
+        let observed = read_metric_by_label(
+            "llmroller_tokens_total",
+            &[("reason", reason), ("model_bucket", MODEL)],
         );
-    }
-    // Any cache_write/reasoning series that exists must use a value from the closed set —
-    // this is the property the new allowlist guarantees for every caller.
-    for line in rendered
-        .lines()
-        .filter(|l| l.starts_with("llmroller_tokens_total"))
-    {
-        if let Some(start) = line.find("reason=\"") {
-            let rest = &line[start + 8..];
-            if let Some(end) = rest.find('"') {
-                let reason = &rest[..end];
-                assert!(
-                    llmroller_proxy::metrics::TOKEN_REASON_ALLOWLIST.contains(&reason),
-                    "series minted for a reason outside the closed set: {reason:?}"
-                );
-            }
-        }
+        assert!(
+            observed > 0.0,
+            "the {reason} token series must be emitted for this model; got {observed}"
+        );
     }
 }
 
@@ -203,25 +217,21 @@ async fn cost_metric_uses_the_effective_cost_while_the_ledger_stores_list_cost()
     .expect("set plan multiplier");
 
     let key = create_upstream_key(&harness, provider, "t154-cost", 100).await;
-    let model_pk = insert_model(&harness, "gpt-4o", Some("smooth_weighted_rr")).await;
+    // A model id no other test uses, so `model_bucket` scopes the cost series to this test.
+    const MODEL: &str = "t154-cost-unique-model";
+    let model_pk = insert_model(&harness, MODEL, Some("smooth_weighted_rr")).await;
+    // The route's `upstream_model_id` stays `gpt-4o` because that is the price-book key
+    // `seed_price` seeds; `model_bucket` is derived from the *canonical* id, which is what
+    // needs to be unique for the metric series to belong to this test alone.
     insert_route(&harness, key, model_pk, "gpt-4o").await;
     seed_price(&harness).await;
     let token = create_client_key(&harness, user, "t154-cost-key").await;
     let app = build_app(&harness).await;
 
-    // Prometheus counters are process-global and monotonic, so assert the **delta** this
-    // request contributed rather than the total (another test in the same process may
-    // already have incremented the same series).
-    let read_cost_total = || -> u64 {
-        llmroller_proxy::metrics::get_or_init_prometheus_recorder()
-            .render()
-            .lines()
-            .filter(|l| l.starts_with("llmroller_cost_micro_usd_total"))
-            .filter_map(|l| l.rsplit_once(' '))
-            .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
-            .sum::<f64>() as u64
-    };
-    let before = read_cost_total();
+    // Scoped to `endpoint="chat"` + this test's unique `model_bucket`, so the series can
+    // only have been minted by this request. No delta and no lock is needed: an absolute
+    // read of a series no other test can touch is exact.
+    const COST_LABELS: [(&str, &str); 2] = [("endpoint", "chat"), ("model_bucket", MODEL)];
 
     let response = app
         .oneshot(non_stream_request(&token, None))
@@ -257,17 +267,22 @@ async fn cost_metric_uses_the_effective_cost_while_the_ledger_stores_list_cost()
         "the stored effective cost must be list cost times the multiplier, computed once"
     );
 
-    // Metric: must carry the **effective** amount. `list_cost` and `effective` differ by
-    // the 50% multiplier here, so asserting the metric equals neither is not enough —
-    // assert it equals the effective value and not the list value.
-    // The metric *value* is asserted by `metrics::token_class_tests::cost_metric_records_
-    // the_value_it_is_given` — a unit test, where the process belongs to that test and a
-    // delta is sound. Here the integration test asserts the half only it can: that this
-    // request produced a cost sample at all, and that the ledger's list/effective split is
-    // intact. An absolute delta is not assertable in a shared process with parallel tests.
-    let observed = read_cost_total().saturating_sub(before);
-    assert!(
-        observed > 0,
-        "a served request must add a non-zero cost sample; got 0"
+    // Metric: must carry the **effective** amount, and the multiplier is 50%, so the two
+    // hypotheses differ by a factor of two. Assert both directions: it equals the effective
+    // value, and it does *not* equal the list value. Asserting only "greater than zero" was
+    // the cycle-14 defect — it passes whether the caller passed `effective_cost` or
+    // `cost_micro_usd`.
+    let observed = read_metric_by_label("llmroller_cost_micro_usd_total", &COST_LABELS);
+    let expected_effective = ((list_cost * multiplier) as f64) / 10_000.0;
+    assert_eq!(
+        observed, expected_effective,
+        "the cost metric must carry the charged (effective) amount {expected_effective}, \
+         not the list amount {list_cost}; a difference here means the metric reports a \
+         price the customer was never charged"
+    );
+    assert_ne!(
+        observed, list_cost as f64,
+        "the cost metric must not equal the un-adjusted list price {list_cost}; that is \
+         the exact substitution this test exists to catch"
     );
 }
