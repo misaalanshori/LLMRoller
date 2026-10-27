@@ -148,7 +148,12 @@ fn visible_models(
 ) -> VisibleModels {
     use std::collections::HashSet;
 
-    let scope = crate::orchestrator::parse_scope(&client_key.routing_scope);
+    // Resolve through `resolve_caller_scope`, not the raw parser: `inherit` has no
+    // arm in `RoutingScope::from_str`, so the raw parser silently widens it to
+    // `PersonalFirst` — broader than `PersonalOnly`/`OwnOnly`/`GlobalOnly`. The
+    // advertised catalogue must agree with what the data plane will actually route
+    // (`CLK-3`, `F-048`, `ISSUE-0009`).
+    let scope = crate::orchestrator::resolve_caller_scope(client_key, snapshot);
     let mut visible: Vec<(String, Option<String>, bool, Option<i64>)> = Vec::new();
     let mut visible_ids = HashSet::new();
 
@@ -392,6 +397,249 @@ mod tests {
             with_context_window(serde_json::json!({"id": "x"}), None)
                 .get("context_window")
                 .is_none()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `inherit` must resolve against the user's default routing scope
+    // (`CLK-3`, `F-048`, `ISSUE-0009`)
+    // -----------------------------------------------------------------------
+
+    use llmroller_core::ids::{ProviderId, UpstreamKeyId};
+    use llmroller_core::provider::{ProviderConfig, ProviderKind};
+    use llmroller_core::rbac::{OwnershipScope, Role, RoutingScope};
+    use llmroller_core::snapshot::{ProviderRecord, SnapshotModelRoute, UpstreamKeyRecord};
+
+    /// Build a one-model snapshot whose only route is a global-tier provider key.
+    ///
+    /// `owner` owns nothing, so `own` and `shared` tiers are empty for every caller;
+    /// the single global route is the only way the model can be reachable.
+    fn snapshot_with_global_route(user: UserId, canonical: &str) -> (ConfigSnapshot, ModelPk) {
+        let model = model(canonical, None);
+        let model_pk = model.id;
+
+        let provider = ProviderRecord {
+            id: ProviderId::generate(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            kind: ProviderKind::Custom,
+            name: "global-provider".to_string(),
+            base_url: "https://upstream.test".to_string(),
+            config_json: "{}".to_string(),
+            config: ProviderConfig::default(),
+            share_config_fingerprint: String::new(),
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+            billing_coverage_mode: "list_price".to_string(),
+            plan_multiplier_bps: 10_000,
+        };
+        let provider_id = provider.id;
+        let key = UpstreamKeyRecord {
+            id: UpstreamKeyId::generate(),
+            provider_id,
+            owner_user_id: None,
+            label: "global-key".to_string(),
+            secret_last4: "0000".to_string(),
+            secret_enc: Vec::new(),
+            master_key_id: "key-0".to_string(),
+            enabled: true,
+            priority: 1,
+            strict_tier: 0,
+            health: "healthy".to_string(),
+            health_version: 0,
+        };
+        let key_id = key.id;
+
+        let route = SnapshotModelRoute {
+            upstream_key_id: key_id,
+            model_pk,
+            upstream_model_id: canonical.to_string(),
+            vendor_prefix: None,
+            protocols: vec!["chat".to_string()],
+            status: llmroller_core::catalog::RouteStatus::Active,
+            enabled: true,
+            priority_override: None,
+            route_health: "healthy".to_string(),
+            route_health_until: None,
+        };
+
+        let user_record = llmroller_core::snapshot::UserRecord {
+            id: user,
+            username: "u".to_string(),
+            role: Role::User,
+            disabled: false,
+            can_use_global_providers: true,
+            global_budget_micro_usd_month: None,
+            default_routing_scope: RoutingScope::PersonalFirst,
+        };
+
+        let mut snapshot = ConfigSnapshot::default();
+        snapshot.models = Arc::new(HashMap::from([(model_pk, model)]));
+        snapshot.routes_by_model = Arc::new(HashMap::from([(model_pk, vec![route])]));
+        snapshot.providers = Arc::new(HashMap::from([(provider_id, provider)]));
+        snapshot.upstream_keys = Arc::new(HashMap::from([(key_id, key)]));
+        snapshot.users = Arc::new(HashMap::from([(user, user_record)]));
+        (snapshot, model_pk)
+    }
+
+    fn key_for(user: UserId, routing_scope: &str) -> ClientKeyRecord {
+        ClientKeyRecord {
+            id: ClientKeyId::generate(),
+            owner_user_id: user,
+            label: "test".to_string(),
+            prefix: "llr_test".to_string(),
+            key_hash: [0; 32],
+            prev_key_hash: None,
+            prev_key_expires_at: None,
+            routing_scope: routing_scope.to_string(),
+            allowed_models: None,
+            rate_limit_rpm: None,
+            rate_limit_tpm: None,
+            budget_micro_usd_month: None,
+            allowed_cidrs: None,
+            constant_session_mode: "off".to_string(),
+            service_account_id: None,
+            disabled: false,
+            paused_at: None,
+            revoked_at: None,
+            expires_at: None,
+        }
+    }
+
+    fn set_user_default(snapshot: &mut ConfigSnapshot, user: UserId, scope: RoutingScope) {
+        let mut users = (*snapshot.users).clone();
+        if let Some(record) = users.get_mut(&user) {
+            record.default_routing_scope = scope;
+        }
+        snapshot.users = Arc::new(users);
+    }
+
+    /// An `inherit` key must be resolved against the owner's default scope.
+    ///
+    /// With `default_routing_scope = GlobalOnly` and the model reachable only through
+    /// a global route, the model must be listed. Pre-fix `inherit` parses to
+    /// `PersonalFirst`, which does allow the global tier — so this test passes before
+    /// the fix and is the *converse* direction; the widening test below is the real
+    /// red. Kept because it pins the intended resolution directly.
+    #[test]
+    #[doc = "Spec: CLK-3, MDL-7 — ISSUE-0009 inherit resolves against the user default"]
+    fn visible_models_resolves_inherit_against_the_user_default() {
+        let user = UserId::generate();
+        let (mut snapshot, _) = snapshot_with_global_route(user, "global-only-model");
+        set_user_default(&mut snapshot, user, RoutingScope::GlobalOnly);
+        let key = key_for(user, "inherit");
+
+        let (visible, _) = visible_models(&snapshot, &key, 0);
+        assert!(
+            visible
+                .iter()
+                .any(|(id, _, _, _)| id == "global-only-model"),
+            "a GlobalOnly user's inherit key must see the global-only model; got {:?}",
+            visible.iter().map(|v| v.0.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The security-relevant direction: `inherit` must **not** widen a strict scope.
+    ///
+    /// An `OwnOnly` user owns no route, so nothing is reachable. Pre-fix `inherit`
+    /// becomes `PersonalFirst`, which allows the global tier, so the model is listed —
+    /// advertising a model the data plane will refuse for this user.
+    #[test]
+    #[doc = "Spec: CLK-3, MDL-7 — ISSUE-0009 inherit does not widen a strict user scope"]
+    fn visible_models_does_not_widen_a_strict_user_scope() {
+        let user = UserId::generate();
+        let (mut snapshot, _) = snapshot_with_global_route(user, "global-only-model");
+        set_user_default(&mut snapshot, user, RoutingScope::OwnOnly);
+        let key = key_for(user, "inherit");
+
+        let (visible, _) = visible_models(&snapshot, &key, 0);
+        assert!(
+            !visible
+                .iter()
+                .any(|(id, _, _, _)| id == "global-only-model"),
+            "an OwnOnly user's inherit key must not see a global-only model; the scope \
+             was widened to the permissive default. Got {:?}",
+            visible.iter().map(|v| v.0.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// An explicit key scope must win over the user default.
+    #[test]
+    #[doc = "Spec: CLK-3, MDL-7 — ISSUE-0009 an explicit key scope overrides inherit"]
+    fn visible_models_honours_an_explicit_scope_over_inherit() {
+        let user = UserId::generate();
+        let (mut snapshot, _) = snapshot_with_global_route(user, "global-only-model");
+        // The user's own default would exclude the global tier.
+        set_user_default(&mut snapshot, user, RoutingScope::OwnOnly);
+        // ... but the key says global_only explicitly, so it must be honoured.
+        let key = key_for(user, "global_only");
+
+        let (visible, _) = visible_models(&snapshot, &key, 0);
+        assert!(
+            visible
+                .iter()
+                .any(|(id, _, _, _)| id == "global-only-model"),
+            "an explicit global_only key must see the global-only model regardless of the \
+             user default; got {:?}",
+            visible.iter().map(|v| v.0.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pre-fix evidence for the widening: the raw parser turns `inherit` into
+    /// `PersonalFirst`, which permits the global tier an `OwnOnly` user excludes.
+    ///
+    /// This asserts the *parser*, deliberately, so the record of what the bypass did
+    /// survives the fix. After the fix no production path calls `parse_scope` with an
+    /// `"inherit"` key, but the parser's behaviour is unchanged and worth pinning.
+    #[test]
+    #[doc = "Spec: CLK-3 — ISSUE-0009 the raw parser widens inherit to personal_first"]
+    fn raw_parser_treats_inherit_as_personal_first() {
+        use llmroller_core::rbac::PoolTier;
+
+        let widened = crate::orchestrator::parse_scope("inherit");
+        assert_eq!(
+            widened,
+            RoutingScope::PersonalFirst,
+            "the raw parser has no inherit arm, so it falls back to the default"
+        );
+        assert!(
+            widened.allows_tier(PoolTier::Global),
+            "personal_first allows the global tier, which a stricter user scope would \
+             exclude: this is the widening the bypass caused"
+        );
+        assert!(
+            !RoutingScope::OwnOnly.allows_tier(PoolTier::Global),
+            "own_only excludes the global tier, so widening it is a real change of reach"
+        );
+    }
+
+    /// Pins the current, known-permissive fallback for an unrecognized scope string.
+    ///
+    /// `RoutingScope::from_str` rejects unknown values and the caller falls back to
+    /// `PersonalFirst`, which is the most permissive scope. This is a deliberate
+    /// pin, not an endorsement: an invalid value should be rejected when the client
+    /// key is written, not guessed at read time. Recorded as an out-of-scope finding
+    /// for the client-key write path.
+    #[test]
+    #[doc = "Spec: CLK-3 — ISSUE-0009 invalid scope falls back to personal_first (pinned)"]
+    fn invalid_routing_scope_falls_back_to_personal_first() {
+        let user = UserId::generate();
+        let (mut snapshot, _) = snapshot_with_global_route(user, "global-only-model");
+        set_user_default(&mut snapshot, user, RoutingScope::GlobalOnly);
+        // A typo the write path should have rejected.
+        let key = key_for(user, "personalfirst");
+
+        let (visible, _) = visible_models(&snapshot, &key, 0);
+        assert!(
+            visible
+                .iter()
+                .any(|(id, _, _, _)| id == "global-only-model"),
+            "PINNED BEHAVIOUR: an invalid routing_scope currently falls back to \
+             personal_first, which allows the global tier, so the model is listed. \
+             Changing this is a validation-policy decision for the client-key write \
+             path, not a read-path tweak. Got {:?}",
+            visible.iter().map(|v| v.0.as_str()).collect::<Vec<_>>()
         );
     }
 }

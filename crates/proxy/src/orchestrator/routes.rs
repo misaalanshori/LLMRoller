@@ -79,7 +79,14 @@ pub(crate) fn spawn_credential_probe(
     });
 }
 
-/// Parse a client key routing scope, failing closed to the safest default.
+/// Parse a client key routing scope string, falling back to `RoutingScope::default()`
+/// (`PersonalFirst`) when the value is not recognized.
+///
+/// Note this is a *literal* parse with no `inherit` handling — `"inherit"` is not a
+/// `RoutingScope` variant, so it lands on the permissive default. Every caller that
+/// resolves a stored client-key scope must go through [`resolve_caller_scope`]
+/// instead; this function exists for that resolver and for pinning the parser's
+/// fallback behaviour in tests (`ISSUE-0009`).
 pub(crate) fn parse_scope(scope: &str) -> RoutingScope {
     scope.parse().unwrap_or_default()
 }
@@ -97,7 +104,7 @@ pub(crate) fn resolve_caller_scope(
             .map(|u| u.default_routing_scope)
             .unwrap_or_default()
     } else {
-        caller.routing_scope.parse().unwrap_or_default()
+        parse_scope(&caller.routing_scope)
     }
 }
 

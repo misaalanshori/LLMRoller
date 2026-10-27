@@ -164,7 +164,12 @@ fn resolve_usage_key(
         return Ok(Some(key.id));
     }
 
-    let scope = crate::orchestrator::parse_scope(&caller.routing_scope);
+    // Resolve through `resolve_caller_scope`, not the raw parser: `RoutingScope::from_str`
+    // has no `inherit` arm, so the raw parser widens an `inherit` key to
+    // `PersonalFirst` — broader than `PersonalOnly`/`OwnOnly`/`GlobalOnly`. On this
+    // path that would let a strict user's scope resolve a key from an excluded tier
+    // (`CLK-3`, `USG-7`, `ISSUE-0009`).
+    let scope = crate::orchestrator::resolve_caller_scope(caller, snapshot);
     if let Some(raw_model) = &params.model {
         let model = snapshot
             .resolve_model(raw_model)
@@ -1118,6 +1123,162 @@ mod tests {
         assert_eq!(
             resolved.as_deref(),
             Some("https://api.commandcode.ai/alpha/billing/credits")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `inherit` must resolve against the user's default routing scope
+    // (`CLK-3`, `USG-7`, `ISSUE-0009`)
+    // -----------------------------------------------------------------------
+
+    use llmroller_core::ids::UserId;
+    use llmroller_core::rbac::RoutingScope;
+
+    /// Build a snapshot with one model reachable only through a global provider key.
+    ///
+    /// Returns `(snapshot, user_id, model_canonical)`. The caller owns nothing, so the
+    /// global tier is the only reachable one and a strict scope excludes everything.
+    fn usage_snapshot_with_global_route(default_scope: RoutingScope) -> (ConfigSnapshot, UserId) {
+        use llmroller_core::catalog::{MergeState, ModelOrigin, RouteStatus};
+        use llmroller_core::ids::{ModelPk, ProviderId};
+        use llmroller_core::rbac::OwnershipScope;
+        use llmroller_core::snapshot::{
+            ProviderRecord, SnapshotModel, SnapshotModelRoute, UserRecord,
+        };
+
+        let user_id = UserId::generate();
+        let model = SnapshotModel {
+            id: ModelPk::generate(),
+            canonical_id: "global-only-model".to_string(),
+            display_name: None,
+            context_window: None,
+            exposed: None,
+            merge_state: MergeState::Confirmed,
+            majority_vendor_prefix: None,
+            distribution: "weighted".to_string(),
+            routing_strategy: None,
+            origin: ModelOrigin::Global,
+            owner_user_id: None,
+        };
+        let model_pk = model.id;
+
+        let provider = ProviderRecord {
+            id: ProviderId::generate(),
+            ownership_scope: OwnershipScope::Global,
+            owner_user_id: None,
+            kind: ProviderKind::Openrouter,
+            name: "global".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            config_json: "{}".to_string(),
+            config: llmroller_core::provider::ProviderConfig::default(),
+            share_config_fingerprint: String::new(),
+            usage_url_cross_origin_ack: false,
+            allow_private_network: false,
+            enabled: true,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            plan_multiplier_bps: 10_000,
+        };
+        let provider_id = provider.id;
+
+        let key = UpstreamKeyRecord {
+            id: UpstreamKeyId::generate(),
+            provider_id,
+            owner_user_id: None,
+            label: "global key".to_string(),
+            secret_last4: "1234".to_string(),
+            secret_enc: Vec::new(),
+            master_key_id: "mk".to_string(),
+            enabled: true,
+            priority: 1,
+            strict_tier: 0,
+            health: "healthy".to_string(),
+            health_version: 1,
+        };
+        let key_id = key.id;
+
+        let route = SnapshotModelRoute {
+            upstream_key_id: key_id,
+            model_pk,
+            upstream_model_id: "global-only-model".to_string(),
+            vendor_prefix: None,
+            protocols: vec!["chat".to_string()],
+            status: RouteStatus::Active,
+            enabled: true,
+            priority_override: None,
+            route_health: "healthy".to_string(),
+            route_health_until: None,
+        };
+
+        let mut snapshot = ConfigSnapshot::default();
+        snapshot.models = Arc::new(std::collections::HashMap::from([(model_pk, model)]));
+        snapshot.routes_by_model =
+            Arc::new(std::collections::HashMap::from([(model_pk, vec![route])]));
+        snapshot.providers = Arc::new(std::collections::HashMap::from([(provider_id, provider)]));
+        snapshot.upstream_keys = Arc::new(std::collections::HashMap::from([(key_id, key)]));
+        snapshot.users = Arc::new(std::collections::HashMap::from([(
+            user_id,
+            UserRecord {
+                id: user_id,
+                username: "u".to_string(),
+                role: Role::User,
+                disabled: false,
+                can_use_global_providers: true,
+                global_budget_micro_usd_month: None,
+                default_routing_scope: default_scope,
+            },
+        )]));
+        (snapshot, user_id)
+    }
+
+    /// An `inherit` key on a `GlobalOnly` user must resolve the global key.
+    ///
+    /// Pre-fix the raw parser widened `inherit` to `PersonalFirst`; that happens to
+    /// allow the global tier too, so this test passes before the fix. It pins the
+    /// intended resolution directly rather than indirectly.
+    #[test]
+    #[doc = "Spec: CLK-3, USG-7 — ISSUE-0009 inherit resolves against the user default"]
+    fn resolve_usage_key_resolves_inherit_against_the_user_default() {
+        let (snapshot, user_id) = usage_snapshot_with_global_route(RoutingScope::GlobalOnly);
+        let who = caller(user_id);
+        let params = UsageQueryParams {
+            session_id: None,
+            model: Some("global-only-model".to_string()),
+            upstream_key_id: None,
+            fresh: None,
+        };
+
+        let resolved = resolve_usage_key(&snapshot, &who, &params, None, None, 0)
+            .expect("resolution must succeed");
+        assert!(
+            resolved.is_some(),
+            "a GlobalOnly user's inherit key must resolve the global-only route"
+        );
+    }
+
+    /// An `inherit` key on an `OwnOnly` user must **not** resolve the global key.
+    ///
+    /// This is the security-relevant direction and the red test: the raw parser turns
+    /// `inherit` into `PersonalFirst`, which allows the global tier, so a strict user
+    /// scope is silently widened and the usage path resolves a key from a tier the
+    /// user's scope excludes.
+    #[test]
+    #[doc = "Spec: CLK-3, USG-7 — ISSUE-0009 inherit does not widen a strict user scope"]
+    fn resolve_usage_key_does_not_widen_a_strict_user_scope() {
+        let (snapshot, user_id) = usage_snapshot_with_global_route(RoutingScope::OwnOnly);
+        let who = caller(user_id);
+        let params = UsageQueryParams {
+            session_id: None,
+            model: Some("global-only-model".to_string()),
+            upstream_key_id: None,
+            fresh: None,
+        };
+
+        let resolved = resolve_usage_key(&snapshot, &who, &params, None, None, 0)
+            .expect("resolution must not error");
+        assert!(
+            resolved.is_none(),
+            "an OwnOnly user's inherit key must not resolve a global-tier key; the scope \
+             was widened to the permissive default (got {resolved:?})"
         );
     }
 }
