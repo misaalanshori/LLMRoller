@@ -208,12 +208,9 @@ impl ThreeTierLoginLimiter {
 ///
 /// Runs only when the map is at capacity, never unconditionally: a sweep on every
 /// request would be a DoS amplifier.
-fn sweep_if_at_capacity<K: std::hash::Hash + Eq + Clone>(
-    map: &mut HashMap<K, Vec<i64>>,
-    window_ms: i64,
-    now_ms: i64,
-) where
-    K: std::fmt::Debug,
+fn sweep_if_at_capacity<K>(map: &mut HashMap<K, Vec<i64>>, window_ms: i64, now_ms: i64)
+where
+    K: std::hash::Hash + Eq + Clone,
 {
     if map.len() < MAX_TRACKED_LIMITER_KEYS {
         return;

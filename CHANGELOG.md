@@ -49,6 +49,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (unbounded memory)
+
+- **Per-IP authentication failure map was unbounded (ISSUE-0059).**
+  `ProxyAuthState::ip_failures` is keyed by attacker-controlled source address and
+  nothing capped it or swept it, so an unauthenticated attacker could grow it without
+  limit by spraying distinct IPs. It is now bounded at `MAX_TRACKED_FAILURE_IPS`
+  (10,000) with a sweep on insert: expired entries are dropped first, and if the map
+  is still full one existing slot is recycled — recycling a live attacker entry
+  resets that attacker's counter, which is strictly better than unbounded memory,
+  while dropping the *new* entry would leave a flooding attacker never rate-limited
+  at all. The sweep runs only at capacity, never on the read path, because an O(n)
+  sweep per request would be a DoS amplifier. `tracked_failure_ip_count()` exposes
+  the bound so it can be asserted.
+- **Login limiter maps grew without bound on the failure path (ISSUE-0059).**
+  `ThreeTierLoginLimiter` holds three maps keyed by source IP, arbitrary
+  `(username, IP)` pairs and arbitrary usernames. Only `check()` had a size guard,
+  and it dropped only empty vectors; `record_failure()` had none and is reachable
+  after the CSRF gate without a preceding `check`. One shared
+  `sweep_if_at_capacity` helper now serves all three maps from both paths. No
+  threshold changed.
+- **`record_success` left the username tier accumulating (ISSUE-0059).** It cleared
+  only the `(username, IP)` pair, so a user who mistyped their password repeatedly
+  across an hour stayed escalated to TOTP-or-delay permanently, even after
+  authenticating successfully. It now clears the per-username tier too. The per-IP
+  tier is deliberately not cleared, since one successful login from an address does
+  not mean that address is not also attacking other accounts.
+
 ### Fixed (memory accounting)
 
 - **Global trace memory release could wrap (ISSUE-0007).** `TraceTap`'s `Drop`
