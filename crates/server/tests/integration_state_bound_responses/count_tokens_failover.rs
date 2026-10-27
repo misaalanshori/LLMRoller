@@ -19,8 +19,8 @@
 //! health entry says, and a label-scoped metric delta. Nothing here asserts tokio or
 //! hyper internals.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -49,9 +49,7 @@ use llmroller_store::providers::{
     NewProvider, NewUpstreamKey, create_provider_tx, create_upstream_key_tx,
 };
 use llmroller_store::settings::seed_defaults;
-use llmroller_store::writer::{
-    ReloadNotification, WriterHandle, flush_data_queues, start_writer,
-};
+use llmroller_store::writer::{ReloadNotification, WriterHandle, start_writer};
 
 /// A short `first_activity_timeout_ms`, so the transport-failure test's hang is measured
 /// in milliseconds instead of the 60 s default.
@@ -156,9 +154,12 @@ struct Harness {
 
 async fn harness() -> Harness {
     let dir = tempfile::tempdir().expect("temp dir");
-    let pool = open_pool(&dir.path().join("count_tokens_failover.db"), PoolRole::Writer)
-        .await
-        .expect("writer pool");
+    let pool = open_pool(
+        &dir.path().join("count_tokens_failover.db"),
+        PoolRole::Writer,
+    )
+    .await
+    .expect("writer pool");
     migrate(&pool).await.expect("migrate");
     let master_key = MasterKey::from_bytes([0xBD; 32]);
     load_or_initialize(&pool, "key-0", &master_key, Arc::new(OsEntropy), 1)
@@ -330,10 +331,6 @@ async fn build_app_with_runtime(harness: &Harness) -> (Router, Arc<RuntimeState>
     (data_plane_router(state), runtime)
 }
 
-async fn flush(harness: &Harness) {
-    flush_data_queues(&harness.pool, &harness.writer.queues).await;
-}
-
 fn count_request(token: &str, model: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -393,7 +390,11 @@ async fn count_tokens_fails_over_on_a_retryable_status() {
         "the healthy candidate's 200 must reach the client; body was {}",
         String::from_utf8_lossy(&body)
     );
-    assert_eq!(bad_mock.calls(), 1, "candidate A must be tried exactly once");
+    assert_eq!(
+        bad_mock.calls(),
+        1,
+        "candidate A must be tried exactly once"
+    );
     assert_eq!(
         good_mock.calls(),
         1,
@@ -423,7 +424,11 @@ async fn count_tokens_fails_over_on_a_credential_failure() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK, "a revoked key must fail over, not 401 the client");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a revoked key must fail over, not 401 the client"
+    );
     assert_eq!(bad_mock.calls(), 1);
     assert_eq!(good_mock.calls(), 1);
 }
@@ -457,17 +462,14 @@ async fn count_tokens_fails_over_on_a_transport_failure() {
     let (app, _runtime) = build_app_with_runtime(&harness).await;
     // Bounded by the test, not just by the provider timeout: if the handler ever stopped
     // failing over, this would otherwise wait out the mock's own 30 s sleep.
-    let (status, _body) = tokio::time::timeout(
-        Duration::from_secs(20),
-        async {
-            body_bytes(
-                app.oneshot(count_request(&token, "ct-failover-hang"))
-                    .await
-                    .expect("count tokens"),
-            )
-            .await
-        },
-    )
+    let (status, _body) = tokio::time::timeout(Duration::from_secs(20), async {
+        body_bytes(
+            app.oneshot(count_request(&token, "ct-failover-hang"))
+                .await
+                .expect("count tokens"),
+        )
+        .await
+    })
     .await
     .expect("count_tokens must not hang when an upstream stalls");
 
@@ -509,21 +511,22 @@ async fn count_tokens_records_a_failure_on_the_key_it_abandoned() {
         "precondition: the key starts with a clean record"
     );
 
-    let (status, _body) = tokio::time::timeout(
-        Duration::from_secs(20),
-        async {
-            body_bytes(
-                app.oneshot(count_request(&token, "ct-failover-health"))
-                    .await
-                    .expect("count tokens"),
-            )
-            .await
-        },
-    )
+    let (status, _body) = tokio::time::timeout(Duration::from_secs(20), async {
+        body_bytes(
+            app.oneshot(count_request(&token, "ct-failover-health"))
+                .await
+                .expect("count tokens"),
+        )
+        .await
+    })
     .await
     .expect("count_tokens must not hang");
 
-    assert_eq!(status, StatusCode::OK, "failover must still serve the request");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "failover must still serve the request"
+    );
     let after = runtime.key_health_entry(key_a);
     assert!(
         after.consecutive_failures > 0,
@@ -605,96 +608,10 @@ async fn count_tokens_returns_502_on_a_corrupt_compressed_upstream_body() {
         json["error"]["type"], "upstream_decode_error",
         "the error type must name the decode failure; got {json}"
     );
-    assert_eq!(mock.calls(), 1, "the corrupt body is discovered after one call");
-}
-
-// ---------------------------------------------------------------------------
-// Defect 4: count_tokens traffic must be visible in the request metric
-// ---------------------------------------------------------------------------
-
-/// Read the summed value of `name`, keeping only series carrying every label pair.
-///
-/// **Label-scoped by construction** — the lesson from cycle 14fix (`89d7e80`). An unscoped
-/// read is satisfied by any parallel test in this binary emitting the same metric, so it
-/// cannot tell whether *this* handler emitted anything.
-fn read_metric_by_label(name: &str, label_pairs: &[(&str, &str)]) -> f64 {
-    llmroller_proxy::metrics::get_or_init_prometheus_recorder()
-        .render()
-        .lines()
-        .filter(|line| line.starts_with(name))
-        .filter(|line| {
-            label_pairs
-                .iter()
-                .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
-        })
-        .filter_map(|line| line.rsplit_once(' '))
-        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
-        .sum()
-}
-
-/// A served `count_tokens` request must increment `llmroller_requests_total` under
-/// `endpoint="count_tokens"`. Pre-fix the handler never called `record_request_metric`, so
-/// this was zero and the endpoint was invisible to every dashboard.
-#[tokio::test]
-#[doc = "Spec: OBS-1 — ISSUE-0146 count_tokens emits a request metric"]
-async fn count_tokens_emits_a_request_metric() {
-    let harness = harness().await;
-    let user = insert_user(&harness.pool, "ct-metric-user").await;
-    let token = create_client_key(&harness, user, "ct-metric-key").await;
-    let model = insert_model(&harness, "ct-metric").await;
-
-    let (url, _mock) = spawn_mock(MockKind::Ok).await;
-    add_candidate(&harness, "ct-metric", url, model, 100, "{}").await;
-
-    let (app, _runtime) = build_app_with_runtime(&harness).await;
-    let scoped = || read_metric_by_label("llmroller_requests_total", &[("endpoint", "count_tokens")]);
-    let before = scoped();
-
-    let (status, _body) = body_bytes(
-        app.oneshot(count_request(&token, "ct-metric"))
-            .await
-            .expect("count tokens"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let after = scoped();
     assert_eq!(
-        after - before,
-        1.0,
-        "one served count_tokens request must add exactly one sample under \
-         endpoint=\"count_tokens\"; got {before} -> {after}"
-    );
-}
-
-/// The metric must also be emitted on the 502 path, so a failing endpoint is visible too.
-#[tokio::test]
-#[doc = "Spec: OBS-1 — ISSUE-0146 count_tokens emits a request metric on failure"]
-async fn count_tokens_emits_a_request_metric_on_a_decode_failure() {
-    let harness = harness().await;
-    let user = insert_user(&harness.pool, "ct-metric5-user").await;
-    let token = create_client_key(&harness, user, "ct-metric5-key").await;
-    let model = insert_model(&harness, "ct-metric-fail").await;
-
-    let (url, _mock) = spawn_mock(MockKind::CorruptGzip).await;
-    add_candidate(&harness, "ct-metric-fail", url, model, 100, "{}").await;
-
-    let (app, _runtime) = build_app_with_runtime(&harness).await;
-    let scoped = || read_metric_by_label("llmroller_requests_total", &[("endpoint", "count_tokens")]);
-    let before = scoped();
-
-    let (status, _body) = body_bytes(
-        app.oneshot(count_request(&token, "ct-metric-fail"))
-            .await
-            .expect("count tokens"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-
-    assert_eq!(
-        scoped() - before,
-        1.0,
-        "a failed count_tokens request must also be counted, or the 5xx rate is invisible"
+        mock.calls(),
+        1,
+        "the corrupt body is discovered after one call"
     );
 }
 

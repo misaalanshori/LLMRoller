@@ -1,5 +1,61 @@
 use super::*;
 
+/// Whether an upstream status should fail over to the next candidate.
+///
+/// Delegates to the shared vocabulary instead of re-deriving it, so this handler cannot
+/// drift out of step with the inference path again (`ISSUE-0146`). `RequestRejected`
+/// (a genuine 4xx that is the client's problem) and `Unclassified403` stay terminal there,
+/// and they stay terminal here. `404`/`405`/`501` are handled separately before this is
+/// consulted: they mean the key does not implement the endpoint, which is not a health
+/// problem.
+fn should_fail_over(class: llmroller_proto::adapters::ErrorClass) -> bool {
+    use llmroller_core::usage::AttemptOutcome;
+    use llmroller_proto::adapters::ErrorClass;
+    if matches!(
+        class,
+        ErrorClass::RequestRejected | ErrorClass::Unclassified403
+    ) {
+        return false;
+    }
+    let status = match class {
+        ErrorClass::QuotaExhausted => 429,
+        ErrorClass::PlanRestricted => 403,
+        ErrorClass::CredentialInvalid => 401,
+        ErrorClass::Other(code) => code,
+        ErrorClass::RequestRejected | ErrorClass::Unclassified403 => return false,
+    };
+    AttemptOutcome::from_http_status(status).is_failover()
+}
+
+/// Record one failed `count_tokens` attempt the same way the inference send path does:
+/// key health, an origin host failure for timeouts/transport errors, and the slow metric on
+/// a timeout. Without this the key keeps a clean record while being unusable, and inference
+/// — which reads the same tracker — keeps selecting it (`API-8`, `ISSUE-0146`).
+fn record_count_tokens_failure(
+    state: &ProxyAuthState,
+    caller: &ClientKeyRecord,
+    candidate: &RouteCandidate,
+    outcome: llmroller_core::usage::AttemptOutcome,
+    retry_after_ms: Option<i64>,
+    now: i64,
+) {
+    let origin = OriginKey::from_base_url(&candidate.base_url, candidate.allow_private_network);
+    let _ = state.runtime_state.record_upstream_failure(
+        &origin,
+        candidate.upstream_key_id,
+        caller.id,
+        outcome,
+        retry_after_ms,
+        now,
+    );
+    enqueue_key_health(
+        state.writer.as_ref(),
+        &state.runtime_state,
+        candidate.upstream_key_id,
+        now,
+    );
+}
+
 /// Load one durable response link for a routed Responses operation.
 pub(crate) async fn load_response_link(
     state: &ProxyAuthState,
@@ -974,14 +1030,32 @@ pub async fn post_messages_count_tokens(
         };
 
         let send_timeout = Duration::from_millis(candidate.config.first_activity_timeout_ms());
-        let response = match tokio::time::timeout(
+        let send_res = tokio::time::timeout(
             send_timeout,
             client.post(&url).body(edited).headers(outbound).send(),
         )
-        .await
-        {
+        .await;
+        let response = match send_res {
             Ok(Ok(response)) => response,
-            _ => {
+            Ok(Err(_)) | Err(_) => {
+                // A failed send used to fall into `_ => continue`: the loop moved on but
+                // recorded nothing, so the key stayed `healthy: true` forever.
+                let is_timeout = send_res.is_err();
+                if is_timeout {
+                    crate::metrics::record_upstream_slow(&candidate.provider_id.to_string());
+                }
+                record_count_tokens_failure(
+                    &state,
+                    &caller,
+                    &candidate,
+                    if is_timeout {
+                        llmroller_core::usage::AttemptOutcome::WaitTimeout
+                    } else {
+                        llmroller_core::usage::AttemptOutcome::ConnectError
+                    },
+                    None,
+                    now,
+                );
                 continue;
             }
         };
@@ -999,6 +1073,7 @@ pub async fn post_messages_count_tokens(
             aux_unsupported_seen = true;
             continue;
         }
+
         let is_admin = snapshot
             .users
             .get(&caller.owner_user_id)
@@ -1015,10 +1090,68 @@ pub async fn post_messages_count_tokens(
         let body_timeout = Duration::from_millis(candidate.config.nonstream_response_timeout_ms());
         let raw_bytes = match tokio::time::timeout(body_timeout, response.bytes()).await {
             Ok(Ok(bytes)) => bytes,
-            _ => return StatusCode::BAD_GATEWAY.into_response(),
+            _ => {
+                // A stalled body is the same class of fault as a stalled send: record it
+                // against the key and try the next candidate.
+                record_count_tokens_failure(
+                    &state,
+                    &caller,
+                    &candidate,
+                    llmroller_core::usage::AttemptOutcome::WriteStalled,
+                    None,
+                    now,
+                );
+                continue;
+            }
         };
-        let bytes =
-            decode_upstream_body(content_encoding.as_deref(), raw_bytes).unwrap_or_default();
+        // A decode failure is a gateway fault, never an empty success. `unwrap_or_default()`
+        // here used to report a corrupt body as `200 OK` with zero bytes, which a client
+        // reads as "your prompt is empty" — worse than an error (`ISSUE-0146`).
+        let bytes = match decode_upstream_body(content_encoding.as_deref(), raw_bytes) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                crate::metrics::record_request_metric("count_tokens", "5xx", "error");
+                return protocol_error(
+                    true,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_decode_error",
+                    "the upstream response body could not be decoded",
+                    Some(&req_id_str),
+                    None,
+                );
+            }
+        };
+
+        // Classify an error status with the shared vocabulary so a retryable failure fails
+        // over instead of being handed to the client (`API-8`).
+        if status.is_client_error() || status.is_server_error() {
+            let class = llmroller_proto::adapters::classify_error_with_classifiers(
+                status.as_u16(),
+                &bytes[..bytes.len().min(8192)],
+                Some(&candidate.config.error_classifiers),
+            );
+            if should_fail_over(class) {
+                record_count_tokens_failure(
+                    &state,
+                    &caller,
+                    &candidate,
+                    llmroller_core::usage::AttemptOutcome::from_http_status(status.as_u16()),
+                    None,
+                    now,
+                );
+                continue;
+            }
+            // Non-retryable (a genuine 4xx that is the client's problem): pass it through.
+            let metric_class = if status.is_client_error() {
+                "4xx"
+            } else {
+                "5xx"
+            };
+            crate::metrics::record_request_metric("count_tokens", metric_class, "error");
+        } else {
+            crate::metrics::record_request_metric("count_tokens", "2xx", "completed");
+        }
+
         let mut builder = Response::builder().status(status);
         for (name, value) in filtered_headers {
             if let Some(name) = name {

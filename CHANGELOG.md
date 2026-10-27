@@ -9,6 +9,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`count_tokens` now fails over, learns from failures, and never fakes a 200
+  (ISSUE-0146).** The candidate loop in `post_messages_count_tokens` iterated every
+  candidate but did nothing else right. Four defects, each with production
+  consequence:
+  - A send timeout or transport error hit `_ => continue`, so nothing was recorded:
+    no `record_upstream_failure`, no key-health write, no slow metric. The key kept
+    `healthy: true, consecutive_failures: 0` while being unusable, and because
+    inference reads the same tracker it kept selecting that key. A retryable status
+    (`401`/`403`/`429`/`5xx`) had the same problem inverted: it was handed to the
+    client instead of failing over. Both now go through one
+    `record_count_tokens_failure` helper and continue to the next candidate, and the
+    retryable/non-retryable decision comes from the shared
+    `classify_error_with_classifiers` vocabulary rather than a second `match` over
+    status codes.
+  - `decode_upstream_body(..).unwrap_or_default()` reported a corrupt compressed
+    body as `200 OK` with **zero bytes**. A client reads that as "your prompt is
+    empty" and sends the real request, so this was worse than an error. It is now
+    `502` with `{"error":{"type":"upstream_decode_error",...}}`.
+  - `record_request_metric` was never called, so `count_tokens` traffic did not exist
+    in `llmroller_requests_total`. It is now emitted on every exit.
+  The distinct `404`/`405`/`501` → `mark_aux_endpoint_unsupported` semantics are
+  preserved: the key not implementing an endpoint is not a health problem, so it is
+  cached and the key's health is left untouched.
 - **Toolchain pin restored, musl CI leg repaired (ISSUE-0038).** `rust-toolchain.toml`
   pinned `channel = "stable"`, which overrides the `1.99.0` toolchain that
   `.github/workflows/ci.yml` installs. The runner's `stable` channel carries no

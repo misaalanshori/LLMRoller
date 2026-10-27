@@ -113,6 +113,9 @@ pub(crate) fn anthropic_error_type_for_code(code: &str) -> &'static str {
         "not_found_error" => "not_found_error",
         "gateway_busy" | "no_eligible_route" => "overloaded_error",
         "timeout_error" => "timeout_error",
+        // A corrupt/undecodable upstream body is a gateway fault the client can act on,
+        // so it gets its own type rather than the generic `api_error` catch-all.
+        "upstream_decode_error" => "upstream_decode_error",
         _ => "api_error",
     }
 }
