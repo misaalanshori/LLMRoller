@@ -101,6 +101,7 @@ pub(crate) mod routes;
 pub(crate) mod session;
 pub(crate) mod state_bound;
 pub(crate) mod streaming;
+pub(crate) mod terminal_accounting;
 pub(crate) mod trace;
 
 pub(crate) use admission::*;
@@ -115,6 +116,7 @@ pub(crate) use routes::*;
 pub(crate) use session::*;
 pub use state_bound::*;
 pub(crate) use streaming::*;
+pub(crate) use terminal_accounting::*;
 pub use trace::*;
 
 #[cfg(test)]
