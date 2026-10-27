@@ -279,7 +279,7 @@ docker compose logs llmroller | grep "SETUP TOKEN"
 
 ### Local Native Build
 
-Prerequisites: Rust 1.99.0+ toolchain and standard build tools.
+Prerequisites: Rust 1.99.0 toolchain (pinned by `rust-toolchain.toml`, which also declares the MSRV in `Cargo.toml`) and standard build tools.
 
 ```bash
 # 1. Build release binary

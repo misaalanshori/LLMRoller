@@ -340,7 +340,7 @@ The design relies on six operational assumptions listed in the table below.
 | A2 | Sizing and memory envelope | One instance on a 2 vCPU, 2 GB RAM reference host supports up to 200 users, 500 upstream keys, 1,000 client keys, 2,000 open SSE streams, and 500 req/s at peak for requests with bodies up to 256 KiB (or `preflight_body_budget / (mean_body * ttff)` in general, bounded by `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB = min(1024, floor(0.40 * memory_limit_mb))`, which is 819 MiB on a 2 GB host). |
 | A3 | Configurable client base URL | Every target client tool (Claude Code, Codex CLI, opencode, Hermes, and standard OpenAI or Anthropic SDKs) lets the user configure a custom base URL and API key. |
 | A4 | TLS endpoint handling | Production deployments handle HTTPS either at an upstream reverse proxy (Caddy, nginx, or Traefik) listed in `LLMROLLER_TRUSTED_PROXIES` with response buffering off, or via LLMRoller's built-in `rustls` listener (`LLMROLLER_TLS_CERT` and `LLMROLLER_TLS_KEY`). |
-| A5 | Rust toolchain and runtime | The project compiles with a pinned stable Rust toolchain (Rust 2024 edition) and runs on Linux (`x86_64` and `aarch64`) and macOS without external runtime dependencies. |
+| A5 | Rust toolchain and runtime | The project compiles with a pinned Rust toolchain (Rust 2024 edition) and runs on Linux (`x86_64` and `aarch64`) and macOS without external runtime dependencies. The pinned channel in `rust-toolchain.toml` and the MSRV declared by `Cargo.toml`'s `rust-version` are the same version (`1.99`), and that version is the only one CI has ever compiled. Changing it requires changing all five declarations together: `Cargo.toml`, `rust-toolchain.toml`, `Dockerfile` (`RUST_IMAGE`), `.github/workflows/ci.yml`, `.github/workflows/release.yml`, plus the `README.md` badge and prerequisite line. The `xtask` test `toolchain_channel_and_declared_msrv_agree` enforces that the two locally checkable declarations never drift apart. |
 | A6 | Disk capacity budget | The data directory provides at least `daily_requests * retention_days * 750 B * 1.3` bytes for raw `usage_events` (including sanitized `request_headers_json` and `list_cost_micro_usd`, default 30-day retention capped at 50,000,000 rows) plus `control_plane_logs` (30-day retention), `usage_rollups_5min`, `usage_rollups_hourly`, and opt-in `trace_records` and `trace_blocks` storage; the web UI displays projected disk usage. |
 
 ### 3.4 UI performance and ergonomics targets
@@ -3103,7 +3103,7 @@ The web interface is server-rendered with Askama templates and HTMX partial upda
 
 ## 15. Technology choices and workspace layout
 
-LLMRoller is implemented in safe Rust (Rust 2024 edition) with a pinned stable toolchain and a small, audited dependency tree.
+LLMRoller is implemented in safe Rust (Rust 2024 edition) with a pinned toolchain and a small, audited dependency tree.
 
 ### 15.1 Core technology stack
 
@@ -3111,7 +3111,7 @@ Every dependency is chosen for predictable speed, memory safety, zero external r
 
 | Layer | Selected crate or tool | Rationale | Rejected alternative |
 | --- | --- | --- | --- |
-| Language & toolchain | Rust (2024 edition, stable 1.99.0 toolchain, `#![forbid(unsafe_code)]`) | Predictable tail latency on 2,000 concurrent SSE streams with no garbage-collector pauses and a single static binary. | Go (GC pauses under high stream counts) or Python (packaging and supply-chain exposure). |
+| Language & toolchain | Rust (2024 edition, pinned 1.99.0 toolchain enforced by `rust-toolchain.toml`, `#![forbid(unsafe_code)]`) | Predictable tail latency on 2,000 concurrent SSE streams with no garbage-collector pauses and a single static binary. | Go (GC pauses under high stream counts) or Python (packaging and supply-chain exposure). |
 | HTTP server | `axum 0.8`, `hyper 1.x`, `hyper-util`, `tower` on `tokio 1.x` | Standard async Rust HTTP stack with native streaming body support and composable middleware. | `actix-web` (separate actor runtime model). |
 | HTTP client & SSRF guard | `reqwest 0.13` (`rustls-tls`, `stream`, `http2`, `default-features = false`) + `hickory-resolver` inside `GuardedConnector` | Connection pooling per upstream origin (`OriginKey`), custom `tower::Service<Uri>` socket connector validating both DNS-resolved and IP-literal socket addresses against special-purpose ranges (`SEC-7`), and unbuffered chunk streaming. | `ureq` (blocking I/O) or `reqwest::dns::Resolve` alone (which `hyper` skips when the URL host is an IP literal). |
 | Database | SQLite in WAL mode via `sqlx 0.9` (`connect_options(role)`) | Zero-configuration single-file persistence with per-role pragma enforcement and migration-tested SQL queries. | PostgreSQL (needs an external database server for single-node installs). |

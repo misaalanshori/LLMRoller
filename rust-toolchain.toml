@@ -1,5 +1,11 @@
-# Pinned stable toolchain. CI installs the POR-1 cross targets on top of this.
+# Pinned toolchain, not a floating channel (A5, Section 15.2).
+# This version is deliberately identical to the MSRV declared in Cargo.toml
+# (`rust-version`), to Dockerfile's RUST_IMAGE, to .github/workflows/ci.yml, and
+# to .github/workflows/release.yml. Change all five together.
+# CI installs its POR-1 cross targets (x86_64/aarch64 musl and gnu) on top of the
+# toolchain this file pins; a floating `stable` here silently overrides that
+# installed toolchain and loses the cross-target rust-std artifacts.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 profile = "minimal"
 components = ["clippy", "rustfmt"]

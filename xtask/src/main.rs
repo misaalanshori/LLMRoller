@@ -171,4 +171,79 @@ mod tests {
         let error = run(["nonsense".to_string()]).expect_err("unknown command must fail");
         assert!(error.contains("unknown subcommand"), "{error}");
     }
+
+    /// Extracts `[toolchain] channel` from a `rust-toolchain.toml` document.
+    fn parse_toolchain_channel(text: &str) -> Option<String> {
+        let document: toml::Value = toml::from_str(text).ok()?;
+        document
+            .get("toolchain")?
+            .get("channel")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Extracts the declared MSRV from a root `Cargo.toml`. The workspace root is
+    /// a virtual manifest, so the value lives at `workspace.package.rust-version`;
+    /// a single-crate manifest keeps it at `package.rust-version`. Both are
+    /// accepted so this guard keeps working if the layout changes.
+    fn parse_rust_version(text: &str) -> Option<String> {
+        let document: toml::Value = toml::from_str(text).ok()?;
+        document
+            .get("workspace")
+            .and_then(|workspace| workspace.get("package"))
+            .and_then(|package| package.get("rust-version"))
+            .or_else(|| {
+                document
+                    .get("package")
+                    .and_then(|package| package.get("rust-version"))
+            })
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Reduces a version string to its `major.minor` pair (A5, Section 15.2).
+    fn major_minor(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
+    }
+
+    /// Guard the pinned-toolchain invariant (A5): the channel named in
+    /// `rust-toolchain.toml` and the MSRV declared in the root `Cargo.toml` must
+    /// name the same compiler. A floating `channel = "stable"` silently resolves
+    /// to whatever the runner's default is, which is what broke the musl leg.
+    #[test]
+    fn toolchain_channel_and_declared_msrv_agree() {
+        let root = workspace_root();
+        let toolchain_path = root.join("rust-toolchain.toml");
+        let cargo_path = root.join("Cargo.toml");
+
+        let toolchain_text = std::fs::read_to_string(&toolchain_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", toolchain_path.display()));
+        let cargo_text = std::fs::read_to_string(&cargo_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", cargo_path.display()));
+
+        let channel = parse_toolchain_channel(&toolchain_text)
+            .unwrap_or_else(|| panic!("{} has no [toolchain].channel", toolchain_path.display()));
+        let rust_version = parse_rust_version(&cargo_text)
+            .unwrap_or_else(|| panic!("{} has no rust-version declaration", cargo_path.display()));
+
+        let channel_version = major_minor(&channel).unwrap_or_else(|| {
+            panic!(
+                "rust-toolchain.toml channel {channel:?} is not a pinned major.minor toolchain; \
+                 pin an exact release such as \"1.99.0\" instead of a floating channel"
+            )
+        });
+        let msrv_version = major_minor(&rust_version).unwrap_or_else(|| {
+            panic!("Cargo.toml rust-version {rust_version:?} is not major.minor")
+        });
+
+        assert_eq!(
+            channel_version, msrv_version,
+            "rust-toolchain.toml channel {channel:?} and Cargo.toml rust-version \
+             {rust_version:?} must name the same major.minor compiler; change them together \
+             with Dockerfile, .github/workflows/ci.yml, .github/workflows/release.yml, and README.md"
+        );
+    }
 }
