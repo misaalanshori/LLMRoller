@@ -313,7 +313,8 @@ impl JobSupervisor {
 mod tests {
     use super::*;
 
-    /// Spec: REL-1; steps 1, 2, 5 and 8 must run in order and report a clean drain.
+    /// Spec: REL-1; steps 1, 2, 5 and 8 must run in order and report a clean drain,
+    /// and step 4 must store the shutdown cut flag before it wakes waiters.
     #[tokio::test]
     async fn shutdown_broadcasts_background_stop_and_completes() {
         let pool = SqlitePool::connect("sqlite::memory:")
@@ -322,6 +323,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let streams = Arc::new(AtomicUsize::new(0));
         let notify = Arc::new(Notify::new());
+        let cut = Arc::new(AtomicBool::new(false));
         let (stop_tx, mut stop_rx) = watch::channel(false);
 
         let supervisor = ShutdownSupervisor::new(
@@ -332,7 +334,8 @@ mod tests {
             Duration::ZERO,
             Duration::from_millis(10),
         )
-        .with_background_stop(stop_tx);
+        .with_background_stop(stop_tx)
+        .with_shutdown_cut(cut.clone());
 
         let observer = tokio::spawn(async move {
             let _ = stop_rx.changed().await;
@@ -342,6 +345,10 @@ mod tests {
         let exit_code = supervisor.execute_graceful_shutdown().await;
         assert_eq!(exit_code, EXIT_SUCCESS);
         assert!(!ready.load(Ordering::SeqCst), "readiness must flip to 503");
+        assert!(
+            cut.load(Ordering::SeqCst),
+            "step 4 must store the shutdown cut flag"
+        );
         assert!(
             observer.await.expect("observer"),
             "step 5 must broadcast stop"

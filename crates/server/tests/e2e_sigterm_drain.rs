@@ -316,6 +316,9 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     let is_ready = Arc::new(AtomicBool::new(true));
     let open_streams = Arc::new(AtomicUsize::new(2));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    // The flag step 4 stores before it notifies. Production wires this at
+    // `cli::serve`, so the test must wire it too or step 4 never runs (REL-1).
+    let shutdown_cut = Arc::new(AtomicBool::new(false));
 
     let (listener_stop_tx, listener_stop_rx) = tokio::sync::watch::channel(false);
     let shutdown = ShutdownSupervisor::new(
@@ -326,17 +329,25 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
         Duration::from_millis(10), // fast drain grace for test
         Duration::from_millis(50), // fast drain timeout for test
     )
-    .with_listener_stop(listener_stop_tx);
+    .with_listener_stop(listener_stop_tx)
+    .with_shutdown_cut(shutdown_cut.clone());
 
-    // Simulate active in-flight stream that listens for shutdown_notify
+    // Simulate an in-flight stream parked on the notify. It registers its waiter
+    // and signals readiness over `registered` before the drain starts, so
+    // `notify_waiters` cannot fire into an empty waiter list.
     let cut_observed = Arc::new(AtomicBool::new(false));
     let cut_clone = cut_observed.clone();
     let streams_clone = open_streams.clone();
-    tokio::spawn(async move {
-        shutdown_notify.notified().await;
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+    let straggler = tokio::spawn(async move {
+        let mut notified = std::pin::pin!(shutdown_notify.notified());
+        notified.as_mut().enable();
+        let _ = registered_tx.send(());
+        notified.await;
         cut_clone.store(true, Ordering::SeqCst);
         streams_clone.store(0, Ordering::SeqCst);
     });
+    registered_rx.await.expect("straggler must register");
 
     let exit_code = shutdown.execute_graceful_shutdown().await;
     assert_eq!(exit_code, 0);
@@ -345,8 +356,26 @@ async fn test_eight_step_graceful_sigterm_drain_and_panic_supervisor() {
     assert!(!is_ready.load(Ordering::SeqCst));
     assert!(*listener_stop_rx.borrow());
 
-    // Step 4: Stragglers cancelled with ShutdownCut
-    assert!(cut_observed.load(Ordering::SeqCst));
+    // Step 4: Stragglers cancelled with ShutdownCut. The cut flag is stored
+    // synchronously inside the shutdown sequence, before the notify fires, so it
+    // is observable as soon as `execute_graceful_shutdown` returns. Assert the
+    // flag itself: that is the mechanism production streams poll, not the wake-up.
+    assert!(
+        shutdown_cut.load(Ordering::SeqCst),
+        "step 4 must store the shutdown cut flag before it notifies"
+    );
+
+    // Step 4 wake-up contract: the same cut wakes waiters that had already
+    // registered. Awaiting the straggler makes its wake-up effects visible, so
+    // this asserts the contract rather than racing the scheduler.
+    let _ = tokio::time::timeout(Duration::from_secs(5), straggler)
+        .await
+        .expect("straggler must be woken by the shutdown cut");
+
+    assert!(
+        cut_observed.load(Ordering::SeqCst),
+        "step 4 must wake waiters that registered before the drain"
+    );
 
     // Step 8: Open streams drained to 0
     assert_eq!(open_streams.load(Ordering::SeqCst), 0);
