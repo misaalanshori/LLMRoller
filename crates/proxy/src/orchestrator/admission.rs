@@ -40,6 +40,110 @@ pub(crate) struct AdmittedRequest {
     pub(crate) pin_ttl_ms: i64,
 }
 
+/// Failure modes of the reserve-then-decompress sequence (`SEC-8`, `PERF-3`).
+#[derive(Debug)]
+enum ReserveDecompressError {
+    /// The preflight budget could not accommodate the reservation.
+    Busy(GatewayBusyError),
+    /// The body claimed an encoding it does not actually use.
+    InvalidEncoding(crate::forward::ForwardError),
+}
+
+/// What a reservation actually covers, so the caller can reconcile it down.
+///
+/// The preflight permit plus the body it covers. The permit is held for the request's
+/// lifetime and released by its `Drop` on every error path (`SEC-8`, `ISSUE-0147`).
+#[derive(Debug)]
+struct ReservedBody {
+    permit: OwnedSemaphorePermit,
+    body: Bytes,
+}
+
+impl ReservedBody {
+    /// Shrink the reservation from the worst case down to `actual` bytes.
+    ///
+    /// Releasing the surplus is what keeps the common case — a compressed body that
+    /// inflates to well under the ceiling — from permanently occupying a 16 MiB slot
+    /// for the whole request. Consumes and returns the permit; the body is left to the
+    /// caller so nothing is moved unnecessarily.
+    ///
+    /// If the split cannot be expressed (`actual > reserved`, a caller bug), the
+    /// original permit is returned unchanged rather than failing the request: over-
+    /// reserving is the safe direction.
+    fn shrink_permit(
+        mut permit: OwnedSemaphorePermit,
+        reserved: usize,
+        actual: usize,
+    ) -> OwnedSemaphorePermit {
+        let units = |bytes: usize| bytes.div_ceil(4096);
+        let reserved_units = units(reserved);
+        let actual_units = units(actual).min(reserved_units);
+        if actual_units == reserved_units {
+            return permit;
+        }
+        match permit.split(reserved_units.saturating_sub(actual_units)) {
+            // `split` moved the surplus tokens into the returned permit, which is
+            // dropped here, releasing them back to the semaphore.
+            Some(surplus) => {
+                drop(surplus);
+                permit
+            }
+            None => permit,
+        }
+    }
+}
+
+/// Acquire the preflight reservation for a compressed body, then decompress it.
+///
+/// The reservation is denominated in the **decompressed** ceiling, not the wire size:
+/// a 1 KB gzip body may legitimately inflate to `MAX_DECOMPRESSED_BYTES`, so reserving
+/// the wire size would let `N` concurrent requests allocate `N × 16 MiB` while the
+/// budget still read free (`SEC-8`, `PERF-3`, `ISSUE-0147`).
+///
+/// The reservation is reconciled down to the actual decompressed size before return,
+/// and released by the permit's `Drop` on every error path.
+async fn reserve_and_decompress_compressed(
+    semaphore: &PreflightBudgetSemaphore,
+    encoding: &str,
+    wire_body: Bytes,
+) -> Result<ReservedBody, ReserveDecompressError> {
+    // Worst case first: the ceiling the decoder is allowed to reach.
+    let ceiling = crate::forward::MAX_DECOMPRESSED_BYTES;
+    let reservation = wire_body.len().max(ceiling);
+    let permit = semaphore
+        .acquire(reservation, Duration::from_millis(2000))
+        .await
+        .map_err(ReserveDecompressError::Busy)?;
+
+    match crate::forward::decompress_chunk(encoding, &wire_body) {
+        Ok(decompressed) => {
+            let body = Bytes::from(decompressed);
+            let actual = body.len();
+            let permit = ReservedBody::shrink_permit(permit, reservation, actual);
+            Ok(ReservedBody { permit, body })
+        }
+        // `permit` is dropped here, releasing the worst-case reservation.
+        Err(error) => Err(ReserveDecompressError::InvalidEncoding(error)),
+    }
+}
+
+/// Acquire the preflight reservation for an uncompressed body and return it unchanged.
+///
+/// Reserves only the wire length: charging the 16 MiB decompression ceiling to a body
+/// that is not compressed would cut throughput on the common path by the ratio of the
+/// ceiling to the typical body size.
+async fn reserve_and_decompress_uncompressed(
+    semaphore: &PreflightBudgetSemaphore,
+    body: Bytes,
+) -> Result<ReservedBody, ReserveDecompressError> {
+    let reserved = body.len();
+    let permit = semaphore
+        .acquire(reserved, Duration::from_millis(2000))
+        .await
+        .map_err(ReserveDecompressError::Busy)?;
+    Ok(ReservedBody { permit, body })
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) async fn admit_inbound_request(
     state: ProxyAuthState,
@@ -79,44 +183,72 @@ pub(crate) async fn admit_inbound_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .trim();
-    let body = if !encoding.is_empty() && encoding != "identity" {
-        match crate::forward::decompress_chunk(encoding, &body) {
-            Ok(decompressed) => Bytes::from(decompressed),
-            Err(e) => {
+    // 1. Reserve preflight memory, then decompress inside that reservation
+    //    (`SEC-8`, `PERF-3`, `ISSUE-0147`).
+    //
+    //    The reservation for a compressed body is denominated in the *decompressed*
+    //    ceiling, not the wire size: a 1 KB gzip body may legitimately inflate to
+    //    `MAX_DECOMPRESSED_BYTES`, so reserving the wire size would let N concurrent
+    //    requests each allocate up to the ceiling while the budget still read free.
+    //    Uncompressed bodies reserve only their own length. The permit is held for the
+    //    request's lifetime and released by its `Drop` on every error path.
+    let is_compressed = !encoding.is_empty() && encoding != "identity";
+    let reserved = if is_compressed {
+        match reserve_and_decompress_compressed(&state.budget_semaphore, encoding, body).await {
+            Ok(reserved) => reserved,
+            Err(ReserveDecompressError::InvalidEncoding(error)) => {
                 crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
                 return Err(protocol_error(
                     is_messages,
                     StatusCode::BAD_REQUEST,
                     "invalid_encoding",
-                    format!("failed to decompress request body: {e}"),
+                    format!("failed to decompress request body: {error}"),
+                    Some(&request_id_str),
+                    None,
+                ));
+            }
+            Err(ReserveDecompressError::Busy(error)) => {
+                crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+                return Err(protocol_error(
+                    is_messages,
+                    error.status_code(),
+                    "gateway_busy",
+                    error.to_string(),
+                    Some(&request_id_str),
+                    Some(error.retry_after_secs()),
+                ));
+            }
+        }
+    } else {
+        match reserve_and_decompress_uncompressed(&state.budget_semaphore, body).await {
+            Ok(reserved) => reserved,
+            Err(ReserveDecompressError::Busy(error)) => {
+                crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
+                return Err(protocol_error(
+                    is_messages,
+                    error.status_code(),
+                    "gateway_busy",
+                    error.to_string(),
+                    Some(&request_id_str),
+                    Some(error.retry_after_secs()),
+                ));
+            }
+            // The uncompressed path never produces an encoding error.
+            Err(ReserveDecompressError::InvalidEncoding(error)) => {
+                crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                return Err(protocol_error(
+                    is_messages,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_encoding",
+                    format!("failed to decompress request body: {error}"),
                     Some(&request_id_str),
                     None,
                 ));
             }
         }
-    } else {
-        body
     };
-
-    // 1. Acquire preflight memory budget permit (up to 2,000 ms)
-    let permit = match state
-        .budget_semaphore
-        .acquire(body.len(), Duration::from_millis(2000))
-        .await
-    {
-        Ok(permit) => permit,
-        Err(error) => {
-            crate::metrics::record_request_metric(endpoint_str, "5xx", "error");
-            return Err(protocol_error(
-                is_messages,
-                error.status_code(),
-                "gateway_busy",
-                error.to_string(),
-                Some(&request_id_str),
-                Some(error.retry_after_secs()),
-            ));
-        }
-    };
+    let permit = reserved.permit;
+    let body = reserved.body;
 
     // 2. Scan and validate body envelope and duplicate keys
     let scan = match scan_top_level(&body) {
@@ -676,4 +808,262 @@ pub(crate) async fn admit_inbound_request(
         store_flag,
         pin_ttl_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    /// Compress `payload` with gzip so tests can build a small body that inflates
+    /// to a known size.
+    fn gzip(payload: &[u8]) -> Bytes {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(payload).expect("compress");
+        Bytes::from(encoder.finish().expect("finish"))
+    }
+
+    fn semaphore(budget_mb: usize) -> PreflightBudgetSemaphore {
+        PreflightBudgetSemaphore::new(budget_mb, 64)
+    }
+
+    /// Remaining permits in 4096-byte units, converted back to bytes.
+    fn available_bytes(sem: &PreflightBudgetSemaphore) -> usize {
+        sem.semaphore.available_permits() * 4096
+    }
+
+    /// A compressed body must reserve its decompressed ceiling *before* inflating.
+    ///
+    /// Sequential form, because "while decompression is in progress" has no
+    /// observable hook: a `decompress_chunk` call is synchronous.
+    ///
+    /// Request A is an uncompressed body that occupies all but one unit of the
+    /// budget. Request B's **wire** size fits in the remaining unit, but its
+    /// decompressed size does not. If the reservation were denominated in wire
+    /// bytes, B would be admitted and then allocate far past the budget; because the
+    /// reservation is denominated in the decompressed ceiling, B is refused.
+    #[tokio::test]
+    #[doc = "Spec: SEC-8, PERF-3 — ISSUE-0147 compressed bodies reserve their decompressed ceiling"]
+    async fn compressed_body_reserves_its_decompressed_ceiling_before_inflating() {
+        // 1 MiB budget = 256 units of 4096 bytes.
+        let sem = semaphore(1);
+        let budget_bytes = 1024 * 1024;
+
+        // Hold everything except one unit, so only 4096 bytes remain.
+        let hog = sem
+            .acquire(budget_bytes - 4096, Duration::from_millis(2000))
+            .await
+            .expect("the hog must fit the budget");
+        assert_eq!(available_bytes(&sem), 4096);
+
+        // B's wire size is tiny and would fit in the remaining 4096 bytes.
+        let body = gzip(&vec![0_u8; 200_000]);
+        assert!(
+            body.len() <= 4096,
+            "the fixture must be smaller than the remaining budget to be a fair test; \
+             got {} bytes",
+            body.len()
+        );
+
+        let outcome = reserve_and_decompress_compressed(&sem, "gzip", body).await;
+        assert!(
+            matches!(outcome, Err(ReserveDecompressError::Busy(_))),
+            "a compressed body whose decompressed size exceeds the remaining budget \
+             must be refused before inflating, not admitted on its wire size"
+        );
+
+        drop(hog);
+        assert_eq!(
+            available_bytes(&sem),
+            budget_bytes,
+            "a refused reservation must not leak permits"
+        );
+    }
+
+    /// Concurrent compressed bodies must not collectively exceed the budget.
+    ///
+    /// N is derived from the budget: with a budget of `n × decompressed_size / 4`,
+    /// at most a small number of requests can hold the worst-case reservation at
+    /// once, so the number admitted is bounded by the budget rather than by N.
+    #[tokio::test]
+    #[doc = "Spec: SEC-8, PERF-3 — ISSUE-0147 concurrent compressed bodies cannot exceed the budget"]
+    async fn concurrent_compressed_bodies_cannot_exceed_the_budget() {
+        const DECOMPRESSED: usize = 4 * 1024 * 1024;
+        // Budget fits exactly one worst-case reservation, with headroom for the
+        // wire bytes of the fixtures.
+        let budget_mb = 17;
+        let sem = Arc::new(semaphore(budget_mb));
+
+        let payload = vec![0_u8; DECOMPRESSED];
+        let body = gzip(&payload);
+        let concurrency = 8;
+
+        let attempts = async {
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let sem = Arc::clone(&sem);
+                let body = body.clone();
+                set.spawn(
+                    async move { reserve_and_decompress_compressed(&sem, "gzip", body).await },
+                );
+            }
+            // Hold every successful reservation: in production the permit lives for
+            // the whole request, and releasing it here would let the next wave in.
+            let mut held = Vec::new();
+            let mut refused = 0;
+            while let Some(joined) = set.join_next().await {
+                match joined.expect("task must not panic") {
+                    Ok(reserved) => held.push(reserved),
+                    Err(ReserveDecompressError::Busy(_)) => refused += 1,
+                    Err(ReserveDecompressError::InvalidEncoding(_)) => {
+                        panic!("the fixture is valid gzip")
+                    }
+                }
+            }
+            (held.len(), refused)
+        };
+
+        let (admitted, refused) = tokio::time::timeout(Duration::from_secs(60), attempts)
+            .await
+            .expect(
+                "the concurrent admission test must terminate; hitting this bound is a \
+                 finding, not a flake",
+            );
+
+        assert_eq!(admitted + refused, concurrency);
+        assert!(
+            admitted <= 1,
+            "{admitted} concurrent compressed bodies were admitted against a budget that \
+             fits exactly one {DECOMPRESSED}-byte decompression; the reservation is not \
+             bounding concurrent decompression"
+        );
+        assert!(
+            refused >= concurrency - 1,
+            "the budget must refuse the rest; only {refused} of {} were refused",
+            concurrency - 1
+        );
+    }
+
+    /// A failed decompression must release its reservation.
+    #[tokio::test]
+    #[doc = "Spec: SEC-8 — ISSUE-0147 reservation is released when decompression fails"]
+    async fn reservation_is_released_when_decompression_fails() {
+        // The worst-case reservation is the 16 MiB decompression ceiling, so the budget
+        // must be able to hold one; this test is about leak detection, not tightness.
+        let sem = semaphore(32);
+        let budget_bytes = 32 * 1024 * 1024;
+        assert_eq!(available_bytes(&sem), budget_bytes);
+
+        // Not valid gzip.
+        let body = Bytes::from_static(b"this is definitely not gzip");
+        let outcome = reserve_and_decompress_compressed(&sem, "gzip", body).await;
+        assert!(
+            matches!(outcome, Err(ReserveDecompressError::InvalidEncoding(_))),
+            "invalid gzip must surface as an encoding error, got {outcome:?}"
+        );
+
+        assert_eq!(
+            available_bytes(&sem),
+            budget_bytes,
+            "the full budget must be available again after a failed decompression; a \
+             leaked permit permanently shrinks the budget"
+        );
+    }
+
+    /// An uncompressed body must reserve only its wire length.
+    #[tokio::test]
+    #[doc = "Spec: SEC-8, PERF-3 — ISSUE-0147 uncompressed bodies reserve only their wire length"]
+    async fn uncompressed_body_reserves_only_its_wire_length() {
+        // Budget large enough for many small bodies but far smaller than the
+        // 16 MiB ceiling an uncompressed body must not reserve.
+        let sem = semaphore(1);
+        let budget_bytes = 1024 * 1024;
+        let body = Bytes::from(vec![b'x'; 8 * 1024]);
+
+        let admitted = reserve_and_decompress_uncompressed(&sem, body.clone())
+            .await
+            .expect("an 8 KiB body must fit a 1 MiB budget");
+        assert_eq!(admitted.body.as_ref(), body.as_ref());
+
+        let remaining = available_bytes(&sem);
+        assert_eq!(
+            remaining,
+            budget_bytes - 8192,
+            "an uncompressed body must reserve exactly its wire length; reserving the \
+             16 MiB decompression ceiling would have exhausted this budget"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prefix_measurement {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    fn gzip(payload: &[u8]) -> Bytes {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(payload).expect("compress");
+        Bytes::from(encoder.finish().expect("finish"))
+    }
+
+    /// Measures the *old* ordering: decompress first, then acquire on the
+    /// decompressed length.
+    ///
+    /// This exists purely to produce the pre-fix number for the cycle report. It is
+    /// the exact sequence the production path used before the fix, so the count it
+    /// prints is what an attacker could have achieved. Left as a test rather than a
+    /// throwaway so the measurement is reproducible.
+    #[tokio::test]
+    #[doc = "Spec: PERF-3 — ISSUE-0147 pre-fix concurrent decompression measurement"]
+    async fn prefix_ordering_admits_every_concurrent_body() {
+        let sem = Arc::new(PreflightBudgetSemaphore::new(17, 64));
+        let payload = vec![0_u8; 4 * 1024 * 1024];
+        let body = gzip(&payload);
+        let concurrency = 16;
+
+        // Pre-fix sequence: decompress each body unconditionally, then try to acquire.
+        let attempts = async {
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let sem = Arc::clone(&sem);
+                let body = body.clone();
+                set.spawn(async move {
+                    // Decompression happens with no reservation at all.
+                    let decompressed =
+                        crate::forward::decompress_chunk("gzip", &body).expect("valid gzip");
+                    let inflated = decompressed.len();
+                    // Only now does the budget get consulted, on the inflated length.
+                    sem.acquire(inflated, Duration::from_millis(2000))
+                        .await
+                        .is_ok()
+                });
+            }
+            let mut admitted = 0;
+            while let Some(joined) = set.join_next().await {
+                if joined.expect("task must not panic") {
+                    admitted += 1;
+                }
+            }
+            admitted
+        };
+
+        let admitted = tokio::time::timeout(Duration::from_secs(60), attempts)
+            .await
+            .expect("the measurement must terminate");
+
+        println!(
+            "PRE-FIX MEASUREMENT: {admitted} of {concurrency} concurrent compressed bodies \
+             reached the budget check, each having already allocated {} bytes with no \
+             reservation",
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            admitted, concurrency,
+            "the pre-fix ordering inflates every body before any admission decision"
+        );
+    }
 }
