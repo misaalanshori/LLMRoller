@@ -372,3 +372,18 @@ body.auth-page {
 .text-strike { text-decoration: line-through; }
 .text-xs { font-size: 0.75rem; }
 .alert.visible { display: block; }
+
+/* Connection Setup Wizard & Format Switcher (SRDD 14.h) */
+.step-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.625rem; font-size: 0.875rem; font-weight: 600; color: var(--text); }
+.step-badge { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); font-size: 0.75rem; font-weight: 700; }
+.format-cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+.format-radio-card { background: var(--bg-subtle); border: 1.5px solid var(--border); border-radius: 8px; padding: 0.875rem 1rem; cursor: pointer; text-align: left; transition: border-color 0.15s, background 0.15s; display: flex; flex-direction: column; gap: 0.25rem; position: relative; }
+.format-radio-card:hover { border-color: var(--border-light); background: var(--card-hover); }
+.format-radio-card.active { border-color: var(--success); background: rgba(16, 185, 129, 0.06); }
+.format-vendor { font-size: 0.75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.format-title { font-size: 0.9375rem; font-weight: 700; color: var(--text); }
+.format-desc { font-size: 0.75rem; color: var(--muted); line-height: 1.35; }
+.connection-url-panel { background: var(--bg-subtle); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; display: flex; flex-direction: column; gap: 0.625rem; }
+.url-copy-box { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.625rem 0.875rem; }
+.url-copy-box code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.875rem; color: var(--accent-key); word-break: break-all; }
+

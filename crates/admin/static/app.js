@@ -365,6 +365,13 @@ document.addEventListener('click', function(e) {
             segBtn.classList.add('btn-primary');
         }
     }
+
+    // 19. Connection Setup Format Switcher (SRDD 14.h)
+    const fmtBtn = e.target.closest('[data-action="select-api-format"]');
+    if (fmtBtn) {
+        selectApiFormat(fmtBtn.getAttribute('data-format') || 'chat', fmtBtn);
+        return;
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -456,8 +463,7 @@ async function handleCreateClientKey(e) {
 
         const revealedToken = data.raw_token || data.token;
         if (revealedToken) {
-            document.getElementById('revealed-token-text').textContent = revealedToken;
-            openModal('modal-token-reveal');
+            showRevealedTokenModal(revealedToken);
         }
     } catch (err) {
         alert('Failed to generate key: ' + err);
@@ -941,7 +947,92 @@ window.addEventListener('resize', () => {
     }
 });
 
+let resolvedDataPlaneOrigin = 'http://127.0.0.1:8080';
+let activeApiFormat = 'chat';
+
+function selectApiFormat(format, clickedBtn) {
+    activeApiFormat = format;
+    if (clickedBtn) {
+        const grid = clickedBtn.closest('.format-cards-grid');
+        if (grid) {
+            grid.querySelectorAll('.format-radio-card').forEach(c => c.classList.remove('active'));
+        }
+        clickedBtn.classList.add('active');
+    }
+    const badgeEl = document.getElementById('connection-format-badge');
+    const urlEl = document.getElementById('connection-base-url');
+    if (format === 'messages') {
+        if (badgeEl) badgeEl.textContent = 'Anthropic · Messages';
+        if (urlEl) urlEl.textContent = resolvedDataPlaneOrigin;
+    } else if (format === 'responses') {
+        if (badgeEl) badgeEl.textContent = 'OpenAI · Responses';
+        if (urlEl) urlEl.textContent = `${resolvedDataPlaneOrigin}/v1`;
+    } else {
+        if (badgeEl) badgeEl.textContent = 'OpenAI · Chat Completions';
+        if (urlEl) urlEl.textContent = `${resolvedDataPlaneOrigin}/v1`;
+    }
+}
+
+function applyDataPlaneOrigin(origin) {
+    resolvedDataPlaneOrigin = origin.replace(/\/+$/, '');
+    const ckOpenai = document.getElementById('ck-openai-base-url');
+    const ckAnth = document.getElementById('ck-anthropic-base-url');
+    const snipClaude = document.getElementById('snippet-claude');
+    const snipOpenai = document.getElementById('snippet-openai');
+    if (ckOpenai) ckOpenai.textContent = `${resolvedDataPlaneOrigin}/v1`;
+    if (ckAnth) ckAnth.textContent = resolvedDataPlaneOrigin;
+    if (snipClaude) {
+        snipClaude.textContent = `export ANTHROPIC_BASE_URL="${resolvedDataPlaneOrigin}"\nexport ANTHROPIC_API_KEY="llr_live_YOUR_CLIENT_KEY"`;
+    }
+    if (snipOpenai) {
+        snipOpenai.textContent = `export OPENAI_BASE_URL="${resolvedDataPlaneOrigin}/v1"\nexport OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"`;
+    }
+    selectApiFormat(activeApiFormat, null);
+}
+
+function showRevealedTokenModal(revealedToken) {
+    const tokenEl = document.getElementById('revealed-token-text');
+    if (tokenEl) tokenEl.textContent = revealedToken;
+    const snipEl = document.getElementById('revealed-token-snippet');
+    if (snipEl) {
+        snipEl.textContent =
+            `export OPENAI_BASE_URL="${resolvedDataPlaneOrigin}/v1"\n` +
+            `export OPENAI_API_KEY="${revealedToken}"\n` +
+            `export ANTHROPIC_BASE_URL="${resolvedDataPlaneOrigin}"\n` +
+            `export ANTHROPIC_API_KEY="${revealedToken}"`;
+    }
+    openModal('modal-token-reveal');
+}
+
+async function initConnectionSetupUrls() {
+    const proto = window.location.protocol || 'http:';
+    const host = window.location.hostname || '127.0.0.1';
+    const port = Number(window.location.port || 0);
+    const candidates = [];
+    if (port === 8081) {
+        candidates.push(`${proto}//${host}:${port + 1}`, `${proto}//${host}:8080`);
+    } else if (port > 0) {
+        candidates.push(`${proto}//${host}:${port}`, `${proto}//${host}:8080`);
+    } else {
+        candidates.push(`${proto}//${host}`);
+    }
+    for (const candidate of candidates) {
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 600);
+            const res = await fetch(`${candidate}/healthz`, { mode: 'no-cors', signal: ctrl.signal });
+            clearTimeout(timer);
+            if (res) {
+                applyDataPlaneOrigin(candidate);
+                return;
+            }
+        } catch (_e) {}
+    }
+    applyDataPlaneOrigin(candidates[0] || 'http://127.0.0.1:8080');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    initConnectionSetupUrls();
     loadAdminSettings();
     loadAdminAliases();
     loadAdminPrices();
@@ -1520,8 +1611,7 @@ async function rotateClientKey(id) {
         await invalidateAndRefetch('client-keys');
         const revealedToken = data.raw_token || data.token;
         if (revealedToken) {
-            document.getElementById('revealed-token-text').textContent = revealedToken;
-            openModal('modal-token-reveal');
+            showRevealedTokenModal(revealedToken);
         }
     } catch (err) {
         alert('Failed to rotate client key: ' + err);

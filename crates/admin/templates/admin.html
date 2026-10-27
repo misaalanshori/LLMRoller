@@ -5,16 +5,18 @@
             <p class="subtitle">Global infrastructure governance, tenant accounts, model catalog, and settings.</p>
         </div>
         <div class="header-actions">
-            <button class="btn btn-primary" data-modal-open="modal-new-user">+ New User Account</button>
+            <button class="btn btn-primary" data-modal-open="modal-new-key">+ Generate Client Key</button>
             <button class="btn btn-secondary" data-modal-open="modal-new-global-prov">+ Add Global Provider</button>
+            <button class="btn btn-outline" data-modal-open="modal-new-user">+ New User Account</button>
         </div>
     </div>
 
     <!-- Tab Navigation -->
     <div class="tabs-nav">
         <button class="tab-btn active" data-tab="tab-adm-overview">Overview</button>
-        <button class="tab-btn" data-tab="tab-adm-users">User Accounts</button>
+        <button class="tab-btn" data-tab="tab-adm-client-keys">Client Keys &amp; API</button>
         <button class="tab-btn" data-tab="tab-adm-providers">Global Providers</button>
+        <button class="tab-btn" data-tab="tab-adm-users">User Accounts</button>
         <button class="tab-btn" data-tab="tab-adm-catalog">Model Catalog</button>
         <button class="tab-btn" data-tab="tab-adm-price-book">Price Book</button>
         <button class="tab-btn" data-tab="tab-adm-traceability">Traceability</button>
@@ -59,6 +61,120 @@
             <p id="uplot-summary" class="card-desc">Loading usage telemetry...</p>
             <div id="uplot-chart" class="uplot-container uplot-box">
                 <span class="text-muted">Metrics aggregated from usage_rollups_5min</span>
+            </div>
+        </div>
+
+        <div class="card connect-card mt-6" id="connection-setup-card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>⚡ Connection Setup &amp; LLM API Endpoints</h3>
+                    <p class="card-desc">Choose your tool's API format, copy the LLMRoller base URL, and authenticate with a Client Key (<code>llr_...</code>).</p>
+                </div>
+                <button class="btn btn-sm btn-primary" data-modal-open="modal-new-key">+ Generate Client Key</button>
+            </div>
+            <div class="step-row">
+                <span class="step-badge">1</span>
+                <span>Which API format does your tool use?</span>
+            </div>
+            <div class="format-cards-grid">
+                <button type="button" class="format-radio-card active" data-action="select-api-format" data-format="chat">
+                    <span class="format-vendor">OpenAI</span>
+                    <span class="format-title">Chat Completions</span>
+                    <span class="format-desc">Recommended for OpenCode, Hermes Agent, and OpenAI SDKs (<code>/v1/chat/completions</code>).</span>
+                </button>
+                <button type="button" class="format-radio-card" data-action="select-api-format" data-format="responses">
+                    <span class="format-vendor">OpenAI</span>
+                    <span class="format-title">Responses</span>
+                    <span class="format-desc">Recommended for OpenAI Codex CLI and stateful Responses turns (<code>/v1/responses</code>).</span>
+                </button>
+                <button type="button" class="format-radio-card" data-action="select-api-format" data-format="messages">
+                    <span class="format-vendor">Anthropic</span>
+                    <span class="format-title">Messages</span>
+                    <span class="format-desc">Recommended for Claude Code and Anthropic SDKs (<code>/v1/messages</code>).</span>
+                </button>
+            </div>
+            <div class="connection-url-panel">
+                <div class="step-row">
+                    <span class="step-badge">2</span>
+                    <span>Copy the API base URL for <span class="badge badge-info" id="connection-format-badge">OpenAI · Chat Completions</span></span>
+                </div>
+                <div class="url-copy-box">
+                    <code id="connection-base-url">http://127.0.0.1:8080/v1</code>
+                    <button type="button" class="btn btn-xs btn-primary" data-copy="connection-base-url">Copy Base URL</button>
+                </div>
+                <div class="grid-2col mt-2">
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span>Claude Code Shell Configuration</span>
+                            <button type="button" class="btn btn-xs btn-ghost" data-copy="snippet-claude">Copy</button>
+                        </div>
+                        <pre id="snippet-claude">export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+                    </div>
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span>OpenCode / Codex / OpenAI SDK</span>
+                            <button type="button" class="btn btn-xs btn-ghost" data-copy="snippet-openai">Copy</button>
+                        </div>
+                        <pre id="snippet-openai">export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Client Keys & API -->
+    <div id="tab-adm-client-keys" class="tab-pane">
+        <div class="card mb-6">
+            <div class="card-header-flex">
+                <div>
+                    <h3>LLM API Endpoints</h3>
+                    <p class="card-desc">Use your generated <code>llr_...</code> client key as the Bearer token or <code>x-api-key</code> against these endpoints:</p>
+                </div>
+            </div>
+            <div class="grid-2col">
+                <div class="url-copy-box">
+                    <div>
+                        <div class="text-xs text-muted">OpenAI Chat Completions &amp; Responses Base URL (OpenCode, Codex)</div>
+                        <code id="ck-openai-base-url">http://127.0.0.1:8080/v1</code>
+                    </div>
+                    <button type="button" class="btn btn-xs btn-outline" data-copy="ck-openai-base-url">Copy</button>
+                </div>
+                <div class="url-copy-box">
+                    <div>
+                        <div class="text-xs text-muted">Anthropic Messages Base URL (Claude Code)</div>
+                        <code id="ck-anthropic-base-url">http://127.0.0.1:8080</code>
+                    </div>
+                    <button type="button" class="btn btn-xs btn-outline" data-copy="ck-anthropic-base-url">Copy</button>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>Issued Client Keys</h3>
+                    <p class="card-desc">Keys authenticating coding agents with rate limits, monthly caps, and CIDR guards.</p>
+                </div>
+                <button class="btn btn-sm btn-primary" data-modal-open="modal-new-key">+ Generate Key</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Prefix</th>
+                            <th>Label</th>
+                            <th>Routing Scope</th>
+                            <th>RPM Limit</th>
+                            <th>Monthly Budget</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="client-keys-body" hx-get="/app/partials/client-keys" hx-trigger="load, refresh" hx-swap="innerHTML">
+                        <tr><td colspan="7" class="text-center text-muted">Loading client keys...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -557,5 +673,75 @@
                 <button type="submit" class="btn btn-primary">Save Budget Window</button>
             </div>
         </form>
+    </div>
+</div>
+
+<!-- Modal: New Client Key -->
+<div id="modal-new-key" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Generate Client Key</h3>
+            <button class="modal-close" data-modal-close="modal-new-key">&times;</button>
+        </div>
+        <form id="form-new-key">
+            <div class="form-group">
+                <label for="key-label">Key Label / Name</label>
+                <input id="key-label" type="text" required placeholder="e.g. Claude Code Laptop">
+            </div>
+            <div class="form-group">
+                <label for="key-scope">Routing Scope</label>
+                <select id="key-scope">
+                    <option value="personal_first" selected>personal_first (Own keys first, fallback to shared/global)</option>
+                    <option value="blended">blended (Even weighted distribution)</option>
+                    <option value="personal_only">personal_only (Own and accepted shared keys only)</option>
+                    <option value="own_only">own_only (Strictly user's own keys)</option>
+                    <option value="global_only">global_only (Strictly global pool keys)</option>
+                </select>
+            </div>
+            <div class="grid-2col">
+                <div class="form-group">
+                    <label for="key-rpm">Rate Limit (RPM)</label>
+                    <input id="key-rpm" type="number" placeholder="Default: 60" min="1" max="10000">
+                </div>
+                <div class="form-group">
+                    <label for="key-budget">Monthly Budget ($)</label>
+                    <input id="key-budget" type="number" step="0.01" placeholder="e.g. 50.00">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" data-modal-close="modal-new-key">Cancel</button>
+                <button type="submit" class="btn btn-primary">Generate Token</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: Revealed Token -->
+<div id="modal-token-reveal" class="modal-backdrop">
+    <div class="modal-dialog">
+        <div class="modal-header">
+            <h3>Client Key Generated</h3>
+            <button class="modal-close" data-modal-close="modal-token-reveal">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p class="alert alert-warning">Make sure to copy your API key now. You will not be able to see it again!</p>
+            <div class="token-box">
+                <code id="revealed-token-text">llr_live_...</code>
+                <button class="btn btn-sm btn-primary" data-copy="revealed-token-text">Copy Key</button>
+            </div>
+            <div class="code-block mt-4">
+                <div class="code-header">
+                    <span>Ready-to-Use Environment Snippet</span>
+                    <button type="button" class="btn btn-xs btn-ghost" data-copy="revealed-token-snippet">Copy Snippet</button>
+                </div>
+                <pre id="revealed-token-snippet">export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_API_KEY="llr_live_..."
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_API_KEY="llr_live_..."</pre>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-primary" data-modal-close="modal-token-reveal">Done</button>
+        </div>
     </div>
 </div>

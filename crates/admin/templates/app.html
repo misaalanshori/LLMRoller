@@ -58,30 +58,92 @@
             </div>
         </div>
 
-        <div class="card connect-card">
-            <h3>⚡ Quick Connect Coding Assistants</h3>
-            <p class="card-desc">Point your coding agent directly to LLMRoller's data-plane listener:</p>
-            <div class="code-block">
-                <div class="code-header">
-                    <span>Claude Code Shell Configuration</span>
-                    <button class="btn btn-xs btn-ghost" data-copy="snippet-claude">Copy</button>
+        <div class="card connect-card mt-6" id="connection-setup-card">
+            <div class="card-header-flex">
+                <div>
+                    <h3>⚡ Connection Setup &amp; LLM API Endpoints</h3>
+                    <p class="card-desc">Choose your tool's API format, copy the LLMRoller base URL, and authenticate with a Client Key (`llr_...`).</p>
                 </div>
-                <pre id="snippet-claude">export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
-export ANTHROPIC_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+                <button class="btn btn-sm btn-primary" data-modal-open="modal-new-key">+ Generate Client Key</button>
             </div>
-            <div class="code-block">
-                <div class="code-header">
-                    <span>OpenAI Compatible SDK / Codex</span>
-                    <button class="btn btn-xs btn-ghost" data-copy="snippet-openai">Copy</button>
+            <div class="step-row">
+                <span class="step-badge">1</span>
+                <span>Which API format does your tool use?</span>
+            </div>
+            <div class="format-cards-grid">
+                <button type="button" class="format-radio-card active" data-action="select-api-format" data-format="chat">
+                    <span class="format-vendor">OpenAI</span>
+                    <span class="format-title">Chat Completions</span>
+                    <span class="format-desc">Recommended for OpenCode, Hermes Agent, and OpenAI SDKs (<code>/v1/chat/completions</code>).</span>
+                </button>
+                <button type="button" class="format-radio-card" data-action="select-api-format" data-format="responses">
+                    <span class="format-vendor">OpenAI</span>
+                    <span class="format-title">Responses</span>
+                    <span class="format-desc">Recommended for OpenAI Codex CLI and stateful Responses turns (<code>/v1/responses</code>).</span>
+                </button>
+                <button type="button" class="format-radio-card" data-action="select-api-format" data-format="messages">
+                    <span class="format-vendor">Anthropic</span>
+                    <span class="format-title">Messages</span>
+                    <span class="format-desc">Recommended for Claude Code and Anthropic SDKs (<code>/v1/messages</code>).</span>
+                </button>
+            </div>
+            <div class="connection-url-panel">
+                <div class="step-row">
+                    <span class="step-badge">2</span>
+                    <span>Copy the API base URL for <span class="badge badge-info" id="connection-format-badge">OpenAI · Chat Completions</span></span>
                 </div>
-                <pre id="snippet-openai">export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+                <div class="url-copy-box">
+                    <code id="connection-base-url">http://127.0.0.1:8080/v1</code>
+                    <button type="button" class="btn btn-xs btn-primary" data-copy="connection-base-url">Copy Base URL</button>
+                </div>
+                <div class="grid-2col mt-2">
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span>Claude Code Shell Configuration</span>
+                            <button type="button" class="btn btn-xs btn-ghost" data-copy="snippet-claude">Copy</button>
+                        </div>
+                        <pre id="snippet-claude">export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+                    </div>
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span>OpenCode / Codex / OpenAI SDK</span>
+                            <button type="button" class="btn btn-xs btn-ghost" data-copy="snippet-openai">Copy</button>
+                        </div>
+                        <pre id="snippet-openai">export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
 export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Tab: Client Keys -->
     <div id="tab-client-keys" class="tab-pane">
+        <div class="card mb-6">
+            <div class="card-header-flex">
+                <div>
+                    <h3>LLM API Endpoints</h3>
+                    <p class="card-desc">Use your generated <code>llr_...</code> client key as the Bearer token or <code>x-api-key</code> against these endpoints:</p>
+                </div>
+            </div>
+            <div class="grid-2col">
+                <div class="url-copy-box">
+                    <div>
+                        <div class="text-xs text-muted">OpenAI Chat Completions &amp; Responses Base URL (OpenCode, Codex)</div>
+                        <code id="ck-openai-base-url">http://127.0.0.1:8080/v1</code>
+                    </div>
+                    <button type="button" class="btn btn-xs btn-outline" data-copy="ck-openai-base-url">Copy</button>
+                </div>
+                <div class="url-copy-box">
+                    <div>
+                        <div class="text-xs text-muted">Anthropic Messages Base URL (Claude Code)</div>
+                        <code id="ck-anthropic-base-url">http://127.0.0.1:8080</code>
+                    </div>
+                    <button type="button" class="btn btn-xs btn-outline" data-copy="ck-anthropic-base-url">Copy</button>
+                </div>
+            </div>
+        </div>
         <div class="card">
             <div class="card-header-flex">
                 <div>
@@ -477,7 +539,17 @@ export OPENAI_API_KEY="llr_live_YOUR_CLIENT_KEY"</pre>
             <p class="alert alert-warning">Make sure to copy your API key now. You will not be able to see it again!</p>
             <div class="token-box">
                 <code id="revealed-token-text">llr_live_...</code>
-                <button class="btn btn-sm btn-primary" data-copy="revealed-token-text">Copy</button>
+                <button class="btn btn-sm btn-primary" data-copy="revealed-token-text">Copy Key</button>
+            </div>
+            <div class="code-block mt-4">
+                <div class="code-header">
+                    <span>Ready-to-Use Environment Snippet</span>
+                    <button type="button" class="btn btn-xs btn-ghost" data-copy="revealed-token-snippet">Copy Snippet</button>
+                </div>
+                <pre id="revealed-token-snippet">export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_API_KEY="llr_live_..."
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_API_KEY="llr_live_..."</pre>
             </div>
         </div>
         <div class="modal-footer">
