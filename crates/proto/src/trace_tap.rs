@@ -42,6 +42,44 @@ pub fn set_global_trace_budget_bytes(bytes: usize) {
     }
 }
 
+/// Current global trace memory in flight, and the active budget.
+///
+/// Exposed so the observability layer and tests can assert the accounting invariant
+/// without touching the statics directly (`PERF-5`). Note that `used > budget` is a
+/// legal state: lowering the budget at runtime does not retroactively clamp money
+/// already reserved.
+#[must_use]
+pub fn global_trace_memory() -> (usize, usize) {
+    (
+        GLOBAL_TRACE_BYTES.load(Ordering::Relaxed),
+        GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Try to claim `bytes` from the global trace budget in one atomic decision.
+///
+/// Both admission sites ([`TraceTap::reserve_global_bytes`] and
+/// [`TraceTap::try_feed_chunk`]) go through this, so the arithmetic cannot drift
+/// into two shapes again — which is exactly how they diverged before (`PERF-5`,
+/// `ISSUE-0007`).
+///
+/// The compare-and-set is the whole point: a load, compare, then add lets concurrent
+/// callers each observe room that only one of them can have, so the sum of grants can
+/// exceed the cap. `fetch_update` retries until the update is consistent with an
+/// observed value, making the budget a hard ceiling.
+///
+/// Saturating arithmetic throughout, so a pathological `bytes` value can neither
+/// panic in debug nor wrap in release.
+fn claim_global_trace_bytes(bytes: usize) -> bool {
+    let budget = GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed);
+    GLOBAL_TRACE_BYTES
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let next = current.saturating_add(bytes);
+            if next > budget { None } else { Some(next) }
+        })
+        .is_ok()
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AssembledToolCall {
     pub id: String,
@@ -405,12 +443,10 @@ impl TraceTap {
         if self.trace_dropped.load(Ordering::Acquire) {
             return false;
         }
-        let curr_global = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
-        if curr_global.saturating_add(bytes) > GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed) {
+        if !claim_global_trace_bytes(bytes) {
             self.trace_dropped.store(true, Ordering::Release);
             return false;
         }
-        GLOBAL_TRACE_BYTES.fetch_add(bytes, Ordering::Relaxed);
         self.allocated_bytes.fetch_add(bytes, Ordering::Relaxed);
         true
     }
@@ -902,15 +938,13 @@ impl TraceTap {
         }
 
         let chunk_len = chunk.len();
-        let curr_global = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
-        if curr_global + chunk_len > GLOBAL_TRACE_BUDGET_BYTES.load(Ordering::Relaxed) {
+        if !claim_global_trace_bytes(chunk_len) {
             self.trace_dropped.store(true, Ordering::Release);
             return false;
         }
 
         match self.tx.try_send(chunk) {
             Ok(()) => {
-                GLOBAL_TRACE_BYTES.fetch_add(chunk_len, Ordering::Relaxed);
                 self.allocated_bytes.fetch_add(chunk_len, Ordering::Relaxed);
                 true
             }
@@ -925,7 +959,20 @@ impl TraceTap {
 impl Drop for TraceTap {
     fn drop(&mut self) {
         let allocated = self.allocated_bytes.load(Ordering::Relaxed);
-        GLOBAL_TRACE_BYTES.fetch_sub(allocated, Ordering::Relaxed);
+        // `fetch_sub` on an `AtomicUsize` wraps, and a counter driven to a value near
+        // `usize::MAX` makes every subsequent reservation fail — content traceability
+        // would switch itself off silently and permanently (`ISSUE-0007`).
+        //
+        // The floor is a defensive guard, not a correctness proof: under-release
+        // leaks the counter upward and degrades traceability toward off, which is the
+        // safe direction; over-release would wrap and kill it instantly, which is not.
+        //
+        // Note this reads `&mut self`, so no concurrent reader of `allocated_bytes`
+        // for *this* tap can exist. Replacing the load with a `swap(0)` would only
+        // obscure the arithmetic without buying anything.
+        let _ = GLOBAL_TRACE_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(allocated))
+        });
     }
 }
 

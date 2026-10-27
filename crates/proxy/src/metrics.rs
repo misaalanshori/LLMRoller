@@ -232,6 +232,17 @@ pub fn record_sealer_in_flight(count: usize) {
     metrics::gauge!("llmroller_sealer_in_flight").set(count as f64);
 }
 
+/// Publish current global trace memory in flight and the active budget (`OBS-1`, `PERF-5`).
+///
+/// Traced turns share one process-wide byte budget. Without this gauge an operator
+/// can only see the effect of exhaustion (traceability quietly switching off), not
+/// its approach, so the counter is worth exposing even though it is only advisory.
+pub fn record_trace_memory(used_bytes: usize, budget_bytes: usize) {
+    let _ = get_or_init_prometheus_recorder();
+    metrics::gauge!("llmroller_trace_memory_bytes").set(used_bytes as f64);
+    metrics::gauge!("llmroller_trace_budget_bytes").set(budget_bytes as f64);
+}
+
 /// Record a queue drop event by reason (`"raw_events"`, `"trace_input"`, `"sealer_backlog"`) (`OBS-1`, `FND-040`).
 pub fn record_queue_drop(reason: &'static str) {
     let _ = get_or_init_prometheus_recorder();
@@ -409,5 +420,20 @@ mod fnd040_tests {
         record_pin_hit("hit");
         record_ttft_seconds("chat", "openrouter", 0.05);
         assert_eq!(CLOSED_LABEL_ALLOWLIST.len(), 10);
+    }
+
+    #[test]
+    #[doc = "Spec: OBS-1, PERF-5 — ISSUE-0007 trace memory is observable as a gauge"]
+    fn trace_memory_gauges_render_with_used_and_budget() {
+        record_trace_memory(1_024, 4_096);
+        let rendered = get_or_init_prometheus_recorder().render();
+        assert!(
+            rendered.contains("llmroller_trace_memory_bytes"),
+            "the used-bytes gauge must be exported; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("llmroller_trace_budget_bytes"),
+            "the budget gauge must be exported; rendered:\n{rendered}"
+        );
     }
 }

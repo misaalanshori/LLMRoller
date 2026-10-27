@@ -5,6 +5,18 @@
 
 use super::*;
 
+/// Serialises every test that reads or writes the process-global trace statics.
+///
+/// `GLOBAL_TRACE_BYTES` and `GLOBAL_TRACE_BUDGET_BYTES` are process-global and the
+/// harness runs tests in one process, so a test that lowers the budget or moves the
+/// counter must not run concurrently with another that reads them.
+pub(crate) fn global_budget_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[doc = "Spec: TRC-2, TRC-3, PERF-2, PERF-5"]
 #[test]
 fn test_binary_block_omission_replacement() {
@@ -68,6 +80,8 @@ fn test_response_head_tail_truncation_at_one_mib() {
 #[doc = "Spec: TRC-2, TRC-3, PERF-2, PERF-5"]
 #[test]
 fn test_trace_tap_non_blocking_try_send_and_memory_budget() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let (tap, _rx) = TraceTap::new();
 
     // Fill the 256-item channel buffer with 1-byte chunks
@@ -86,6 +100,8 @@ fn test_trace_tap_non_blocking_try_send_and_memory_budget() {
 #[doc = "Spec: TRC-2, TRC-3, API-5"]
 #[test]
 fn reassembles_chat_responses_and_messages_deltas() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let (_tap, _rx) = TraceTap::new();
     let mut tap = TraceTap::new().0;
     tap.feed_sse_data_json(&serde_json::json!({
@@ -150,6 +166,8 @@ fn drops_oversized_request_blocks_above_four_mebibytes() {
 /// Spec: TRC-2; SSE frames may be split across arbitrary chunk boundaries.
 #[test]
 fn test_feed_sse_chunk_reassembles_frames_split_across_chunks() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let mut tap = TraceTap::new().0;
     tap.feed_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel");
     assert_eq!(tap.output.assistant_text, "");
@@ -160,6 +178,8 @@ fn test_feed_sse_chunk_reassembles_frames_split_across_chunks() {
 /// Spec: TRC-2; Responses text deltas and Anthropic events share the same collector.
 #[test]
 fn test_feed_sse_chunk_reassembles_responses_and_anthropic_events() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let mut tap = TraceTap::new().0;
     tap.feed_sse_chunk(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"resp \"}\n\n");
     tap.feed_sse_chunk(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"claude\"}}\n\n");
@@ -169,6 +189,8 @@ fn test_feed_sse_chunk_reassembles_responses_and_anthropic_events() {
 /// Spec: TRC-2, TRC-4; non-streaming responses normalize into the same shape.
 #[test]
 fn test_feed_json_response_normalizes_chat_completion() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let mut tap = TraceTap::new().0;
     tap.feed_json_response(&serde_json::json!({
         "id": "chatcmpl-1",
@@ -350,6 +372,8 @@ fn test_prepare_request_blocks_drops_oldest_blocks_first_when_exceeding_4mib() {
 #[doc = "Spec: TRC-2, TRC-5"]
 #[test]
 fn test_responses_sse_function_call_deltas_and_reasoning_text_delta() {
+    // Shares the budget lock: these paths allocate from GLOBAL_TRACE_BYTES.
+    let _serial = global_budget_lock();
     let mut tap = TraceTap::new().0;
     tap.feed_sse_data_json(&serde_json::json!({
         "type": "response.reasoning_text.delta",
@@ -404,7 +428,9 @@ fn test_bounded_tool_call_index_and_global_trace_budget_accounting() {
     assert!(tap.output.truncated);
     assert!(tap.output.assistant_tool_calls.is_empty());
 
-    // F014: reserve_global_bytes tracks against GLOBAL_TRACE_BYTES and releases on Drop
+    // F014: reserve_global_bytes tracks against GLOBAL_TRACE_BYTES and releases on Drop.
+    // Serialised against the other budget-touching tests, which lower the budget.
+    let _serial = global_budget_lock();
     let before = GLOBAL_TRACE_BYTES.load(Ordering::Relaxed);
     {
         let tap2 = TraceTap::new().0;
@@ -413,3 +439,15 @@ fn test_bounded_tool_call_index_and_global_trace_budget_accounting() {
     }
     assert_eq!(GLOBAL_TRACE_BYTES.load(Ordering::Relaxed), before);
 }
+
+// ---------------------------------------------------------------------------
+// Global trace memory accounting (`PERF-5`, ISSUE-0007)
+// ---------------------------------------------------------------------------
+//
+// `GLOBAL_TRACE_BYTES` and `GLOBAL_TRACE_BUDGET_BYTES` are process-global statics
+// and the test harness runs tests in one process. Every test below serialises on a
+// crate-level mutex (the same one held by any other test that lowers the budget)
+// and restores both statics through a guard that also runs on panic, so a failure
+// in one test cannot leak a lowered budget into another.
+
+mod global_budget;

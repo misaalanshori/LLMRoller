@@ -578,6 +578,15 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                     .await
                                     .unwrap_or_else(|_| std::fs::metadata(&wal_path).map_or(0, |m| m.len()));
                                 llmroller_proxy::metrics::record_wal_bytes(wal_bytes);
+                                // Trace memory is process-global and only changes on reservation
+                                // and release, so sampling it on this 30 s tick is enough to see
+                                // it approaching the cap (`PERF-5`, `OBS-1`).
+                                let (trace_used, trace_budget) =
+                                    llmroller_proto::trace_tap::global_trace_memory();
+                                llmroller_proxy::metrics::record_trace_memory(
+                                    trace_used,
+                                    trace_budget,
+                                );
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map_or(0, |d| d.as_millis() as i64);
