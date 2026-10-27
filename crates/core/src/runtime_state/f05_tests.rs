@@ -319,3 +319,134 @@ fn reconcile_upstream_usage_honors_reserve_pct_and_preserves_local_delta() {
     assert!(!runtime.is_key_routable(key, now + 4_000));
     assert!(runtime.is_key_routable(key, now + 303_001));
 }
+
+// ---------------------------------------------------------------------------
+// In-flight spend must gate admission and headroom (ISSUE-0004, LIM-1, RTE-13)
+// ---------------------------------------------------------------------------
+
+/// Headroom must account for money already spoken for by live reservations, not
+/// only money already committed.
+///
+/// A key at zero committed spend with a reservation covering half its allowance
+/// has half its allowance free, so the reported headroom must be about 5,000 bps.
+/// Before the fix this returned 10_000 because `effective_used` was blind to
+/// in-flight spend.
+#[test]
+#[doc = "Spec: LIM-1, RTE-13 — ISSUE-0004 headroom sees in-flight reservations"]
+fn headroom_bps_reflects_in_flight_reservations() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    // $10.00 allowance, no reserve percentage, so max allowed spend is the limit.
+    let snapshot = snapshot_with_windows(vec![window(
+        "headroom",
+        key,
+        "upstream_key",
+        None,
+        10_000_000,
+    )]);
+    let counter = install_counter(&runtime, &snapshot, "headroom");
+
+    assert_eq!(
+        runtime.headroom_bps_for_route(&snapshot, key, None, now),
+        10_000,
+        "an untouched window starts with full headroom"
+    );
+
+    // Hold half the allowance in flight without committing anything.
+    let reservation = crate::windows::Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn crate::windows::BudgetCounter>],
+        5_000_000,
+        now,
+    )
+    .expect("half the allowance must be reservable");
+
+    assert_eq!(
+        runtime.headroom_bps_for_route(&snapshot, key, None, now),
+        5_000,
+        "headroom must drop by the reserved fraction even though nothing is committed"
+    );
+
+    drop(reservation);
+}
+
+/// Admission must reject when in-flight reservations have consumed the window,
+/// even though nothing has been committed yet.
+#[test]
+#[doc = "Spec: LIM-1 — ISSUE-0004 admission sees in-flight reservations"]
+fn key_budget_admitted_rejects_when_reservations_exhaust_the_window() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let snapshot = snapshot_with_windows(vec![window(
+        "admission",
+        key,
+        "upstream_key",
+        None,
+        1_000_000,
+    )]);
+    let counter = install_counter(&runtime, &snapshot, "admission");
+
+    assert!(
+        runtime.key_budget_admitted(&snapshot, key, None, now),
+        "a fully unused window must admit"
+    );
+
+    // Reserve the entire allowance. Nothing is committed; it is only in flight.
+    let reservation = crate::windows::Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn crate::windows::BudgetCounter>],
+        1_000_000,
+        now,
+    )
+    .expect("the whole allowance must be reservable once");
+
+    assert!(
+        !runtime.key_budget_admitted(&snapshot, key, None, now),
+        "a window fully spoken for by in-flight reservations must not admit more"
+    );
+
+    drop(reservation);
+}
+
+/// Dropping an uncommitted reservation must give the headroom back.
+///
+/// This pins the `Drop` symmetry the whole scheme depends on: if the rollback
+/// fails, every admission decision after it is wrong for the rest of the window.
+#[test]
+#[doc = "Spec: LIM-1 — ISSUE-0004 reservation rollback restores headroom"]
+fn dropping_a_reservation_restores_headroom() {
+    let runtime = RuntimeState::new();
+    let key = UpstreamKeyId::generate();
+    let now = utc_now_ms_for_tests();
+    let snapshot = snapshot_with_windows(vec![window(
+        "rollback",
+        key,
+        "upstream_key",
+        None,
+        10_000_000,
+    )]);
+    let counter = install_counter(&runtime, &snapshot, "rollback");
+
+    let reservation = crate::windows::Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn crate::windows::BudgetCounter>],
+        4_000_000,
+        now,
+    )
+    .expect("reservable");
+    assert_eq!(
+        runtime.headroom_bps_for_route(&snapshot, key, None, now),
+        6_000
+    );
+
+    drop(reservation);
+
+    assert_eq!(
+        runtime.headroom_bps_for_route(&snapshot, key, None, now),
+        10_000,
+        "dropping an uncommitted reservation must restore the full headroom"
+    );
+    assert!(
+        runtime.key_budget_admitted(&snapshot, key, None, now),
+        "admission must recover once the reservation is released"
+    );
+}

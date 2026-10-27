@@ -443,7 +443,31 @@ pub fn estimate_reservation_cost_micro_usd(
 /// Budget counter abstraction for CAS-based reservation.
 pub trait BudgetCounter: Send + Sync {
     fn counter_id(&self) -> u64;
-    fn effective_used(&self, now_ms: i64) -> i64;
+    /// Spend this window has spoken for: committed spend, projected by the latest
+    /// upstream observation, **plus** money held by live reservations.
+    ///
+    /// This is the single definition of "how much of this window is taken". Both
+    /// admission gates (`key_budget_admitted`, `headroom_bps_for_route`) and
+    /// `Reservation::try_reserve` read it, so a burst of concurrent streams cannot
+    /// each pass admission against a window that is already fully spoken for
+    /// (`LIM-1`, `ISSUE-0004`).
+    ///
+    /// The reservation term is added **after** the observation projection: the
+    /// projection extrapolates upstream-reported spend forward from local deltas,
+    /// and feeding it reservations would be projecting something the provider never
+    /// reported. Callers that need committed-only spend use [`Self::local_used`].
+    fn effective_used(&self, now_ms: i64) -> i64 {
+        self.local_used(now_ms)
+            .saturating_add(self.reserved_in_flight().load(Ordering::Acquire))
+    }
+    /// Committed spend only, without the in-flight reservation term, projected by
+    /// the latest upstream observation when one is present.
+    ///
+    /// This is the quantity the upstream observation projects forward: it is what
+    /// the provider has reported, adjusted for local deltas since that report. Call
+    /// it `projected` rather than `local` because for a provider-backed window it
+    /// is the projection, not the raw ring sum (`F05`).
+    fn local_used(&self, now_ms: i64) -> i64;
     fn limit_micro_usd(&self) -> i64;
     fn reserve_percent(&self) -> i64;
     fn max_allowed_spend(&self) -> i64 {
@@ -697,8 +721,8 @@ impl BudgetCounter for AtomicBudgetCounter {
         self.id
     }
 
-    fn effective_used(&self, now_ms: i64) -> i64 {
-        let local = self.local_used(now_ms);
+    fn local_used(&self, now_ms: i64) -> i64 {
+        let local = AtomicBudgetCounter::local_used(self, now_ms);
         let obs = *self.observation.read();
         match obs {
             None => local,
@@ -728,7 +752,12 @@ impl BudgetCounter for AtomicBudgetCounter {
 pub enum ReservationError {
     LimitExceeded {
         counter_id: u64,
+        /// Spend the window had spoken for at rejection time. **Includes** the
+        /// in-flight component reported in `reserved` (`ISSUE-0004`).
         effective_used: i64,
+        /// The in-flight reservation component, kept as a separate field because it
+        /// explains the rejection. This value is also contained in `effective_used`,
+        /// so the two fields overlap by design; do not add them together.
         reserved: i64,
         max_allowed: i64,
         requested: i64,
@@ -767,8 +796,12 @@ impl Reservation {
             let max_allowed = counter.max_allowed_spend();
             loop {
                 let current_reserved = counter.reserved_in_flight().load(Ordering::Acquire);
+                // `effective_used` already includes `current_reserved`, so the
+                // estimate is added to it exactly once. Adding `current_reserved`
+                // here as well would reject every reservation roughly twice as
+                // early (`ISSUE-0004`).
                 let used = counter.effective_used(now_ms);
-                if used + current_reserved + estimate_micro_usd > max_allowed {
+                if used.saturating_add(estimate_micro_usd) > max_allowed {
                     // Roll back all previously acquired counters in reverse order
                     for prev in acquired.iter().rev() {
                         prev.reserved_in_flight()

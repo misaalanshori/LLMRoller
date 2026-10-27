@@ -360,3 +360,102 @@ fn test_phase_2b_saturating_reservation_and_alert_dedup() {
         "second check in same window instance must be deduplicated"
     );
 }
+
+/// Reserving must not count in-flight spend twice.
+///
+/// With `effective_used` including `reserved_in_flight`, the admission comparison
+/// inside `try_reserve` must add the estimate only once. If it kept adding
+/// `current_reserved` on top, a window with room for exactly two estimates would
+/// admit only one, and every reservation in the system would reject roughly twice
+/// as early as it should.
+#[doc = "Spec: LIM-1 — ISSUE-0004 no double counting of in-flight spend"]
+#[test]
+fn try_reserve_does_not_double_count_in_flight() {
+    let t0 = 1_000_000_000_000;
+    let estimate = 1_000_000;
+    // Room for exactly two estimates, with no reserve percentage.
+    let counter = Arc::new(AtomicBudgetCounter::new(1, 2 * estimate, 0, 18_000_000));
+
+    let first = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        estimate,
+        t0,
+    )
+    .expect("first reservation must fit");
+
+    let second = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        estimate,
+        t0,
+    )
+    .expect("second reservation must fit: the window has room for exactly two");
+
+    let third = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        estimate,
+        t0,
+    )
+    .expect_err("third reservation must be rejected: the window is fully spoken for");
+    assert!(
+        matches!(third, ReservationError::LimitExceeded { .. }),
+        "rejection must be LimitExceeded, got {third:?}"
+    );
+
+    drop(second);
+    drop(first);
+    assert_eq!(
+        counter.reserved_in_flight().load(Ordering::SeqCst),
+        0,
+        "dropping both reservations must return the counter to zero in flight"
+    );
+}
+
+/// `effective_used` must include in-flight spend, and `LimitExceeded` must keep
+/// reporting the in-flight component so the diagnostic still explains itself.
+#[doc = "Spec: LIM-1 — ISSUE-0004 effective_used includes in-flight spend"]
+#[test]
+fn effective_used_includes_in_flight_reservations() {
+    let t0 = 1_000_000_000_000;
+    let counter = Arc::new(AtomicBudgetCounter::new(1, 10_000_000, 0, 18_000_000));
+    counter.record_actual(t0, 1_000_000);
+    assert_eq!(counter.effective_used(t0), 1_000_000);
+
+    let reservation = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        2_000_000,
+        t0,
+    )
+    .expect("reservable");
+
+    assert_eq!(
+        counter.effective_used(t0),
+        3_000_000,
+        "effective_used must be committed spend plus in-flight reservations"
+    );
+
+    // The error variant keeps `reserved` as the in-flight component, which is now
+    // also contained in `effective_used`. Pin that so the overlap stays documented
+    // rather than drifting.
+    let error = Reservation::try_reserve(
+        vec![Arc::clone(&counter) as Arc<dyn BudgetCounter>],
+        9_000_000,
+        t0,
+    )
+    .expect_err("must not fit");
+    match error {
+        ReservationError::LimitExceeded {
+            effective_used,
+            reserved,
+            ..
+        } => {
+            assert_eq!(reserved, 2_000_000, "reserved reports the in-flight part");
+            assert_eq!(
+                effective_used,
+                1_000_000 + reserved,
+                "effective_used contains committed spend plus the same in-flight part"
+            );
+        }
+    }
+
+    drop(reservation);
+}
