@@ -22,7 +22,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use llmroller_core::ids::UserId;
 use llmroller_core::rbac::Role;
-use llmroller_core::seams::{Clock, EntropySource, OsEntropy, SystemClock};
+use llmroller_core::seams::{
+    Clock, EntropySource, OsEntropy, SecretBytes, SystemClock, secret_bytes,
+};
 use llmroller_store::crypto::sha256_hex;
 use llmroller_store::users::{
     NewWebSession, SessionWithUser, User, count_users, delete_web_session, find_login_record,
@@ -427,6 +429,20 @@ pub struct AuthAppState {
     /// Identifier of the active master key, bound into the TOTP AAD.
     pub master_key_id: String,
     pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
+    /// Instance-wide session secret, shared with the data plane's `session_hash`
+    /// derivation and used as the CSRF key (`SEC-5`, `FND-041`).
+    ///
+    /// The production path always supplies this from `instance_secrets`. When it
+    /// is absent — unit tests and CLI paths that construct this state without
+    /// instance secrets — CSRF derivation falls back to
+    /// [`Self::csrf_fallback_key`], which is **per-process random**, never a
+    /// compile-time constant, so a token stays unforgeable without the session
+    /// token even on that path. The fallback does not survive a restart, which is
+    /// correct: CSRF tokens are per-rendered-page and are re-minted on every
+    /// login.
+    pub session_hmac_secret: Option<SecretBytes>,
+    /// Per-process random key used only when `session_hmac_secret` is absent.
+    csrf_fallback_key: SecretBytes,
     pub writer: Option<llmroller_store::writer::WriterHandle>,
     /// Short-lived replay cache `(user_id, totp_code) -> expires_at_ms` rejecting reuse within 90s (`AUTH-3`, `F-113`).
     pub used_totp_codes: Arc<Mutex<HashMap<(UserId, String), i64>>>,
@@ -446,6 +462,9 @@ impl AuthAppState {
             .map(|n| n.get())
             .unwrap_or(2)
             .max(2);
+        let entropy = OsEntropy::new();
+        let mut fallback_key = [0_u8; 32];
+        entropy.fill_bytes(&mut fallback_key);
         Self {
             reader_pool: pool.clone(),
             pool,
@@ -457,8 +476,30 @@ impl AuthAppState {
             master_key: None,
             master_key_id: String::new(),
             audit_hmac_key: None,
+            session_hmac_secret: None,
+            csrf_fallback_key: secret_bytes(fallback_key.to_vec()),
             writer: None,
             used_totp_codes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Derive the verifiable per-session CSRF token for this instance (`SEC-5`).
+    ///
+    /// Uses the instance session secret when present, otherwise the per-process
+    /// fallback key. Callers must not pass a token derived by a different state
+    /// instance and expect it to validate, unless both share the same instance
+    /// secret.
+    #[must_use]
+    pub fn derive_session_csrf(&self, session_token: &str) -> String {
+        derive_session_csrf_with_secret(self.csrf_key(), session_token)
+    }
+
+    /// The key this state uses for CSRF derivation.
+    fn csrf_key(&self) -> &[u8] {
+        use secrecy::ExposeSecret as _;
+        match &self.session_hmac_secret {
+            Some(secret) => secret.expose_secret(),
+            None => self.csrf_fallback_key.expose_secret(),
         }
     }
 
@@ -893,7 +934,7 @@ async fn post_login(
     let session_token = URL_SAFE_NO_PAD.encode(raw_session);
     let session_id_hash = sha256_hex(session_token.as_bytes());
 
-    let csrf_token = derive_session_csrf(&session_token);
+    let csrf_token = state.derive_session_csrf(&session_token);
     let csrf_hash = sha256_hex(csrf_token.as_bytes());
 
     let expires_at = now_ms + SESSION_ABSOLUTE_TIMEOUT_MS;
@@ -1108,38 +1149,31 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     response
 }
 
-/// Derives a keyed HMAC-SHA256 CSRF token when a server secret is provided, or the
-/// domain-separated SHA-256 derivation used by default sessions (`FND-041`, `SEC-5`).
+/// Derive a keyed CSRF token from a session token (`SEC-5`, `FND-041`).
+///
+/// `HMAC-SHA256(key = instance secret, message = domain separator || session token)`,
+/// rendered as lowercase hex. The `b"llmroller.csrf.v1:"` domain separator keeps
+/// this derivation separated from the data plane's use of the same
+/// `session_hmac_secret` for `session_hash`.
+///
+/// The key must be supplied by the caller. There is deliberately no "derive with
+/// no key" form: a public or absent key would make the token reproducible by
+/// anyone who learns the session token, which is exactly the property the header
+/// exists to add.
 #[must_use]
-pub fn derive_session_csrf_with_secret(secret: Option<&[u8]>, session_token: &str) -> String {
-    let key = secret.unwrap_or(b"llmroller.csrf.v1.default_hmac_key");
-    let mut ipad = [0x36_u8; 64];
-    let mut opad = [0x5c_u8; 64];
-    let key_bytes = if key.len() > 64 {
-        let hashed = sha256_hex(key);
-        hashed.into_bytes()
-    } else {
-        key.to_vec()
-    };
-    for (i, &b) in key_bytes.iter().take(64).enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
+pub fn derive_session_csrf_with_secret(secret: &[u8], session_token: &str) -> String {
+    use hmac::{Hmac, Mac as _};
+    let mut mac = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(secret)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts keys of any length"));
+    mac.update(b"llmroller.csrf.v1:");
+    mac.update(session_token.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
     }
-    let mut inner = Vec::with_capacity(64 + session_token.len() + 18);
-    inner.extend_from_slice(&ipad);
-    inner.extend_from_slice(b"llmroller.csrf.v1:");
-    inner.extend_from_slice(session_token.as_bytes());
-    let inner_hash = sha256_hex(&inner);
-    let mut outer = Vec::with_capacity(64 + inner_hash.len());
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(inner_hash.as_bytes());
-    sha256_hex(&outer)
-}
-
-/// Derives the verifiable per-session CSRF token from the session token (`SEC-5`, `FND-041`).
-#[must_use]
-pub fn derive_session_csrf(session_token: &str) -> String {
-    derive_session_csrf_with_secret(None, session_token)
+    hex
 }
 
 pub fn parse_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {

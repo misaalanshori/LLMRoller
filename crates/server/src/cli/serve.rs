@@ -421,6 +421,10 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     auth_state.master_key = Some(master_key.clone());
     auth_state.master_key_id = master_key_id.clone();
     auth_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
+    // Session CSRF derivation is keyed by the same instance secret the data plane
+    // uses for `session_hash` (`SEC-5`, `FND-041`, ISSUE-0002). Both are
+    // domain-separated, so sharing the key is safe.
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     auth_state.writer = Some(writer_handle.clone());
     let setup_state = llmroller_admin::SetupAppState {
         pool: pool.clone(),

@@ -24,7 +24,13 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
 use llmroller_store::users::{NewUser, create_user};
 
-async fn setup_traceability_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey, UserId) {
+async fn setup_traceability_test_db() -> (
+    tempfile::TempDir,
+    sqlx::SqlitePool,
+    MasterKey,
+    UserId,
+    llmroller_store::instance::InstanceState,
+) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("traceability_test.db");
 
@@ -35,9 +41,10 @@ async fn setup_traceability_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, M
 
     let entropy = OsEntropy;
     let master_key = MasterKey::from_bytes([0xEE; 32]);
-    load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
-        .await
-        .expect("instance load");
+    let instance_state =
+        load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
+            .await
+            .expect("instance load");
     seed_defaults(&writer_pool, None, 1)
         .await
         .expect("seed settings");
@@ -58,20 +65,21 @@ async fn setup_traceability_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, M
     .await
     .expect("admin");
 
-    (dir, writer_pool, master_key, admin.id)
+    (dir, writer_pool, master_key, admin.id, instance_state)
 }
 
 #[doc = "Spec: TRC-1, TRC-7, AUD-1"]
 #[tokio::test]
 async fn test_traceability_settings_confirm_purge_guard_and_auto_disable() {
-    let (dir, pool, master_key, _admin_id) = setup_traceability_test_db().await;
+    let (dir, pool, master_key, _admin_id, instance_state) = setup_traceability_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -82,7 +90,7 @@ async fn test_traceability_settings_confirm_purge_guard_and_auto_disable() {
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
 
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     // 1. GET /login to retrieve login CSRF cookie
     let login_page_req = Request::builder()
@@ -212,14 +220,15 @@ async fn test_rbac_isolated_sessions_and_preview() {
         SealJob, StoredTurnTraceV2, insert_sealed_trace_tx, seal_turn_sync,
     };
 
-    let (dir, pool, master_key, _admin_id) = setup_traceability_test_db().await;
+    let (dir, pool, master_key, _admin_id, instance_state) = setup_traceability_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -229,7 +238,7 @@ async fn test_rbac_isolated_sessions_and_preview() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
     let entropy = OsEntropy;
@@ -475,14 +484,15 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         SealJob, StoredTurnTraceV2, insert_sealed_trace_tx, seal_turn_sync,
     };
 
-    let (dir, pool, master_key, admin_id) = setup_traceability_test_db().await;
+    let (dir, pool, master_key, admin_id, instance_state) = setup_traceability_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -492,7 +502,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
     let entropy = OsEntropy;
@@ -516,7 +526,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
     // Authenticate Charlie session
     let raw_charlie = "charlie_trace_session_token_123456789";
     let id_hash = llmroller_store::crypto::sha256_hex(raw_charlie.as_bytes());
-    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_charlie);
+    let csrf_token = auth_state.derive_session_csrf(raw_charlie);
     let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
@@ -537,7 +547,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
     // Authenticate Admin session
     let raw_admin = "admin_trace_session_token_123456789";
     let admin_id_hash = llmroller_store::crypto::sha256_hex(raw_admin.as_bytes());
-    let admin_csrf = llmroller_admin::auth::derive_session_csrf(raw_admin);
+    let admin_csrf = auth_state.derive_session_csrf(raw_admin);
     let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,

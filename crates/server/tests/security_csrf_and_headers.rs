@@ -27,7 +27,13 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
 use llmroller_store::users::{NewUser, create_user};
 
-async fn setup_csrf_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey, UserId) {
+async fn setup_csrf_test_db() -> (
+    tempfile::TempDir,
+    sqlx::SqlitePool,
+    MasterKey,
+    UserId,
+    llmroller_store::instance::InstanceState,
+) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("csrf_test.db");
 
@@ -38,9 +44,10 @@ async fn setup_csrf_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey
 
     let entropy = OsEntropy;
     let master_key = MasterKey::from_bytes([0xFA; 32]);
-    load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
-        .await
-        .expect("instance load");
+    let instance_state =
+        load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
+            .await
+            .expect("instance load");
     seed_defaults(&writer_pool, None, 1)
         .await
         .expect("seed settings");
@@ -61,7 +68,7 @@ async fn setup_csrf_test_db() -> (tempfile::TempDir, sqlx::SqlitePool, MasterKey
     .await
     .expect("admin");
 
-    (dir, writer_pool, master_key, admin.id)
+    (dir, writer_pool, master_key, admin.id, instance_state)
 }
 
 #[doc = "Spec: UI-1, UI-3, UI-4, SEC-5 | Phase: ./docs/bigbang/08_PHASE_7_DASHBOARD_UX_AND_FINAL_SECURITY_HARDENING.md#T7.4"]
@@ -154,14 +161,17 @@ fn collect_html_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 #[doc = "Spec: UI-1, UI-3, UI-4, SEC-5 | Phase: ./docs/bigbang/08_PHASE_7_DASHBOARD_UX_AND_FINAL_SECURITY_HARDENING.md#T7.4"]
 #[tokio::test]
 async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
-    let (dir, pool, master_key, _admin_id) = setup_csrf_test_db().await;
+    let (dir, pool, master_key, _admin_id, instance_state) = setup_csrf_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    // Bind CSRF derivation to the same instance secret production wires, so the
+    // rendered tokens match a real deployment (SEC-5, ISSUE-0002).
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -171,7 +181,7 @@ async fn test_strict_csp_headers_and_csrf_middleware_enforcement() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     // 1. GET /login: Check security headers (SEC-5, UI-3)
     let login_page_req = Request::builder()

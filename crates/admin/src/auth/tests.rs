@@ -146,3 +146,9 @@ fn non_loopback_control_plane_bind_refuses_without_tls_or_trusted_proxies() {
 // ---------------------------------------------------------------------------
 
 mod login_concurrency;
+
+// ---------------------------------------------------------------------------
+// Session CSRF derivation (`SEC-5`, `FND-041`, ISSUE-0002)
+// ---------------------------------------------------------------------------
+
+mod session_csrf;

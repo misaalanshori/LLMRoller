@@ -15,7 +15,6 @@ use axum::http::{Request, StatusCode, header};
 use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
 
-use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
 use llmroller_core::seams::OsEntropy;
 
 use crate::auth::{AuthAppState, AuthConfig, router};
@@ -64,19 +63,21 @@ async fn build_harness(permits: Option<usize>) -> LoginHarness {
         .await
         .expect("seed settings");
 
-    let actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
-    llmroller_store::users::create_user(
-        &pool,
-        &actor,
-        llmroller_store::users::NewUser {
-            username: TEST_USERNAME,
-            password: TEST_PASSWORD,
-            role: Role::User,
-            must_change_password: false,
-        },
-        &entropy,
-        1,
+    // Seed the login user directly rather than through `create_user`: that helper
+    // requires an admin actor, and `crates/admin` must never construct
+    // `ActorScope::System` (workspace boundary USR-1/SEC-17).
+    let password_hash =
+        llmroller_store::users::hash_password(TEST_PASSWORD, &entropy).expect("hash password");
+    sqlx::query(
+        "INSERT INTO users (
+            id, username, password_hash, role, must_change_password,
+            totp_enabled, can_use_global_providers, disabled, created_at
+         ) VALUES (?, ?, ?, 'user', 0, 0, 1, 0, 1)",
     )
+    .bind(llmroller_core::ids::UserId::generate().to_string())
+    .bind(TEST_USERNAME)
+    .bind(&password_hash)
+    .execute(&pool)
     .await
     .expect("seed user");
 

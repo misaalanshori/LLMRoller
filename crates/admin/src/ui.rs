@@ -62,7 +62,7 @@ pub async fn get_app_ui(
     let session_token =
         crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
             .unwrap_or("");
-    let csrf_token = crate::auth::derive_session_csrf(session_token);
+    let csrf_token = state.auth.derive_session_csrf(session_token);
 
     let now_ms = state.auth.clock.now_ms();
     let traceability_enabled =
@@ -144,7 +144,7 @@ pub async fn get_admin_ui(
     let session_token =
         crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
             .unwrap_or("");
-    let csrf_token = crate::auth::derive_session_csrf(session_token);
+    let csrf_token = state.auth.derive_session_csrf(session_token);
 
     let now_ms = state.auth.clock.now_ms();
     let traceability_enabled =

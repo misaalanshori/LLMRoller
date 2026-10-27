@@ -6,14 +6,15 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
     use axum::http::header;
     use std::time::Duration;
 
-    let (dir, pool, master_key, _admin_id) = setup_dashboard_test_db().await;
+    let (dir, pool, master_key, _admin_id, instance_state) = setup_dashboard_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -23,7 +24,7 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let entropy = OsEntropy;
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
@@ -46,7 +47,7 @@ async fn test_control_plane_api_logging_and_api_logs_query() {
 
     let raw_session = "aud2_session_token_12345678901234";
     let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
-    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_token = auth_state.derive_session_csrf(raw_session);
     let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
@@ -121,14 +122,15 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
     use axum::http::header;
     use llmroller_core::ids::{ClientKeyId, RequestId, UsageEventId};
 
-    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
+    let (dir, pool, master_key, admin_id, instance_state) = setup_dashboard_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -138,7 +140,7 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let entropy = OsEntropy;
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
@@ -161,7 +163,7 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
 
     let raw_session = "usg9_session_token_12345678901234";
     let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
-    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_token = auth_state.derive_session_csrf(raw_session);
     let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
@@ -181,7 +183,7 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
 
     let admin_session = "usg9_admin_session_token_12345678";
     let admin_id_hash = llmroller_store::crypto::sha256_hex(admin_session.as_bytes());
-    let admin_csrf = llmroller_admin::auth::derive_session_csrf(admin_session);
+    let admin_csrf = auth_state.derive_session_csrf(admin_session);
     let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
@@ -372,14 +374,15 @@ async fn test_dual_stream_logs_explorer_and_request_detail_drawer() {
 async fn test_overview_analytics_dashboard_kpis_and_models_breakdown() {
     use axum::http::header;
 
-    let (dir, pool, master_key, admin_id) = setup_dashboard_test_db().await;
+    let (dir, pool, master_key, admin_id, instance_state) = setup_dashboard_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -389,7 +392,7 @@ async fn test_overview_analytics_dashboard_kpis_and_models_breakdown() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let entropy = OsEntropy;
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
@@ -412,7 +415,7 @@ async fn test_overview_analytics_dashboard_kpis_and_models_breakdown() {
 
     let raw_session = "ui6_session_token_12345678901234";
     let id_hash = llmroller_store::crypto::sha256_hex(raw_session.as_bytes());
-    let csrf_token = llmroller_admin::auth::derive_session_csrf(raw_session);
+    let csrf_token = auth_state.derive_session_csrf(raw_session);
     let csrf_hash = llmroller_store::crypto::sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,
@@ -432,7 +435,7 @@ async fn test_overview_analytics_dashboard_kpis_and_models_breakdown() {
 
     let raw_admin = "ui6_admin_token_12345678901234";
     let admin_hash = llmroller_store::crypto::sha256_hex(raw_admin.as_bytes());
-    let admin_csrf = llmroller_admin::auth::derive_session_csrf(raw_admin);
+    let admin_csrf = auth_state.derive_session_csrf(raw_admin);
     let admin_csrf_hash = llmroller_store::crypto::sha256_hex(admin_csrf.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,

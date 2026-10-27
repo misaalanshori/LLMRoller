@@ -2,8 +2,13 @@ use super::*;
 
 use llmroller_store::users::{NewUser, create_user};
 
-pub(crate) async fn setup_dashboard_test_db()
--> (tempfile::TempDir, sqlx::SqlitePool, MasterKey, UserId) {
+pub(crate) async fn setup_dashboard_test_db() -> (
+    tempfile::TempDir,
+    sqlx::SqlitePool,
+    MasterKey,
+    UserId,
+    llmroller_store::instance::InstanceState,
+) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("dashboard_test.db");
 
@@ -14,9 +19,10 @@ pub(crate) async fn setup_dashboard_test_db()
 
     let entropy = OsEntropy;
     let master_key = MasterKey::from_bytes([0xBB; 32]);
-    load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
-        .await
-        .expect("instance load");
+    let instance_state =
+        load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
+            .await
+            .expect("instance load");
     seed_defaults(&writer_pool, None, 1)
         .await
         .expect("seed settings");
@@ -37,7 +43,7 @@ pub(crate) async fn setup_dashboard_test_db()
     .await
     .expect("admin");
 
-    (dir, writer_pool, master_key, admin.id)
+    (dir, writer_pool, master_key, admin.id, instance_state)
 }
 
 /// Assert an HTMX partial rendered user-controlled text as inert markup (SEC-19).

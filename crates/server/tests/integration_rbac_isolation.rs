@@ -31,6 +31,7 @@ async fn setup_rbac_test_db() -> (
     MasterKey,
     UserId,
     UserId,
+    llmroller_store::instance::InstanceState,
 ) {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("rbac_isolation_test.db");
@@ -42,9 +43,10 @@ async fn setup_rbac_test_db() -> (
 
     let entropy = OsEntropy;
     let master_key = MasterKey::from_bytes([0xAB; 32]);
-    load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
-        .await
-        .expect("instance load");
+    let instance_state =
+        load_or_initialize(&writer_pool, "key-0", &master_key, Arc::new(entropy), 1)
+            .await
+            .expect("instance load");
     seed_defaults(&writer_pool, None, 1)
         .await
         .expect("seed settings");
@@ -80,13 +82,20 @@ async fn setup_rbac_test_db() -> (
     .await
     .expect("bob");
 
-    (dir, writer_pool, master_key, alice.id, bob.id)
+    (
+        dir,
+        writer_pool,
+        master_key,
+        alice.id,
+        bob.id,
+        instance_state,
+    )
 }
 
 #[doc = "Spec: USR-2, USR-3, USR-4, UI-1, UI-2"]
 #[tokio::test]
 async fn test_rbac_isolation_and_project_key_redaction() {
-    let (_dir, _pool, _master_key, alice_id, bob_id) = setup_rbac_test_db().await;
+    let (_dir, _pool, _master_key, alice_id, bob_id, _instance_state) = setup_rbac_test_db().await;
 
     let alice_actor = ActorScope::user(alice_id, Role::User);
     let bob_actor = ActorScope::user(bob_id, Role::User);
@@ -172,7 +181,8 @@ async fn test_rbac_isolation_and_project_key_redaction() {
 #[doc = "Spec: USR-3, SEC-17"]
 #[tokio::test]
 async fn test_cross_tenant_existence_oracle_and_mutation_guards() {
-    let (_dir, writer_pool, master_key, alice_id, bob_id) = setup_rbac_test_db().await;
+    let (_dir, writer_pool, master_key, alice_id, bob_id, _instance_state) =
+        setup_rbac_test_db().await;
     let entropy = OsEntropy;
 
     let alice_actor = ActorScope::user(alice_id, Role::User);
@@ -363,21 +373,22 @@ async fn test_user_routing_matrix_and_self_service_security() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt as _;
-    use llmroller_admin::auth::{AuthConfig, derive_session_csrf};
+    use llmroller_admin::auth::AuthConfig;
     use llmroller_admin::setup::SetupAppState;
     use llmroller_admin::{ApiAppState, AuthAppState, control_plane_router_full};
     use llmroller_store::crypto::sha256_hex;
     use llmroller_store::models::upsert_discovered_models_tx;
     use tower::ServiceExt as _;
 
-    let (dir, pool, master_key, alice_id, _bob_id) = setup_rbac_test_db().await;
+    let (dir, pool, master_key, alice_id, _bob_id, instance_state) = setup_rbac_test_db().await;
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(instance_state.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: pool.clone(),
         expected_token: Some("mock_token".to_string()),
@@ -387,7 +398,7 @@ async fn test_user_routing_matrix_and_self_service_security() {
         audit_hmac_key: None,
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
-    let app = control_plane_router_full(setup_state, auth_state, api_state);
+    let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let alice_actor = ActorScope::user(alice_id, Role::User);
     let admin_actor = ActorScope::user(UserId::generate(), Role::Admin);
@@ -503,7 +514,7 @@ async fn test_user_routing_matrix_and_self_service_security() {
     // 3. Establish Alice's authenticated session
     let raw_session = "alice_test_session_token_1234567890123456";
     let id_hash = sha256_hex(raw_session.as_bytes());
-    let csrf_token = derive_session_csrf(raw_session);
+    let csrf_token = auth_state.derive_session_csrf(raw_session);
     let csrf_hash = sha256_hex(csrf_token.as_bytes());
     llmroller_store::users::insert_web_session(
         &pool,

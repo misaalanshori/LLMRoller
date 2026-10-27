@@ -12,14 +12,14 @@ use axum::http::{Request, StatusCode, header};
 use tempfile::tempdir;
 use tower::ServiceExt as _;
 
-use llmroller_admin::auth::{AuthAppState, AuthConfig, derive_session_csrf};
+use llmroller_admin::auth::{AuthAppState, AuthConfig, derive_session_csrf_with_secret};
 use llmroller_admin::setup::SetupAppState;
 use llmroller_admin::{ApiAppState, control_plane_router_full};
 use llmroller_core::eligibility::CandidatePoolTier;
 use llmroller_core::ids::{ClientKeyId, ModelPk, ProviderId, UpstreamKeyId, UserId};
 use llmroller_core::pins::{PinEntry, PinKey, PinState, PinStore};
 use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
-use llmroller_core::seams::{Clock as _, OsEntropy};
+use llmroller_core::seams::{Clock as _, ExposeSecret as _, OsEntropy};
 use llmroller_store::crypto::MasterKey;
 use llmroller_store::instance::load_or_initialize;
 use llmroller_store::migrations::migrate;
@@ -32,6 +32,7 @@ struct Harness {
     pool: sqlx::SqlitePool,
     master_key: MasterKey,
     admin: UserId,
+    session_hmac_secret: llmroller_core::seams::SecretBytes,
     alice_key: FixtureKey,
     bob_key: FixtureKey,
 }
@@ -48,10 +49,11 @@ async fn insert_session(
     pool: &sqlx::SqlitePool,
     user_id: UserId,
     raw_token: &str,
+    session_hmac_secret: &[u8],
 ) -> (String, String) {
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
     let id_hash = llmroller_store::crypto::sha256_hex(raw_token.as_bytes());
-    let csrf = derive_session_csrf(raw_token);
+    let csrf = derive_session_csrf_with_secret(session_hmac_secret, raw_token);
     let csrf_hash = llmroller_store::crypto::sha256_hex(csrf.as_bytes());
     insert_web_session(
         pool,
@@ -76,6 +78,7 @@ async fn insert_personal_key(
     label: &str,
     model_pk: ModelPk,
     session_hash: &str,
+    session_hmac_secret: &[u8],
 ) -> FixtureKey {
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
     let client_key_id = ClientKeyId::generate();
@@ -139,8 +142,13 @@ async fn insert_personal_key(
     .await
     .expect("insert pin");
 
-    let (cookie, csrf) =
-        insert_session(pool, owner, &format!("{label}-session-token-0123456789")).await;
+    let (cookie, csrf) = insert_session(
+        pool,
+        owner,
+        &format!("{label}-session-token-0123456789"),
+        session_hmac_secret,
+    )
+    .await;
     FixtureKey {
         owner,
         client_key_id,
@@ -159,7 +167,7 @@ async fn harness() -> Harness {
     seed_defaults(&pool, None, 1).await.expect("seed settings");
 
     let master_key = MasterKey::from_bytes([0xC7; 32]);
-    load_or_initialize(&pool, "key-0", &master_key, Arc::new(OsEntropy), 1)
+    let instance_state = load_or_initialize(&pool, "key-0", &master_key, Arc::new(OsEntropy), 1)
         .await
         .expect("instance load");
 
@@ -215,15 +223,31 @@ async fn harness() -> Harness {
         .await
         .expect("insert model");
 
-    let alice_key =
-        insert_personal_key(&pool, alice.id, "alice", model_pk, "shared-session-hash").await;
-    let bob_key = insert_personal_key(&pool, bob.id, "bob", model_pk, "shared-session-hash").await;
+    let alice_key = insert_personal_key(
+        &pool,
+        alice.id,
+        "alice",
+        model_pk,
+        "shared-session-hash",
+        instance_state.session_hmac_secret.expose_secret(),
+    )
+    .await;
+    let bob_key = insert_personal_key(
+        &pool,
+        bob.id,
+        "bob",
+        model_pk,
+        "shared-session-hash",
+        instance_state.session_hmac_secret.expose_secret(),
+    )
+    .await;
 
     Harness {
         _dir: dir,
         pool,
         master_key,
         admin: admin.id,
+        session_hmac_secret: instance_state.session_hmac_secret.clone(),
         alice_key,
         bob_key,
     }
@@ -235,7 +259,8 @@ fn build_app(harness: &Harness, pin_store: Arc<PinStore>) -> axum::Router {
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let auth_state = AuthAppState::new(harness.pool.clone(), auth_config);
+    let mut auth_state = AuthAppState::new(harness.pool.clone(), auth_config);
+    auth_state.session_hmac_secret = Some(harness.session_hmac_secret.clone());
     let setup_state = SetupAppState {
         pool: harness.pool.clone(),
         expected_token: Some("f11-token".to_string()),
@@ -407,6 +432,7 @@ async fn test_standard_user_cannot_delete_another_users_session_pin() {
         &harness.pool,
         harness.admin,
         "admin-f11-session-token-0123456789",
+        harness.session_hmac_secret.expose_secret(),
     )
     .await;
     let admin_delete = delete_request(
@@ -440,6 +466,7 @@ async fn test_audit_log_captures_authenticated_actor_user_id_on_mutations() {
         &harness.pool,
         harness.admin,
         "admin-audit-session-token-0123456789",
+        harness.session_hmac_secret.expose_secret(),
     )
     .await;
 
@@ -624,8 +651,13 @@ async fn test_client_key_sessions_report_live_session_pins() {
     );
 
     // Admin queries sessions: receives full unredacted key details
-    let (admin_cookie, _admin_csrf) =
-        insert_session(&harness.pool, harness.admin, "admin_sessions_token_12345").await;
+    let (admin_cookie, _admin_csrf) = insert_session(
+        &harness.pool,
+        harness.admin,
+        "admin_sessions_token_12345",
+        harness.session_hmac_secret.expose_secret(),
+    )
+    .await;
     let admin_req = Request::builder()
         .method("GET")
         .uri(format!(
@@ -1123,8 +1155,13 @@ async fn regression_test_f082_user_portal_session_pins_endpoint_masks_global_ups
     );
 
     // Admin user calls /admin/api/pins (JSON): receives real label
-    let (admin_cookie, _admin_csrf) =
-        insert_session(&harness.pool, harness.admin, "admin_pins_token_f082").await;
+    let (admin_cookie, _admin_csrf) = insert_session(
+        &harness.pool,
+        harness.admin,
+        "admin_pins_token_f082",
+        harness.session_hmac_secret.expose_secret(),
+    )
+    .await;
     let admin_req = Request::builder()
         .method("GET")
         .uri("/admin/api/pins")
