@@ -88,6 +88,13 @@ enum MockMode {
     /// have a real elapsed time to observe (`ISSUE-0148`).
     ChatJsonAfter(u64),
     Chat429,
+    /// HTTP 200 whose JSON body embeds an `invalid_request_error`, which the classifier
+    /// maps to `RequestRejected` (`ISSUE-0150`).
+    EmbeddedRequestRejected,
+    /// A plain non-retryable upstream 400, passed through unchanged (`ISSUE-0151`).
+    NonRetryable400,
+    /// An SSE stream whose first frame is an `invalid_request_error` (`ISSUE-0150`).
+    StreamRequestRejected,
     ResponsesFailed,
     SleepDelay(u64),
 }
@@ -170,6 +177,31 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
             })),
         )
             .into_response(),
+        MockMode::EmbeddedRequestRejected => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "context_length_exceeded: too many tokens"
+                }
+            })),
+        )
+            .into_response(),
+        MockMode::NonRetryable400 => (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "unsupported parameter: temperature"
+                }
+            })),
+        )
+            .into_response(),
+        MockMode::StreamRequestRejected => sse_response(
+            "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded\"}}\n\n",
+        ),
         MockMode::ResponsesFailed => (
             StatusCode::OK,
             [("content-type", "application/json")],
@@ -1482,3 +1514,8 @@ fn _writer_handle(_writer: &WriterHandle) {}
 // 1,600-line ceiling (`MNT-3`); it reuses the harness defined above.
 #[path = "integration_streaming_accounting/charged_timeout_ledger.rs"]
 mod charged_timeout_ledger;
+
+// Dropped-ledger coverage for the remaining terminal paths (`ISSUE-0150`, `ISSUE-0151`).
+// Kept in a submodule for the same 1,600-line MNT-3 reason as the cycle-10 module.
+#[path = "integration_streaming_accounting/terminal_ledger_paths.rs"]
+mod terminal_ledger_paths;

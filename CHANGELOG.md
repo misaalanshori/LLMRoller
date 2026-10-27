@@ -49,6 +49,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (dropped ledger rows)
+
+- **An embedded 200 rejection never reached the ledger (ISSUE-0150).** When an upstream
+  answered HTTP 200 with a `RequestRejected` error in the body, the non-streaming handler
+  pushed an attempt row and returned a synthesised 400 — with no usage event. The
+  streaming first-frame equivalent in `attempt_streaming.rs` was worse: it committed a
+  failure charge and *then* returned a rejection without enqueuing, so money was billed
+  with nothing recording it. Both now call the shared `enqueue_terminal_usage`, attributed
+  to the key and provider that answered.
+- **A Gate G7 budget refusal never reached the ledger (ISSUE-0151).** When the client-key
+  monthly cap rejected a request at admission, the caller was told their budget was
+  exhausted while `usage_events` held no record that they had tried — the refusal was
+  invisible to `/usage`. The event now carries no key or provider attribution (the gate
+  fails before any upstream call) and no cost, with `error_code` identifying which cap
+  was hit.
+- Also extracted `provider_billing(snapshot, provider_id)`: the same four-line billing
+  lookup was repeated at four call sites and a fifth was about to be added.
+
+Note: the non-retryable-4xx passthrough the issue also names as a drop site **already
+emitted** — every non-2xx is intercepted at `pipeline.rs` before the attempt handler runs,
+and that path enqueues. The test for it is kept as a status-quo pin rather than a red.
+
 ### Fixed (billing integrity)
 
 - **A charged timeout never reached the usage ledger (ISSUE-0149).** On the

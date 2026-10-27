@@ -778,6 +778,52 @@ pub(crate) async fn admit_inbound_request(
         Ok(guard) => Some(guard),
         Err(error) => {
             crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+            // Gate G7 rejected before any upstream call, so the event carries no key or
+            // provider attribution and costs nothing (`USG-1`, `ISSUE-0151`). Without
+            // this the refusal is invisible to `/usage`: the caller is told their budget
+            // is exhausted while the ledger holds no record that they tried.
+            enqueue_terminal_usage(
+                &state,
+                TerminalUsageFacts {
+                    request_id,
+                    caller: &caller,
+                    canonical_model: &model.canonical_id,
+                    upstream_key_id: None,
+                    provider_id: None,
+                    provider_scope: None,
+                    share_id: None,
+                    upstream_model_id: model.canonical_id.clone(),
+                    endpoint_str,
+                    session_hash: None,
+                    pin_outcome: None,
+                    failovers: 0,
+                    error_code: Some(
+                        match error {
+                            llmroller_core::accumulators::GateG7Error::ClientKeyBudgetExhausted { .. } => {
+                                "client_key_budget_exhausted"
+                            }
+                            llmroller_core::accumulators::GateG7Error::UserGlobalBudgetExhausted { .. } => {
+                                "user_budget_exhausted"
+                            }
+                            llmroller_core::accumulators::GateG7Error::ProviderShareCapExhausted { .. } => {
+                                "provider_share_budget_exhausted"
+                            }
+                        }
+                        .to_string(),
+                    ),
+                    billing_coverage_mode: "pay_as_you_go".to_string(),
+                    plan_multiplier_bps: 10_000,
+                    request_headers_json: request_headers_json.clone(),
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    is_streaming: scan.stream.as_ref().is_some_and(|(s, _)| *s),
+                    termination: Termination::Completed.as_str(),
+                    cost_micro_usd: 0,
+                    cost_source: CostSource::EstimatedIncomplete,
+                    now,
+                    latency_ms: Some(0),
+                },
+                Vec::new(),
+            );
             return Err(gate_error_response(&error, is_messages));
         }
     };

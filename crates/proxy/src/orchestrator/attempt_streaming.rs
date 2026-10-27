@@ -143,6 +143,43 @@ pub(crate) async fn handle_streaming_attempt(
                             } else {
                                 StatusCode::BAD_REQUEST
                             };
+                        // A real upstream key produced this rejection, so the event is
+                        // attributed to that key and provider. The failure charge above
+                        // is what makes persisting it mandatory: the money was committed
+                        // and the ledger must say so (`USG-1`, `ISSUE-0150`).
+                        let (billing_coverage_mode, plan_multiplier_bps) =
+                            provider_billing(snapshot, &candidate.provider_id);
+                        enqueue_terminal_usage(
+                            state,
+                            TerminalUsageFacts {
+                                request_id,
+                                caller,
+                                canonical_model: &model.canonical_id,
+                                upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                                provider_id: Some(candidate.provider_id.to_string()),
+                                provider_scope: Some(provider_scope_label(candidate).to_string()),
+                                share_id: candidate.share_id.map(|share| share.to_string()),
+                                upstream_model_id: candidate.upstream_model_id.clone(),
+                                endpoint_str,
+                                session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                                pin_outcome: pin_ticket
+                                    .as_ref()
+                                    .map(|ticket| ticket.outcome.as_str().to_string()),
+                                failovers: *failovers,
+                                error_code: Some("invalid_request_error".to_string()),
+                                billing_coverage_mode,
+                                plan_multiplier_bps,
+                                request_headers_json: request_headers_json.clone(),
+                                status: rej_status,
+                                is_streaming: true,
+                                termination: Termination::Completed.as_str(),
+                                cost_micro_usd: charged_micro_usd,
+                                cost_source: CostSource::EstimatedIncomplete,
+                                now,
+                                latency_ms: Some(state.clock.now_ms() - attempt_started),
+                            },
+                            std::mem::take(attempts),
+                        );
                         return Some(protocol_error(
                             is_messages,
                             rej_status,

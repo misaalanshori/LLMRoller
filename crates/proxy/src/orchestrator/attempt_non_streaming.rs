@@ -283,6 +283,42 @@ pub(crate) async fn handle_non_streaming_attempt(
                 );
                 attempts.push(att);
                 crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+                // A real upstream key answered with the 200 that carried this rejection, so
+                // the event is attributed to that key and provider rather than to "none"
+                // (`USG-1`, `ISSUE-0150`). Nothing is billed for a rejected request.
+                let (billing_coverage_mode, plan_multiplier_bps) =
+                    provider_billing(snapshot, &candidate.provider_id);
+                enqueue_terminal_usage(
+                    state,
+                    TerminalUsageFacts {
+                        request_id,
+                        caller,
+                        canonical_model: &model.canonical_id,
+                        upstream_key_id: Some(candidate.upstream_key_id.to_string()),
+                        provider_id: Some(candidate.provider_id.to_string()),
+                        provider_scope: Some(provider_scope_label(candidate).to_string()),
+                        share_id: candidate.share_id.map(|share| share.to_string()),
+                        upstream_model_id: candidate.upstream_model_id.clone(),
+                        endpoint_str,
+                        session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+                        pin_outcome: pin_ticket
+                            .as_ref()
+                            .map(|ticket| ticket.outcome.as_str().to_string()),
+                        failovers: *failovers,
+                        error_code: Some("invalid_request_error".to_string()),
+                        billing_coverage_mode,
+                        plan_multiplier_bps,
+                        request_headers_json: request_headers_json.clone(),
+                        status: StatusCode::BAD_REQUEST,
+                        is_streaming: false,
+                        termination: Termination::Completed.as_str(),
+                        cost_micro_usd: 0,
+                        cost_source: CostSource::EstimatedIncomplete,
+                        now,
+                        latency_ms: Some(state.clock.now_ms() - attempt_started),
+                    },
+                    std::mem::take(attempts),
+                );
                 return Some(upstream_error_response(
                     StatusCode::BAD_REQUEST,
                     &response_headers,

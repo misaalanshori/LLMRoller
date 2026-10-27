@@ -104,6 +104,22 @@ pub(crate) fn enqueue_terminal_usage(
     writer.queues.usage_writer.enqueue(event, attempts);
 }
 
+/// Billing coverage mode and plan multiplier for a provider, defaulting to
+/// pay-as-you-go at 1.0x when the provider row is absent.
+///
+/// Extracted because the same four-line lookup is repeated at four call sites; a fifth
+/// was about to be added for `ISSUE-0150`.
+pub(crate) fn provider_billing(
+    snapshot: &ConfigSnapshot,
+    provider_id: &ProviderId,
+) -> (String, i64) {
+    snapshot
+        .providers
+        .get(provider_id)
+        .map(|p| (p.billing_coverage_mode.clone(), p.plan_multiplier_bps))
+        .unwrap_or_else(|| ("pay_as_you_go".to_string(), 10_000))
+}
+
 pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Response {
     let AdmittedRequest {
         state,
@@ -1331,6 +1347,53 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
 
     if let Some(error) = last_cap_error.take() {
         crate::metrics::record_request_metric(endpoint_str, "4xx", "error");
+        // Gate G7 rejected before any upstream call, so this event carries **no** key or
+        // provider attribution and costs nothing — the one site in this family where
+        // `None`/`None`/`None` is correct (`USG-1`, `ISSUE-0151`). Any attempt rows from
+        // earlier candidates are real and are passed through rather than dropped.
+        enqueue_terminal_usage(
+            &state,
+            TerminalUsageFacts {
+                request_id,
+                caller: &caller,
+                canonical_model: &model.canonical_id,
+                upstream_key_id: None,
+                provider_id: None,
+                provider_scope: None,
+                share_id: None,
+                upstream_model_id: model.canonical_id.clone(),
+                endpoint_str,
+                session_hash: None,
+                pin_outcome: None,
+                failovers,
+                error_code: Some(
+                    match error {
+                        llmroller_core::accumulators::GateG7Error::ClientKeyBudgetExhausted {
+                            ..
+                        } => "client_key_budget_exhausted",
+                        llmroller_core::accumulators::GateG7Error::UserGlobalBudgetExhausted {
+                            ..
+                        } => "user_budget_exhausted",
+                        llmroller_core::accumulators::GateG7Error::ProviderShareCapExhausted {
+                            ..
+                        } => "provider_share_budget_exhausted",
+                    }
+                    .to_string(),
+                ),
+                billing_coverage_mode: "pay_as_you_go".to_string(),
+                plan_multiplier_bps: 10_000,
+                request_headers_json: request_headers_json.clone(),
+                // Every `GateG7Error` renders as 429 (`gate_error_response`).
+                status: StatusCode::TOO_MANY_REQUESTS,
+                is_streaming,
+                termination: Termination::Completed.as_str(),
+                cost_micro_usd: 0,
+                cost_source: CostSource::EstimatedIncomplete,
+                now,
+                latency_ms: Some(state.clock.now_ms() - now),
+            },
+            std::mem::take(&mut attempts),
+        );
         return gate_error_response(&error, is_messages);
     }
 
