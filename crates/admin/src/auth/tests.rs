@@ -140,3 +140,9 @@ fn non_loopback_control_plane_bind_refuses_without_tls_or_trusted_proxies() {
         Ok(())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Login concurrency harness (`AUTH-7`, `SEC-5`, ISSUE-0001)
+// ---------------------------------------------------------------------------
+
+mod login_concurrency;

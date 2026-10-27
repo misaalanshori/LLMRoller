@@ -662,6 +662,37 @@ async fn log_login_failed(
     }
 }
 
+/// Bounded wait for one Argon2id permit.
+///
+/// A login burst can legitimately queue behind in-flight verifications, so the
+/// wait is bounded rather than unbounded; when the bound is reached the caller
+/// receives `503 login_busy` and can retry. Five seconds matches the historical
+/// outer bound and is long enough to absorb a full queue of realistic logins.
+const ARGON2_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Verify a password while holding exactly one Argon2id permit.
+///
+/// The permit bounds concurrent Argon2id work, which is the whole point of the
+/// semaphore, and it is released as soon as the blocking task finishes so the
+/// caller's rate-limit and audit work never pins it (`ISSUE-0001`).
+///
+/// Every Argon2id invocation in the login path goes through this helper — the
+/// real verification and the constant-time dummy verification used for
+/// user-enumeration defence — so both are bounded identically.
+async fn verify_password_with_permit(
+    state: &AuthAppState,
+    password: String,
+    password_hash: String,
+) -> Result<bool, AuthError> {
+    let _permit = tokio::time::timeout(ARGON2_PERMIT_TIMEOUT, state.argon2_semaphore.acquire())
+        .await
+        .map_err(|_| AuthError::LoginBusy)?
+        .map_err(|_| AuthError::Internal)?;
+    tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+        .await
+        .map_err(|_| AuthError::Internal)
+}
+
 #[doc = "Spec: AUTH-7, Spec: AUTH-8, Spec: SEC-4, Spec: SEC-5"]
 async fn post_login(
     State(state): State<AuthAppState>,
@@ -734,20 +765,23 @@ async fn post_login(
     // 2. Evaluate three-tier rate limiter before Argon2id
     let limiter_outcome = state.limiter.check(&payload.username, client_ip, now_ms)?;
 
-    // 3. Acquire Argon2id concurrency semaphore (bounded permits, 5s timeout -> 503)
-    let _permit = tokio::time::timeout(Duration::from_secs(5), state.argon2_semaphore.acquire())
-        .await
-        .map_err(|_| AuthError::LoginBusy)?
-        .map_err(|_| AuthError::Internal)?;
-
-    // 4. Lookup user and verify password (with constant-time dummy Argon2id and rate-limit recording on missing user; F081)
+    // 3. Lookup the user before taking any Argon2id permit. A slow or blocked
+    //    reader must not pin a verification permit, and the two early-return
+    //    branches below perform no password work at all (ISSUE-0001).
     const DUMMY_ARGON2_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZTEyMzQ1Ng$RSub7nN5qN1sK7O+8m+6P0vK3X2zW9Y1qP4L5M6N7O8";
     let record = match find_login_record(&state.reader_pool, &payload.username).await {
         Ok(Some(record)) => record,
         Ok(None) => {
-            let pwd = payload.password.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_ARGON2_PHC)).await;
+            // Constant-time user-enumeration defence (`F081`): verify against a
+            // dummy PHC through the same single-permit helper, so this Argon2id
+            // call is bounded exactly like a real one. The join handle is awaited
+            // so the work actually completes before the timing comparison is made.
+            let _ = verify_password_with_permit(
+                &state,
+                payload.password.clone(),
+                DUMMY_ARGON2_PHC.to_string(),
+            )
+            .await?;
             state
                 .limiter
                 .record_failure(&payload.username, client_ip, now_ms);
@@ -779,16 +813,15 @@ async fn post_login(
         return Err(AuthError::AccountDisabled);
     }
 
-    let _argon_permit =
-        tokio::time::timeout(Duration::from_secs(2), state.argon2_semaphore.acquire())
-            .await
-            .map_err(|_| AuthError::LoginBusy)?
-            .map_err(|_| AuthError::Internal)?;
-    let password = payload.password.clone();
-    let password_hash = record.password_hash.clone();
-    let verified = tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
-        .await
-        .map_err(|_| AuthError::Internal)?;
+    // 4. Verify the password holding exactly one permit for the duration of the
+    //    Argon2id work only (ISSUE-0001). The helper releases the permit before
+    //    returning, so the rate-limit and audit work below never pins it.
+    let verified = verify_password_with_permit(
+        &state,
+        payload.password.clone(),
+        record.password_hash.clone(),
+    )
+    .await?;
 
     if !verified {
         state
