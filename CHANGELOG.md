@@ -49,6 +49,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (routing signal)
+
+- **Non-streaming latency was always recorded as 0 ms (ISSUE-0148).**
+  `handle_non_streaming_attempt` computed latency as
+  `(now - attempt_started).max(0)`, but `now` is the *admission* timestamp and
+  `attempt_started` is read just before the upstream send, so the difference is
+  negative and clamps to zero. That zero was fed to
+  `load_tracker.record_ttfb(route, 0, 0.2)`, so every successful non-streaming
+  attempt dragged the route's P2C EWMA toward zero and the slowest route reported as
+  the fastest — defeating `power_of_two_choices` for the whole non-streaming traffic
+  class. Measured pre-fix against a mock upstream delaying 50 ms: EWMA = 0 ms. The
+  measurement point now reads `state.clock.now_ms()`, matching the three sibling
+  latency sites in the same file. Only the latency gets a fresh read; cost, usage,
+  key-health and audit timestamps stay on the admission timestamp.
+
 ### Fixed (memory budget)
 
 - **Decompression ran outside the preflight memory budget (ISSUE-0147).**
