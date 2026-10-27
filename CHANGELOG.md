@@ -27,6 +27,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `major.minor` compilers, or if the channel is a floating name rather than a
   pinned release.
 
+- **Budget admission was blind to in-flight spend (ISSUE-0004).**
+  `BudgetCounter::effective_used` meant "committed spend, projected by the latest
+  upstream observation". `Reservation::try_reserve` compensated at its own call
+  site by adding `reserved_in_flight`, but the two gates that decide *whether to
+  try* — `headroom_bps_for_route` and `key_budget_admitted` — did not. A burst of
+  concurrent streams could therefore each pass admission against a key whose
+  budget was already fully spoken for, and headroom was reported as 10,000 bps for
+  a key with none of it free. `effective_used` is now a default trait method that
+  includes the in-flight term, and the manual addition is gone from
+  `try_reserve`. The reservation term is added after the observation projection,
+  not before, because a projection extrapolates upstream-reported spend and
+  reservations are spend the provider never reported.
+- **`counter_id` was a hash of the window id (ISSUE-0005).** `try_reserve` sorts
+  counters by `counter_id` to establish the acquisition order its comment claims
+  prevents deadlocks, but the id came from `DefaultHasher`, whose output is
+  unspecified and unstable, in a `u64` that makes collisions improbable rather
+  than impossible. Ids are now allocated monotonically from a process-wide
+  `AtomicU64`, preserving an existing counter's id across rebuilds and hydration so
+  the order stays stable across a config reload. No `dedup` was introduced:
+  reserving on every counter in the list is correct, and deduplicating would have
+  created the window-dropping bug the issue imagined.
+
 ### Fixed (security)
 
 - **Login self-deadlock (ISSUE-0001).** `post_login` acquired the Argon2id
