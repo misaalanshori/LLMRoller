@@ -49,6 +49,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (routing scope)
+
+- **`inherit` routing scope was silently widened, not inherited (ISSUE-0009).**
+  `resolve_caller_scope` resolves `inherit` against `users.default_routing_scope` and
+  is used on the inference data plane, but two paths bypassed it and called the raw
+  parser: `visible_models` (feeding `GET /v1/models`) and `resolve_usage_key` (the
+  usage passthrough). `RoutingScope::from_str` has no `"inherit"` arm and the parser
+  falls back to `RoutingScope::default()` = `PersonalFirst`, which is broader than
+  `PersonalOnly`/`OwnOnly`/`GlobalOnly`. So an `inherit` key on a user whose default
+  was `own_only` resolved to `PersonalFirst` — own plus shared plus global. That
+  over-advertised models the data plane would refuse, and on the usage path let a
+  strict user's scope resolve a key from an excluded tier. Both sites now call
+  `resolve_caller_scope`. The parser's permissive fallback for *invalid* scope
+  strings is unchanged and now pinned by a test, pending a decision on the
+  client-key write path.
+
 ### Fixed (unbounded memory)
 
 - **Per-IP authentication failure map was unbounded (ISSUE-0059).**

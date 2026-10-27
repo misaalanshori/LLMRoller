@@ -474,12 +474,14 @@ mod tests {
             default_routing_scope: RoutingScope::PersonalFirst,
         };
 
-        let mut snapshot = ConfigSnapshot::default();
-        snapshot.models = Arc::new(HashMap::from([(model_pk, model)]));
-        snapshot.routes_by_model = Arc::new(HashMap::from([(model_pk, vec![route])]));
-        snapshot.providers = Arc::new(HashMap::from([(provider_id, provider)]));
-        snapshot.upstream_keys = Arc::new(HashMap::from([(key_id, key)]));
-        snapshot.users = Arc::new(HashMap::from([(user, user_record)]));
+        let snapshot = ConfigSnapshot {
+            models: Arc::new(HashMap::from([(model_pk, model)])),
+            routes_by_model: Arc::new(HashMap::from([(model_pk, vec![route])])),
+            providers: Arc::new(HashMap::from([(provider_id, provider)])),
+            upstream_keys: Arc::new(HashMap::from([(key_id, key)])),
+            users: Arc::new(HashMap::from([(user, user_record)])),
+            ..ConfigSnapshot::default()
+        };
         (snapshot, model_pk)
     }
 

@@ -1136,9 +1136,9 @@ mod tests {
 
     /// Build a snapshot with one model reachable only through a global provider key.
     ///
-    /// Returns `(snapshot, user_id, model_canonical)`. The caller owns nothing, so the
-    /// global tier is the only reachable one and a strict scope excludes everything.
-    fn usage_snapshot_with_global_route(default_scope: RoutingScope) -> (ConfigSnapshot, UserId) {
+    /// Returns `(user_id, snapshot)`. The caller owns nothing, so the global tier is
+    /// the only reachable one and a strict scope excludes everything.
+    fn usage_snapshot_with_global_route(default_scope: RoutingScope) -> (UserId, ConfigSnapshot) {
         use llmroller_core::catalog::{MergeState, ModelOrigin, RouteStatus};
         use llmroller_core::ids::{ModelPk, ProviderId};
         use llmroller_core::rbac::OwnershipScope;
@@ -1209,25 +1209,26 @@ mod tests {
             route_health_until: None,
         };
 
-        let mut snapshot = ConfigSnapshot::default();
-        snapshot.models = Arc::new(std::collections::HashMap::from([(model_pk, model)]));
-        snapshot.routes_by_model =
-            Arc::new(std::collections::HashMap::from([(model_pk, vec![route])]));
-        snapshot.providers = Arc::new(std::collections::HashMap::from([(provider_id, provider)]));
-        snapshot.upstream_keys = Arc::new(std::collections::HashMap::from([(key_id, key)]));
-        snapshot.users = Arc::new(std::collections::HashMap::from([(
-            user_id,
-            UserRecord {
-                id: user_id,
-                username: "u".to_string(),
-                role: Role::User,
-                disabled: false,
-                can_use_global_providers: true,
-                global_budget_micro_usd_month: None,
-                default_routing_scope: default_scope,
-            },
-        )]));
-        (snapshot, user_id)
+        let snapshot = ConfigSnapshot {
+            models: Arc::new(std::collections::HashMap::from([(model_pk, model)])),
+            routes_by_model: Arc::new(std::collections::HashMap::from([(model_pk, vec![route])])),
+            providers: Arc::new(std::collections::HashMap::from([(provider_id, provider)])),
+            upstream_keys: Arc::new(std::collections::HashMap::from([(key_id, key)])),
+            users: Arc::new(std::collections::HashMap::from([(
+                user_id,
+                UserRecord {
+                    id: user_id,
+                    username: "u".to_string(),
+                    role: Role::User,
+                    disabled: false,
+                    can_use_global_providers: true,
+                    global_budget_micro_usd_month: None,
+                    default_routing_scope: default_scope,
+                },
+            )])),
+            ..ConfigSnapshot::default()
+        };
+        (user_id, snapshot)
     }
 
     /// An `inherit` key on a `GlobalOnly` user must resolve the global key.
@@ -1238,7 +1239,7 @@ mod tests {
     #[test]
     #[doc = "Spec: CLK-3, USG-7 — ISSUE-0009 inherit resolves against the user default"]
     fn resolve_usage_key_resolves_inherit_against_the_user_default() {
-        let (snapshot, user_id) = usage_snapshot_with_global_route(RoutingScope::GlobalOnly);
+        let (user_id, snapshot) = usage_snapshot_with_global_route(RoutingScope::GlobalOnly);
         let who = caller(user_id);
         let params = UsageQueryParams {
             session_id: None,
@@ -1264,7 +1265,7 @@ mod tests {
     #[test]
     #[doc = "Spec: CLK-3, USG-7 — ISSUE-0009 inherit does not widen a strict user scope"]
     fn resolve_usage_key_does_not_widen_a_strict_user_scope() {
-        let (snapshot, user_id) = usage_snapshot_with_global_route(RoutingScope::OwnOnly);
+        let (user_id, snapshot) = usage_snapshot_with_global_route(RoutingScope::OwnOnly);
         let who = caller(user_id);
         let params = UsageQueryParams {
             session_id: None,
