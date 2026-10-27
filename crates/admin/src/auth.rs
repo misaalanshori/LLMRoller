@@ -4,6 +4,14 @@
 //! Spec: ./docs/srdd/6. SRDD - Functional Requirements.md#61-setup-accounts-and-authentication-auth
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 
+mod login_limiter;
+
+pub use login_limiter::{
+    LimiterOutcome, MAX_FAILURES_PER_IP_15M, MAX_FAILURES_PER_USER_IP_15M,
+    MAX_TRACKED_LIMITER_KEYS, NormalizedClientIp, ThreeTierLoginLimiter,
+    USERNAME_ATTACK_THRESHOLD_1H,
+};
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -53,12 +61,6 @@ pub const SESSION_IDLE_TIMEOUT_MS: i64 = 12 * 3600 * 1000;
 pub const SESSION_ABSOLUTE_TIMEOUT_MS: i64 = 7 * 86400 * 1000;
 /// Login CSRF cookie validity (10 minutes in seconds).
 pub const LOGIN_CSRF_MAX_AGE_SECS: i64 = 600;
-
-const RATE_LIMIT_WINDOW_15M_MS: i64 = 15 * 60 * 1000;
-const RATE_LIMIT_WINDOW_1H_MS: i64 = 60 * 60 * 1000;
-const MAX_FAILURES_PER_IP_15M: usize = 20;
-const MAX_FAILURES_PER_USER_IP_15M: usize = 5;
-const USERNAME_ATTACK_THRESHOLD_1H: usize = 50;
 
 /// Authentication errors with deterministic HTTP mappings.
 #[derive(Debug, Error)]
@@ -133,144 +135,6 @@ impl IntoResponse for AuthError {
             Json(serde_json::json!({ "error": { "code": code, "message": message } })),
         )
             .into_response()
-    }
-}
-
-/// Normalized client IP for rate-limiting (exact IPv4, IPv6 `/64` prefix) per `AUTH-8`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NormalizedClientIp {
-    V4(Ipv4Addr),
-    V6(u64),
-}
-
-impl From<IpAddr> for NormalizedClientIp {
-    fn from(ip: IpAddr) -> Self {
-        match ip {
-            IpAddr::V4(addr) => Self::V4(addr),
-            IpAddr::V6(addr) => {
-                let segments = addr.segments();
-                let prefix = (u64::from(segments[0]) << 48)
-                    | (u64::from(segments[1]) << 32)
-                    | (u64::from(segments[2]) << 16)
-                    | u64::from(segments[3]);
-                Self::V6(prefix)
-            }
-        }
-    }
-}
-
-/// Three-tier in-memory login rate limiter per `AUTH-8`.
-#[derive(Debug)]
-pub struct ThreeTierLoginLimiter {
-    ip_failures: Mutex<HashMap<NormalizedClientIp, Vec<i64>>>,
-    user_ip_failures: Mutex<HashMap<(String, NormalizedClientIp), Vec<i64>>>,
-    username_failures: Mutex<HashMap<String, Vec<i64>>>,
-}
-
-impl Default for ThreeTierLoginLimiter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Evaluation outcome from the three-tier login limiter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimiterOutcome {
-    Allowed,
-    EnforceTotpOrDelay,
-}
-
-impl ThreeTierLoginLimiter {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            ip_failures: Mutex::new(HashMap::new()),
-            user_ip_failures: Mutex::new(HashMap::new()),
-            username_failures: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Check whether a login attempt is admitted under the three-tier policy.
-    pub fn check(
-        &self,
-        username: &str,
-        ip: IpAddr,
-        now_ms: i64,
-    ) -> Result<LimiterOutcome, AuthError> {
-        let client_key = NormalizedClientIp::from(ip);
-
-        // Tier 1: 20 failures per 15 minutes per IP
-        {
-            let mut ip_map = self.ip_failures.lock();
-            if ip_map.len() > 10_000 {
-                ip_map.retain(|_, v| !v.is_empty());
-            }
-            let attempts = ip_map.entry(client_key).or_default();
-            attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_15M_MS);
-            if attempts.len() >= MAX_FAILURES_PER_IP_15M {
-                return Err(AuthError::RateLimited);
-            }
-        }
-
-        // Tier 2: 5 failures per 15 minutes per (username, IP)
-        {
-            let mut user_ip_map = self.user_ip_failures.lock();
-            if user_ip_map.len() > 10_000 {
-                user_ip_map.retain(|_, v| !v.is_empty());
-            }
-            let key = (username.to_ascii_lowercase(), client_key);
-            let attempts = user_ip_map.entry(key).or_default();
-            attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_15M_MS);
-            if attempts.len() >= MAX_FAILURES_PER_USER_IP_15M {
-                return Err(AuthError::RateLimited);
-            }
-        }
-
-        // Tier 3: Across all IPs for this username, > 50 failures per 1 hour
-        {
-            let mut user_map = self.username_failures.lock();
-            if user_map.len() > 10_000 {
-                user_map.retain(|_, v| !v.is_empty());
-            }
-            let attempts = user_map.entry(username.to_ascii_lowercase()).or_default();
-            attempts.retain(|&ts| now_ms - ts < RATE_LIMIT_WINDOW_1H_MS);
-            if attempts.len() >= USERNAME_ATTACK_THRESHOLD_1H {
-                return Ok(LimiterOutcome::EnforceTotpOrDelay);
-            }
-        }
-
-        Ok(LimiterOutcome::Allowed)
-    }
-
-    /// Record a failed login attempt.
-    pub fn record_failure(&self, username: &str, ip: IpAddr, now_ms: i64) {
-        let client_key = NormalizedClientIp::from(ip);
-        let normalized = username.to_ascii_lowercase();
-
-        {
-            let mut ip_map = self.ip_failures.lock();
-            ip_map.entry(client_key).or_default().push(now_ms);
-        }
-        {
-            let mut user_ip_map = self.user_ip_failures.lock();
-            user_ip_map
-                .entry((normalized.clone(), client_key))
-                .or_default()
-                .push(now_ms);
-        }
-        {
-            let mut user_map = self.username_failures.lock();
-            user_map.entry(normalized).or_default().push(now_ms);
-        }
-    }
-
-    /// Reset failure counters for a username and IP on successful authentication.
-    pub fn record_success(&self, username: &str, ip: IpAddr) {
-        let client_key = NormalizedClientIp::from(ip);
-        let normalized = username.to_ascii_lowercase();
-
-        let mut user_ip_map = self.user_ip_failures.lock();
-        user_ip_map.remove(&(normalized, client_key));
     }
 }
 
