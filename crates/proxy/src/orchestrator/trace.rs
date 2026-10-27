@@ -488,13 +488,37 @@ impl StreamFinalizer {
                 extracted.cache_read_tokens as u64,
             );
         }
-        if cost.cost_micro_usd > 0 {
+        if extracted.cache_write_tokens > 0 {
+            crate::metrics::record_tokens(
+                ep,
+                "2xx",
+                "stream",
+                &self.usage.canonical_model,
+                "cache_write",
+                extracted.cache_write_tokens as u64,
+            );
+        }
+        if extracted.reasoning_tokens > 0 {
+            crate::metrics::record_tokens(
+                ep,
+                "2xx",
+                "stream",
+                &self.usage.canonical_model,
+                "reasoning",
+                extracted.reasoning_tokens as u64,
+            );
+        }
+        // Same rule as the non-streaming path: the metric is an observed operator number
+        // and reflects what was charged, so it takes the plan-multiplied
+        // `effective_cost`. The ledger keeps list cost plus `plan_multiplier_bps`
+        // separately (`USG-10`, SRDD 13).
+        if effective_cost > 0 {
             crate::metrics::record_cost(
                 ep,
                 "2xx",
                 "stream",
                 &self.usage.canonical_model,
-                cost.cost_micro_usd as u64,
+                effective_cost as u64,
             );
         }
 

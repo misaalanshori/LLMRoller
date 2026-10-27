@@ -739,13 +739,39 @@ pub(crate) async fn handle_non_streaming_attempt(
             extracted.cache_read_tokens as u64,
         );
     }
-    if cost.cost_micro_usd > 0 {
+    if extracted.cache_write_tokens > 0 {
+        crate::metrics::record_tokens(
+            endpoint_str,
+            "2xx",
+            "completed",
+            &model.canonical_id,
+            "cache_write",
+            extracted.cache_write_tokens as u64,
+        );
+    }
+    if extracted.reasoning_tokens > 0 {
+        crate::metrics::record_tokens(
+            endpoint_str,
+            "2xx",
+            "completed",
+            &model.canonical_id,
+            "reasoning",
+            extracted.reasoning_tokens as u64,
+        );
+    }
+    // The metric is an *observed operator number* and must reflect what was actually
+    // charged, so it gets the plan-multiplied `effective_cost`. The ledger keeps
+    // `cost.cost_micro_usd` (list cost) plus a separate `plan_multiplier_bps` so a later
+    // re-price can redo the multiplication — see `USG-10` and SRDD 13 (`list_cost_micro_usd`
+    // and `actual_cost_micro_usd = div_ceil(list_cost * multiplier_bps, 10_000)`).
+    // Pre-multiplying here and there would double-charge the operator's view.
+    if effective_cost > 0 {
         crate::metrics::record_cost(
             endpoint_str,
             "2xx",
             "completed",
             &model.canonical_id,
-            cost.cost_micro_usd as u64,
+            effective_cost as u64,
         );
     }
     let latency_duration = (state.clock.now_ms() - attempt_started).max(0);

@@ -49,6 +49,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (metrics coverage)
+
+- **The token counter omitted two token classes and reported list cost (ISSUE-0154).**
+  Both completion paths emitted `llmroller_tokens_total` for `input`, `output` and
+  `cache_read` only, so an operator could not see cache-write or reasoning volume at all —
+  the two classes that most distinguish a reasoning model from a chat model. Both now emit
+  `cache_write` and `reasoning`, mirroring the existing `cache_read` shape including its
+  `> 0` guard.
+- **The cost metric reported list price, not what was charged.** The metric now receives
+  the plan-multiplied `effective_cost`, so a 50% plan multiplier shows half the list price
+  instead of double what the customer paid. The **ledger is unchanged**: it keeps
+  `list_cost_micro_usd` plus a separate `plan_multiplier_bps` so a later re-price can redo
+  the multiplication (`USG-10`, SRDD 13). Pre-multiplying there would double-charge.
+- **The token `reason` label had no closed value set.** `CLOSED_LABEL_ALLOWLIST` bounds
+  *which labels exist*; nothing bounded *which values a label takes*, so any caller could
+  mint a new Prometheus series and grow cardinality without limit. `reason` is the only
+  value-carrying label on the token counter, so it now has its own
+  `TOKEN_REASON_ALLOWLIST` (five values), with a `debug_assert!` plus early return in
+  `record_tokens`. #128 will make `validate_metric_labels` enforce results; this is the set
+  it will check.
+
 ### Fixed (retry and attribution)
 
 - **A failed 429 short-retry silently reused the stale 429 (ISSUE-0152).** The

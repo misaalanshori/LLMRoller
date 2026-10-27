@@ -26,6 +26,19 @@ pub const CLOSED_LABEL_ALLOWLIST: [&str; 10] = [
     "model_bucket",
 ];
 
+/// Closed set of `reason` label **values** for `llmroller_tokens_total` (`OBS-1`,
+/// `ISSUE-0154`).
+///
+/// [`CLOSED_LABEL_ALLOWLIST`] bounds *which labels exist*; nothing bounded *which values a
+/// label takes*. `reason` is the only value-carrying label on the token counter, and an
+/// open value set would let any caller mint a new Prometheus series — unbounded
+/// cardinality, which is exactly what `OBS-1`'s closed allowlist exists to prevent.
+///
+/// #128 will make `validate_metric_labels`' results enforced rather than discarded; this
+/// constant is what it will check for this label.
+pub const TOKEN_REASON_ALLOWLIST: [&str; 5] =
+    ["input", "output", "cache_read", "cache_write", "reasoning"];
+
 static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 /// Retrieve or install the global Prometheus recorder handle.
@@ -63,6 +76,17 @@ pub fn record_tokens(
     count: u64,
 ) {
     if count == 0 {
+        return;
+    }
+    // A reason outside the closed set is a programmer error, not untrusted input: every
+    // caller passes a literal. `debug_assert!` catches it in test builds while production
+    // drops the sample rather than panicking on a metrics path, matching how this module
+    // treats label problems elsewhere (it discards them, pending #128).
+    debug_assert!(
+        TOKEN_REASON_ALLOWLIST.contains(&reason),
+        "token reason {reason:?} is outside TOKEN_REASON_ALLOWLIST"
+    );
+    if !TOKEN_REASON_ALLOWLIST.contains(&reason) {
         return;
     }
     let _ = get_or_init_prometheus_recorder();
@@ -435,5 +459,129 @@ mod fnd040_tests {
             rendered.contains("llmroller_trace_budget_bytes"),
             "the budget gauge must be exported; rendered:\n{rendered}"
         );
+    }
+}
+
+/// Token-reason and cost-metric coverage (`OBS-1`, `USG-10`, `ISSUE-0154`).
+///
+/// The Prometheus recorder is a process-global `OnceLock`, so every test here holds one
+/// mutex: a rendered-output assertion would otherwise observe series minted by another
+/// test in the same process.
+#[cfg(test)]
+mod token_class_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn metrics_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A rendered series for `reason` with the given endpoint/model, if present.
+    fn rendered_tokens(endpoint: &str, reason: &str) -> Option<String> {
+        let rendered = get_or_init_prometheus_recorder().render();
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("llmroller_tokens_total")
+                    && line.contains(&format!("endpoint=\"{endpoint}\""))
+                    && line.contains(&format!("reason=\"{reason}\""))
+            })
+            .map(ToString::to_string)
+    }
+
+    /// The five documented token reasons are accepted; anything else is refused.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0154 the token reason value set is closed"]
+    fn token_reason_allowlist_is_closed() {
+        let _serial = metrics_lock();
+
+        // A unique endpoint per assertion so series cannot be confused with another test's.
+        for reason in ["input", "output", "cache_read", "cache_write", "reasoning"] {
+            record_tokens("t154-allowed", "2xx", "completed", "m", reason, 5);
+            assert!(
+                rendered_tokens("t154-allowed", reason).is_some(),
+                "reason {reason:?} is in the allowlist and must be emitted"
+            );
+        }
+
+        // A bogus reason must never mint a series, or the label's cardinality is open.
+        //
+        // `record_tokens` `debug_assert!`s on an out-of-set value, because that is a
+        // programmer error and a test build should catch it loudly. The rendered-output
+        // property is therefore asserted against a reason the guard cannot see: an
+        // endpoint that was never recorded must have no series at all. The guard itself
+        // is covered by `token_reason_guard_rejects_unknown_values` below.
+        assert!(
+            rendered_tokens("t154-never-recorded", "cache_write").is_none(),
+            "an endpoint that was never recorded must have no series"
+        );
+    }
+
+    /// The guard refuses an unknown reason rather than minting a series for it.
+    ///
+    /// Kept separate from the rendered-output test because the failure mode is a
+    /// `debug_assert!` panic, which would abort the emitting test before it could assert
+    /// anything about the output.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0154 an unknown token reason is refused"]
+    #[should_panic(expected = "is outside TOKEN_REASON_ALLOWLIST")]
+    fn token_reason_guard_rejects_unknown_values() {
+        record_tokens("t154-bogus", "2xx", "completed", "m", "made_up_reason", 5);
+    }
+
+    /// The constant matches the documented set exactly, so an addition is deliberate.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0154 the token reason set has exactly five values"]
+    fn token_reason_allowlist_matches_the_documented_set() {
+        assert_eq!(TOKEN_REASON_ALLOWLIST.len(), 5);
+        assert_eq!(
+            TOKEN_REASON_ALLOWLIST,
+            ["input", "output", "cache_read", "cache_write", "reasoning"]
+        );
+    }
+
+    /// `record_cost` records exactly the value it is handed.
+    ///
+    /// This is where the "metric uses the effective cost" half of `ISSUE-0154` is asserted
+    /// at the unit level: the caller is responsible for passing `effective_cost`, and this
+    /// pins that the emitter does not itself re-scale. The caller-side behaviour is covered
+    /// by the integration test, which can only assert that a sample exists because the
+    /// Prometheus recorder is process-global and its counters are monotonic.
+    #[test]
+    #[doc = "Spec: OBS-1, USG-10 — ISSUE-0154 record_cost records the value it is given"]
+    fn cost_metric_records_the_value_it_is_given() {
+        let _serial = metrics_lock();
+
+        let read = |endpoint: &str| -> f64 {
+            get_or_init_prometheus_recorder()
+                .render()
+                .lines()
+                .filter(|l| l.starts_with("llmroller_cost_micro_usd_total"))
+                .filter(|l| l.contains(&format!("endpoint=\"{endpoint}\"")))
+                .filter_map(|l| l.rsplit_once(' '))
+                .filter_map(|(_, v)| v.trim().parse::<f64>().ok())
+                .sum()
+        };
+
+        record_cost("t154-cost-unit", "2xx", "completed", "m", 1_000);
+        assert_eq!(
+            read("t154-cost-unit"),
+            1_000.0,
+            "the emitter must record the value verbatim; any scaling here would \
+             double-multiply once the caller already passed the effective amount"
+        );
+    }
+
+    /// The reason *key* was already allowlisted; the value was not. Pin both facts.
+    #[test]
+    #[doc = "Spec: OBS-1 — the label allowlist is key-only, so a value set is required"]
+    fn label_allowlist_bounds_keys_not_values() {
+        // The key is permitted, which is why an unvalidated value used to pass.
+        assert!(validate_metric_labels(&[("reason", "anything_at_all")]).is_ok());
+        // The value is what the new constant constrains.
+        assert!(!TOKEN_REASON_ALLOWLIST.contains(&"anything_at_all"));
     }
 }

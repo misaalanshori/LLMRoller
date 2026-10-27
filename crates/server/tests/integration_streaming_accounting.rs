@@ -77,228 +77,6 @@ const SSE_STALL_AFTER_FIRST_FRAME: &str = concat!(
     "\"finish_reason\":null}]}\n\n",
 );
 
-#[derive(Clone, Copy)]
-enum MockMode {
-    StreamOk,
-    StreamOverloaded,
-    StreamModelNotFound,
-    StreamStall,
-    ChatJson,
-    /// Non-streaming JSON completion after a fixed delay, so latency measurements
-    /// have a real elapsed time to observe (`ISSUE-0148`).
-    ChatJsonAfter(u64),
-    Chat429,
-    /// HTTP 200 whose JSON body embeds an `invalid_request_error`, which the classifier
-    /// maps to `RequestRejected` (`ISSUE-0150`).
-    EmbeddedRequestRejected,
-    /// A plain non-retryable upstream 400, passed through unchanged (`ISSUE-0151`).
-    NonRetryable400,
-    /// An SSE stream whose first frame is an `invalid_request_error` (`ISSUE-0150`).
-    StreamRequestRejected,
-    /// `429` with `Retry-After: 1` on the first call, then hangs past the send timeout
-    /// (`ISSUE-0152`). Exists to exercise the short-retry failure branch.
-    Retry429ThenHang,
-    /// `429` with `Retry-After: 1` on the first call, then a successful JSON completion
-    /// (`ISSUE-0152`). The non-regression counterpart.
-    Retry429ThenOk,
-    /// `429` with `Retry-After: 1` on every call, to pin that the retry does not loop.
-    Retry429Always,
-    ResponsesFailed,
-    SleepDelay(u64),
-}
-
-#[derive(Clone)]
-struct MockUpstreamState {
-    mode: MockMode,
-    calls: Arc<AtomicUsize>,
-}
-
-impl MockUpstreamState {
-    fn new(mode: MockMode) -> Self {
-        Self {
-            mode,
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
-    state.calls.fetch_add(1, Ordering::SeqCst);
-    match state.mode {
-        MockMode::StreamOk => sse_response(SSE_OK),
-        MockMode::StreamOverloaded => sse_response(SSE_OVERLOADED),
-        MockMode::StreamModelNotFound => sse_response(SSE_MODEL_NOT_FOUND),
-        MockMode::StreamStall => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(
-                stream::once(async {
-                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                        SSE_STALL_AFTER_FIRST_FRAME.as_bytes(),
-                    ))
-                })
-                .chain(stream::pending()),
-            ))
-            .expect("stall response"),
-        MockMode::ChatJson => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "id": "chatcmpl-json",
-                "object": "chat.completion",
-                "created": 1_700_000_000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "ok" },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500 }
-            })),
-        )
-            .into_response(),
-        MockMode::ChatJsonAfter(ms) => {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-            (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                Json(serde_json::json!({
-                    "id": "chatcmpl-json-delayed",
-                    "object": "chat.completion",
-                    "created": 1_700_000_000,
-                    "model": "gpt-4o",
-                    "choices": [{
-                        "index": 0,
-                        "message": { "role": "assistant", "content": "delayed" },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-                })),
-            )
-                .into_response()
-        }
-        MockMode::Chat429 => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
-            })),
-        )
-            .into_response(),
-        // The short-retry fixtures are call-count dependent: the first call answers 429
-        // with a 1-second `Retry-After` (the only shape that triggers the retry), and
-        // the second call does whatever the variant name says.
-        MockMode::Retry429ThenHang if state.calls.load(Ordering::SeqCst) == 1 => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("content-type", "application/json"), ("retry-after", "1")],
-            Json(serde_json::json!({
-                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
-            })),
-        )
-            .into_response(),
-        MockMode::Retry429ThenHang => {
-            // Never respond: the client's send timeout is what ends this call.
-            std::future::pending::<()>().await;
-            unreachable!("pending never resolves")
-        }
-        MockMode::Retry429ThenOk if state.calls.load(Ordering::SeqCst) == 1 => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("content-type", "application/json"), ("retry-after", "1")],
-            Json(serde_json::json!({
-                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
-            })),
-        )
-            .into_response(),
-        MockMode::Retry429ThenOk => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "id": "chatcmpl-retry-ok",
-                "object": "chat.completion",
-                "created": 1_700_000_000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "after retry" },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })),
-        )
-            .into_response(),
-        MockMode::Retry429Always => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("content-type", "application/json"), ("retry-after", "1")],
-            Json(serde_json::json!({
-                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
-            })),
-        )
-            .into_response(),
-        MockMode::EmbeddedRequestRejected => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "context_length_exceeded: too many tokens"
-                }
-            })),
-        )
-            .into_response(),
-        MockMode::NonRetryable400 => (
-            StatusCode::BAD_REQUEST,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "unsupported parameter: temperature"
-                }
-            })),
-        )
-            .into_response(),
-        MockMode::StreamRequestRejected => sse_response(
-            "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"context_length_exceeded\"}}\n\n",
-        ),
-        MockMode::ResponsesFailed => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            Json(serde_json::json!({
-                "id": "resp_failed_1",
-                "status": "failed",
-                "last_error": { "code": "server_error", "message": "Model execution failed" }
-            })),
-        )
-            .into_response(),
-        MockMode::SleepDelay(ms) => {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-            sse_response(SSE_OK)
-        }
-    }
-}
-
-fn sse_response(body: &'static str) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from(body))
-        .expect("sse response")
-}
-
-async fn spawn_mock(mode: MockMode) -> (SocketAddr, MockUpstreamState) {
-    let state = MockUpstreamState::new(mode);
-    let app = Router::new()
-        .route("/chat/completions", post(mock_chat))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock listener");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    (addr, state)
-}
-
 struct Harness {
     _dir: tempfile::TempDir,
     pool: sqlx::SqlitePool,
@@ -1569,6 +1347,12 @@ fn _writer_handle(_writer: &WriterHandle) {}
 
 // Charged-timeout ledger coverage lives in its own module to keep this file under the
 // 1,600-line ceiling (`MNT-3`); it reuses the harness defined above.
+// The mock upstream fixtures live in their own module for the same MNT-3 reason as the
+// test submodules below.
+#[path = "integration_streaming_accounting/mock_upstream.rs"]
+mod mock_upstream;
+pub(crate) use mock_upstream::*;
+
 #[path = "integration_streaming_accounting/charged_timeout_ledger.rs"]
 mod charged_timeout_ledger;
 
@@ -1581,3 +1365,17 @@ mod terminal_ledger_paths;
 // A hanging mock is hang-prone by construction, so every test here is bounded.
 #[path = "integration_streaming_accounting/retry_and_attribution.rs"]
 mod retry_and_attribution;
+
+// Metrics coverage for token classes and effective cost (`ISSUE-0154`).
+/// One serialisation point for every test that asserts on process-global Prometheus
+/// state. `cargo test` runs tests in one process and in parallel, so a per-test lock
+/// would not stop another module's cost sample landing inside a delta window.
+pub(crate) async fn metrics_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+#[path = "integration_streaming_accounting/metrics_token_classes.rs"]
+mod metrics_token_classes;
