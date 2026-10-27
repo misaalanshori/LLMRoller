@@ -372,6 +372,29 @@ async fn build_app(harness: &Harness) -> Router {
     data_plane_router(state)
 }
 
+/// Build the router with a client-key TPM limit applied to every key.
+///
+/// `rate_limit_tpm` has no `client_keys` column; it lives only on the snapshot's
+/// `ClientKeyRecord`, so the limit is injected by rebuilding the snapshot
+/// (`ISSUE-0145`).
+async fn build_app_with_tpm(harness: &Harness, tpm: i64) -> Router {
+    let mut snapshot = load_initial_snapshot(&harness.pool)
+        .await
+        .expect("load snapshot");
+    let mut keys_map = (*snapshot.client_keys_by_hash).clone();
+    for (record, _) in keys_map.values_mut() {
+        record.rate_limit_tpm = Some(tpm);
+    }
+    snapshot.client_keys_by_hash = Arc::new(keys_map);
+
+    let shared_snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
+    let state = ProxyAuthState::new(shared_snapshot, harness.pool.clone(), vec![])
+        .with_master_key(harness.master_key.clone())
+        .with_writer(harness.writer.clone());
+    state.is_ready.store(true, Ordering::SeqCst);
+    data_plane_router(state)
+}
+
 async fn flush(harness: &Harness) {
     flush_data_queues(&harness.pool, &harness.writer.queues).await;
 }
@@ -871,5 +894,325 @@ async fn test_count_tokens_unsupported_upstream_returns_local_not_implemented_an
             .count(),
         1,
         "a cached unsupported probe must short-circuit before dispatch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `count_tokens` must pass the same pre-candidate gates as inference
+// (`API-1`, `SEC-8`, `F040`, `ISSUE-0145`)
+// ---------------------------------------------------------------------------
+//
+// Before the fix `post_messages_count_tokens` was a hand-rolled miniature of the
+// inference path: it never touched the preflight budget, never decompressed, and
+// never consumed client-key TPM. Each test here pins one of those gates and asserts
+// the upstream received **zero** calls, because a status-code-only assertion could
+// pass for an unrelated reason.
+
+fn gzip_json(payload: &str) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(payload.as_bytes()).expect("compress");
+    encoder.finish().expect("finish")
+}
+
+fn gzip_request(token: &str, body: &[u8], content_type: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_ENCODING, "gzip")
+        .body(Body::from(body.to_vec()))
+        .expect("request")
+}
+
+/// A saturated preflight budget must reject `count_tokens` before it reaches upstream.
+#[tokio::test]
+#[doc = "Spec: API-1, SEC-8 — ISSUE-0145 count_tokens respects the preflight budget"]
+async fn count_tokens_respects_the_preflight_budget() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "budget-counter").await;
+    let token = create_client_key(&harness, user, "budget-counter-key").await;
+    let (addr, mock) = spawn_mock(false).await;
+    let provider = create_provider(&harness, "anthropic", format!("http://{addr}")).await;
+    let key = create_upstream_key(&harness, provider, "anthropic", 100).await;
+    let model = insert_model(&harness, "claude-sonnet").await;
+    insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
+
+    // A one-megabyte budget whose only permit is already held.
+    let snapshot = load_initial_snapshot(&harness.pool)
+        .await
+        .expect("load snapshot");
+    let shared = Arc::new(ArcSwap::from_pointee(snapshot));
+    let mut state = ProxyAuthState::new(shared, harness.pool.clone(), vec![])
+        .with_master_key(harness.master_key.clone())
+        .with_writer(harness.writer.clone());
+    let budget = Arc::new(llmroller_proxy::orchestrator::PreflightBudgetSemaphore::new(1, 32));
+    state.budget_semaphore = Arc::clone(&budget);
+    state.is_ready.store(true, Ordering::SeqCst);
+    let app = data_plane_router(state);
+
+    // Hold every permit so count_tokens cannot get one.
+    let held = budget
+        .acquire(1024 * 1024, std::time::Duration::from_millis(500))
+        .await
+        .expect("hold the entire budget");
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}]}"#),
+        ))
+        .await
+        .expect("count tokens");
+
+    assert!(
+        response.status().is_client_error() || response.status().is_server_error(),
+        "count_tokens must be refused when the preflight budget is saturated; got {}",
+        response.status()
+    );
+    let calls = mock.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "a budget-refused count_tokens must never reach upstream; upstream saw {} call(s)",
+        calls.len()
+    );
+    drop(calls);
+    drop(held);
+}
+
+/// A gzip-compressed count_tokens body must be decompressed before forwarding.
+///
+/// Pre-fix the raw gzip bytes were forwarded, so the upstream mock saw binary
+/// garbage — an interop bug independent of the security framing.
+#[tokio::test]
+#[doc = "Spec: API-1, SEC-8 — ISSUE-0145 count_tokens decompresses a compressed body"]
+async fn count_tokens_decompresses_a_compressed_body() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "gzip-counter").await;
+    let token = create_client_key(&harness, user, "gzip-counter-key").await;
+    let (addr, mock) = spawn_mock(false).await;
+    let provider = create_provider(&harness, "anthropic", format!("http://{addr}")).await;
+    let key = create_upstream_key(&harness, provider, "anthropic", 100).await;
+    let model = insert_model(&harness, "claude-sonnet").await;
+    insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
+
+    let app = build_app(&harness).await;
+    // Repetitive content so gzip genuinely shrinks it; a short unique string gzips
+    // *larger* than its input and the assertion below would be meaningless.
+    let filler = "compress me ".repeat(200);
+    let payload = format!(
+        r#"{{"model":"claude-sonnet","messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+    let compressed = gzip_json(&payload);
+    assert!(
+        compressed.len() < payload.len(),
+        "the fixture must actually be compressed for this test to mean anything: \
+         {} compressed vs {} raw",
+        compressed.len(),
+        payload.len()
+    );
+
+    let response = app
+        .oneshot(gzip_request(&token, &compressed, "application/json"))
+        .await
+        .expect("count tokens");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a valid gzipped count_tokens request must succeed"
+    );
+
+    let calls = mock.calls.lock().expect("calls");
+    let call = calls
+        .iter()
+        .find(|call| call.path == "/messages/count_tokens")
+        .expect("upstream count_tokens");
+    assert!(
+        call.body.contains("compress me"),
+        "the upstream must receive the decompressed JSON; it saw {} bytes starting {:?}",
+        call.body.len(),
+        call.body.chars().take(24).collect::<String>()
+    );
+    assert!(
+        call.body.trim_start().starts_with('{'),
+        "the forwarded body must be JSON, not gzip bytes"
+    );
+}
+
+/// An exhausted client-key TPM budget must reject `count_tokens`.
+#[tokio::test]
+#[doc = "Spec: F040 — ISSUE-0145 count_tokens is rejected when client-key TPM is exhausted"]
+async fn count_tokens_is_rejected_when_the_client_key_tpm_is_exhausted() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "tpm-counter").await;
+    let token = create_client_key(&harness, user, "tpm-counter-key").await;
+    let (addr, mock) = spawn_mock(false).await;
+    let provider = create_provider(&harness, "anthropic", format!("http://{addr}")).await;
+    let key = create_upstream_key(&harness, provider, "anthropic", 100).await;
+    let model = insert_model(&harness, "claude-sonnet").await;
+    insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
+
+    // `rate_limit_tpm` is not a client_keys column — it is carried only on the
+    // snapshot's `ClientKeyRecord`, so the limit is set by rebuilding the snapshot,
+    // which is the same pattern `integration_client_keys.rs` uses.
+    //
+    // The limiter only rejects once something has already been consumed in this
+    // minute (`entry.1 > 0 && entry.1 + add > limit`), so a 1-TPM key needs a first
+    // request to prime the window and a second to be refused.
+    let app = build_app_with_tpm(&harness, 1).await;
+    let body =
+        r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"count me please"}]}"#;
+    let first = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(body),
+        ))
+        .await
+        .expect("first count tokens");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the first request of the minute must be admitted"
+    );
+
+    let second = app
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(body),
+        ))
+        .await
+        .expect("second count tokens");
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an exhausted client-key TPM must reject count_tokens with 429"
+    );
+
+    let calls = mock.calls.lock().expect("calls");
+    let upstream_calls = calls
+        .iter()
+        .filter(|call| call.path == "/messages/count_tokens")
+        .count();
+    assert_eq!(
+        upstream_calls, 1,
+        "the TPM-rejected request must never reach upstream; it saw {upstream_calls} call(s)"
+    );
+}
+
+/// A successful count_tokens must not reserve budget windows or create pins.
+///
+/// This protects the auxiliary-endpoint design: C8 is skipped for `CountTokens`
+/// (SRDD 10.1), so the handler must share the *gates* without inheriting the
+/// reservations and pin machinery. It is the guard against a future
+/// "just call `admit_inbound_request`" simplification.
+#[tokio::test]
+#[doc = "Spec: API-1, SRDD 10.1 C8 — ISSUE-0145 count_tokens reserves no budget or pins"]
+async fn count_tokens_does_not_reserve_budget_windows_or_create_pins() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "aux-counter").await;
+    let token = create_client_key(&harness, user, "aux-counter-key").await;
+    let (addr, _mock) = spawn_mock(false).await;
+    let provider = create_provider(&harness, "anthropic", format!("http://{addr}")).await;
+    let key = create_upstream_key(&harness, provider, "anthropic", 100).await;
+    let model = insert_model(&harness, "claude-sonnet").await;
+    insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
+
+    let app = build_app(&harness).await;
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}]}"#),
+        ))
+        .await
+        .expect("count tokens");
+    assert_eq!(response.status(), StatusCode::OK);
+    flush(&harness).await;
+
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_attempts")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("count attempts");
+    assert_eq!(
+        attempts, 0,
+        "count_tokens is auxiliary and must not enqueue usage attempts"
+    );
+
+    let pins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pins")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("count pins");
+    assert_eq!(pins, 0, "count_tokens must not create session pins");
+}
+
+/// Status-quo pin: count_tokens is already RPM-limited via the auth middleware.
+///
+/// This passes before and after the change. It exists so a later router-wiring
+/// "simplification" cannot quietly drop the G5 coverage count_tokens already has.
+#[tokio::test]
+#[doc = "Spec: CLK-1, API-2 — ISSUE-0145 count_tokens stays RPM limited (status-quo pin)"]
+async fn count_tokens_is_still_rpm_limited() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "rpm-counter").await;
+    let token = create_client_key(&harness, user, "rpm-counter-key").await;
+    let (addr, mock) = spawn_mock(false).await;
+    let provider = create_provider(&harness, "anthropic", format!("http://{addr}")).await;
+    let key = create_upstream_key(&harness, provider, "anthropic", 100).await;
+    let model = insert_model(&harness, "claude-sonnet").await;
+    insert_route(&harness, key, model, "claude-native", r#"["messages"]"#).await;
+
+    sqlx::query("UPDATE client_keys SET rate_limit_rpm = 1")
+        .execute(&harness.pool)
+        .await
+        .expect("set rpm");
+
+    let app = build_app(&harness).await;
+    let body = r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}]}"#;
+    let first = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(body),
+        ))
+        .await
+        .expect("first");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(request(
+            "POST",
+            "/v1/messages/count_tokens",
+            &token,
+            Some(body),
+        ))
+        .await
+        .expect("second");
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a 1-RPM key must be refused on its second count_tokens call"
+    );
+
+    let calls = mock.calls.lock().expect("calls");
+    let upstream_calls = calls
+        .iter()
+        .filter(|call| call.path == "/messages/count_tokens")
+        .count();
+    assert_eq!(
+        upstream_calls, 1,
+        "only the admitted request may reach upstream; the RPM-rejected one must not"
     );
 }

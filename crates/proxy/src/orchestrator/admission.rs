@@ -144,40 +144,75 @@ async fn reserve_and_decompress_uncompressed(
     Ok(ReservedBody { permit, body })
 }
 
-#[allow(clippy::result_large_err)]
-pub(crate) async fn admit_inbound_request(
-    state: ProxyAuthState,
-    endpoint: EndpointKind,
-    headers: HeaderMap,
-    body: Bytes,
-    client_key: Option<ClientKeyRecord>,
-) -> Result<AdmittedRequest, Response> {
-    let endpoint_str = match endpoint {
-        EndpointKind::Chat => "chat",
-        EndpointKind::Responses => "responses",
-        EndpointKind::ResponsesCompact => "responses_compact",
-        EndpointKind::Messages => "messages",
-        EndpointKind::Embeddings => "embeddings",
-        _ => "chat",
-    };
-    let protocol = match endpoint {
-        // The compact endpoint speaks the Responses wire protocol but has its own upstream path.
-        EndpointKind::ResponsesCompact => "responses",
-        EndpointKind::Embeddings => "embeddings",
-        _ => endpoint_str,
-    };
-    let aux_label = aux_endpoint_label(endpoint);
-    // `F-021`, `F-022`: one protocol flag and one request id are established
-    // before any early return so every error envelope is schema-conformant.
-    let is_messages = matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens);
-    let request_id = RequestId::generate();
-    let request_id_str = request_id.to_string();
-    // `SEC-6`, `USG-9` (`F-011`): persist only the closed allow-list of
-    // diagnostic request headers, scrubbed of secrets, for every event path.
-    let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
-        &headers,
-    ));
+/// Pre-candidate gate sequence shared by inference and the auxiliary endpoints
+/// (`API-1`, `SEC-8`, `F040`, `ISSUE-0145`).
+///
+/// Everything here runs **before** candidate selection, so `admit_inbound_request`
+/// and `post_messages_count_tokens` can share one copy rather than each maintaining
+/// its own list. The defect this replaces was two hand-maintained gate lists, one of
+/// which drifted: `count_tokens` had no preflight reservation, no decompression, and
+/// no client-key TPM accounting.
+///
+/// Deliberately **not** included: `is_ip_rate_limited`, the RPM limiter, and
+/// diagnostic-header extraction. Those live in `client_key_auth_middleware`, which
+/// both endpoints already pass through; re-implementing them here would restart the
+/// same drift in a new place.
+///
+/// Also not included: candidate selection, pins, budget-window reservations, usage
+/// events, and tracing. `CountTokens` is auxiliary, so C8 budget windows are skipped
+/// for it (SRDD 10.1) — it needs the gates, not the pipeline.
+pub(crate) struct GatedInbound {
+    /// Body after decompression.
+    pub(crate) body: Bytes,
+    /// Preflight memory-admission permit for the buffered body. Held by the caller
+    /// for as long as the buffered body is live; `count_tokens` drops it immediately
+    /// because its continuation is a cheap auxiliary call.
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+    pub(crate) scan: llmroller_proto::body_edit::TopLevelScan,
+    pub(crate) model: SnapshotModel,
+    pub(crate) scope: RoutingScope,
+    pub(crate) now: i64,
+    /// Estimated input tokens, from the same `estimate_input_tokens` the TPM gate used.
+    pub(crate) input_tokens_est: i64,
+    /// Echoed back so the continuation does not have to re-derive it.
+    pub(crate) is_streaming: bool,
+    pub(crate) store_flag: bool,
+}
 
+/// Run the shared pre-candidate gates.
+///
+/// The per-request facts the gates need that are not derived from the body itself.
+pub(crate) struct GateRequest<'a> {
+    pub(crate) endpoint: EndpointKind,
+    pub(crate) endpoint_str: &'static str,
+    pub(crate) is_messages: bool,
+    pub(crate) headers: &'a HeaderMap,
+    pub(crate) request_id_str: String,
+    pub(crate) body: Bytes,
+}
+
+/// On success returns everything the continuation needs. On any rejection returns a
+/// fully-formed protocol error response, so both callers propagate it verbatim.
+///
+/// The preflight permit is returned to the caller inside [`GatedInbound`] rather than
+/// dropped here, because the buffered body it accounts for is returned too. Each
+/// caller decides how long to hold it: inference keeps it for the request, while
+/// `count_tokens` drops it immediately after its own candidate loop has copied the
+/// body it needs.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn gate_inbound_request(
+    state: &ProxyAuthState,
+    caller: &ClientKeyRecord,
+    request: GateRequest<'_>,
+) -> Result<GatedInbound, Response> {
+    let GateRequest {
+        endpoint,
+        endpoint_str,
+        is_messages,
+        headers,
+        request_id_str,
+        body,
+    } = request;
     let encoding = headers
         .get(axum::http::header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -247,7 +282,7 @@ pub(crate) async fn admit_inbound_request(
             }
         }
     };
-    let permit = reserved.permit;
+    let permit = Some(reserved.permit);
     let body = reserved.body;
 
     // 2. Scan and validate body envelope and duplicate keys
@@ -299,6 +334,8 @@ pub(crate) async fn admit_inbound_request(
     let now = state.clock.now_ms();
 
     let snapshot = state.snapshot.load();
+    // `snapshot` is a guard borrowed from `state`; everything below reads through it,
+    // and `GatedInbound` carries only owned values.
     // 3. Canonical model resolution is a pure in-memory lookup (PERF-1).
     let model = match snapshot.resolve_model(model_str) {
         Ok(model) => model.clone(),
@@ -348,22 +385,6 @@ pub(crate) async fn admit_inbound_request(
         }
     };
 
-    let Some(caller) = client_key.clone() else {
-        return Err(protocol_error(
-            is_messages,
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "authentication required",
-            Some(&request_id_str),
-            None,
-        ));
-    };
-    // Response header policy R4 depends on the caller role, not the request path (SEC-16).
-    let is_admin = snapshot
-        .users
-        .get(&caller.owner_user_id)
-        .is_some_and(|user| user.role == Role::Admin);
-
     // 4. Gate G6: client key model allow-list (supporting wildcards and canonical IDs; F043).
     if let Some(ref allowed) = caller.allowed_models
         && !llmroller_core::client_key::is_model_allowed_by_patterns(
@@ -402,7 +423,102 @@ pub(crate) async fn admit_inbound_request(
         ));
     }
 
-    let scope = resolve_caller_scope(&caller, &snapshot);
+    let scope = resolve_caller_scope(caller, &snapshot);
+    Ok(GatedInbound {
+        body,
+        permit,
+        scan,
+        model,
+        scope,
+        now,
+        input_tokens_est,
+        is_streaming,
+        store_flag,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn admit_inbound_request(
+    state: ProxyAuthState,
+    endpoint: EndpointKind,
+    headers: HeaderMap,
+    body: Bytes,
+    client_key: Option<ClientKeyRecord>,
+) -> Result<AdmittedRequest, Response> {
+    let endpoint_str = match endpoint {
+        EndpointKind::Chat => "chat",
+        EndpointKind::Responses => "responses",
+        EndpointKind::ResponsesCompact => "responses_compact",
+        EndpointKind::Messages => "messages",
+        EndpointKind::Embeddings => "embeddings",
+        _ => "chat",
+    };
+    let protocol = match endpoint {
+        // The compact endpoint speaks the Responses wire protocol but has its own upstream path.
+        EndpointKind::ResponsesCompact => "responses",
+        EndpointKind::Embeddings => "embeddings",
+        _ => endpoint_str,
+    };
+    let aux_label = aux_endpoint_label(endpoint);
+    // `F-021`, `F-022`: one protocol flag and one request id are established
+    // before any early return so every error envelope is schema-conformant.
+    let is_messages = matches!(endpoint, EndpointKind::Messages | EndpointKind::CountTokens);
+    let request_id = RequestId::generate();
+    let request_id_str = request_id.to_string();
+    // `SEC-6`, `USG-9` (`F-011`): persist only the closed allow-list of
+    // diagnostic request headers, scrubbed of secrets, for every event path.
+    let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
+        &headers,
+    ));
+
+    // 1-4. Shared pre-candidate gates: preflight memory admission, decompression,
+    // envelope scan, model resolution, G6 allow-list, client-key TPM and scope
+    // resolution. One copy, shared with the auxiliary endpoints
+    // (`API-1`, `SEC-8`, `F040`, `ISSUE-0145`).
+    let Some(caller) = client_key.clone() else {
+        return Err(protocol_error(
+            is_messages,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "authentication required",
+            Some(&request_id_str),
+            None,
+        ));
+    };
+    let gated = gate_inbound_request(
+        &state,
+        &caller,
+        GateRequest {
+            endpoint,
+            endpoint_str,
+            is_messages,
+            headers: &headers,
+            request_id_str: request_id_str.clone(),
+            body,
+        },
+    )
+    .await?;
+    let GatedInbound {
+        body,
+        permit,
+        scan,
+        model,
+        scope,
+        now,
+        input_tokens_est,
+        is_streaming,
+        store_flag,
+    } = gated;
+    // `gate_inbound_request` always returns a permit; the struct makes it optional only
+    // so `count_tokens` can drop its own without a second type.
+    let permit = permit
+        .unwrap_or_else(|| unreachable!("gate_inbound_request always reserves a preflight permit"));
+    let snapshot = state.snapshot.load();
+    // Response header policy R4 depends on the caller role, not the request path (SEC-16).
+    let is_admin = snapshot
+        .users
+        .get(&caller.owner_user_id)
+        .is_some_and(|user| user.role == Role::Admin);
     // Trace mode is decided exactly once at request start (TRC-1).
     let trace_config = &snapshot.settings.traceability_config;
     let trace_enabled = state.sealer_pool.is_some()
