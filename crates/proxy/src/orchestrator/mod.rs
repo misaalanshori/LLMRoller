@@ -90,6 +90,7 @@ const PROTOCOL_BLOCK_MS: i64 = 6 * 60 * 60 * 1_000;
 const AUX_UNSUPPORTED_TTL_MS: i64 = 60 * 60 * 1_000;
 
 pub(crate) mod admission;
+pub(crate) mod attempt_body;
 pub(crate) mod attempt_context;
 pub(crate) mod attempt_non_streaming;
 pub(crate) mod attempt_streaming;
@@ -105,6 +106,7 @@ pub(crate) mod terminal_accounting;
 pub(crate) mod trace;
 
 pub(crate) use admission::*;
+pub(crate) use attempt_body::*;
 pub(crate) use attempt_context::*;
 pub(crate) use attempt_non_streaming::*;
 pub(crate) use attempt_streaming::*;
