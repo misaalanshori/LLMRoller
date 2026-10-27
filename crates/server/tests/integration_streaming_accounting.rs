@@ -95,6 +95,14 @@ enum MockMode {
     NonRetryable400,
     /// An SSE stream whose first frame is an `invalid_request_error` (`ISSUE-0150`).
     StreamRequestRejected,
+    /// `429` with `Retry-After: 1` on the first call, then hangs past the send timeout
+    /// (`ISSUE-0152`). Exists to exercise the short-retry failure branch.
+    Retry429ThenHang,
+    /// `429` with `Retry-After: 1` on the first call, then a successful JSON completion
+    /// (`ISSUE-0152`). The non-regression counterpart.
+    Retry429ThenOk,
+    /// `429` with `Retry-After: 1` on every call, to pin that the retry does not loop.
+    Retry429Always,
     ResponsesFailed,
     SleepDelay(u64),
 }
@@ -172,6 +180,55 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
         MockMode::Chat429 => (
             StatusCode::TOO_MANY_REQUESTS,
             [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
+            })),
+        )
+            .into_response(),
+        // The short-retry fixtures are call-count dependent: the first call answers 429
+        // with a 1-second `Retry-After` (the only shape that triggers the retry), and
+        // the second call does whatever the variant name says.
+        MockMode::Retry429ThenHang if state.calls.load(Ordering::SeqCst) == 1 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json"), ("retry-after", "1")],
+            Json(serde_json::json!({
+                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
+            })),
+        )
+            .into_response(),
+        MockMode::Retry429ThenHang => {
+            // Never respond: the client's send timeout is what ends this call.
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+        MockMode::Retry429ThenOk if state.calls.load(Ordering::SeqCst) == 1 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json"), ("retry-after", "1")],
+            Json(serde_json::json!({
+                "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
+            })),
+        )
+            .into_response(),
+        MockMode::Retry429ThenOk => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            Json(serde_json::json!({
+                "id": "chatcmpl-retry-ok",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "after retry" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })),
+        )
+            .into_response(),
+        MockMode::Retry429Always => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json"), ("retry-after", "1")],
             Json(serde_json::json!({
                 "error": { "message": "rate limited", "code": "rate_limit_exceeded" }
             })),
@@ -1519,3 +1576,8 @@ mod charged_timeout_ledger;
 // Kept in a submodule for the same 1,600-line MNT-3 reason as the cycle-10 module.
 #[path = "integration_streaming_accounting/terminal_ledger_paths.rs"]
 mod terminal_ledger_paths;
+
+// The 429 short-retry failure branch and terminal attribution (`ISSUE-0152`, `ISSUE-0153`).
+// A hanging mock is hang-prone by construction, so every test here is bounded.
+#[path = "integration_streaming_accounting/retry_and_attribution.rs"]
+mod retry_and_attribution;

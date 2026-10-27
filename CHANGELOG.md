@@ -49,6 +49,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (retry and attribution)
+
+- **A failed 429 short-retry silently reused the stale 429 (ISSUE-0152).** The
+  same-key retry for `429` with `Retry-After <= 2 s` (`RTE-8`) had no failure branch: when
+  the retry timed out or failed to connect, the code fell through and processed the
+  **first** 429 as if it were current. The client was therefore told to back off a key
+  that was actually unresponsive, the second upstream call went unrecorded in
+  `usage_attempts`, and `record_upstream_failure` never ran so key health and the origin
+  breaker did not learn. The branch now records the attempt, updates health, emits
+  `record_upstream_slow` on the timeout shape, pushes a matching `TryOutcome` so
+  `select_terminal_error` cannot re-select the stale 429, and continues the loop with a
+  timeout/host-failure classification. `failovers` is deliberately not incremented — a
+  same-key retry is not a failover.
+- **The terminal all-failed event dropped session attribution (ISSUE-0153).** The event
+  left `session_hash` and `pin_outcome` as `None` even when a session had been resolved
+  and a pin consulted before every attempt failed. Both are now populated from `pin_key`
+  and `pin_ticket`, using `PinOutcome::as_str`'s real vocabulary rather than a synthesised
+  string. The Gate-G7 path in the same file correctly keeps `None`: no pin is consulted
+  there, and a guess would look authoritative in the trace inspector.
+
 ### Changed (internal structure)
 
 - **`orchestrator/pipeline.rs` decomposed ahead of the MNT-3 ceiling (ISSUE-0225).**

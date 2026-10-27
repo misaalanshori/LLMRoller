@@ -534,11 +534,71 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                 for (name, value) in &outbound_headers {
                     retry_builder = retry_builder.header(name, value);
                 }
-                if let Ok(Ok(retry_resp)) =
-                    tokio::time::timeout(send_timeout, retry_builder.send()).await
-                {
-                    response = retry_resp;
-                    status = response.status();
+                let retry_res = tokio::time::timeout(send_timeout, retry_builder.send()).await;
+                match retry_res {
+                    Ok(Ok(retry_resp)) => {
+                        response = retry_resp;
+                        status = response.status();
+                    }
+                    // The retry failed. Without this branch the stale first-429 `response`
+                    // would be processed as current, so the client would be told to back
+                    // off a key that is actually unresponsive, the second call would go
+                    // unrecorded, and key health would never learn (`ISSUE-0152`).
+                    Ok(Err(_)) | Err(_) => {
+                        let retry_timed_out = retry_res.is_err();
+                        if retry_timed_out {
+                            crate::metrics::record_upstream_slow(
+                                &candidate.provider_id.to_string(),
+                            );
+                        }
+                        let attempt_outcome = if retry_timed_out {
+                            llmroller_core::usage::AttemptOutcome::WaitTimeout
+                        } else {
+                            llmroller_core::usage::AttemptOutcome::ConnectError
+                        };
+                        attempts.push(attempt_record(
+                            request_id,
+                            attempt_no as i64,
+                            now,
+                            candidate.upstream_key_id,
+                            candidate_share_id.clone(),
+                            attempt_outcome,
+                            Some(if retry_timed_out { 504 } else { 502 }),
+                            body.len(),
+                            0,
+                            "none",
+                        ));
+                        // `record_upstream_failure` returns the credential-strike decision.
+                        // It is discarded here for the same reason the main send path
+                        // discards it: this branch has no key to re-probe and the strike
+                        // state itself is already recorded inside the call.
+                        let _ = state.runtime_state.record_upstream_failure(
+                            &origin,
+                            candidate.upstream_key_id,
+                            caller.id,
+                            attempt_outcome,
+                            None,
+                            now,
+                        );
+                        enqueue_key_health(
+                            state.writer.as_ref(),
+                            &state.runtime_state,
+                            candidate.upstream_key_id,
+                            now,
+                        );
+                        // Consume the stale response so the loop cannot observe it, and
+                        // push a matching `TryOutcome` so `select_terminal_error` classifies
+                        // this as a timeout/host failure rather than the earlier 429.
+                        drop(response);
+                        try_outcomes.push(if retry_timed_out {
+                            TryOutcome::WaitTimeout
+                        } else {
+                            TryOutcome::HostFailure
+                        });
+                        // `failovers` is deliberately untouched: this is a same-key retry,
+                        // not a failover to a different key.
+                        continue;
+                    }
                 }
             }
         }
@@ -1194,8 +1254,12 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             share_id: None,
             upstream_model_id: model.canonical_id.clone(),
             endpoint_str,
-            session_hash: None,
-            pin_outcome: None,
+            // The session *was* resolved before the attempt loop, so the hash is known
+            // even though every attempt failed (`ISSUE-0153`).
+            session_hash: pin_key.as_ref().map(|key| key.session_hash.clone()),
+            pin_outcome: pin_ticket
+                .as_ref()
+                .map(|ticket| ticket.outcome.as_str().to_string()),
             failovers,
             error_code: Some(terminal_code.to_string()),
             billing_coverage_mode: "pay_as_you_go".to_string(),
