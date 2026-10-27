@@ -799,7 +799,19 @@ async fn post_login(
     let (Some(expected), Some(header_token)) = (expected_csrf, header_csrf) else {
         return Err(AuthError::InvalidCsrf);
     };
-    if expected.is_empty() || !bool::from(expected.as_bytes().ct_eq(header_token.as_bytes())) {
+    // Double-submit comparison. Both sides are hashed first so the compared values
+    // are fixed-width regardless of the token format: `ct_eq` for byte slices
+    // returns early on unequal lengths, which would leak the token length by
+    // timing the moment the format stopped being a constant-width nonce
+    // (`SEC-5`, `ISSUE-0045`). This also matches the digest comparison the
+    // authenticated-session path already uses.
+    if expected.is_empty()
+        || !bool::from(
+            sha256_hex(expected.as_bytes())
+                .as_bytes()
+                .ct_eq(sha256_hex(header_token.as_bytes()).as_bytes()),
+        )
+    {
         return Err(AuthError::InvalidCsrf);
     }
 

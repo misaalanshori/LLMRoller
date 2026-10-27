@@ -27,6 +27,39 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `major.minor` compilers, or if the channel is a floating name rather than a
   pinned release.
 
+### Fixed (security)
+
+- **Login self-deadlock (ISSUE-0001).** `post_login` acquired the Argon2id
+  semaphore twice in one request, holding the first permit while waiting for the
+  second. With `N` permits, `N` concurrent logins each held one permit and
+  blocked on another, so no permit could ever be released; the second acquisition
+  was bounded at 2 s and mapped to `503 login_busy`, making every concurrent
+  login fail. Both Argon2id call sites now go through one helper that holds a
+  single permit for the blocking verification only, and the user lookup no longer
+  runs under a permit. The missing-user constant-time dummy verification, which
+  previously ran without a permit at all, is now bounded the same way.
+- **Session CSRF key was a public constant (ISSUE-0002).** The authenticated
+  session CSRF token was `HMAC(a compile-time constant in the source tree,
+  session_token)`, because `AuthAppState` had no field for the instance secret
+  and every caller used the fallback. Anyone who learned a session token could
+  compute the matching CSRF header offline, so the header added no proof over the
+  cookie. `AuthAppState` now carries `session_hmac_secret`, wired from
+  `instance_secrets` in `cli::serve` exactly as the data plane already does, and
+  the hand-rolled HMAC is replaced by `hmac::Hmac<sha2::Sha256>`. The no-secret
+  API form is removed; the fallback for test and CLI paths is a per-process
+  random key rather than a public literal.
+- **Pre-login CSRF comparison leaked token length (ISSUE-0045).** The
+  double-submit check compared the cookie and header with
+  `subtle::ConstantTimeEq` directly, which returns early on unequal lengths and
+  is constant-time only for equal-length inputs. Both sides are now compared as
+  fixed-width SHA-256 digests, matching the authenticated-session path. Harmless
+  today because the nonce is a constant-width base64url value, but it constrained
+  any future token-format change.
+- **Signed pre-login CSRF cookie declined (ISSUE-0046).** Signing the cookie was
+  analysed and deliberately not implemented: it stops the same attacker for the
+  same reason the existing double-submit equality check already stops them, and
+  it would cost an HMAC per page render plus a cookie-format migration.
+
 ### Fixed (tests)
 
 - **`e2e_sigterm_drain` could not fail for the right reason.** The test built
