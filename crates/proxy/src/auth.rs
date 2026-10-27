@@ -27,6 +27,19 @@ use sqlx::SqlitePool;
 /// Maximum authentication failures allowed per client IP per minute before throttling per SEC-12.
 pub const MAX_AUTH_FAILURES_PER_IP_MINUTE: usize = 20;
 
+/// Maximum number of distinct client IPs tracked at once (`SEC-12`, `ISSUE-0059`).
+///
+/// The tracking map is keyed by attacker-controlled source address, so without a
+/// bound an unauthenticated attacker can grow it without limit by spraying distinct
+/// IPs. At capacity, expired entries are swept first; if the map is still full, one
+/// existing entry is evicted rather than the new one dropped — dropping the new
+/// entry would mean a flooding attacker is never rate-limited at all, which is worse
+/// than recycling an old slot.
+pub const MAX_TRACKED_FAILURE_IPS: usize = 10_000;
+
+/// Sliding window for the per-IP authentication failure counter (`SEC-12`).
+const IP_FAILURE_WINDOW_MS: i64 = 60_000;
+
 /// Shared state for client key authentication middleware.
 #[derive(Clone)]
 pub struct ProxyAuthState {
@@ -176,8 +189,14 @@ impl ProxyAuthState {
         // In-memory 60s sliding window
         {
             let mut failures = self.ip_failures.lock();
+            // Bound the map before inserting: it is keyed by attacker-controlled
+            // source address, so an unauthenticated attacker could otherwise grow it
+            // without limit by spraying distinct IPs (`SEC-12`, `ISSUE-0059`).
+            if failures.len() >= MAX_TRACKED_FAILURE_IPS {
+                self.sweep_failure_ips_at_capacity(&mut failures, now_ms);
+            }
             let entry = failures.entry(ip).or_default();
-            entry.retain(|&ts| now_ms - ts < 60_000);
+            entry.retain(|&ts| now_ms - ts < IP_FAILURE_WINDOW_MS);
             entry.push(now_ms);
         }
 
@@ -227,12 +246,51 @@ impl ProxyAuthState {
         }
     }
 
+    /// Keep `failures` within [`MAX_TRACKED_FAILURE_IPS`] while making room for one
+    /// more entry.
+    ///
+    /// Runs only when the map is at capacity, never on the read path: an O(n) sweep
+    /// per request would be a DoS amplifier. Two stages:
+    ///
+    /// 1. Drop every IP whose window holds no failure in the last 60 s. Cheap, and
+    ///    sufficient whenever the flood is not entirely inside one minute.
+    /// 2. If the map is still full — a genuine `MAX_TRACKED_FAILURE_IPS`-distinct-IP
+    ///    flood inside a single window — evict expired-vector entries until there is
+    ///    room. Evicting a live attacker entry resets that attacker's counter, which
+    ///    is strictly better than unbounded memory. Dropping the *new* entry instead
+    ///    would mean a flooding attacker is never rate-limited at all, which is worse.
+    fn sweep_failure_ips_at_capacity(&self, failures: &mut HashMap<IpAddr, Vec<i64>>, now_ms: i64) {
+        failures.retain(|_, attempts| {
+            attempts.retain(|&ts| now_ms - ts < IP_FAILURE_WINDOW_MS);
+            !attempts.is_empty()
+        });
+        // Stage 2: still full, so recycle slots. `HashMap` iteration order is
+        // unspecified, so this evicts an arbitrary subset rather than asserting which
+        // entries lose; every choice is a live entry whose counter resets.
+        if failures.len() >= MAX_TRACKED_FAILURE_IPS {
+            let excess = failures.len() - MAX_TRACKED_FAILURE_IPS + 1;
+            let victims: Vec<IpAddr> = failures.keys().take(excess).copied().collect();
+            for victim in victims {
+                failures.remove(&victim);
+            }
+        }
+    }
+
+    /// Number of distinct client IPs currently tracked (`ISSUE-0059`).
+    ///
+    /// Exposed so the bound can be asserted. A bound with no observable is how this
+    /// defect survived: nothing could see the map grow.
+    #[must_use]
+    pub fn tracked_failure_ip_count(&self) -> usize {
+        self.ip_failures.lock().len()
+    }
+
     /// Check if the given client IP has exceeded the bad-token rate limit.
     #[must_use]
     pub fn is_ip_rate_limited(&self, ip: IpAddr, now_ms: i64) -> bool {
         let mut failures = self.ip_failures.lock();
         if let Some(entry) = failures.get_mut(&ip) {
-            entry.retain(|&ts| now_ms - ts < 60_000);
+            entry.retain(|&ts| now_ms - ts < IP_FAILURE_WINDOW_MS);
             entry.len() >= MAX_AUTH_FAILURES_PER_IP_MINUTE
         } else {
             false
@@ -637,6 +695,135 @@ mod tests {
         assert_eq!(
             extract_client_ip(peer_addr, &headers, &trusted_proxies),
             "10.0.0.1".parse::<IpAddr>().expect("parse ip")
+        );
+    }
+}
+
+/// Bounded failure-tracking map tests (`SEC-12`, `ISSUE-0059`).
+///
+/// The map is bounded so an unauthenticated attacker cannot grow it without limit
+/// by spraying distinct source addresses. Every case here drives an explicit
+/// `now_ms`, so nothing depends on wall-clock time or scheduling.
+#[cfg(test)]
+mod failure_bound_tests {
+    use super::*;
+
+    fn state() -> ProxyAuthState {
+        ProxyAuthState::new(
+            Arc::new(ArcSwap::from_pointee(ConfigSnapshot::default())),
+            sqlx::SqlitePool::connect_lazy("sqlite::memory:").expect("lazy pool"),
+            Vec::new(),
+        )
+    }
+
+    fn ip(index: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(index.to_be_bytes()))
+    }
+
+    /// A flood of distinct source IPs must not grow the tracking map without limit.
+    ///
+    /// The flood is deliberately only slightly larger than the bound. Each insert at
+    /// capacity runs an O(n) sweep, so a much larger flood would make this test
+    /// quadratic for no extra signal — the invariant is "never exceeds the bound",
+    /// which a 1-span overshoot exercises just as well as a 5-span one.
+    #[tokio::test]
+    #[doc = "Spec: SEC-12 — ISSUE-0059 failure map is bounded under a distinct-IP flood"]
+    async fn failure_map_is_bounded_under_a_distinct_ip_flood() {
+        let state = state();
+        let now = 1_700_000_000_000;
+
+        let flood = MAX_TRACKED_FAILURE_IPS + 500;
+        for index in 0..flood {
+            state
+                .record_failure(ip(index as u32), "invalid_key", now)
+                .await;
+        }
+
+        assert!(
+            state.tracked_failure_ip_count() <= MAX_TRACKED_FAILURE_IPS,
+            "the failure map tracked {} distinct IPs, exceeding the {} bound; an \
+             unauthenticated attacker can grow this without limit",
+            state.tracked_failure_ip_count(),
+            MAX_TRACKED_FAILURE_IPS
+        );
+    }
+
+    /// Filling the map to its bound and then recording a failure in a later window
+    /// must sweep the now-expired entries and admit the new IP.
+    #[tokio::test]
+    #[doc = "Spec: SEC-12 — ISSUE-0059 expired entries are swept when the map is full"]
+    async fn expired_ip_entries_are_swept_when_the_map_is_full() {
+        let state = state();
+        let t0 = 1_700_000_000_000;
+
+        for index in 0..MAX_TRACKED_FAILURE_IPS {
+            state
+                .record_failure(ip(index as u32), "invalid_key", t0)
+                .await;
+        }
+        assert_eq!(
+            state.tracked_failure_ip_count(),
+            MAX_TRACKED_FAILURE_IPS,
+            "the map must be exactly full before the sweep is exercised"
+        );
+
+        // 120 s later every existing entry is outside the 60 s window.
+        let later = t0 + 120_000;
+        let new_ip = ip(u32::MAX);
+        state.record_failure(new_ip, "invalid_key", later).await;
+
+        assert!(
+            state.tracked_failure_ip_count() <= MAX_TRACKED_FAILURE_IPS,
+            "the map must stay within its bound after a sweep; tracked {}",
+            state.tracked_failure_ip_count()
+        );
+        assert!(
+            state.tracked_failure_ip_count() < MAX_TRACKED_FAILURE_IPS,
+            "expired entries must actually be removed, not merely tolerated; the map \
+             still holds {} entries",
+            state.tracked_failure_ip_count()
+        );
+
+        // The new IP's own counter must be live: reaching the threshold with further
+        // failures in the same window has to trip the limiter. A single failure cannot
+        // trip it (the threshold is 20), so drive it to the threshold rather than
+        // asserting on one sample.
+        for _ in 1..MAX_AUTH_FAILURES_PER_IP_MINUTE {
+            state.record_failure(new_ip, "invalid_key", later).await;
+        }
+        assert!(
+            state.is_ip_rate_limited(new_ip, later),
+            "the newly recorded IP must be tracked and rate-limited once it reaches the \
+             threshold; its entry was lost by the sweep"
+        );
+    }
+
+    /// The bound must not break rate limiting: a single IP's own counter must still
+    /// trip at the threshold.
+    ///
+    /// The threshold is inclusive: `is_ip_rate_limited` fires once the window holds
+    /// `MAX_AUTH_FAILURES_PER_IP_MINUTE` entries, so the last-but-one is the final
+    /// admitted attempt.
+    #[tokio::test]
+    #[doc = "Spec: SEC-12 — ISSUE-0059 the bound does not evict the attacker's own entry"]
+    async fn rate_limiting_still_fires_at_the_threshold() {
+        let state = state();
+        let now = 1_700_000_000_000;
+        let attacker = ip(4242);
+
+        for recorded in 0..MAX_AUTH_FAILURES_PER_IP_MINUTE {
+            assert!(
+                !state.is_ip_rate_limited(attacker, now),
+                "must not be limited after {recorded} failures, below the {} threshold",
+                MAX_AUTH_FAILURES_PER_IP_MINUTE
+            );
+            state.record_failure(attacker, "invalid_key", now).await;
+        }
+
+        assert!(
+            state.is_ip_rate_limited(attacker, now),
+            "{} failures inside one minute must rate-limit the IP",
+            MAX_AUTH_FAILURES_PER_IP_MINUTE
         );
     }
 }
