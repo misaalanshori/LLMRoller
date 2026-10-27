@@ -49,6 +49,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (memory budget)
+
+- **Decompression ran outside the preflight memory budget (ISSUE-0147).**
+  `admit_inbound_request` decompressed the request body and only then requested
+  preflight permits, sized on the decompressed length. The semaphore therefore
+  bounded post-decompression concurrency only: N concurrent compressed requests
+  each allocated up to `MAX_DECOMPRESSED_BYTES` (16 MiB) before any of them touched
+  the budget, so an attacker could keep several GB live while the budget still read
+  free. Measured pre-fix: 16 of 16 concurrent compressed bodies each inflated 4 MiB
+  with no reservation — 64 MiB against a 17 MiB budget. The reservation is now taken
+  before decompression and denominated in the decompressed ceiling, then reconciled
+  down to the actual size via `OwnedSemaphorePermit::split`. Uncompressed bodies
+  reserve only their wire length, so the common path keeps its throughput. The
+  permit is held for the request's lifetime and released on every error path, so a
+  failed decompression leaks nothing.
+
 ### Fixed (routing scope)
 
 - **`inherit` routing scope was silently widened, not inherited (ISSUE-0009).**
