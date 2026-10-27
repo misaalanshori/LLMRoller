@@ -1216,3 +1216,8 @@ async fn count_tokens_is_still_rpm_limited() {
         "only the admitted request may reach upstream; the RPM-rejected one must not"
     );
 }
+
+// `count_tokens` failover, failure learning, decode-failure and metric coverage
+// (`ISSUE-0146`). Kept in a submodule so this file stays under the MNT-3 ceiling.
+#[path = "integration_state_bound_responses/count_tokens_failover.rs"]
+mod count_tokens_failover;
