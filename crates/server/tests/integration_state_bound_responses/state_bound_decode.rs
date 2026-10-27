@@ -19,8 +19,8 @@
 //! nothing to smuggle through, so the two tests at the bottom of this file pin that
 //! status quo: a saturated preflight budget must **not** reject a state-bound op.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -100,7 +100,10 @@ async fn spawn_mock(corrupt_gzip: bool) -> (String, MockState) {
     let app = Router::new()
         .route("/responses/{id}", get(mock_responses))
         .route("/responses/{id}/input_items", get(mock_responses))
-        .route("/responses/{id}/cancel", axum::routing::post(mock_responses))
+        .route(
+            "/responses/{id}/cancel",
+            axum::routing::post(mock_responses),
+        )
         .route("/responses", axum::routing::post(mock_responses))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -269,7 +272,11 @@ async fn create_link(
         )
         .await
         .expect("create response");
-    assert_eq!(response.status(), StatusCode::OK, "link creation must succeed");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "link creation must succeed"
+    );
     let json: serde_json::Value = serde_json::from_slice(
         &to_bytes(response.into_body(), usize::MAX)
             .await
@@ -281,14 +288,10 @@ async fn create_link(
 }
 
 async fn build_app(harness: &Harness) -> Router {
-    build_app_with_state(harness)
-        .await
-        .0
+    build_app_with_state(harness).await.0
 }
 
-async fn build_app_with_state(
-    harness: &Harness,
-) -> (Router, ProxyAuthState) {
+async fn build_app_with_state(harness: &Harness) -> (Router, ProxyAuthState) {
     let snapshot = load_initial_snapshot(&harness.pool)
         .await
         .expect("load snapshot");
@@ -405,7 +408,10 @@ async fn state_bound_response_op_records_an_usage_event_on_a_decode_failure() {
         Some("upstream_decode_error"),
         "the row must name the decode failure so the failure is queryable"
     );
-    assert_eq!(status_code, 502, "the recorded status must be what the client saw");
+    assert_eq!(
+        status_code, 502,
+        "the recorded status must be what the client saw"
+    );
     assert_eq!(
         termination, "completed",
         "the request did terminate — badly, but terminally; the error_code carries the \
@@ -433,8 +439,7 @@ async fn state_bound_response_op_is_not_budget_semaphore_gated() {
     let (id, _key, _mock) = create_link(&harness, &token, false).await;
 
     let (_app, state) = build_app_with_state(&harness).await;
-    let budget =
-        Arc::new(llmroller_proxy::orchestrator::PreflightBudgetSemaphore::new(1, 32));
+    let budget = Arc::new(llmroller_proxy::orchestrator::PreflightBudgetSemaphore::new(1, 32));
     // Saturate: hold the only permit for the duration of the assertion.
     let held = budget
         .acquire(1024 * 1024, std::time::Duration::from_millis(200))

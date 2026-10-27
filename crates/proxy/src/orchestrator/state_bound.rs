@@ -56,6 +56,16 @@ fn record_count_tokens_failure(
     );
 }
 
+/// Ledger label for a candidate pool tier, shared so the success and decode-failure
+/// emit sites cannot disagree about what they called the same tier.
+fn tier_str_for(pool_tier: PoolTier) -> &'static str {
+    match pool_tier {
+        PoolTier::Own => "personal",
+        PoolTier::Shared => "shared",
+        PoolTier::Global | PoolTier::Blended => "global",
+    }
+}
+
 /// Load one durable response link for a routed Responses operation.
 pub(crate) async fn load_response_link(
     state: &ProxyAuthState,
@@ -752,7 +762,70 @@ pub(crate) async fn forward_state_bound_response_op(
         }
         Ok(Err(_)) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let body = decode_upstream_body(content_encoding.as_deref(), raw_body).unwrap_or_default();
+    let canonical_id = snapshot
+        .models
+        .get(&link.model_pk)
+        .map_or_else(|| "gpt-4o".to_string(), |m| m.canonical_id.clone());
+
+    // A decode failure is a gateway fault, never an empty success. `unwrap_or_default()`
+    // here used to hand the client `200 OK` with zero bytes, which is indistinguishable
+    // from "this response has no content" — the worst shape available, because the client
+    // proceeds on wrong information (`ISSUE-0156`). Mirrors the identical fix cycle 15
+    // made in `post_messages_count_tokens` so the two handlers read the same.
+    let body = match decode_upstream_body(content_encoding.as_deref(), raw_body) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // The linked key really did answer, so the row is attributed to it. A row
+            // credited to "none" while a real key answered is a row that exists but is
+            // wrong, which is not an improvement over a missing row (`ISSUE-0149`).
+            let (billing_coverage_mode, plan_multiplier_bps) =
+                provider_billing(&snapshot, &key.provider_id);
+            enqueue_terminal_usage(
+                state,
+                TerminalUsageFacts {
+                    request_id: RequestId::from_str(&request_id)
+                        .unwrap_or_else(|_| RequestId::generate()),
+                    caller,
+                    canonical_model: &canonical_id,
+                    upstream_key_id: Some(link.upstream_key_id.to_string()),
+                    provider_id: Some(key.provider_id.to_string()),
+                    provider_scope: Some(tier_str_for(pool_tier).to_string()),
+                    share_id: None,
+                    upstream_model_id: String::new(),
+                    endpoint_str: "responses",
+                    session_hash: if link.session_hash.is_empty() {
+                        None
+                    } else {
+                        Some(link.session_hash.clone())
+                    },
+                    pin_outcome: None,
+                    failovers: 0,
+                    error_code: Some("upstream_decode_error".to_string()),
+                    billing_coverage_mode,
+                    plan_multiplier_bps,
+                    request_headers_json: None,
+                    // The client sees 502, and the row records what the client saw.
+                    status: StatusCode::BAD_GATEWAY,
+                    is_streaming: false,
+                    termination: Termination::Completed.as_str(),
+                    // Nothing was billable: the body never became readable.
+                    cost_micro_usd: 0,
+                    cost_source: CostSource::PriceBook,
+                    now,
+                    latency_ms: Some((state.clock.now_ms() - now).max(0)),
+                },
+                Vec::new(),
+            );
+            return protocol_error(
+                true,
+                StatusCode::BAD_GATEWAY,
+                "upstream_decode_error",
+                "the upstream response body could not be decoded",
+                Some(&request_id),
+                None,
+            );
+        }
+    };
 
     if status.is_success() {
         if method == Method::DELETE && subpath.is_empty() {
@@ -793,11 +866,6 @@ pub(crate) async fn forward_state_bound_response_op(
         }
     }
 
-    let canonical_id = snapshot
-        .models
-        .get(&link.model_pk)
-        .map_or_else(|| "gpt-4o".to_string(), |m| m.canonical_id.clone());
-
     if !link.session_hash.is_empty() {
         let pin_key = PinKey {
             client_key_id: caller.id,
@@ -815,11 +883,7 @@ pub(crate) async fn forward_state_bound_response_op(
     }
 
     if let Some(writer) = &state.writer {
-        let tier_str = match pool_tier {
-            PoolTier::Own => "personal",
-            PoolTier::Shared => "shared",
-            PoolTier::Global | PoolTier::Blended => "global",
-        };
+        let tier_str = tier_str_for(pool_tier);
         let rid = RequestId::from_str(&request_id).unwrap_or_else(|_| RequestId::generate());
         writer.queues.usage_writer.enqueue(
             UsageEventRecord {

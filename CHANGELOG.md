@@ -9,6 +9,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **State-bound Responses operations no longer turn a decode failure into an empty
+  `200 OK` (ISSUE-0156).** `forward_state_bound_response_op` used
+  `decode_upstream_body(..).unwrap_or_default()`, so a corrupt, truncated, or
+  decompression-bomb upstream body became an empty byte string while the response kept
+  the upstream status — typically `200 OK`. A client reading an empty
+  `GET /v1/responses/{id}` cannot distinguish "this response has no content" from "the
+  gateway could not read the upstream's bytes", and proceeds on the wrong one. It is now
+  `502` with `{"error":{"type":"upstream_decode_error",...}}`, mirroring the identical
+  fix cycle 15 made in `post_messages_count_tokens`. The failure also lands in
+  `usage_events` attributed to the linked upstream key (cost `0`, `error_code`
+  `upstream_decode_error`), because a row credited to `"none"` when a real key answered
+  is a row that exists but is wrong.
+- **No body gate was added to state-bound operations (ISSUE-0155).** The issue asked for
+  `state.budget_semaphore`, `check_transfer_encoding_smuggling`, and the three rate
+  limiters on `forward_state_bound_response_op`. Three of the five are not applicable:
+  the handler has no inbound request body at all — its signature takes
+  `inbound: &HeaderMap` and all four callers (`GET`/`DELETE /v1/responses/{id}`,
+  `/input_items`, `/cancel`) pass only `&headers`. Client RPM was already enforced
+  (`auth.rs` sets `is_inference` from `path.starts_with("/v1/responses")`, which covers
+  state-bound paths), and `upstream_rpm` / `upstream_concurrency` exist nowhere in the
+  schema, the code, or the SRDD — they are not implemented features, so there was nothing
+  to consume. Two regression tests pin the status quo so a future reader taking the
+  issue's text at face value cannot make bodyless operations fail under load.
 - **`count_tokens` now fails over, learns from failures, and never fakes a 200
   (ISSUE-0146).** The candidate loop in `post_messages_count_tokens` iterated every
   candidate but did nothing else right. Four defects, each with production
