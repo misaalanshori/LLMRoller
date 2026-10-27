@@ -370,7 +370,8 @@ impl RuntimeState {
             for window in windows {
                 live.push(window.id.clone());
                 let kind = crate::windows::WindowKind::parse(&window.window_kind);
-                let stale = self.window_counters.get(&window.id).is_none_or(|counter| {
+                let existing = self.window_counters.get(&window.id);
+                let stale = existing.as_ref().is_none_or(|counter| {
                     !counter.matches_config(
                         kind,
                         window.period_ms,
@@ -379,9 +380,16 @@ impl RuntimeState {
                         window.reserve_pct,
                     )
                 });
+                // Preserve the id of the counter being replaced so a config reload
+                // does not silently change the acquisition order `try_reserve`
+                // relies on (`ISSUE-0005`).
+                let counter_id = existing
+                    .as_ref()
+                    .map_or_else(allocate_counter_id, |counter| counter.counter_id());
+                drop(existing);
                 if stale {
                     let counter = Arc::new(AtomicBudgetCounter::for_window(
-                        stable_counter_id(&window.id),
+                        counter_id,
                         window.limit_micro_usd,
                         window.reserve_pct,
                         kind,
@@ -1032,8 +1040,14 @@ impl RuntimeState {
         ring_seed: i64,
         now_ms: i64,
     ) {
+        // Reuse the existing counter's id for this window, allocating only when the
+        // window has never been hydrated (`ISSUE-0005`).
+        let counter_id = self
+            .window_counters
+            .get(&window.id)
+            .map_or_else(allocate_counter_id, |counter| counter.counter_id());
         let counter = Arc::new(AtomicBudgetCounter::for_window(
-            stable_counter_id(&window.id),
+            counter_id,
             window.limit_micro_usd,
             window.reserve_pct,
             crate::windows::WindowKind::parse(&window.window_kind),
@@ -1056,8 +1070,14 @@ impl RuntimeState {
         ring: Option<&crate::windows::RollingRing>,
         now_ms: i64,
     ) {
+        // Reuse the existing counter's id for this window, allocating only when the
+        // window has never been hydrated (`ISSUE-0005`).
+        let counter_id = self
+            .window_counters
+            .get(&window.id)
+            .map_or_else(allocate_counter_id, |counter| counter.counter_id());
         let counter = Arc::new(AtomicBudgetCounter::for_window(
-            stable_counter_id(&window.id),
+            counter_id,
             window.limit_micro_usd,
             window.reserve_pct,
             crate::windows::WindowKind::parse(&window.window_kind),
@@ -1103,10 +1123,23 @@ impl RuntimeState {
     }
 }
 
-fn stable_counter_id(id: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(id, &mut hasher);
-    std::hash::Hasher::finish(&hasher)
+/// Next counter id to hand out.
+///
+/// `counter_id` is the sort key `Reservation::try_reserve` uses to establish a
+/// deterministic acquisition order and the identifier reported in a
+/// `ReservationError::LimitExceeded`. A `u64` hash of the window id can only make a
+/// collision improbable, and `std::collections::hash_map::DefaultHasher`'s output
+/// is explicitly unspecified and not stable across releases. Monotonic allocation
+/// makes collisions impossible and gives a total, reproducible order.
+///
+/// The guarantee is per-process uniqueness, which is sufficient because
+/// `counter_id` is only ever compared inside one process; it is never persisted
+/// and never crosses a wire.
+static NEXT_COUNTER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh counter id.
+fn allocate_counter_id() -> u64 {
+    NEXT_COUNTER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
