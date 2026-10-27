@@ -49,6 +49,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reserving on every counter in the list is correct, and deduplicating would have
   created the window-dropping bug the issue imagined.
 
+### Fixed (memory accounting)
+
+- **Global trace memory release could wrap (ISSUE-0007).** `TraceTap`'s `Drop`
+  used `fetch_sub` on an `AtomicUsize`, which wraps. Releasing more than the counter
+  held drove it to a value near `usize::MAX`, after which every reservation failed
+  and content traceability switched itself off silently and permanently. Release now
+  floors at zero via compare-and-set. A `shortcut:`-style note in the code records
+  that the floor is a defensive guard, not a correctness proof: under-release leaks
+  upward and degrades traceability toward off (safe), while over-release wraps and
+  kills it instantly (unsafe).
+- **Trace memory admission was check-then-act (ISSUE-0007).** Both
+  `reserve_global_bytes` and `try_feed_chunk` loaded the global counter, compared it
+  against the budget, then added — so concurrent callers could each observe room that
+  only one of them could have, and the sum of grants could exceed the cap. Both sites
+  now share one compare-and-set helper, with saturating arithmetic so a pathological
+  byte count can neither panic in debug nor wrap in release.
+- **Trace memory is now observable (PERF-5).** `global_trace_memory()` returns
+  `(used, budget)`, and `metrics::record_trace_memory` publishes
+  `llmroller_trace_memory_bytes` and `llmroller_trace_budget_bytes` on the existing
+  30-second background tick. A silent global counter is the kind of thing that
+  degrades for months unnoticed.
+
 ### Fixed (security)
 
 - **Login self-deadlock (ISSUE-0001).** `post_login` acquired the Argon2id
