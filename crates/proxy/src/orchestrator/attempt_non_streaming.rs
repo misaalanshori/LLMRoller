@@ -520,7 +520,19 @@ pub(crate) async fn handle_non_streaming_attempt(
         extracted.cache_read_tokens,
         extracted.cache_write_tokens,
     );
-    let attempt_latency = (now - attempt_started).max(0) as u64;
+    // Read the clock here, not from `now`. `now` is the *admission* timestamp, which
+    // precedes `attempt_started`, so `now - attempt_started` is negative and clamps to
+    // zero — teaching the P2C EWMA that this route is instantaneously fast on every
+    // successful non-streaming attempt (`RTE-3`, `ISSUE-0148`). The three sibling
+    // latency sites in this file already re-read the clock.
+    //
+    // `.max(0)` is deliberately kept: a clock that steps backwards (NTP) must clamp
+    // rather than wrap.
+    //
+    // Only the latency reads a fresh clock. Every other use of `now` in this function
+    // — cost commit, usage-event timestamps, key-health cooldowns, audit ordering —
+    // stays on the admission timestamp, which is a separate question.
+    let attempt_latency = (state.clock.now_ms() - attempt_started).max(0) as u64;
     state.runtime_state.record_upstream_success(
         origin,
         candidate.upstream_key_id,

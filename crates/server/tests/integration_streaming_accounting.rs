@@ -84,6 +84,9 @@ enum MockMode {
     StreamModelNotFound,
     StreamStall,
     ChatJson,
+    /// Non-streaming JSON completion after a fixed delay, so latency measurements
+    /// have a real elapsed time to observe (`ISSUE-0148`).
+    ChatJsonAfter(u64),
     Chat429,
     ResponsesFailed,
     SleepDelay(u64),
@@ -139,6 +142,26 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
             })),
         )
             .into_response(),
+        MockMode::ChatJsonAfter(ms) => {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                Json(serde_json::json!({
+                    "id": "chatcmpl-json-delayed",
+                    "object": "chat.completion",
+                    "created": 1_700_000_000,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "delayed" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                })),
+            )
+                .into_response()
+        }
         MockMode::Chat429 => (
             StatusCode::TOO_MANY_REQUESTS,
             [("content-type", "application/json")],
@@ -1334,6 +1357,120 @@ async fn regression_test_f003_timeout_failover_disabled_prevents_duplicate_billi
         backup_state.calls.load(Ordering::SeqCst),
         0,
         "backup key must NEVER be called, preventing duplicate billing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming latency must reach the P2C load tracker (`RTE-3`, `ISSUE-0148`)
+// ---------------------------------------------------------------------------
+
+/// A served non-streaming attempt must record a non-zero latency for its route.
+///
+/// The gate is that the value fed to the P2C EWMA must be non-zero. `now` in
+/// `handle_non_streaming_attempt` is the *admission* timestamp, which precedes
+/// `attempt_started` (captured just before the upstream send), so the subtraction
+/// clamps to zero and every non-streaming success teaches the tracker that the
+/// route has zero latency. The real gate is therefore "not clamped to zero", which
+/// a one-millisecond floor states exactly and a wall-clock band cannot.
+#[doc = "Spec: RTE-3 — ISSUE-0148 non-streaming attempts record a real latency"]
+#[tokio::test]
+async fn non_streaming_attempt_records_a_non_zero_latency() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "latency-user").await;
+    // The upstream delays by a known amount so a correct latency is unambiguously
+    // non-zero; without it a sub-millisecond mock response would also round to 0
+    // and the test could not tell the defect from a fast server.
+    let (mock_addr, _mock_state) = spawn_mock(MockMode::ChatJsonAfter(50)).await;
+    let (_provider, key_id, model_pk) =
+        single_key_route(&harness, mock_addr, "latency-a", 100).await;
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "latency-key").await;
+    let (app, runtime) = build_app_with_runtime(&harness).await;
+
+    let response = app
+        .oneshot(non_stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+
+    let route = llmroller_core::strategy::RouteId {
+        upstream_key_id: key_id,
+        model_pk,
+    };
+    let recorded = runtime.load_tracker.ewma_ttfb_ms(&route);
+    assert!(
+        recorded > 0,
+        "a served non-streaming attempt must record a real latency for its route; the \
+         P2C EWMA saw {recorded} ms, so every non-streaming success teaches the tracker \
+         that this route is instantaneously fast"
+    );
+}
+
+/// The P2C selector must prefer the route the tracker reports as faster.
+///
+/// This is the behavioural consequence of the defect: with every non-streaming
+/// success recording 0 ms, both routes' estimates collapse toward zero and the
+/// selector has nothing to discriminate on. Driven through the selector directly so
+/// the assertion is about our selection rule, not about sampling luck.
+#[test]
+#[doc = "Spec: RTE-3 — ISSUE-0148 P2C prefers the route reporting lower latency"]
+fn p2c_avoids_the_route_that_reports_high_latency() {
+    use llmroller_core::ids::{ModelPk, UpstreamKeyId};
+    use llmroller_core::seams::OsEntropy;
+    use llmroller_core::strategy::{
+        PowerOfTwoChoicesSelector, RouteId, RouteLoadTracker, RouteSelector, RoutingStrategy,
+        WrrGroupKey,
+    };
+
+    let tracker = llmroller_core::runtime_state::LoadTracker::new();
+    let fast = RouteId {
+        upstream_key_id: UpstreamKeyId::generate(),
+        model_pk: ModelPk::generate(),
+    };
+    let slow = RouteId {
+        upstream_key_id: UpstreamKeyId::generate(),
+        model_pk: fast.model_pk,
+    };
+
+    // Drive the estimates far apart with a high smoothing weight so one sample sets
+    // the value, then confirm the tracker holds them apart.
+    tracker.record_ttfb(fast, 10, 1.0);
+    tracker.record_ttfb(slow, 5_000, 1.0);
+    assert_eq!(tracker.ewma_ttfb_ms(&fast), 10);
+    assert_eq!(tracker.ewma_ttfb_ms(&slow), 5_000);
+
+    let selector = PowerOfTwoChoicesSelector;
+    let group = WrrGroupKey {
+        user_id: llmroller_core::ids::UserId::generate(),
+        model_pk: fast.model_pk,
+        protocol: "chat".to_string(),
+        pool_tier: llmroller_core::eligibility::CandidatePoolTier::Own as u8,
+    };
+    let candidates = vec![(fast, 100_i64), (slow, 100_i64)];
+    let entropy = OsEntropy::new();
+
+    let mut fast_picks = 0;
+    let mut slow_picks = 0;
+    for _ in 0..200 {
+        match selector.select_next(&group, &candidates, 0, &entropy, Some(&tracker)) {
+            Some(picked) if picked == fast => fast_picks += 1,
+            Some(picked) if picked == slow => slow_picks += 1,
+            other => panic!("P2C must always pick one of the candidates, got {other:?}"),
+        }
+    }
+
+    assert!(
+        fast_picks > slow_picks,
+        "power_of_two_choices must prefer the lower-latency route; it picked the fast \
+         route {fast_picks} times and the slow route {slow_picks} times out of 200"
+    );
+    assert_eq!(
+        selector.strategy(),
+        RoutingStrategy::PowerOfTwoChoices,
+        "sanity: the selector under test is P2C"
     );
 }
 
