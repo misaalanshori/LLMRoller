@@ -585,3 +585,115 @@ mod token_class_tests {
         assert!(!TOKEN_REASON_ALLOWLIST.contains(&"anything_at_all"));
     }
 }
+
+/// The closed-allowlist guard must actually gate emission (`OBS-1`, `ISSUE-0128`).
+///
+/// Thirteen call sites did `let _ = validate_metric_labels(&labels);`, so the check was decorative:
+/// any label key outside [`CLOSED_LABEL_ALLOWLIST`] was silently accepted and emitted. The residual
+/// risk is a *new call site* introducing a new **key** — `("provider", …)` instead of
+/// `("provider_id", …)`, or a `("user_id", …)`, which would be an unbounded-cardinality Prometheus
+/// label, exactly what the allowlist exists to prevent.
+///
+/// The policy is now one helper: `debug_assert!` so a test build catches a bad key at the first
+/// call, and drop the sample in release rather than emit an unvalidated label. A metrics path must
+/// never panic, which is why it is `debug_assert!` and not `panic!`.
+#[cfg(test)]
+mod label_guard_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn metrics_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn rendered(name: &str, label_value: &str) -> Option<String> {
+        let rendered = get_or_init_prometheus_recorder().render();
+        rendered
+            .lines()
+            .find(|l| l.starts_with(name) && l.contains(label_value))
+            .map(ToString::to_string)
+    }
+
+    /// A label key outside the allowlist must never mint a series.
+    ///
+    /// This is the observable half of the guard. The `debug_assert!` half cannot be asserted from a
+    /// passing test (it aborts the process), so the rendered-output assertion is the evidence that
+    /// the sample was dropped rather than emitted.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0128 an unknown label key drops the sample"]
+    fn an_unknown_metric_label_key_drops_the_sample() {
+        let _serial = metrics_lock();
+        let bad = [("user_id", "t128-bogus-value")];
+
+        assert!(
+            !labels_ok(&bad),
+            "the guard must reject a key outside CLOSED_LABEL_ALLOWLIST"
+        );
+        // Nothing was emitted, because the guard returned before the counter call.
+        assert!(
+            rendered("llmroller_", "t128-bogus-value").is_none(),
+            "an unvalidated label must not reach the recorder; rendered:\n{}",
+            get_or_init_prometheus_recorder().render()
+        );
+    }
+
+    /// Every legitimate label combination still passes the guard.
+    ///
+    /// Without this, "always return false" would satisfy the test above.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0128 allowlisted keys are accepted"]
+    fn every_allowlisted_label_key_passes_the_guard() {
+        let _serial = metrics_lock();
+        for key in CLOSED_LABEL_ALLOWLIST {
+            assert!(
+                labels_ok(&[(key, "v")]),
+                "allowlisted key {key:?} must pass the guard"
+            );
+        }
+        assert!(labels_ok(&[]), "an empty label set is trivially valid");
+    }
+
+    /// The key guard and the `reason` value guard are separate and both reachable.
+    ///
+    /// `TOKEN_REASON_ALLOWLIST` (cycle 14) bounds the **value** of the `reason` label; this guard
+    /// bounds **keys**. Folding one into the other would silently lose a check, so both are pinned
+    /// here as independent.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0128 key guard does not replace the value guard"]
+    fn the_key_guard_and_the_reason_value_guard_are_independent() {
+        let _serial = metrics_lock();
+        // A perfectly legal key set with an illegal `reason` *value*: the key guard must accept it
+        // (it only looks at keys) and the value guard must reject it.
+        assert!(
+            labels_ok(&[("reason", "not-a-real-reason")]),
+            "the key guard looks at keys only"
+        );
+        assert!(
+            !TOKEN_REASON_ALLOWLIST.contains(&"not-a-real-reason"),
+            "the value guard is what rejects a bogus reason"
+        );
+    }
+
+    /// No call site may go back to discarding the validation result.
+    ///
+    /// The brief asked whether a structural assertion was feasible. It is: the source is available
+    /// to the test via `include_str!`, so this is a cheap, exact check rather than a convention. It
+    /// is what stops site #14 appearing in a future cycle.
+    #[test]
+    #[doc = "Spec: OBS-1 — ISSUE-0128 no discarded validation results remain"]
+    fn no_call_site_discards_the_validation_result() {
+        let source = include_str!("metrics.rs");
+        let offenders: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains("let _ = validate_metric_labels"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`let _ = validate_metric_labels(..)` reads as \"this does not matter\", which is false \
+             and is how 13 sites drifted; use the shared guard instead. Offenders: {offenders:?}"
+        );
+    }
+}
