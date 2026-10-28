@@ -9,6 +9,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The admin log projection sums every token class and stops hiding charged rejections
+  (ISSUE-0173).** `get_logs_internal` computed `total_tokens` as `input_uncached + output`, dropping
+  `cache_read`, `cache_write`, and `reasoning`, while the query already selected all five columns.
+  The Usage Ledger reported 650 for an event the Logs Explorer reported as 150 — two screens, one
+  request, two numbers. Both projections now use the storage layer's definition,
+  `input_uncached + cache_read + cache_write + output`, which is also what
+  `calculate_cost_micro_usd` prices and what the overview KPI query sums. **`reasoning` is excluded
+  deliberately**: it is a diagnostic subset of `output` (`12. SRDD:133-134`), so adding it would
+  double-count.
+- **Non-200 rows now show the tokens and cost they actually consumed.** The `if status == 200`
+  guards on `tokens_formatted` and `cost_formatted` hid exactly the rows cycles 10/11 established
+  carry real `cost_micro_usd` — a charged timeout, an embedded-200 rejection. They are replaced by
+  a zero-vs-absent distinction: the token columns are nullable `INTEGER`s, so `NULL` ("the provider
+  never reported it") renders `—` while a real `0` on a rejected row renders as zero. `status_label`
+  also now reports a 5xx as `Failed` rather than `Rejected`, because an upstream fault is not a
+  decision about the caller's request.
+- **The usage projections read the `reasoning` token class (ISSUE-0176).** The `TokenUsage` literal
+  in `get_usage_event_breakdown_internal` hardcoded `reasoning: 0`; `get_usage_ledger_internal`'s
+  aggregate and row queries omitted `reasoning_tokens` from their `SELECT` entirely. Both now read
+  the column. It is surfaced as `reasoning_tokens` beside the total and deliberately **not** as a
+  `line_items.reasoning` entry, since reasoning is a subset of `output` and a fifth priced line
+  would imply a charge that does not exist.
 - **Share approval is kind-checked and reaches the data plane (ISSUE-0191).** `SHR-3` requires
   `admin_approved_at` only for **custom** providers — `is_share_eligible` gates on
   `provider_kind == Custom` — so approving a built-in provider's share set a column nothing read:
