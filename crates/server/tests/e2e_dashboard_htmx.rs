@@ -35,6 +35,8 @@ mod logs_and_analytics;
 pub(crate) mod setup;
 #[path = "e2e_dashboard_htmx/token_class_projections.rs"]
 mod token_class_projections;
+#[path = "e2e_dashboard_htmx/usage_filters.rs"]
+mod usage_filters;
 #[path = "e2e_dashboard_htmx/usage_ledger_and_csv.rs"]
 mod usage_ledger_and_csv;
 
