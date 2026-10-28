@@ -1224,5 +1224,9 @@ mod count_tokens_failover;
 
 // `forward_state_bound_response_op`: decode failure must not fake a 200 (`ISSUE-0156`),
 // and the body controls #155 names are not applicable to a bodyless op (`ISSUE-0155`).
+#[path = "integration_state_bound_responses/state_bound_billing.rs"]
+mod state_bound_billing;
 #[path = "integration_state_bound_responses/state_bound_decode.rs"]
 mod state_bound_decode;
+#[path = "integration_state_bound_responses/state_bound_fixture.rs"]
+pub(crate) mod state_bound_fixture;
