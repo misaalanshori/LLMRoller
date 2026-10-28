@@ -7,6 +7,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **`app.js` split into twelve domain modules, and the MNT-3 ceiling now gates static assets
+  (ISSUE-0013, ISSUE-0056).** `crates/admin/static/app.js` was 1,649 lines — 49 over the 1,600
+  ceiling — and `all_rust_files_are_under_1600_lines` could not see it because its collector
+  accepted only `.rs`. A gate that names a number and never checks it is worse than no gate:
+  the green tick reads as verification and nobody re-measures. It is now twelve modules loaded
+  by twelve `<script>` tags, largest **449 lines** (`app-core.js`, which holds the HTMX config,
+  shared helpers, the tab router, and every delegated listener), with `APP_JS_MODULES` as the
+  single ordered table and a test asserting the templates list the same modules in the same
+  order. The files deliberately share one global scope rather than each being an IIFE: 53 of 54
+  functions are invoked *by name* from the delegated listeners, so wrapping them would have
+  meant rewriting all 53 call sites — a rewrite rather than the extraction. `/static/app.js`
+  still serves the whole application as a compile-time `concat!` of the twelve bodies. The move
+  is byte-exact: comparing the multiset of non-blank source lines before and after shows **zero
+  lost or altered**, and the 24 `innerHTML` sites, 6 listeners and 54 functions each appear
+  exactly once. New gate `all_static_assets_are_under_1600_lines` extends the same walker (and
+  the same `MNT3_MAX_LINES` constant) to `.js`, `.css`, and `.html` under `static/` and
+  `templates/`, excluding the three vendored minified bundles by a pinned list — they are 0–2
+  lines but ~95 KB, so a line ceiling says nothing about them and a byte ceiling would be the
+  right gate for that class. Since the repo has no JS harness, one executable Node check
+  (`tests/js/app-modules-smoke.js`, wired into `cargo test`) loads the modules in template order
+  in a shared `vm` context, asserts all 53 listener-reachable functions are globals, and fires
+  synthetic clicks to confirm the dispatcher still routes. It passes identically against the
+  pre-split file, which is the evidence that behaviour did not change.
+
 ### Fixed
 
 - **`control_plane_logs` is swept in production, and the sweep is bounded (ISSUE-0230).** The table
