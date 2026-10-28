@@ -445,3 +445,106 @@ async fn a_route_preference_write_bumps_the_config_version_exactly_once() {
         "one write must bump the config version exactly once; pre-fix and a naive conversion          differ here ({before} -> {after})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The audit decision
+// ---------------------------------------------------------------------------
+
+/// One route-preference write must produce exactly **one** audit row.
+///
+/// The decision recorded for `ISSUE-0233` is that this mutation **does** need an audit entry, and
+/// that it gets one from `control_mutation_barrier` rather than from the atomic path. That is
+/// already true pre-fix and stays true after the conversion, so the test is a regression guard
+/// rather than a red — but "exactly one" is the part worth pinning: the conversion introduces a
+/// second candidate supplier (`scan_mutation_audit` inside `execute_atomic_mutation`), and two
+/// rows for one write would be a silent duplication of the audit trail.
+///
+/// This is also what makes the conversion to the atomic path *observable* rather than
+/// cosmetic: `control_mutation_barrier` appends only when the handler did not mark the mutation
+/// handled, so the row exists either way and the count is what distinguishes the paths.
+#[tokio::test]
+#[doc = "Spec: AUD-1, REL-4"]
+async fn a_route_preference_write_writes_exactly_one_audit_row() {
+    let h = harness().await;
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&h.pool)
+        .await
+        .expect("audit count before");
+
+    let (status, body) = h
+        .put_preference(serde_json::json!({"priority_override": 6, "enabled": true}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "write must succeed; body: {body}");
+
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&h.pool)
+        .await
+        .expect("audit count after");
+
+    assert_eq!(
+        after - before,
+        1,
+        "one write must leave exactly one audit row, not zero (unaudited) and not two \
+         (double-counted by the barrier and the atomic path); {before} -> {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The structural invariant, and why no behavioural test can carry it
+// ---------------------------------------------------------------------------
+
+/// `put_user_route_preference_handler` must reach the atomic path, not the plain pool.
+///
+/// This is a **structural** guard, and it is the only kind that can pin this conversion.
+/// Measured, not assumed: reverting the handler to the pre-fix bare `UPSERT` on
+/// `state.auth.pool` leaves every behavioural test in this file green, because
+/// `control_mutation_barrier` publishes and audits for any successful mutation. So no
+/// assertion on rows, snapshots, versions or audit counts can distinguish the two shapes on
+/// this route.
+///
+/// What the conversion actually buys is the property the issue was *reaching for*: the write is
+/// atomic with its version bump, so it no longer depends on the barrier for correctness. If the
+/// barrier were ever narrowed, moved, or removed for this route, the bare handler would silently
+/// stop publishing and the route preference would go stale — while every behavioural test kept
+/// passing. This test is what would notice.
+///
+/// Source inspection is used deliberately, following the same reasoning as
+/// `price_sync_stamps_rows_from_the_injected_clock`: the property is "which seam this handler
+/// calls", and there is no runtime observation that separates the two seams because the
+/// middleware compensates for the difference.
+#[test]
+#[doc = "Spec: REL-4, RTE-4 — ISSUE-0233"]
+fn route_preference_handler_uses_the_atomic_mutation_path() {
+    let source = include_str!("../../admin/src/api/models.rs");
+    let handler = source
+        .split("pub(crate) async fn put_user_route_preference_handler")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(
+                "// ---------------------------------------------------------------------------",
+            )
+            .next()
+        })
+        .expect("the route-preference handler body");
+
+    assert!(
+        handler.contains("execute_atomic_mutation"),
+        "the handler must run its write through `execute_atomic_mutation`, so the row and the \
+         publish are one unit rather than relying on `control_mutation_barrier`"
+    );
+    assert!(
+        !handler.contains(".execute(&state.auth.pool)"),
+        "the handler must not write on the reader-facing pool; a bare statement there is the \
+         defect class this cycle is closing"
+    );
+
+    // `ConfigDomain::Models` is the domain that rebuilds `user_route_prefs`
+    // (`reloader.rs`'s `reload_catalog` predicate includes `Models`, and `user_route_prefs` is
+    // part of the catalog slice). Publishing any other domain would be a no-op reload.
+    assert!(
+        handler.contains("ConfigDomain::Models"),
+        "the handler must publish `ConfigDomain::Models`, the domain that rebuilds \
+         `user_route_prefs`"
+    );
+}

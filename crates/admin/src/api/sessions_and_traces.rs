@@ -922,6 +922,35 @@ pub(crate) async fn post_admin_move_pin_body_handler(
 }
 
 /// Move personal session pin via `POST /api/user/pins/move` (`RTE-11`, `USR-3`, `F-108`).
+///
+/// # Three defects this used to have (`ISSUE-0232`)
+///
+/// It ran a bare `let _ = sqlx::query(... UPDATE pins ...).execute(&state.auth.pool).await;`
+/// and then unconditionally read the rows back and called `store.admin_move_with_tier(...)`.
+///
+/// 1. **The `Result` was discarded**, so `SQLITE_BUSY`, a constraint failure or a dropped
+///    connection became an invisible no-op and the caller was still told `{"moved": true}`.
+/// 2. **Zero rows affected was reported as success.** The `WHERE` is ownership-scoped, so moving
+///    a pin in a session the caller owns no client key for matched nothing and returned `200`.
+///    `USR-3` requires a foreign resource to be indistinguishable from a missing one; a success
+///    claim for another user's session is not indistinguishable, it is false.
+/// 3. **`PinStore` was updated even when the database wrote nothing.** The store is what the data
+///    plane routes from, so store and database disagreed and the divergence was live traffic.
+///
+/// # The decisions, recorded rather than inferred
+///
+/// - **`404` on zero rows.** Matching `delete_user_pin_handler` directly below, which already
+///   returns `404` for a foreign client key: one rule for a foreign resource, not two. The
+///   ownership predicate is untouched — only the response for "matched nothing" changed.
+/// - **The store is updated only for rows the transaction moved.** The `UPDATE`'s `RETURNING`
+///   clause yields exactly the rows it changed, so the store update is driven by that result
+///   instead of by a separate read-back query. A read-back would re-query by `session_hash`
+///   alone and could reach rows the `UPDATE` never touched — that was defect 3.
+/// - **`ConfigDomain` is empty.** Pins are runtime routing state, not configuration: they are
+///   held in `PinStore` and updated in place (see `delete_pin_handler`, the reference). Publishing
+///   a config domain for them would trigger a pointless full catalog rebuild. The
+///   `control_mutation_barrier` still supplies the audit row for the mutation, which is the
+///   behaviour every other mutation in this file already has.
 pub(crate) async fn post_user_move_pin_body_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -961,47 +990,78 @@ pub(crate) async fn post_user_move_pin_body_handler(
         1 => llmroller_core::eligibility::CandidatePoolTier::Shared,
         _ => llmroller_core::eligibility::CandidatePoolTier::Global,
     };
-    let _ = sqlx::query(
-        "UPDATE pins SET upstream_key_id = ?, pool_tier = ?, last_used_at = ?
-         WHERE session_hash = ?
-           AND client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
-    )
-    .bind(target_key.to_string())
-    .bind(target_tier_int)
-    .bind(now_ms)
-    .bind(&session_hash)
-    .bind(user_id.to_string())
-    .execute(&state.auth.pool)
-    .await;
+
+    let user_id_str = user_id.to_string();
+    let session_for_tx = session_hash.clone();
+    // `RETURNING` gives the rows this statement actually changed, so the store is driven by the
+    // write's own result rather than by a second query that could disagree with it.
+    let moved: Vec<(String, String)> = execute_atomic_mutation(&state, Vec::new(), move |tx| {
+        Box::pin(async move {
+            // `RETURNING` in SQLite yields column references only -- no subqueries -- so
+            // the moved rows come back with `model_pk` and the canonical id is resolved in
+            // one follow-up query *inside the same transaction*. Both queries see the same
+            // rows: `pins.model_pk` is `REFERENCES models(model_pk) ON DELETE RESTRICT`, so
+            // a moved row's model exists, and a concurrent delete cannot slip between them.
+            let rows = sqlx::query(
+                "UPDATE pins SET upstream_key_id = ?, pool_tier = ?, last_used_at = ?
+                     WHERE session_hash = ?
+                       AND client_key_id IN (
+                           SELECT id FROM client_keys WHERE owner_user_id = ?
+                       )
+                     RETURNING client_key_id, model_pk",
+            )
+            .bind(target_key.to_string())
+            .bind(target_tier_int)
+            .bind(now_ms)
+            .bind(&session_for_tx)
+            .bind(&user_id_str)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            let mut moved_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                // A decode failure here is a real fault, not an empty value: reporting it
+                // beats silently skipping the row and leaving the store stale.
+                let client_key_id: String = row
+                    .try_get("client_key_id")
+                    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                let model_pk: String = row
+                    .try_get("model_pk")
+                    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                moved_rows.push((client_key_id, model_pk));
+            }
+            resolve_canonical_ids(tx, moved_rows).await
+        })
+    })
+    .await?;
+
+    // Zero rows means this caller owns no pin in that session. `404`, matching the sibling
+    // delete handler, and reaching this point wrote neither the database nor the store.
+    if moved.is_empty() {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "not_found"));
+    }
 
     if let Some(store) = &state.pin_store {
-        let rows = sqlx::query(
-            "SELECT p.client_key_id, m.canonical_id
-             FROM pins p
-             JOIN client_keys ck ON p.client_key_id = ck.id
-             LEFT JOIN models m ON p.model_pk = m.model_pk
-             WHERE p.session_hash = ? AND ck.owner_user_id = ?",
-        )
-        .bind(&session_hash)
-        .bind(user_id.to_string())
-        .fetch_all(&state.auth.pool)
-        .await
-        .unwrap_or_default();
-
-        for r in rows {
-            let ckid_str: String = r.try_get("client_key_id").unwrap_or_default();
-            let model_id: String = r
-                .try_get::<Option<String>, _>("canonical_id")
-                .unwrap_or_default()
-                .unwrap_or_default();
-            if let Ok(client_key_id) = ClientKeyId::parse(&ckid_str) {
-                let pin_key = llmroller_core::pins::PinKey {
+        for (client_key_id, canonical_id) in moved {
+            let Ok(client_key_id) = ClientKeyId::parse(&client_key_id) else {
+                tracing::warn!(
+                    client_key_id,
+                    "moved pin row carried a client_key_id that does not parse; \
+                     store left untouched for it"
+                );
+                continue;
+            };
+            store.admin_move_with_tier(
+                &llmroller_core::pins::PinKey {
                     client_key_id,
                     session_hash: session_hash.clone(),
-                    canonical_id: model_id,
-                };
-                store.admin_move_with_tier(&pin_key, target_key, Some(target_tier_enum), now_ms);
-            }
+                    canonical_id,
+                },
+                target_key,
+                Some(target_tier_enum),
+                now_ms,
+            );
         }
     }
 
@@ -1012,7 +1072,71 @@ pub(crate) async fn post_user_move_pin_body_handler(
     })))
 }
 
-/// Admin manually moves session pin to a new upstream key (RTE-11).
+/// Resolve `model_pk` to `canonical_id` for the rows an `UPDATE ... RETURNING` just moved.
+///
+/// Runs inside the caller's transaction, so it observes exactly the rows the `UPDATE` changed.
+/// SQLite's `RETURNING` clause accepts column references only, which is why this is a second
+/// statement rather than a subquery in the `RETURNING` list.
+///
+/// A missing model row is not treated as a fault: `pins.model_pk` is
+/// `REFERENCES models(model_pk) ON DELETE RESTRICT`, so a moved pin's model exists, and the
+/// `unwrap_or_default` here only covers a canonical id that is genuinely absent. A *decode*
+/// failure is still propagated, because that is a fault rather than an empty value.
+async fn resolve_canonical_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, (StatusCode, Json<serde_json::Value>)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (client_key_id, model_pk) in rows {
+        let canonical: Option<String> =
+            sqlx::query_scalar("SELECT canonical_id FROM models WHERE model_pk = ?")
+                .bind(&model_pk)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        out.push((client_key_id, canonical.unwrap_or_default()));
+    }
+    Ok(out)
+}
+
+/// [`resolve_canonical_ids`] carrying each row's `pool_tier` through unchanged.
+async fn resolve_canonical_ids_with_tier(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: Vec<(String, String, i64)>,
+) -> Result<Vec<(String, String, i64)>, (StatusCode, Json<serde_json::Value>)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (client_key_id, model_pk, tier_int) in rows {
+        let canonical: Option<String> =
+            sqlx::query_scalar("SELECT canonical_id FROM models WHERE model_pk = ?")
+                .bind(&model_pk)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        out.push((client_key_id, canonical.unwrap_or_default(), tier_int));
+    }
+    Ok(out)
+}
+
+/// Admin manually moves session pin to a new upstream key (`RTE-11`, `SEC-17`).
+///
+/// # Same three defects as the user handler (`ISSUE-0232`)
+///
+/// Two `let _ = sqlx::query(... UPDATE pins ...).execute(&state.auth.pool).await;` sites (one per
+/// branch) discarded their `Result`, zero rows was reported as `{"moved": true}`, and the
+/// `PinStore` read-back loop ran unconditionally and selected by `session_hash` **alone** — with
+/// no ownership or model filter, so it could move store entries the `UPDATE` had not touched.
+///
+/// # The decisions, and how they differ from the user handler
+///
+/// - **`404` on zero rows**, same as the user handler, but for a different reason: an admin has no
+///   ownership predicate, so zero rows means the session hash simply has no pins. Reporting that
+///   as a move is still a false success claim.
+/// - **One `UPDATE`, not two branches.** The `canonical_id` filter is expressed as
+///   `(? IS NULL OR model_pk IN (...))` so the statement's `RETURNING` set is the exact set of
+///   rows moved, in both cases. Two string-built statements differing only in a `WHERE` clause is
+///   how the original drifted.
+/// - **`ConfigDomain` is empty**, as in the user handler: pins are `PinStore` runtime state, not
+///   configuration. The audit row still comes from `control_mutation_barrier`.
 pub(crate) async fn post_admin_move_session_pin_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -1041,81 +1165,93 @@ pub(crate) async fn post_admin_move_session_pin_handler(
         ));
     };
 
-    if let Some(ref cid) = payload.canonical_id {
-        let _ = sqlx::query(
-            "UPDATE pins
-             SET upstream_key_id = ?,
-                 pool_tier = CASE
-                     WHEN ? = 'global' THEN 2
-                     WHEN ? IS NOT NULL AND ? = (SELECT owner_user_id FROM client_keys WHERE id = pins.client_key_id) THEN 0
-                     ELSE 1
-                 END,
-                 last_used_at = ?
-             WHERE session_hash = ? AND model_pk IN (SELECT model_pk FROM models WHERE canonical_id = ?)",
-        )
-        .bind(target_key.to_string())
-        .bind(&key_scope)
-        .bind(&key_owner_uid)
-        .bind(&key_owner_uid)
-        .bind(now_ms)
-        .bind(&session_hash)
-        .bind(cid)
-        .execute(&state.auth.pool)
-        .await;
-    } else {
-        let _ = sqlx::query(
-            "UPDATE pins
-             SET upstream_key_id = ?,
-                 pool_tier = CASE
-                     WHEN ? = 'global' THEN 2
-                     WHEN ? IS NOT NULL AND ? = (SELECT owner_user_id FROM client_keys WHERE id = pins.client_key_id) THEN 0
-                     ELSE 1
-                 END,
-                 last_used_at = ?
-             WHERE session_hash = ?",
-        )
-        .bind(target_key.to_string())
-        .bind(&key_scope)
-        .bind(&key_owner_uid)
-        .bind(&key_owner_uid)
-        .bind(now_ms)
-        .bind(&session_hash)
-        .execute(&state.auth.pool)
-        .await;
+    let canonical_filter = payload.canonical_id.clone();
+    let session_for_tx = session_hash.clone();
+    let moved: Vec<(String, String, i64)> =
+        execute_atomic_mutation(&state, Vec::new(), move |tx| {
+            Box::pin(async move {
+                // One statement for both cases: `? IS NULL` covers "move every pin in the
+                // session", otherwise the model filter applies. `RETURNING` reports exactly the
+                // rows changed, including the tier the CASE assigned.
+                // `RETURNING` yields column references only, so `pool_tier` comes back from
+                // the row and the canonical id is resolved in one follow-up query inside the
+                // same transaction (see the user handler for why that is safe).
+                let rows = sqlx::query(
+                    "UPDATE pins
+                     SET upstream_key_id = ?,
+                         pool_tier = CASE
+                             WHEN ? = 'global' THEN 2
+                             WHEN ? IS NOT NULL AND ? = (
+                                 SELECT owner_user_id FROM client_keys WHERE id = pins.client_key_id
+                             ) THEN 0
+                             ELSE 1
+                         END,
+                         last_used_at = ?
+                     WHERE session_hash = ?
+                       AND (? IS NULL OR model_pk IN (
+                           SELECT model_pk FROM models WHERE canonical_id = ?
+                       ))
+                     RETURNING client_key_id, model_pk, pool_tier",
+                )
+                .bind(target_key.to_string())
+                .bind(&key_scope)
+                .bind(&key_owner_uid)
+                .bind(&key_owner_uid)
+                .bind(now_ms)
+                .bind(&session_for_tx)
+                .bind(&canonical_filter)
+                .bind(&canonical_filter)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+                let mut moved_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let client_key_id: String = row
+                        .try_get("client_key_id")
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    let model_pk: String = row
+                        .try_get("model_pk")
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    let tier_int: i64 = row
+                        .try_get("pool_tier")
+                        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                    moved_rows.push((client_key_id, model_pk, tier_int));
+                }
+                resolve_canonical_ids_with_tier(tx, moved_rows).await
+            })
+        })
+        .await?;
+
+    if moved.is_empty() {
+        return Err(map_price_error(StatusCode::NOT_FOUND, "not_found"));
     }
 
     if let Some(store) = &state.pin_store {
-        let rows = sqlx::query(
-            "SELECT p.client_key_id, p.pool_tier, m.canonical_id
-             FROM pins p
-             LEFT JOIN models m ON p.model_pk = m.model_pk
-             WHERE p.session_hash = ?",
-        )
-        .bind(&session_hash)
-        .fetch_all(&state.auth.pool)
-        .await
-        .unwrap_or_default();
-
-        for r in rows {
-            let ckid_str: String = r.try_get("client_key_id").unwrap_or_default();
-            let tier_int: i64 = r.try_get("pool_tier").unwrap_or(2);
+        for (client_key_id, canonical_id, tier_int) in moved {
             let tier_enum = match tier_int {
                 0 => llmroller_core::eligibility::CandidatePoolTier::Own,
                 1 => llmroller_core::eligibility::CandidatePoolTier::Shared,
                 _ => llmroller_core::eligibility::CandidatePoolTier::Global,
             };
-            let model_id: String = r
-                .try_get::<Option<String>, _>("canonical_id")
-                .unwrap_or_default()
-                .unwrap_or_default();
-            if let Ok(client_key_id) = ClientKeyId::parse(&ckid_str) {
-                let pin_key = llmroller_core::pins::PinKey {
+            let Ok(client_key_id) = ClientKeyId::parse(&client_key_id) else {
+                tracing::warn!(
+                    client_key_id,
+                    "moved pin row carried a client_key_id that does not parse; \
+                     store left untouched for it"
+                );
+                continue;
+            };
+            store.admin_move_with_tier(
+                &llmroller_core::pins::PinKey {
                     client_key_id,
                     session_hash: session_hash.clone(),
-                    canonical_id: model_id,
-                };
-                store.admin_move_with_tier(&pin_key, target_key, Some(tier_enum), now_ms);
-            }
+                    canonical_id,
+                },
+                target_key,
+                Some(tier_enum),
+                now_ms,
+            );
         }
     }
 

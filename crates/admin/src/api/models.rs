@@ -578,21 +578,41 @@ pub(crate) async fn put_user_route_preference_handler(
         0i64
     };
 
-    sqlx::query(
-        "INSERT INTO user_route_preferences (user_id, upstream_key_id, model_pk, priority_override, enabled)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (user_id, upstream_key_id, model_pk) DO UPDATE SET
-            priority_override = excluded.priority_override,
-            enabled = excluded.enabled",
-    )
-    .bind(user_id.to_string())
-    .bind(key_id.to_string())
-    .bind(model_pk)
-    .bind(priority_override)
-    .bind(enabled)
-    .execute(&state.auth.pool)
-    .await
-    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // `execute_atomic_mutation`, not a bare UPSERT on the pool.
+    //
+    // `user_route_prefs` is projected into `ConfigSnapshot` by `load_catalog_snapshot_tx`
+    // (`store/src/models.rs`) and read by the orchestrator's route selection, so the write and
+    // the publish that makes it visible must be one unit -- the rule this file states twenty
+    // lines up for `patch_admin_model_handler`.
+    //
+    // `ConfigDomain::Models` is the domain that rebuilds those prefs: the reloader's
+    // `reload_catalog` predicate includes `Models`, and `user_route_prefs` is part of the
+    // catalog slice. `RTE-4`, `REL-4`.
+    let model_pk_string = model_pk.clone();
+    execute_atomic_mutation(&state, vec![ConfigDomain::Models], move |tx| {
+        Box::pin(async move {
+            // No `rows_affected` guard: an UPSERT cannot affect zero rows on a successful
+            // commit, so guarding it would mean the wrong statement was wrapped.
+            sqlx::query(
+                "INSERT INTO user_route_preferences \
+                 (user_id, upstream_key_id, model_pk, priority_override, enabled)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT (user_id, upstream_key_id, model_pk) DO UPDATE SET
+                    priority_override = excluded.priority_override,
+                    enabled = excluded.enabled",
+            )
+            .bind(user_id.to_string())
+            .bind(key_id.to_string())
+            .bind(&model_pk_string)
+            .bind(priority_override)
+            .bind(enabled)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(())
+        })
+    })
+    .await?;
 
     Ok(StatusCode::OK)
 }

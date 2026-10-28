@@ -35,6 +35,51 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The session-pin move handlers discarded their SQL result, reported success for zero
+  rows, and moved the in-memory `PinStore` regardless (ISSUE-0232).** Three defects in
+  eight lines, in both the user handler and its admin sibling.
+
+  Both ran a bare `let _ = sqlx::query(... UPDATE pins ...).execute(&state.auth.pool).await;`
+  and then unconditionally read the rows back and called `store.admin_move_with_tier(...)`.
+  So a `SQLITE_BUSY`, a constraint failure or a dropped connection became an invisible no-op
+  and the caller was told `{"moved": true}`; a move targeting a session the caller owns no
+  client key for matched **zero rows** and was also reported as `{"moved": true}`; and the
+  `PinStore` — which is what the data plane routes from — was updated in every case. The last
+  one is the serious one: it is not a wrong response, it is a wrong system state, and it is
+  the only part a response-only test would miss.
+
+  Both handlers now run their `UPDATE` inside `execute_atomic_mutation` and drive the
+  `PinStore` from the statement's own `RETURNING` set rather than from a second read-back
+  query — a read-back selects by `session_hash` and can reach rows the `UPDATE` never
+  touched, which is exactly how the divergence happened. Zero rows is `404`, matching
+  `delete_user_pin_handler` directly below: one rule for a foreign resource, not two
+  (`USR-3`, `SEC-17`). The ownership predicates are unchanged; only the response for
+  "matched nothing" and the store's source of truth changed. `ConfigDomain` is empty for
+  these mutations because pins are `PinStore` runtime state rather than configuration —
+  `delete_pin_handler` is the reference — and the audit row still comes from
+  `control_mutation_barrier`. Also removed: two `try_get(...).unwrap_or_default()` decode
+  collapses that made "column read failed", `NULL` and "empty" the same value, so a decode
+  fault is now reported instead of silently skipping a row.
+
+- **`put_user_route_preference_handler` now runs through the atomic mutation path
+  (ISSUE-0233).** The issue reported that it wrote on the reader-facing pool with no
+  transaction, no audit entry, no `ConfigDomain` publish and no version bump, leaving the
+  data plane on the old preference. **The publish and audit halves of that were not real:**
+  `control_mutation_barrier` supplies both for any successful mutation, which is why the
+  verification test passes against the unmodified handler. Verified by detaching the
+  barrier, at which point the snapshot assertion fails exactly as the issue describes —
+  and by reverting the handler to the bare `UPSERT`, at which point every behavioural test
+  still passes. This is the third appearance of that premise (#170, the cycle-33 correction
+  on #232, now #233), so it is recorded again: `execute_atomic_mutation` is not what
+  supplies the audit row or the publish; the barrier does.
+
+  The handler still moves onto the atomic path, because it removes the dependence on the
+  barrier for correctness: the row, its version bump and `ConfigDomain::Models` — the
+  domain whose `reload_catalog` predicate rebuilds `ConfigSnapshot::user_route_prefs` —
+  are now one unit. That is pinned by a **structural** test, since no behavioural test can
+  distinguish the two shapes on this route while the barrier compensates for the
+  difference; the report says so rather than implying the behavioural tests cover it.
+
 - **`doctor` told an operator `15` where `serve` said `14`, and the instance-state
   security check existed twice (ISSUE-0183).** Both are follow-ups to the `doctor` fix
   above, found in review.
