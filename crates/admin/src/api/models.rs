@@ -153,6 +153,23 @@ pub(crate) async fn delete_admin_model_alias_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The custom-provider admin-approval predicate, in one place (`ISSUE-0171`, `SHR-2`).
+///
+/// `crates/core/src/shares.rs::is_share_eligible` refuses a `custom` share whose
+/// `admin_approved_at` is `NULL`, so the data plane cannot use one. Every display and write
+/// path that offers a share to a grantee must apply the same rule, or the routing matrix
+/// claims a route the data plane will refuse and the grantee cannot diagnose why.
+///
+/// A macro rather than a `const &str` because `sqlx::query_scalar` deliberately rejects
+/// runtime-built SQL: pasting it with `concat!` keeps the string a compile-time literal, so
+/// the injection lint stays satisfied and the predicate still exists once. Three sites need
+/// it — two join `providers p`, one does not — so each caller supplies its own join.
+macro_rules! share_approval_guard {
+    () => {
+        "AND (p.kind != 'custom' OR s.admin_approved_at IS NOT NULL)"
+    };
+}
+
 pub(crate) async fn get_user_routes_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -255,7 +272,7 @@ pub(crate) async fn get_user_routes_handler(
                 // A provider-level grant covers only keys of THAT provider, must be
                 // accepted against the current fingerprint, and must still have an
                 // active grantor (`SEC-17`, F042).
-                let is_shared = sqlx::query_scalar::<_, i64>(
+                let is_shared = sqlx::query_scalar::<_, i64>(concat!(
                     "SELECT 1 FROM provider_shares s
                      JOIN providers p ON p.id = s.provider_id
                      JOIN users u ON u.id = s.owner_user_id
@@ -268,8 +285,11 @@ pub(crate) async fn get_user_routes_handler(
                        AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
                        AND (s.allowed_models IS NULL OR EXISTS (
                             SELECT 1 FROM json_each(s.allowed_models) WHERE value = ?))
+                       ",
+                    share_approval_guard!(),
+                    "
                      LIMIT 1",
-                )
+                ))
                 .bind(user_id.to_string())
                 .bind(&provider_id)
                 .bind(&key_id)
@@ -353,9 +373,10 @@ pub(crate) async fn put_user_route_preference_handler(
         let share_fingerprint: String = key_info
             .try_get("share_config_fingerprint")
             .unwrap_or_default();
-        let is_shared = sqlx::query_scalar::<_, i64>(
+        let is_shared = sqlx::query_scalar::<_, i64>(concat!(
             "SELECT 1 FROM provider_shares s
              JOIN users u ON u.id = s.owner_user_id
+             JOIN providers p ON p.id = s.provider_id
              WHERE s.grantee_user_id = ? AND s.provider_id = ?
                AND s.enabled = 1 AND s.revoked_at IS NULL
                AND s.accepted_at IS NOT NULL
@@ -363,8 +384,11 @@ pub(crate) async fn put_user_route_preference_handler(
                AND s.accepted_config_fingerprint = ?
                AND u.disabled = 0
                AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
+               ",
+            share_approval_guard!(),
+            "
              LIMIT 1",
-        )
+        ))
         .bind(&user_id_str)
         .bind(&provider_id)
         .bind(&share_fingerprint)
@@ -407,16 +431,20 @@ pub(crate) async fn put_user_route_preference_handler(
                 .fetch_one(&state.auth.reader_pool)
                 .await
                 .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let allowed = sqlx::query_scalar::<_, i64>(
+        let allowed = sqlx::query_scalar::<_, i64>(concat!(
             "SELECT 1 FROM provider_shares s
+             JOIN providers p ON p.id = s.provider_id
              WHERE s.grantee_user_id = ? AND s.provider_id = ?
                AND s.enabled = 1 AND s.revoked_at IS NULL
                AND s.accepted_at IS NOT NULL
                AND (s.upstream_key_id IS NULL OR s.upstream_key_id = ?)
                AND (s.allowed_models IS NULL OR EXISTS (
                     SELECT 1 FROM json_each(s.allowed_models) WHERE value = ?))
+               ",
+            share_approval_guard!(),
+            "
              LIMIT 1",
-        )
+        ))
         .bind(&user_id_str)
         .bind(&provider_id)
         .bind(key_id.to_string())

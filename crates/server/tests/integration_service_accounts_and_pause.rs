@@ -862,10 +862,16 @@ async fn provider_level_shares_do_not_expose_unrelated_tenant_keys() {
 
     // A provider-level grant for `provider_other` must not make `key_shared`
     // (a different provider) visible to the grantee (F042).
+    //
+    // `admin_approved_at` is set because these providers are `custom`: since
+    // `ISSUE-0171` an unapproved custom share is correctly hidden from the grantee, and
+    // this test is about provider scoping, not approval. Without approval both
+    // assertions below would be testing the approval rule instead.
     sqlx::query(
         "INSERT INTO provider_shares (id, provider_id, upstream_key_id, owner_user_id,
-            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at)
-         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS1', ?, NULL, ?, ?, 1000, 'fp-a', 1, 1000)",
+            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at,
+            admin_approved_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS1', ?, NULL, ?, ?, 1000, 'fp-a', 1, 1000, 1000)",
     )
     .bind(provider_other)
     .bind(&admin_id)
@@ -930,8 +936,9 @@ async fn provider_level_shares_do_not_expose_unrelated_tenant_keys() {
     // and mutable by the grantee.
     sqlx::query(
         "INSERT INTO provider_shares (id, provider_id, upstream_key_id, owner_user_id,
-            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at)
-         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS2', ?, ?, ?, ?, 1000, 'fp-a', 1, 1000)",
+            grantee_user_id, accepted_at, accepted_config_fingerprint, enabled, created_at,
+            admin_approved_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5PS2', ?, ?, ?, ?, 1000, 'fp-a', 1, 1000, 1000)",
     )
     .bind(provider_shared)
     .bind(key_shared)

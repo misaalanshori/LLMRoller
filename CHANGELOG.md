@@ -9,6 +9,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The routing matrix now agrees with the data plane about unapproved custom shares
+  (ISSUE-0171).** `is_share_eligible` already refused a `custom` provider share whose
+  `admin_approved_at` is `NULL`, so the inference path could not use one. The admin display
+  and write queries in `admin/src/api/models.rs` filtered only on `accepted_at` /
+  `revoked_at` / fingerprint, so a grantee saw the unapproved share in their routing matrix,
+  could set a preference on it, and then their requests silently did not use it — with the
+  matrix claiming it was available. Three sites now apply the same predicate: the routing
+  matrix (`GET /api/user/routes`), the share check in `PUT /api/user/routes/{key}/{model}`,
+  and the model-allow-list check in the same handler. The predicate exists once, as the
+  `share_approval_guard!()` macro, pasted at compile time with `concat!` so `sqlx`'s
+  injection lint stays satisfied. No traffic was ever misrouted by this: the data plane was
+  correct throughout.
+- **No new label redaction was added, and that is deliberate.** #171 also asked for grantor
+  upstream-key labels to be hidden from share grantees. The normative specification says
+  the opposite: `USR-4` scopes label-hiding to `global` keys ("nor `secret_last4` or raw
+  `/usage` JSON of shared keys"), `4. SRDD:47` grants a grantee "key label … never the
+  secret or `secret_last4`", `4. SRDD:118` grants it "before accepting the share", and
+  `14.s.1` renders a standard user's shared column as `shared: <owner>/<label>`. A
+  regression test now pins that a shared key's label is visible to the grantee while the
+  upstream secret never is, so a future "redaction" cannot silently break the documented
+  routing-matrix heading.
 - **State-bound Responses operations no longer turn a decode failure into an empty
   `200 OK` (ISSUE-0156).** `forward_state_bound_response_op` used
   `decode_upstream_body(..).unwrap_or_default()`, so a corrupt, truncated, or

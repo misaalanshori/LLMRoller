@@ -96,10 +96,9 @@ async fn fixture(approve: bool) -> Fixture {
     migrate(&pool).await.expect("migrate");
 
     let master_key = MasterKey::from_bytes([0xC1; 32]);
-    let instance_state =
-        load_or_initialize(&pool, "key-0", &master_key, Arc::new(OsEntropy), 1)
-            .await
-            .expect("instance load");
+    let instance_state = load_or_initialize(&pool, "key-0", &master_key, Arc::new(OsEntropy), 1)
+        .await
+        .expect("instance load");
     seed_defaults(&pool, None, 1).await.expect("seed settings");
 
     let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
@@ -143,7 +142,8 @@ async fn fixture(approve: bool) -> Fixture {
     .expect("insert model");
 
     // Alice's personal CUSTOM provider + key, shared with Bob.
-    let custom_config = r#"{"base_url":"https://custom-c17.example/v1","paths":{"chat":"/chat/completions"}}"#;
+    let custom_config =
+        r#"{"base_url":"https://custom-c17.example/v1","paths":{"chat":"/chat/completions"}}"#;
     let alice_provider = create_provider(
         &pool,
         &alice_actor,
@@ -375,23 +375,21 @@ impl Fixture {
 #[doc = "Spec: SHR-2, RTE-4 — ISSUE-0171 user_routes omits an unapproved custom share"]
 async fn user_routes_omits_an_unapproved_custom_share() {
     let fx = fixture(false).await;
-    let alice_key_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_keys WHERE label = ?",
-    )
-    .bind(SHARED_KEY_LABEL)
-    .fetch_one(&fx.pool)
-    .await
-    .expect("count alice keys");
+    let alice_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM upstream_keys WHERE label = ?")
+            .bind(SHARED_KEY_LABEL)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count alice keys");
     assert_eq!(alice_key_count, 1, "precondition: Alice's key exists");
 
     let json = fx.get_routes().await;
     let offered = Fixture::offered_key_ids(&json);
-    let alice_key_id: String =
-        sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
-            .bind(SHARED_KEY_LABEL)
-            .fetch_one(&fx.pool)
-            .await
-            .expect("alice key id");
+    let alice_key_id: String = sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
+        .bind(SHARED_KEY_LABEL)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("alice key id");
 
     assert!(
         !offered.contains(&alice_key_id),
@@ -416,12 +414,11 @@ async fn user_routes_includes_the_same_share_once_admin_approved() {
     let fx = fixture(true).await;
     let json = fx.get_routes().await;
     let offered = Fixture::offered_key_ids(&json);
-    let alice_key_id: String =
-        sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
-            .bind(SHARED_KEY_LABEL)
-            .fetch_one(&fx.pool)
-            .await
-            .expect("alice key id");
+    let alice_key_id: String = sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
+        .bind(SHARED_KEY_LABEL)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("alice key id");
 
     assert!(
         offered.contains(&alice_key_id),
@@ -503,12 +500,11 @@ async fn user_routes_keeps_your_own_key_labels() {
 #[doc = "Spec: SHR-2, RTE-5 — ISSUE-0171 route preference cannot target an unapproved custom share"]
 async fn route_preference_cannot_target_an_unapproved_custom_share() {
     let fx = fixture(false).await;
-    let alice_key_id: String =
-        sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
-            .bind(SHARED_KEY_LABEL)
-            .fetch_one(&fx.pool)
-            .await
-            .expect("alice key id");
+    let alice_key_id: String = sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
+        .bind(SHARED_KEY_LABEL)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("alice key id");
 
     let request = Request::builder()
         .method("PUT")
@@ -529,14 +525,16 @@ async fn route_preference_cannot_target_an_unapproved_custom_share() {
          endpoint's existing contract for keys the caller may not use; a 200 stores a \
          preference for a route that will never be selected"
     );
-    let stored: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM user_route_preferences WHERE upstream_key_id = ?",
-    )
-    .bind(&alice_key_id)
-    .fetch_one(&fx.pool)
-    .await
-    .expect("count prefs");
-    assert_eq!(stored, 0, "no preference row may be written for a refused share");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_route_preferences WHERE upstream_key_id = ?")
+            .bind(&alice_key_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count prefs");
+    assert_eq!(
+        stored, 0,
+        "no preference row may be written for a refused share"
+    );
 }
 
 /// The approved share accepts a preference, so the guard is an approval check and not a
@@ -545,12 +543,11 @@ async fn route_preference_cannot_target_an_unapproved_custom_share() {
 #[doc = "Spec: RTE-5 — ISSUE-0171 route preference works on an approved custom share"]
 async fn route_preference_works_on_an_approved_custom_share() {
     let fx = fixture(true).await;
-    let alice_key_id: String =
-        sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
-            .bind(SHARED_KEY_LABEL)
-            .fetch_one(&fx.pool)
-            .await
-            .expect("alice key id");
+    let alice_key_id: String = sqlx::query_scalar("SELECT id FROM upstream_keys WHERE label = ?")
+        .bind(SHARED_KEY_LABEL)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("alice key id");
 
     let request = Request::builder()
         .method("PUT")
