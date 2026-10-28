@@ -35,6 +35,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The upstream-key probe resolves a real credential, classifies by status, and writes
+  atomically (ISSUE-0178).** Three defects in one handler. It never called `TokenManager`: it
+  unsealed `secret_enc` and used it directly, and for an `auth_kind = 'oauth'` key that secret
+  is the **refresh token**, so the probe sent a refresh token as a bearer credential, failed,
+  and reported a perfectly healthy OAuth key as broken. It classified by success/failure rather
+  than by meaning — `if status == "ok" { "healthy" } else { "invalid" }` — so a `429` (the
+  provider saying "slow down") or a transient `503` **permanently marked a working key invalid
+  in SQLite**, meaning an operator clicking "Test" during a rate-limit window silently disabled
+  a good key. And it discarded the write (`let _ =`) on the reader-facing pool with no
+  `health_version` bump, so a correct `healthy` result left the in-memory snapshot stale — the
+  UI said "ok" while routing still refused the key. Now the credential is resolved through
+  `resolve_and_persist_secret` with the same argument shape the data plane uses (shared
+  `TokenManager` preferred so a probe and a proxied request cannot hold different live
+  credentials); the result is classified with the vocabulary the schema already had
+  (`0001_initial.sql:181`: `healthy | cooling_down | exhausted | invalid`), so `429` →
+  `exhausted` and `5xx`/timeout → `cooling_down` — **no migration**, because the distinction the
+  issue asked for already existed; and the write goes through
+  `execute_atomic_mutation_with_invalidations` like its neighbour
+  `post_reset_upstream_key_health_handler`. The two recoverable states also set `health_until`,
+  which is load-bearing rather than decorative: `KeyHealthEntry::is_routable` consults only the
+  timestamp, so a bare `exhausted` string with no `until` would route as normal. `invalid` sets
+  none, because it is an indefinite state. The response now reports the classified `health` too.
+  Relatedly, `delete_admin_model_alias_handler` was the fourth handler bypassing the atomic
+  mutation path (ISSUE-0232): a bare `DELETE` returning `204` even when zero rows matched, so a
+  deleted alias kept resolving in the data plane — `ConfigSnapshot::aliases` is projected from
+  `model_aliases` and read by `resolve_model`. It now runs through
+  `execute_atomic_mutation(vec![ConfigDomain::Models])` with `404` on zero rows.
 - **`PATCH /admin/api/models/{id}` accepts its documented fields, validates them, and answers
   truthfully (ISSUE-0170).** The handler was eleven lines with four defects. It accepted only
   `exposed` — `distribution` and `routing_strategy` could not be sent at all, because

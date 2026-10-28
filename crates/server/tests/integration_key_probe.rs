@@ -370,7 +370,7 @@ async fn stored_health(harness: &ProbeHarness) -> (String, Option<i64>) {
 /// `Authorization` the probe actually sent, and the form body of the refresh exchange — so this
 /// asserts the token was *obtained*, not merely that the header text differed.
 #[tokio::test]
-#[doc = "Spec: PRV-6, SEC-21 — ISSUE-0178 the probe resolves an OAuth access token"]
+#[doc = "Spec: PRV-6 — ISSUE-0178 the probe resolves an OAuth access token"]
 async fn key_probe_uses_a_refreshed_oauth_access_token() {
     // The spec has to know the mock's port, so spawn first and build the secret afterwards.
     let (base_url, mock) = spawn_mock(200).await;
