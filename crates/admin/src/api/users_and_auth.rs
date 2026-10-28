@@ -503,18 +503,30 @@ pub(crate) async fn post_user_password_handler(
     Ok(StatusCode::OK)
 }
 
-pub(crate) async fn load_sealer(
+/// Build the sealer for this instance, or error if `instance_meta.instance_id` is absent/corrupt.
+///
+/// `instance_id` is the HKDF **salt** (`store/src/crypto.rs:303`), so substituting `[0u8; 16]` would
+/// derive a different key and make every previously sealed row unreadable (`ISSUE-0229`). Public so
+/// integration tests can assert the failure rather than only the handlers' status codes.
+pub async fn load_sealer(
     state: &ApiAppState,
 ) -> Result<llmroller_store::crypto::XChaCha20Poly1305Sealer, (StatusCode, Json<serde_json::Value>)>
 {
+    // `fetch_one`, not `fetch_optional`: a missing `instance_meta` row is a configuration fault and
+    // must surface, never become a `[0u8; 16]` HKDF salt (`ISSUE-0229`).
     let instance_id_vec: Vec<u8> =
         sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
             .fetch_one(&state.auth.pool)
             .await
             .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let instance_id: [u8; 16] = instance_id_vec
-        .try_into()
-        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "corrupt instance_id"))?;
+    // The schema guarantees `length(instance_id) = 16` (`0001_initial.sql:11`), so a mismatch means
+    // the database was written by something that bypassed the constraint. Error, do not substitute.
+    let instance_id: [u8; 16] = instance_id_vec.try_into().map_err(|_| {
+        map_price_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt instance_id: expected 16 bytes",
+        )
+    })?;
     Ok(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
         state.master_key.clone(),
         instance_id,

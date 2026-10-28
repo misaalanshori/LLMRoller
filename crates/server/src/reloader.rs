@@ -219,14 +219,46 @@ impl DomainArcs {
     }
 }
 
-async fn load_instance_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> [u8; 16] {
-    let bytes: Option<Vec<u8>> =
+/// Read the instance id used as the HKDF **salt** for every sealer built from this snapshot.
+///
+/// `store/src/crypto.rs:303` derives subkeys with `Hkdf::new(Some(instance_id), master_key)`, so a
+/// substituted id is a *different key*, not a different AAD. Anything sealed while a zero id was in
+/// effect becomes permanently unreadable once the real id loads — silently (`ISSUE-0229`).
+///
+/// The previous version swallowed **two** distinct failures:
+///
+/// ```ignore
+/// .await
+/// .ok()                 // <- a query error became "no row"
+/// .flatten();           // <- so did a NULL
+/// bytes.and_then(|b| b.try_into().ok()).unwrap_or([0_u8; 16])  // <- and a bad length
+/// ```
+///
+/// All three now propagate. The schema forbids a null or non-16-byte id
+/// (`instance_id BLOB NOT NULL CHECK (length(instance_id) = 16)`, `0001_initial.sql:11`), so in
+/// practice the reachable failure is an absent row — an uninitialised or partially restored
+/// database — or a genuine query error. Both are configuration faults that must not be papered
+/// over with a constant.
+async fn load_instance_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<[u8; 16], ReloaderError> {
+    let bytes: Vec<u8> =
         sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
-            .fetch_optional(&mut **tx)
+            .fetch_one(&mut **tx)
             .await
-            .ok()
-            .flatten();
-    bytes.and_then(|b| b.try_into().ok()).unwrap_or([0_u8; 16])
+            .map_err(|error| {
+                ReloaderError::Other(format!(
+                    "instance_meta.instance_id is unreadable ({error}); refusing to derive sealing \
+                     keys from a substituted id"
+                ))
+            })?;
+    bytes.try_into().map_err(|_| {
+        ReloaderError::Other(
+            "instance_meta.instance_id is not 16 bytes; refusing to derive sealing keys from a \
+             substituted id"
+                .to_string(),
+        )
+    })
 }
 
 /// Load the initial immutable [`ConfigSnapshot`] directly from SQLite during server startup.
@@ -241,7 +273,7 @@ pub async fn load_initial_snapshot(pool: &SqlitePool) -> Result<ConfigSnapshot, 
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
 
-    let instance_id = load_instance_id(&mut tx).await;
+    let instance_id = load_instance_id(&mut tx).await?;
     let users = load_user_records_tx(&mut tx).await?;
     let settings = load_settings_tx(&mut tx).await?;
     let providers = load_provider_records_tx(&mut tx).await?;
@@ -724,7 +756,13 @@ fn start_reloader_inner(
 
                 let next_instance_id =
                     if reload_all || changed_domains.contains(&ConfigDomain::Providers) {
-                        load_instance_id(&mut tx).await
+                        match load_instance_id(&mut tx).await {
+                            Ok(id) => id,
+                            Err(err) => {
+                                tracing::error!("reloader failed to read instance_id: {err}");
+                                continue;
+                            }
+                        }
                     } else {
                         current.instance_id
                     };

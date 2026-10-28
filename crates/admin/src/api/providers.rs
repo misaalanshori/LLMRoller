@@ -414,18 +414,11 @@ pub(crate) async fn post_test_upstream_key_handler(
     let config_json: String = key.try_get("config_json").unwrap_or_default();
     let allow_private: bool = key.try_get::<i64, _>("allow_private_network").unwrap_or(0) != 0;
 
-    let instance_id_vec: Vec<u8> =
-        sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
-            .fetch_optional(&state.auth.pool)
-            .await
-            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .unwrap_or_else(|| vec![0_u8; 16]);
-    let instance_id: [u8; 16] = instance_id_vec.try_into().unwrap_or([0_u8; 16]);
-    let sealer = llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
-        state.master_key.clone(),
-        instance_id,
-        std::sync::Arc::new(llmroller_core::seams::OsEntropy),
-    );
+    // One accessor for every admin sealer (`ISSUE-0229`). This used to build its own with
+    // `unwrap_or_else(|| vec![0u8; 16])` and `try_into().unwrap_or([0u8; 16])` — substituting a
+    // zero HKDF salt, which derives a *different* key and makes every previously sealed row
+    // unreadable. `load_sealer` propagates instead.
+    let sealer = load_sealer(&state).await?;
     let key_id_text = id.to_string();
     let secret = sealer
         .open(

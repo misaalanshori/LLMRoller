@@ -100,6 +100,8 @@ pub(crate) use usage_filters::{
     bind_ledger_filters, bind_logs_export_filters, bind_usage_filters, canonical_total,
     event_query, ledger_query, logs_export_query, rollup_query,
 };
+#[doc(hidden)]
+pub use users_and_auth::load_sealer;
 pub(crate) use users_and_auth::*;
 
 #[cfg(test)]

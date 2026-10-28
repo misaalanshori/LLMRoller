@@ -164,3 +164,6 @@ mod pre_login_csrf;
 // ---------------------------------------------------------------------------
 
 mod login_limiter_bounds;
+
+#[path = "tests/instance_id_salt.rs"]
+mod instance_id_salt;

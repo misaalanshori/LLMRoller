@@ -485,6 +485,44 @@ impl AuthAppState {
         self
     }
 
+    /// Read `instance_meta.instance_id`, which is the **HKDF salt** for every sealer subkey
+    /// (`store/src/crypto.rs:303`).
+    ///
+    /// A substitute here is not a cosmetic default: a zero salt derives a *different* key, so any
+    /// row sealed under it becomes permanently unreadable once the real id loads — lost upstream
+    /// credentials and locked-out TOTP accounts, with no error reported (`ISSUE-0229`).
+    ///
+    /// Both failures the old code swallowed now propagate:
+    ///
+    /// ```ignore
+    /// .fetch_optional(…)               // a missing row became `None`
+    /// .map_err(|_| AuthError::Internal)?  // <- previously `.ok()`
+    /// .unwrap_or_else(|| vec![0; 16])     // <- the substitution
+    /// … .try_into().unwrap_or([0; 16])    // <- and a bad length
+    /// ```
+    ///
+    /// `fetch_one` errors on a missing row; the length is checked explicitly because the schema's
+    /// `CHECK (length(instance_id) = 16)` can be bypassed by a direct writer or a partial restore.
+    async fn load_instance_id(&self) -> Result<[u8; 16], AuthError> {
+        let bytes: Vec<u8> =
+            sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| AuthError::Internal)?;
+        bytes.try_into().map_err(|_| AuthError::Internal)
+    }
+
+    /// Test-only entry point for the TOTP verification seam.
+    #[cfg(test)]
+    pub(crate) async fn verify_totp_code_for_test(
+        &self,
+        user_id: llmroller_core::ids::UserId,
+        code: &str,
+        now_ms: i64,
+    ) -> Result<bool, AuthError> {
+        self.verify_totp_code(user_id, code, now_ms).await
+    }
+
     /// Verify a login TOTP or single-use recovery code, advancing replay state.
     async fn verify_totp_code(
         &self,
@@ -493,13 +531,7 @@ impl AuthAppState {
         now_ms: i64,
     ) -> Result<bool, AuthError> {
         let master_key = self.master_key.clone().ok_or(AuthError::Internal)?;
-        let instance_id: Vec<u8> =
-            sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|_| AuthError::Internal)?
-                .unwrap_or_else(|| vec![0_u8; 16]);
-        let instance_id: [u8; 16] = instance_id.try_into().unwrap_or([0_u8; 16]);
+        let instance_id = self.load_instance_id().await?;
         let sealer = llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
             master_key,
             instance_id,
