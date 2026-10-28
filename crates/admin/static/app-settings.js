@@ -8,6 +8,18 @@
 // templates; a test asserts they agree.
 // CSP: script-src 'self'; no inline handlers.
 
+// A settings key becomes an HTML element id, and `saveSetting` looks it up again with
+// `getElementById`. Both require the key to be an identifier, so it is checked rather than
+// assumed: escaping it instead would produce `&quot;` — a valid attribute value but not a valid
+// element id — and silently break the save path for exactly the keys it was meant to protect.
+// The server guarantees the shape (`get_admin_settings_handler` returns the closed
+// `RuntimeSettings` struct), so a key failing this is a server bug: skip it loudly by name.
+const SETTING_KEY_PATTERN = /^[a-z0-9_]+$/;
+
+function isValidSettingKey(key) {
+    return typeof key === 'string' && SETTING_KEY_PATTERN.test(key);
+}
+
 const ROUTING_STRATEGIES = [
     'smooth_weighted_rr',
     'naive_rr',
@@ -33,25 +45,29 @@ async function loadAdminSettings() {
         }
         const keys = Object.keys(settings).sort();
         grid.innerHTML = keys.map(key => {
+            if (!isValidSettingKey(key)) {
+                console.error('Ignoring a runtime setting whose key is not identifier-shaped:', key);
+                return '';
+            }
             const id = `setting-${key}`;
             const value = settings[key];
             const label = key.replace(/_/g, ' ');
             let input;
             if (key === 'traceability_config') {
-                input = `<textarea id="${id}" rows="5" disabled>${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
+                input = `<textarea id="${escapeHtml(id)}" rows="5" disabled>${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
             } else if (key === 'default_routing_strategy') {
                 const opts = ROUTING_STRATEGIES.map(s =>
-                    `<option value="${s}" ${value === s ? 'selected' : ''}>${s}</option>`
+                    `<option value="${escapeHtml(s)}" ${value === s ? 'selected' : ''}>${escapeHtml(s)}</option>`
                 ).join('');
-                input = `<select id="${id}">${opts}</select>`;
+                input = `<select id="${escapeHtml(id)}">${opts}</select>`;
             } else if (typeof value === 'boolean') {
-                input = `<label class="checkbox-group" for="${id}"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}><span>${value ? 'Enabled' : 'Disabled'}</span></label>`;
+                input = `<label class="checkbox-group" for="${escapeHtml(id)}"><input type="checkbox" id="${escapeHtml(id)}" ${value ? 'checked' : ''}><span>${value ? 'Enabled' : 'Disabled'}</span></label>`;
             } else if (typeof value === 'number') {
-                input = `<input type="number" id="${id}" value="${value}">`;
+                input = `<input type="number" id="${escapeHtml(id)}" value="${escapeHtml(value)}">`;
             } else if (typeof value === 'string') {
-                input = `<input type="text" id="${id}" value="${escapeHtml(value)}">`;
+                input = `<input type="text" id="${escapeHtml(id)}" value="${escapeHtml(value)}">`;
             } else {
-                input = `<textarea id="${id}" data-json="true" rows="4">${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
+                input = `<textarea id="${escapeHtml(id)}" data-json="true" rows="4">${escapeHtml(JSON.stringify(value, null, 2))}</textarea>`;
             }
             const save = key === 'traceability_config'
                 ? '<span class="text-muted text-xs">Use the Traceability tab to change this setting.</span>'

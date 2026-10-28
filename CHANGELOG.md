@@ -35,6 +35,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The settings grid interpolated its own keys into `id`/`for` attributes unescaped, safe
+  only by accident (ISSUE-0231).** `app-settings.js` builds each setting row from
+  `Object.keys(settings)` and put the raw key into six `id`/`for` attributes before
+  `escapeHtml` appeared anywhere — the string, number and boolean branches escaped the
+  *value* while leaving the *id* raw, so the file read as careful with the hazard in the part
+  that looks like boilerplate.
+
+  It was safe because `get_admin_settings_handler` returns `Json<RuntimeSettings>`, a closed
+  struct, so every key is a fixed `[a-z_]+` identifier. Nothing recorded that dependency, and
+  the failure mode is a refactor rather than an attack: return a `HashMap<String, _>` — the
+  natural shape, and the settings store is already string-keyed — and a key containing `"` or
+  `<` reaches an attribute.
+
+  The key is now validated as an identifier (`^[a-z0-9_]+$`) before it is used, and a key that
+  fails is skipped with a console error rather than rendered. Escaping the key instead is the
+  tempting one-liner and is wrong: `escapeHtml` produces `&quot;`, a valid attribute value but
+  not a valid element id, while `saveSetting` looks the element up again with
+  `getElementById(\`setting-${key}\`)` — so a naive fix silently breaks the save path for
+  exactly the keys it was meant to protect. With the guard in place `escapeHtml(id)` is an
+  identity transformation for every key that can reach it, so the attribute interpolations are
+  escaped too without changing any valid id.
+
+  Four tests now hold the guarantee, because the JS is the consumer and the Rust side owns the
+  promise: `admin_settings_payload_key_set_is_closed` asserts the served payload's key set
+  equals a literal list, so gaining a field — or being rebuilt from raw `settings` rows — goes
+  red with the unexpected key named; `an_undeclared_settings_row_does_not_appear_in_the_payload`
+  pins the `_ => {}` arm that drops unknown rows; and
+  `no_module_interpolates_into_an_attribute_without_escaping` is the census, scanning all
+  twelve modules for `${…}` inside a quoted attribute and requiring `escapeHtml(` or a literal,
+  so a future un-escaping edit cannot land quietly. The guard itself is asserted structurally
+  from Rust (exists, is called before the id is built, skips on failure, tests that pattern)
+  because the repository has **no JS test harness** — no `package.json`, no `node_modules`, no
+  Node step in CI — and adding a build step for one guard was not worth it.
+
 - **The session-pin move handlers discarded their SQL result, reported success for zero
   rows, and moved the in-memory `PinStore` regardless (ISSUE-0232).** Three defects in
   eight lines, in both the user handler and its admin sibling.

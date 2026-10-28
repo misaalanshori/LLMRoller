@@ -216,6 +216,20 @@ async fn get_settings(harness: &Harness) -> serde_json::Value {
 #[doc = "Spec: SEC-6, MDL-3 — ISSUE-0231 admin settings payload key set is closed"]
 async fn admin_settings_payload_key_set_is_closed() {
     let harness = harness().await;
+
+    // A hostile row is planted here as well as in the test below, and deliberately: without it
+    // this test is only sensitive to a *struct* gaining a field, and passes against a payload
+    // built from raw `settings` rows as long as none of them is hostile. With it, this test also
+    // catches that refactor. Measured, not assumed -- mutation M5 (payload built from raw rows)
+    // survives this test when the fixture is clean and dies when it is not.
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")
+        .bind("evil\"><img src=x onerror=alert(1)>")
+        .bind("\"x\"")
+        .bind(1_i64)
+        .execute(&harness.pool)
+        .await
+        .expect("plant a hostile settings row");
+
     let payload = get_settings(&harness).await;
 
     let object = payload
