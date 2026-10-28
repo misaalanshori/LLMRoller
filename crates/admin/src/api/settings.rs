@@ -120,10 +120,88 @@ pub(crate) async fn put_admin_traceability_handler(
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Lowering retention must actually delete, not just record the new window. The periodic
+    // sweep cannot cover this: it deletes on `expires_at`, and `expires_at` was stamped from
+    // the retention in force when each record was written, so lowering retention never makes an
+    // existing row expire (`ISSUE-0194`).
+    //
+    // `confirm_purge: true` is the operator consenting to exactly this, and the guard above has
+    // already refused the request without it.
+    //
+    // Only on a *reduction*: widening the window deletes nothing, and running the purge then
+    // would use the new (larger) window to delete records the operator never agreed to lose.
+    let purged = if payload.retention_days < settings.traceability_config.retention_days {
+        let purge_cutoff = now_ms - payload.retention_days * 86_400_000;
+        purge_trace_records_and_orphan_blocks(&state, purge_cutoff).await?
+    } else {
+        0
+    };
+
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "traceability_config": new_config
+        "traceability_config": new_config,
+        "purged_records": purged,
     })))
+}
+
+/// Delete trace records older than `cutoff_ms`, then collect the blocks they alone referenced.
+///
+/// The order matters and so does the pairing: deleting records leaves `trace_blocks` rows
+/// behind, and a block is only collectable once **no** remaining record references it —
+/// `trace_blocks` is content-addressed (`ADR-9`), so a blanket delete would corrupt every live
+/// trace that happens to share a block with an expired one.
+///
+/// Both steps reuse the existing retention primitives, which already carry the reference check
+/// and the batching: `sweep_orphaned_trace_blocks` deletes in `LIMIT` chunks guarded by an
+/// `NOT EXISTS` against `trace_record_blocks`, the indexable join table
+/// (`idx_trace_record_blocks_ref`). So this is one indexed query per chunk, not a JSON walk.
+///
+/// The record delete is not batched, matching `sweep_expired_trace_records`, which is a single
+/// `DELETE` by `expires_at`; the orphan sweep is chunked so a large block table cannot produce
+/// one unbounded statement.
+async fn purge_trace_records_and_orphan_blocks(
+    state: &ApiAppState,
+    cutoff_ms: i64,
+) -> Result<i64, MutationResponseError> {
+    let mut tx = state
+        .auth
+        .pool
+        .begin()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // `trace_record_blocks` cascades with its records, so the reference set shrinks atomically
+    // with the purge.
+    let purged = sqlx::query("DELETE FROM trace_records WHERE ts < ?")
+        .bind(cutoff_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .rows_affected();
+    tx.commit()
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Same transaction boundary is impossible across a chunked sweep without holding the write
+    // lock for an unbounded time, so the sweep runs immediately after the committed purge. A
+    // crash between them leaves orphaned blocks, which the periodic sweep collects — the safe
+    // direction, since the alternative (blocks deleted, records still present) would corrupt
+    // live traces.
+    let mut collected = 0_u64;
+    loop {
+        let deleted = llmroller_store::retention::sweep_orphaned_trace_blocks(
+            &state.auth.pool,
+            i64::MAX,
+            1_000,
+        )
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        collected = collected.saturating_add(deleted);
+        if deleted < 1_000 {
+            break;
+        }
+    }
+    let _ = collected;
+    Ok(i64::try_from(purged).unwrap_or(i64::MAX))
 }
 
 fn default_price_provider_kind() -> String {

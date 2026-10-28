@@ -256,12 +256,11 @@ async fn record_count(h: &Harness) -> i64 {
 }
 
 async fn block_exists(h: &Harness, hash: &str) -> bool {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks WHERE block_hash = ?")
-            .bind(hash)
-            .fetch_one(&h.pool)
-            .await
-            .expect("count");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks WHERE block_hash = ?")
+        .bind(hash)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count");
     count > 0
 }
 
