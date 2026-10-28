@@ -606,18 +606,23 @@ impl RuntimeState {
         let Some(limit) = tpm_limit.filter(|&l| l > 0) else {
             return Ok(());
         };
-        let minute = now_ms.div_euclid(60_000);
+        // The window is anchored on the first request of the burst, NOT on wall-clock
+        // minutes. Keying it on `now_ms.div_euclid(60_000)` reset the counter at every
+        // minute boundary, so two requests a millisecond apart could straddle one and
+        // both pass a limit they jointly exceed — a real wall-clock race that surfaced as
+        // an intermittent CI failure (`ISSUE-0171` follow-up,
+        // `regression_test_f040_client_key_tpm_rate_limiting` getting 503 instead of 429).
         let add = tokens.max(0);
         let mut entry = self
             .client_key_tpm
             .entry(client_key_id)
-            .or_insert((minute, 0));
-        if entry.0 != minute {
-            *entry = (minute, 0);
+            .or_insert((now_ms, 0));
+        if now_ms.saturating_sub(entry.0) >= 60_000 {
+            *entry = (now_ms, 0);
         }
         if entry.1 > 0 && entry.1.saturating_add(add) > limit {
-            let elapsed_in_min_ms = now_ms.rem_euclid(60_000);
-            let retry_secs = ((60_000 - elapsed_in_min_ms).max(1000) as u64).div_ceil(1000);
+            let remaining_ms = 60_000 - now_ms.saturating_sub(entry.0);
+            let retry_secs = (remaining_ms.max(1000) as u64).div_ceil(1000);
             return Err(retry_secs);
         }
         entry.1 = entry.1.saturating_add(add);

@@ -162,3 +162,38 @@ fn aborted_half_open_probe_releases_slot_via_raii_guard() {
     drop(retry);
     assert_eq!(breaker.lock().state, BreakerState::Closed);
 }
+
+/// The client-key TPM window must not reset mid-burst.
+///
+/// `try_consume_client_key_tpm` keys its window on `now_ms.div_euclid(60_000)`, so a
+/// request that lands just before a minute boundary and one that lands just after are
+/// counted in *different* windows. Two requests in the same burst then both pass a limit
+/// they should jointly exceed.
+///
+/// This is a wall-clock race, so it surfaces as an intermittent CI failure rather than a
+/// deterministic one — cycle 17 hit it on `aarch64-apple-darwin` in
+/// `regression_test_f040_client_key_tpm_rate_limiting`, where the second of two 25-token
+/// requests against a 30 TPM limit returned 503 (no eligible route) instead of 429,
+/// because the TPM gate had reset between them. Driving `now_ms` explicitly makes the
+/// race reproducible instead of luck-dependent.
+#[test]
+fn client_key_tpm_window_must_not_reset_at_a_minute_boundary() {
+    let state = RuntimeState::new();
+    let key = ClientKeyId::generate();
+    let limit = Some(30);
+    // 1 ms before a minute boundary, and 1 ms after it: the same burst.
+    let before_boundary = 59_999;
+    let after_boundary = 60_001;
+
+    assert_eq!(
+        state.try_consume_client_key_tpm(key, 25, limit, before_boundary),
+        Ok(()),
+        "the first request of the burst is under the limit"
+    );
+    assert_eq!(
+        state.try_consume_client_key_tpm(key, 25, limit, after_boundary),
+        Err(60),
+        "25 + 25 exceeds a 30 TPM limit even across a minute boundary; a window keyed on \
+         div_euclid(60_000) forgets the first request and lets the burst through"
+    );
+}

@@ -9,6 +9,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The client-key TPM window no longer resets at wall-clock minute boundaries
+  (follow-up found during ISSUE-0171's CI run).** `try_consume_client_key_tpm` keyed its
+  window on `now_ms.div_euclid(60_000)`, so two requests a millisecond apart could straddle
+  a minute boundary, land in different windows, and both pass a limit they jointly exceed.
+  It surfaced as an intermittent `regression_test_f040_client_key_tpm_rate_limiting`
+  failure on `aarch64-apple-darwin` — the second of two 25-token requests against a 30 TPM
+  limit returned `503` instead of `429`, because the TPM gate had already reset. The window
+  is now anchored on the first request of the burst and expires 60 s after it, and a
+  regression test drives `now_ms` explicitly across the boundary so the race is
+  reproducible rather than luck-dependent.
 - **The routing matrix now agrees with the data plane about unapproved custom shares
   (ISSUE-0171).** `is_share_eligible` already refused a `custom` provider share whose
   `admin_approved_at` is `NULL`, so the inference path could not use one. The admin display
