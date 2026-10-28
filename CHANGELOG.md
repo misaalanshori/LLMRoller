@@ -9,6 +9,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **One canonical session-hash fallback (ISSUE-0137).** The product had **two** secret-less
+  fallbacks for the same concept, and they disagreed: `orchestrator::session::session_hash` used a
+  domain-separated SHA-256 scoped by `client_key_id`, while `usage_passthrough` used
+  `compute_session_hash(&[0u8; 32], …)` scoped by `owner_user_id`. Same session, two subsystems,
+  two different hashes — pinning and usage attribution could not agree on which session a request
+  belonged to. The zero-key HMAC was also worse than the plain derivation beside it, because it
+  *looked* keyed while providing no secrecy. Both pass-through call sites now route through the
+  orchestrator's helper, and the empty-key affinity token
+  (`session_hmac_secret.unwrap_or(b"")`) — a third instance of the same pattern — goes through one
+  extracted `derive_salted_affinity_token`. **The keyed path is byte-identical to before**, so no
+  stored pin is orphaned on upgrade. The `client_key_id`/`owner_user_id` scoping asymmetry is kept
+  deliberately: changing which identity a hash is scoped by would re-key every deployment.
+- **The audit HMAC key is never derived from the master key (ISSUE-0138).** Two sites —
+  `execute_atomic_mutation` and the trace-view audit write — fell back to `sha256_hex(master_key)`
+  when no instance key was configured. That breaks the guarantee `ADR-11` exists to make: rotating
+  `LLMRoller_MASTER_KEY` must not invalidate the audit chain, and a master-key-derived audit key
+  makes every previously written row stop verifying *silently* after a rotation. `resolve_audit_hmac_key`
+  now returns the instance key or an error, and both call sites skip the write rather than invent a
+  substitute. A missing audit row is visible and recoverable; a chain that looks valid for new rows
+  and invalid for old ones is discovered during an incident.
 - **The log detail drawer projects and renders every `14.m` field (ISSUE-0174).**
   `get_log_detail_internal` uses `SELECT *`, so every inspector column was already in the row and
   the hand-written projection discarded seven of them: `client_location`, `termination`,
