@@ -390,12 +390,20 @@ async fn serve_with_env(extra: &[(&str, &str)]) -> ServeOutcome {
         std::fs::read_to_string(path).unwrap_or_else(|_| String::from("<no stderr captured>"))
     };
 
-    match tokio::time::timeout(SERVE_EXIT_BUDGET, command.output()).await {
-        // stderr goes to the file, so it is read back here rather than taken from `output`.
-        Ok(Ok(output)) => ServeOutcome::Exited(output.status.code(), read_stderr(&stderr_path)),
-        Ok(Err(error)) => panic!("could not run serve: {error}"),
-        // Dropping the future drops the child (kill_on_drop) before this returns.
-        Err(_elapsed) => ServeOutcome::StillRunning(read_stderr(&stderr_path)),
+    // `spawn` + `wait`, not `output`: stderr is redirected to a file, so `output()` would return
+    // an empty buffer and the assertions on the message would fail for the wrong reason.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => panic!("could not spawn serve: {error}"),
+    };
+    match tokio::time::timeout(SERVE_EXIT_BUDGET, child.wait()).await {
+        Ok(Ok(status)) => ServeOutcome::Exited(status.code(), read_stderr(&stderr_path)),
+        Ok(Err(error)) => panic!("could not wait for serve: {error}"),
+        // Dropping the child reaps it (`kill_on_drop`), then anything it managed to log is read.
+        Err(_elapsed) => {
+            drop(child);
+            ServeOutcome::StillRunning(read_stderr(&stderr_path))
+        }
     }
 }
 

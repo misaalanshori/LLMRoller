@@ -19,7 +19,11 @@ pub(crate) fn render_log_detail_drawer_html(json: &serde_json::Value) -> String 
             .and_then(|v| v.as_str())
             .unwrap_or(""),
     );
-    let status = json.get("status").and_then(|v| v.as_i64()).unwrap_or(200);
+    // `ISSUE-0228` sibling sweep: `usage_events.status` is `NOT NULL`, so this key is always
+    // present in a real payload -- but defaulting a *missing* status to `200` invents a **success**
+    // for the one field an inspector reads first. `0` is not a valid HTTP status and reads as
+    // "unknown" rather than as a healthy response.
+    let status = json.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
     let model = escape_html(json.get("model").and_then(|v| v.as_str()).unwrap_or("-"));
     let ts = json.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
     let latency_ms = json
@@ -149,6 +153,15 @@ pub(crate) fn render_log_detail_drawer_html(json: &serde_json::Value) -> String 
     // are attacker-influenced, and this is the first place they reach the drawer.
     let headers_html = render_headers_grid(json.get("request_headers"));
 
+    // `ISSUE-0228`: an empty `usage_attempts` set must not be rendered as an attempt. It used to
+    // emit `<li>1 attempt (served)</li>` -- an invented count *and* an invented outcome.
+    //
+    // What empty actually means, read from the write path: `usage_writer::enqueue` takes
+    // `(UsageEventRecord, Vec<UsageAttemptRecord>)`, and `proxy/src/auth.rs` and
+    // `orchestrator/state_bound.rs` pass `Vec::new()` for requests rejected before an upstream key
+    // was chosen, and for state-bound short-circuits. So empty means **no upstream attempt was
+    // made** -- not "attempts failed" and not "recording is missing" (the event row exists because
+    // accounting ran). The wording below claims exactly that and no more.
     let mut attempts_html = String::new();
     if let Some(attempts) = json.get("attempts").and_then(|a| a.as_array()) {
         for a in attempts {
@@ -165,7 +178,11 @@ pub(crate) fn render_log_detail_drawer_html(json: &serde_json::Value) -> String 
         }
     }
     if attempts_html.is_empty() {
-        attempts_html = "<li>1 attempt (served)</li>".to_string();
+        // Same rule this file already applies to `client_location`: state the absence, do not
+        // invent a value. Distinguishable at a glance from "one attempt that succeeded".
+        attempts_html =
+            "<li class=\"text-muted\">No upstream attempt was recorded for this request.</li>"
+                .to_string();
     }
 
     // Traces are opt-in (`ADR-9`), so most rows have none. When there is no trace the section

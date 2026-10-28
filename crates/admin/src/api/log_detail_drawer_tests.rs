@@ -119,4 +119,57 @@ fn drawer_with_one_served_attempt_still_reads_as_one_served_attempt() {
         "the render for no attempt data must differ from the render for one served attempt; \
          if these are equal the drawer is still conflating absence with a served attempt"
     );
+
+    // Inequality alone is not enough, and mutation showed why: deleting the no-data branch leaves
+    // the two renders different (an empty `<ul>` versus a populated one), so an inequality-only
+    // assertion stays green while the drawer stops explaining *why* the list is empty. The absence
+    // must be **stated**, not merely not-claimed. Measured: with this assertion removed, mutation
+    // "delete the no-data branch" survives.
+    assert!(
+        with_none.contains("No upstream attempt"),
+        "the no-data render must explain the absence rather than emitting an empty list; an \
+         empty `<ul>` is a silent gap, which is the same defect as inventing an attempt, one \
+         notch quieter. got: {with_none}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sibling sweep: a missing status must not invent a success
+// ---------------------------------------------------------------------------
+
+/// A payload with no `status` must not render as `200`.
+///
+/// `usage_events.status` is `NOT NULL`, so a real payload always carries it — which is exactly why
+/// `unwrap_or(200)` was easy to miss. But defaulting a *missing* status to `200` invents a
+/// **success** for the field an inspector reads first, and "healthy" is the one wrong answer that
+/// stops someone investigating. The default is now `0`, which is not a valid HTTP status and reads
+/// as unknown.
+#[test]
+#[doc = "Spec: REL-6 — ISSUE-0228 a missing status must not read as success"]
+fn drawer_with_no_status_does_not_invent_a_200() {
+    let mut event = event_without_attempts();
+    event.as_object_mut().expect("object").remove("status");
+    let html = render_log_detail_drawer_html(&event);
+
+    assert!(
+        !html.contains("HTTP status:</span><span>200"),
+        "a missing status must not be rendered as 200 — a fabricated success is the one wrong \
+         answer that stops an operator investigating; got: {html}"
+    );
+}
+
+/// A present status is still rendered verbatim, so the default change did not break the normal path.
+#[test]
+#[doc = "Spec: REL-6 — ISSUE-0228 status still renders when present"]
+fn drawer_with_a_status_renders_it_verbatim() {
+    let mut event = event_without_attempts();
+    event
+        .as_object_mut()
+        .expect("object")
+        .insert("status".to_string(), serde_json::json!(503));
+    let html = render_log_detail_drawer_html(&event);
+    assert!(
+        html.contains("HTTP status:</span><span>503"),
+        "a present status must render verbatim; got: {html}"
+    );
 }

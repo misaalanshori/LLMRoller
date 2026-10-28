@@ -35,6 +35,38 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`llmroller serve` silently ignored the documented TLS variables, and the log-detail
+  drawer invented an attempt from no data (ISSUE-0227, ISSUE-0228).** Both are "the system
+  states something it has not established".
+
+  Four spec documents described a native `rustls` listener configured by
+  `LLMROLLER_TLS_CERT` / `LLMROLLER_TLS_KEY`; the binary never read them for a listener,
+  because TLS terminates at the reverse proxy (`A4`). A deployment that set them was therefore
+  served **plaintext with no warning** — the worst failure mode for a security-relevant
+  option, since it is indistinguishable from one that works. `serve` now refuses to start with
+  exit **`2`** (§5.5.1's existing "invalid environment variable" row, so no new code was
+  allocated) and names the alternative: terminate TLS at the proxy and list it in
+  `LLMROLLER_TRUSTED_PROXIES`. Rejection triggers on **either** variable alone, and on an
+  **empty-string** value: presence is tested with `env::var(..).is_ok()`, not
+  `unwrap_or_default()`, because an operator who exported an empty variable believes they
+  configured something and treating that as absent would reproduce the same defect at a
+  smaller size. `A4`, §5's env table, `SEC-9` and `22` were all rewritten to say upstream-only,
+  which is what makes the four documents agree rather than merely each be wrong differently.
+  Native TLS stays deferred on purpose: with a real listener `cookie_policy_for` would have to
+  derive the request scheme, and a wrong answer strips `Secure` from genuinely secure cookies —
+  two changes, not one, and a half-done listener is worse than none.
+
+  Separately, the log-detail drawer rendered `<li>1 attempt (served)</li>` when a request had
+  **no** `usage_attempts` rows — an invented count *and* an invented outcome, in the one place
+  an operator goes to diagnose a gap. An empty set means "no upstream attempt was made", which
+  was read out of the write path rather than assumed: `usage_writer::enqueue` takes
+  `(event, Vec<UsageAttemptRecord>)`, and `proxy/src/auth.rs` and `state_bound.rs` deliberately
+  pass `Vec::new()` for requests rejected before a key was chosen and for state-bound
+  short-circuits. The drawer now says so, matching the rule the same file already applies to
+  `client_location`: state the absence, do not invent a value. Also swept in that renderer: a
+  missing `status` defaulted to `200`, inventing a **success** for the field an inspector reads
+  first — it is now `0`, which is not a valid HTTP status and reads as unknown.
+
 - **The settings grid interpolated its own keys into `id`/`for` attributes unescaped, safe
   only by accident (ISSUE-0231).** `app-settings.js` builds each setting row from
   `Object.keys(settings)` and put the raw key into six `id`/`for` attributes before

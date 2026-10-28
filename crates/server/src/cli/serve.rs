@@ -18,6 +18,13 @@ use llmroller_store::writer::start_writer;
 use super::args::ServeArgs;
 use super::helpers::{CliFailure, acquire_lock, resolve_data_dir};
 
+/// The documented-but-unimplemented native TLS listener variables (`ISSUE-0227`).
+///
+/// Named here so the rejection message and the docs can be checked against one spelling, and so a
+/// future native listener has an obvious place to replace this pairing with a real one.
+const TLS_CERT_ENV: &str = "LLMROLLER_TLS_CERT";
+const TLS_KEY_ENV: &str = "LLMROLLER_TLS_KEY";
+
 /// Initializes global `tracing_subscriber` formatting (JSON or compact pretty) and level filtering (`FND-052`, `OBS-2`).
 pub(crate) fn init_tracing(log_level: &str, log_format: &str) {
     let filter_directive = std::env::var("LLMROLLER_LOG")
@@ -59,6 +66,34 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let _lock = acquire_lock(&data_dir)?;
 
     // 2. Validate listener configuration, require_tls, trusted_proxies, and master key
+
+    // `ISSUE-0227`: refuse to start when a native TLS listener is requested.
+    //
+    // Four spec documents describe `LLMROLLER_TLS_CERT`/`LLMROLLER_TLS_KEY`, and this binary never
+    // reads them for a listener (TLS terminates at the reverse proxy — see `A4`). Before this
+    // check, a deployment that set them was served **plaintext with no warning**, which is the
+    // worst failure mode for a security-relevant option: indistinguishable from one that works.
+    //
+    // Exit `2` is §5.5.1's existing row for "invalid CLI flag, invalid environment variable";
+    // no new code is allocated. Presence is tested with `env::var`, not `env::var(...).is_ok()`,
+    // so `LLMROLLER_TLS_CERT=""` counts as **set**: an operator who exported an empty variable
+    // believes they configured something, and treating that as absent would reproduce this exact
+    // defect at a smaller size.
+    if let Some(name) = [TLS_CERT_ENV, TLS_KEY_ENV]
+        .into_iter()
+        .find(|name| env::var(name).is_ok())
+    {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "{name} is set, but this binary does not run a TLS listener. Terminate TLS at the \
+                 reverse proxy instead, and list the proxy in LLMROLLER_TRUSTED_PROXIES so \
+                 forwarded headers and the real scheme are trusted. Unset {TLS_CERT_ENV} and \
+                 {TLS_KEY_ENV} to start the server."
+            ),
+        ));
+    }
+
     let trusted_proxies = env::var("LLMROLLER_TRUSTED_PROXIES").unwrap_or_default();
     let require_tls = env::var("LLMROLLER_REQUIRE_TLS")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
