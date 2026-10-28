@@ -116,6 +116,10 @@ pub use pipeline::*;
 pub use preflight::*;
 pub(crate) use routes::*;
 pub(crate) use session::*;
+#[doc(hidden)]
+pub use session::{
+    fallback_session_hash_for_test, salted_affinity_token_for_test, session_hash_for_test,
+};
 pub use state_bound::*;
 pub(crate) use streaming::*;
 pub(crate) use terminal_accounting::*;

@@ -784,13 +784,15 @@ pub(crate) async fn append_audit_entry_helper(
     use llmroller_core::seams::ExposeSecret as _;
 
     let audit_id = llmroller_core::ids::RequestId::generate().to_string();
-    // Production always provides the instance audit key; tests without one derive a
-    // deterministic fallback so the hash chain remains well-formed.
-    let fallback = llmroller_store::crypto::sha256_hex(state.master_key.as_bytes());
-    let key: &[u8] = state
-        .audit_hmac_key
-        .as_ref()
-        .map_or(fallback.as_bytes(), |secret| secret.expose_secret());
+    // No master-key fallback (`ISSUE-0138`, `ADR-11`): the audit chain's key must not depend on a
+    // key that `ADR-11` promises is irrelevant to it. A rotation would silently orphan every
+    // previously written row. When no instance key is configured, skip the write.
+    let Some(instance_key) =
+        resolve_audit_hmac_key(state.audit_hmac_key.as_ref(), &state.master_key).ok()
+    else {
+        return Ok(());
+    };
+    let key: &[u8] = instance_key.expose_secret();
 
     let mut tx = state.auth.pool.begin().await?;
     llmroller_store::audit::append(

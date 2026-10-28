@@ -274,6 +274,11 @@ fn build_app(harness: &Harness, pin_store: Arc<PinStore>) -> axum::Router {
         harness.master_key.clone(),
         "key-0".to_string(),
     );
+    // An instance audit key, as production supplies (`serve.rs:443`). Without it the mutation path
+    // now deliberately writes **no** audit row rather than deriving one from the master key
+    // (`ISSUE-0138`, `ADR-11`), so a fixture that asserts an audit row must configure the key it
+    // claims to be testing.
+    api_state.audit_hmac_key = Some(llmroller_core::seams::secret_bytes(vec![0x24; 32]));
     api_state.attach_pin_store(pin_store);
     control_plane_router_full(setup_state, auth_state, api_state)
 }

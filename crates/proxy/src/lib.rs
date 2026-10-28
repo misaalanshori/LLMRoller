@@ -14,3 +14,17 @@ pub mod orchestrator;
 pub mod ssrf;
 pub mod token_manager;
 pub mod usage_passthrough;
+
+/// Test-only re-export of the affinity token derivation.
+#[doc(hidden)]
+pub fn affinity_token_for_test(
+    session_hmac_secret: &[u8],
+    owner_user_id: &llmroller_core::ids::UserId,
+    raw_session_id: &str,
+) -> String {
+    llmroller_proto::affinity::compute_salted_affinity_token(
+        session_hmac_secret,
+        owner_user_id,
+        raw_session_id,
+    )
+}

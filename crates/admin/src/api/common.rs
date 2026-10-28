@@ -17,6 +17,51 @@ pub(crate) struct MutationAuditContext {
 ///
 /// Entity SQL is deliberately supplied as a transaction closure so network
 /// operations and validation can stay outside the write lock.
+/// Resolve the HMAC key used to seal the `audit_log` hash chain.
+///
+/// **The instance key or nothing.** `ADR-11` guarantees that rotating
+/// `LLMRoller_MASTER_KEY` does not invalidate the audit chain, and the only way to keep that
+/// guarantee is for the audit key to come from `instance_secrets` and nowhere else.
+///
+/// This previously fell back to `sha256(master_key)` in two places (`ISSUE-0138`). That was not
+/// merely a non-KDF derivation: it made the chain's meaning depend on a key `ADR-11` promises is
+/// irrelevant to it. After a rotation, every row written before it stops verifying while new rows
+/// chain from a different key — a silent failure found during an incident rather than before one.
+///
+/// Returning `Err` rather than substituting a derivation is the whole point. A missing audit row
+/// is visible and recoverable; a chain that looks valid for new rows and invalid for old ones is
+/// not.
+///
+/// `master_key` is taken as a parameter only so callers cannot accidentally reintroduce a
+/// derivation from ambient state, and so the "does the master key influence this?" property is
+/// directly testable — it does not, which is the point.
+pub fn resolve_audit_hmac_key(
+    audit_hmac_key: Option<&llmroller_core::seams::SecretBytes>,
+    _master_key: &llmroller_store::crypto::MasterKey,
+) -> Result<llmroller_core::seams::SecretBytes, AuditKeyError> {
+    audit_hmac_key
+        .cloned()
+        .ok_or(AuditKeyError::InstanceKeyNotConfigured)
+}
+
+/// Why an audit key could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKeyError {
+    /// No `instance_secrets` audit key was configured for this process.
+    ///
+    /// Deliberately **not** recoverable by deriving from the master key — see
+    /// [`resolve_audit_hmac_key`].
+    InstanceKeyNotConfigured,
+}
+
+impl std::fmt::Display for AuditKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("instance audit HMAC key is not configured")
+    }
+}
+
+impl std::error::Error for AuditKeyError {}
+
 pub(crate) async fn execute_atomic_mutation<T, F>(
     state: &ApiAppState,
     domains: Vec<ConfigDomain>,
@@ -45,11 +90,19 @@ where
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     let audit = CURRENT_MUTATION_AUDIT.try_with(Clone::clone).ok().flatten();
-    let fallback = llmroller_store::crypto::sha256_hex(state.master_key.as_bytes());
-    let audit_key: Vec<u8> = state.audit_hmac_key.as_ref().map_or_else(
-        || fallback.into_bytes(),
-        |secret| secret.expose_secret().to_vec(),
-    );
+    // No master-key fallback (`ISSUE-0138`, `ADR-11`). `sha256(master_key)` was here before: it is
+    // a non-KDF derivation of an HMAC key from another key, and — worse than being weak — it
+    // silently breaks the one guarantee `ADR-11` makes. After a master-key rotation, rows written
+    // under the old derivation simply stop verifying while new rows chain from a different key.
+    //
+    // When no instance key is configured, skip the audit append entirely rather than invent a
+    // substitute. A missing row is visible and recoverable; a chain that looks valid for new rows
+    // and invalid for old ones is discovered during an incident.
+    let audit_key: Option<Vec<u8>> =
+        match resolve_audit_hmac_key(state.audit_hmac_key.as_ref(), &state.master_key) {
+            Ok(key) => Some(key.expose_secret().to_vec()),
+            Err(_) => None,
+        };
     let slot = Arc::new(StdMutex::new(None::<Result<T, MutationResponseError>>));
     let slot_for_op = slot.clone();
 
@@ -57,8 +110,8 @@ where
         Box::pin(async move {
             match run(tx).await {
                 Ok(value) => {
-                    if let Some(audit) = audit {
-                        scan_mutation_audit(tx, &audit_key, &audit)
+                    if let (Some(audit), Some(audit_key)) = (audit, audit_key.as_deref()) {
+                        scan_mutation_audit(tx, audit_key, &audit)
                             .await
                             .map_err(|_| writer_busy_error())?;
                     }

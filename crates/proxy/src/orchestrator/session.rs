@@ -74,6 +74,26 @@ impl ResolvedSession {
     }
 }
 
+/// Derive the outbound affinity token, with the same one-canonical-fallback rule as the pin key.
+///
+/// A secret-less context gets the domain-separated `fallback_session_hash` rather than an HMAC
+/// under `b""` (`ISSUE-0137`). An empty-key HMAC is as public as an all-zero one, and it *looks*
+/// keyed — which is the property that makes it worse than an obviously-unkeyed derivation.
+///
+/// This is the only place the derivation lives, so a test hook can exercise the production
+/// expression instead of re-implementing it and becoming unfalsifiable.
+pub(crate) fn derive_salted_affinity_token(
+    session_hmac_secret: Option<&[u8]>,
+    owner_user_id: &UserId,
+    client_key_id: ClientKeyId,
+    affinity_seed: &str,
+) -> String {
+    session_hmac_secret.map_or_else(
+        || fallback_session_hash(client_key_id, affinity_seed),
+        |secret| compute_salted_affinity_token(secret, owner_user_id, affinity_seed),
+    )
+}
+
 /// Deterministic in-memory pin key; the raw session string never leaves the process.
 ///
 /// Implements the eight-step inbound session precedence (`RTE-1`), the Step 8
@@ -228,9 +248,14 @@ pub(crate) fn resolve_session(
     } else {
         raw_session.as_str()
     };
-    let salted_token = compute_salted_affinity_token(
-        session_hmac_secret.unwrap_or(b""),
+    // No empty-key HMAC (`ISSUE-0137`). An HMAC under `b""` is as public as one under
+    // `[0u8; 32]`: it looks keyed and provides nothing. Secret-less contexts get the same
+    // domain-separated derivation the pin key uses, so the token is stable for fixtures while
+    // never pretending to be a keyed value.
+    let salted_token = derive_salted_affinity_token(
+        session_hmac_secret,
         &client_key.owner_user_id,
+        client_key.id,
         affinity_seed,
     );
     let outbound_raw_session = if use_step8 {
@@ -275,4 +300,44 @@ pub(crate) async fn read_bounded_error_body(response: reqwest::Response) -> Byte
         }
     }
     Bytes::from(buffer)
+}
+
+/// Test-only re-exports so integration tests can exercise the fallback without widening the
+/// production API surface. `session_hash` and `fallback_session_hash` are `pub(crate)`, which is
+/// right for production; these wrappers exist only under `cfg(test)`-equivalents.
+#[doc(hidden)]
+pub fn session_hash_for_test(
+    session_hmac_secret: Option<&[u8]>,
+    owner_user_id: &UserId,
+    client_key_id: ClientKeyId,
+    raw_session: &str,
+) -> String {
+    session_hash(
+        session_hmac_secret,
+        owner_user_id,
+        client_key_id,
+        raw_session,
+    )
+}
+
+#[doc(hidden)]
+pub fn fallback_session_hash_for_test(client_key_id: ClientKeyId, raw_session: &str) -> String {
+    fallback_session_hash(client_key_id, raw_session)
+}
+
+/// Test-only: the salted affinity token as `resolve_session` derives it, including its
+/// secret-less path.
+#[doc(hidden)]
+pub fn salted_affinity_token_for_test(
+    session_hmac_secret: Option<&[u8]>,
+    owner_user_id: &UserId,
+    client_key_id: ClientKeyId,
+    raw_session: &str,
+) -> String {
+    derive_salted_affinity_token(
+        session_hmac_secret,
+        owner_user_id,
+        client_key_id,
+        raw_session,
+    )
 }

@@ -625,6 +625,52 @@ async fn fresh_poll_usage(
     Ok(parsed)
 }
 
+/// The pass-through session hash — one canonical fallback, shared with the orchestrator.
+///
+/// This used to be `compute_session_hash(&[0u8; 32], owner_user_id, …)` when the instance secret
+/// was absent: an HMAC under a publicly-known key. That *looked* keyed while providing no secrecy
+/// at all, and it disagreed with the orchestrator's domain-separated `fallback_session_hash`,
+/// which scopes by `client_key_id` instead of `owner_user_id`. Two subsystems, one session, two
+/// different hashes — pinning and usage attribution could not agree on which session a request
+/// belonged to (`ISSUE-0137`, `RTE-1`).
+///
+/// Every pass-through endpoint goes through here, so the fix cannot be half-applied to one handler
+/// and missed in another.
+pub(crate) fn usage_session_hash(
+    state: &ProxyAuthState,
+    client_key: &ClientKeyRecord,
+    raw_session: &str,
+) -> Option<String> {
+    usage_session_hash_with(
+        state
+            .session_hmac_secret
+            .as_ref()
+            .map(llmroller_core::seams::SecretBytes::expose_secret),
+        &client_key.owner_user_id,
+        client_key.id,
+        raw_session,
+    )
+}
+
+/// The secret-in, hash-out core, so the behaviour is testable without constructing a
+/// `ProxyAuthState` (which needs a database).
+pub(crate) fn usage_session_hash_with(
+    session_hmac_secret: Option<&[u8]>,
+    owner_user_id: &llmroller_core::ids::UserId,
+    client_key_id: llmroller_core::ids::ClientKeyId,
+    raw_session: &str,
+) -> Option<String> {
+    if raw_session.is_empty() {
+        return None;
+    }
+    Some(crate::orchestrator::session_hash(
+        session_hmac_secret,
+        owner_user_id,
+        client_key_id,
+        raw_session,
+    ))
+}
+
 /// Handler for GET /v1/usage (USG-7).
 pub async fn get_v1_usage_handler(
     State(state): State<ProxyAuthState>,
@@ -645,22 +691,7 @@ pub async fn get_v1_usage_handler(
         .collect();
     let (sess_id, _step) =
         llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
-    let fallback = [0u8; 32];
-    use llmroller_core::seams::ExposeSecret as _;
-    let secret = state
-        .session_hmac_secret
-        .as_ref()
-        .map(|s| s.expose_secret())
-        .unwrap_or(&fallback);
-    let session_hash = if !sess_id.is_empty() {
-        Some(llmroller_core::session::compute_session_hash(
-            secret,
-            &client_key.owner_user_id,
-            &sess_id,
-        ))
-    } else {
-        None
-    };
+    let session_hash = usage_session_hash(&state, &client_key, &sess_id);
 
     let now = state.clock.now_ms();
     let snapshot = state.snapshot.load();
@@ -900,21 +931,7 @@ pub async fn get_v1_usage_raw_handler(
         .collect();
     let (sess_id, _step) =
         llmroller_core::session::extract_session_precedence(&header_vec, &HashMap::new());
-    let fallback = [0u8; 32];
-    let secret = state
-        .session_hmac_secret
-        .as_ref()
-        .map(|s| s.expose_secret())
-        .unwrap_or(&fallback);
-    let session_hash = if !sess_id.is_empty() {
-        Some(llmroller_core::session::compute_session_hash(
-            secret,
-            &client_key.owner_user_id,
-            &sess_id,
-        ))
-    } else {
-        None
-    };
+    let session_hash = usage_session_hash(&state, &client_key, &sess_id);
 
     let now = state.clock.now_ms();
     let snapshot = state.snapshot.load();
@@ -985,6 +1002,38 @@ mod tests {
         )
         .expect("default openrouter url");
         assert_eq!(default_or, "https://openrouter.ai/api/v1/key");
+    }
+
+    /// The pass-through path must use the canonical fallback, not a zero-key HMAC.
+    ///
+    /// This exercises the *production* expression (`usage_session_hash_with` → the orchestrator's
+    /// `session_hash`), so reverting the fix here fails this test. The integration test in
+    /// `tests/session_hash_fallback.rs` pins the shared helper; this pins the call site.
+    #[test]
+    #[doc = "Spec: RTE-1, SEC-5, USG-7; ISSUE-0137"]
+    fn usage_session_hash_uses_the_canonical_secretless_fallback() {
+        let user: llmroller_core::ids::UserId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("user");
+        let key_id: llmroller_core::ids::ClientKeyId =
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW".parse().expect("key");
+
+        let secretless = usage_session_hash_with(None, &user, key_id, "sess-abc")
+            .expect("a non-empty session yields a hash");
+
+        // Pre-fix this was `compute_session_hash(&[0u8; 32], owner_user_id, …)`.
+        let zero_keyed =
+            llmroller_core::session::compute_session_hash(&[0u8; 32], &user, "sess-abc");
+        assert_ne!(
+            secretless, zero_keyed,
+            "the pass-through path must not hash under an all-zero HMAC key"
+        );
+        assert_eq!(
+            secretless,
+            crate::orchestrator::fallback_session_hash_for_test(key_id, "sess-abc"),
+            "it must resolve through the one canonical fallback, the same one the orchestrator uses"
+        );
+
+        // An empty session is still `None`, not a hash of the empty string.
+        assert!(usage_session_hash_with(None, &user, key_id, "").is_none());
     }
 
     fn caller(user_id: llmroller_core::ids::UserId) -> ClientKeyRecord {

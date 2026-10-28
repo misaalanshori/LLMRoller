@@ -13,6 +13,7 @@ pub mod setup;
 pub mod ui;
 
 pub use api::ApiAppState;
+pub use api::common::{AuditKeyError, resolve_audit_hmac_key};
 pub use auth::AuthAppState;
 use axum::Router;
 use axum::middleware::from_fn;
