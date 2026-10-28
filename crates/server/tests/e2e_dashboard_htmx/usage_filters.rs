@@ -291,14 +291,21 @@ async fn usage_summary_honors_the_initiator_filter() {
 
     // The same user owns both keys, so filtering by the user id must return both rows. This is
     // what makes the predicate a union over identity kinds rather than a single column.
-    let by_user = get_json(
+    //
+    // Asserted on **timeseries**, not summary: `get_usage_summary_internal` falls back to scanning
+    // raw `usage_events` whenever the rollup aggregate is zero, and that fallback has its own
+    // predicate. A summary assertion here is therefore satisfied by the fallback even when the
+    // rollup clause is wrong — mutant M2c, which collapses the union to `client_key_id`, still
+    // passed. Timeseries has no fallback, so it pins the rollup predicate directly.
+    let by_user_ts = get_json(
         &app,
         &cookie,
-        &format!("/admin/api/usage/summary?initiator={admin_id}"),
+        &format!("/admin/api/usage/timeseries?initiator={admin_id}"),
     )
     .await;
     assert_eq!(
-        by_user["total_requests"], 2,
+        timeseries_total(&by_user_ts),
+        ROWS[0].total() + ROWS[1].total(),
         "filtering by the owning user must return every row that user initiated"
     );
 
@@ -307,6 +314,17 @@ async fn usage_summary_honors_the_initiator_filter() {
     assert_eq!(
         unknown["total_requests"], 0,
         "an unknown initiator matches nothing"
+    );
+    let unknown_ts = get_json(
+        &app,
+        &cookie,
+        "/admin/api/usage/timeseries?initiator=nobody",
+    )
+    .await;
+    assert_eq!(
+        timeseries_total(&unknown_ts),
+        0,
+        "an unknown initiator must not fall through to the unfiltered total"
     );
 }
 
@@ -319,33 +337,73 @@ async fn usage_summary_honors_the_initiator_filter() {
 #[tokio::test]
 async fn since_until_boundaries_are_inclusive() {
     let (_dir, pool, app, cookie, admin_id) = setup().await;
-    seed_two_rows(&pool, admin_id).await;
 
-    // Window exactly bounding both rows.
+    // Deliberately aligned to **hour boundaries**, because `summary`/`timeseries`/`breakdown`
+    // filter on `hour_ms`: a fixture at an arbitrary millisecond can never sit exactly on the
+    // boundary of the column being compared, so a strict `>` mutation would go unnoticed.
+    // Mutant M5 proved exactly that — the original fixture passed with `>=` turned into `>`.
+    let h1 = 1_000 * 3_600_000_i64;
+    let h2 = h1 + 3_600_000;
+    let rows = [
+        Row {
+            ts: h1,
+            client_key_id: "ck_alpha",
+            provider_id: "prov_a",
+            model: "model-one",
+            tokens: (10, 0, 0, 0),
+            reasoning: 0,
+            cost_micro_usd: 100,
+        },
+        Row {
+            ts: h2,
+            client_key_id: "ck_alpha",
+            provider_id: "prov_a",
+            model: "model-one",
+            tokens: (20, 0, 0, 0),
+            reasoning: 0,
+            cost_micro_usd: 200,
+        },
+    ];
+    seed_client_keys(&pool, admin_id, &["ck_alpha"]).await;
+    seed(&pool, admin_id, &rows).await;
+
+    // `hour_ms` of each row equals its `ts` here, so `since = h1` and `until = h2` land exactly on
+    // the boundary of both rows.
+    for endpoint in ["summary", "timeseries", "breakdown", "events"] {
+        let json = get_json(
+            &app,
+            &cookie,
+            &format!("/admin/api/usage/{endpoint}?since={h1}&until={h2}"),
+        )
+        .await;
+        let total = match endpoint {
+            "summary" => json["total_tokens"].as_i64().expect("summary total"),
+            "timeseries" => timeseries_total(&json),
+            "breakdown" => breakdown_total(&json),
+            _ => json["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|e| e["total_tokens"].as_i64().expect("event total"))
+                .sum(),
+        };
+        assert_eq!(
+            total, 30,
+            "{endpoint}: a row exactly at `since` and one exactly at `until` must both be counted"
+        );
+    }
+
+    // One millisecond inside the first row excludes it, on the endpoints that compare `hour_ms`.
     let json = get_json(
         &app,
         &cookie,
-        &format!(
-            "/admin/api/usage/summary?since={}&until={}",
-            ROWS[0].ts, ROWS[1].ts
-        ),
+        &format!("/admin/api/usage/timeseries?since={}", h1 + 1),
     )
     .await;
     assert_eq!(
-        json["total_requests"], 2,
-        "an event exactly at `since` and one exactly at `until` must both be included"
-    );
-
-    // A window that excludes the first row by one millisecond.
-    let json = get_json(
-        &app,
-        &cookie,
-        &format!("/admin/api/usage/summary?since={}", ROWS[0].ts + 1),
-    )
-    .await;
-    assert_eq!(
-        json["total_requests"], 1,
-        "since is a strict lower bound of one ms"
+        timeseries_total(&json),
+        20,
+        "`since` is an inclusive lower bound, so a row strictly before it is excluded"
     );
 }
 
