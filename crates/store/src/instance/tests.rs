@@ -8,7 +8,7 @@ use std::sync::Arc;
 use llmroller_core::seams::{DeterministicRng, EntropySource, ExposeSecret};
 use tempfile::TempDir;
 
-use super::{InstanceError, load_or_initialize};
+use super::{InstanceError, load_instance_state, load_or_initialize};
 use crate::crypto::MasterKey;
 use crate::migrations::migrate;
 use crate::pool::{Role, open_pool};
@@ -129,4 +129,92 @@ async fn reload_preserves_secret_values_and_rejects_mismatches() {
     assert_eq!(rotating.exit_code(), 3);
 
     pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// ISSUE-0183 — the read-only loader must never bootstrap
+// ---------------------------------------------------------------------------
+
+/// `load_instance_state` must refuse an uninitialised database instead of creating the row.
+///
+/// This is the store-level guarantee `llmroller doctor` depends on. `load_or_initialize`
+/// bootstraps on the same input; that difference is the whole point of having two functions.
+#[tokio::test]
+#[doc = "Spec: SEC-2"]
+async fn read_only_loader_refuses_an_uninitialised_database() {
+    let (_directory, pool) = database().await;
+    let key = MasterKey::from_bytes([0x22; 32]);
+
+    let err = load_instance_state(&pool, "mk_one", &key, entropy(0x55))
+        .await
+        .expect_err("an uninitialised database must be refused");
+    assert!(
+        matches!(err, InstanceError::NotInitialized),
+        "expected NotInitialized, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 10, "uninitialised is a 10, not a crypto 3");
+
+    // Nothing may have been written.
+    let meta_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_meta")
+        .fetch_one(&pool)
+        .await
+        .expect("meta count");
+    let secret_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_secrets")
+        .fetch_one(&pool)
+        .await
+        .expect("secret count");
+    assert_eq!(
+        meta_count, 0,
+        "the read-only loader must not create instance_meta"
+    );
+    assert_eq!(
+        secret_count, 0,
+        "the read-only loader must not create instance_secrets"
+    );
+}
+
+/// On an initialised database the read-only loader returns the same state as the initialiser.
+#[tokio::test]
+#[doc = "Spec: SEC-1, Spec: SEC-2"]
+async fn read_only_loader_returns_the_same_state_as_the_initialiser() {
+    let (_directory, pool) = database().await;
+    let key = MasterKey::from_bytes([0x33; 32]);
+
+    let initialized = load_or_initialize(&pool, "mk_one", &key, entropy(0x77), 1_000)
+        .await
+        .expect("bootstrap");
+    let read_back = load_instance_state(&pool, "mk_one", &key, entropy(0x99))
+        .await
+        .expect("read-only load");
+
+    assert_eq!(read_back.instance_id, initialized.instance_id);
+    assert_eq!(read_back.active_master_key_id, "mk_one");
+    assert_eq!(
+        read_back.session_hmac_secret.expose_secret(),
+        initialized.session_hmac_secret.expose_secret()
+    );
+    assert_eq!(
+        read_back.audit_hmac_key.expose_secret(),
+        initialized.audit_hmac_key.expose_secret()
+    );
+}
+
+/// A master-key id disagreement is a `3`, not an "uninitialised" `10`.
+#[tokio::test]
+#[doc = "Spec: SEC-2"]
+async fn read_only_loader_keeps_the_master_key_id_guard() {
+    let (_directory, pool) = database().await;
+    let key = MasterKey::from_bytes([0x44; 32]);
+    load_or_initialize(&pool, "mk_one", &key, entropy(0x11), 1_000)
+        .await
+        .expect("bootstrap");
+
+    let err = load_instance_state(&pool, "mk_two", &key, entropy(0x12))
+        .await
+        .expect_err("a key-id mismatch must be refused");
+    assert!(
+        matches!(err, InstanceError::MasterKeyIdMismatch { .. }),
+        "expected MasterKeyIdMismatch, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 3);
 }

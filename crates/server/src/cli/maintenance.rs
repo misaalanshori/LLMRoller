@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use llmroller_core::seams::{Clock, ExposeSecret, OsEntropy, SystemClock};
 use llmroller_store::crypto::{load_master_key_from_env, load_master_key_id_from_env};
-use llmroller_store::instance::load_or_initialize;
+use llmroller_store::instance::{load_instance_state, load_or_initialize};
 use llmroller_store::migrations::migrate;
 use llmroller_store::pool::{Role, open_pool};
 use llmroller_store::rotation::rotate_master_key;
@@ -84,6 +84,27 @@ pub(crate) async fn run_restore_cmd(args: RestoreArgs) -> ExitCode {
     }
 }
 
+/// Exit code for "the file's `_llmroller_schema.version` is not the version this binary was
+/// built for" (`5. SRDD §5.5.1`, `ISSUE-0183`).
+///
+/// `0..=14` are all assigned in that table -- `12` is the writer-panic code, so the brief's
+/// suggested slot was already taken -- making `15` the first free value.
+const EXIT_SCHEMA_MISMATCH: u8 = 15;
+
+/// The schema version actually recorded in the database file.
+///
+/// Returns `None` when `_llmroller_schema` has no usable row, which means the file is not a
+/// recognised LLMRoller database at all. This is a *read*: `migrations::SCHEMA_VERSION` is
+/// what the binary was compiled against and says nothing about the file on disk, which is
+/// the distinction `doctor` exists to surface (`ISSUE-0183`).
+async fn read_database_schema_version(pool: &sqlx::SqlitePool) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _llmroller_schema")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
 pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
     let data_dir = resolve_data_dir(args.data_dir);
     let database = data_dir.join("llmroller.db");
@@ -98,10 +119,18 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
             return ExitCode::from(13);
         }
     };
-    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check;")
+    // A query failure is not a failed check. Collapsing both into "integrity failed" would
+    // send an operator hunting for corruption when SQLite simply refused to run the pragma.
+    let integrity: String = match sqlx::query_scalar("PRAGMA integrity_check;")
         .fetch_one(&pool)
         .await
-        .unwrap_or_else(|_| "error".to_string());
+    {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("error: sqlite integrity_check could not run: {e}");
+            return ExitCode::from(13);
+        }
+    };
     if integrity != "ok" {
         eprintln!("error: sqlite integrity_check failed: {integrity}");
         return ExitCode::from(13);
@@ -109,6 +138,7 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
     for kind in llmroller_core::provider::ProviderKind::ALL {
         let _ = kind.preset_toml();
     }
+    let database_schema_version = read_database_schema_version(&pool).await;
     let mk = match load_master_key_from_env() {
         Ok(k) => k,
         Err(e) => {
@@ -124,13 +154,25 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
         }
     };
     {
+        // A diagnostic must never initialise. `load_or_initialize` would create
+        // `instance_meta`/`instance_secrets` on exactly the partially-restored database this
+        // command is meant to report on, so the read-only loader is used instead
+        // (`ISSUE-0183`).
         let entropy = Arc::new(OsEntropy::new());
-        let clock = SystemClock::new();
-        let state = match load_or_initialize(&pool, &mk_id, &mk, entropy, clock.now_ms()).await {
+        let state = match load_instance_state(&pool, &mk_id, &mk, entropy).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("error: master key check failed: {e}");
-                return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(3));
+                eprintln!("error: instance state check failed: {e}");
+                let code = u8::try_from(e.exit_code()).unwrap_or(3);
+                // Report the schema we did read, so a drifted file is not misreported as a
+                // bare instance fault.
+                if let Some(version) = database_schema_version {
+                    eprintln!(
+                        "error: database schema version is {version}, this binary supports {}",
+                        llmroller_store::migrations::SCHEMA_VERSION
+                    );
+                }
+                return ExitCode::from(code);
             }
         };
         if let Err(e) = llmroller_store::audit::verify_audit_log(
@@ -146,16 +188,36 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
         }
     }
     pool.close().await;
+
+    // Report the version the *file* declares, not the one this binary was built for. Equal
+    // is `ok`; anything else is schema drift, which is the condition this command cannot
+    // otherwise detect (`ISSUE-0183`).
+    let compiled = llmroller_store::migrations::SCHEMA_VERSION;
+    let (status, exit_code) = match database_schema_version {
+        Some(version) if version == compiled => ("ok", ExitCode::SUCCESS),
+        Some(version) => {
+            eprintln!(
+                "error: database schema version is {version}, this binary supports {compiled}; \
+                 run the binary that matches the database, or migrate it"
+            );
+            ("schema_mismatch", ExitCode::from(EXIT_SCHEMA_MISMATCH))
+        }
+        None => {
+            eprintln!("error: database has no readable _llmroller_schema version row");
+            ("schema_unknown", ExitCode::from(EXIT_SCHEMA_MISMATCH))
+        }
+    };
     println!(
         "{}",
         serde_json::json!({
-            "status": "ok",
+            "status": status,
             "database": database.to_string_lossy(),
             "integrity": "ok",
-            "schema_version": llmroller_store::migrations::SCHEMA_VERSION,
+            "schema_version": database_schema_version,
+            "binary_schema_version": compiled,
         })
     );
-    ExitCode::SUCCESS
+    exit_code
 }
 
 /// Redacts sensitive header values (`authorization`, `*key*`, `*token*`, `*secret*`, `cookie`)
@@ -227,10 +289,14 @@ pub(crate) async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> E
             })
         })
         .collect();
+    // Same rule as `doctor`: report what the file says, not what the binary was built for
+    // (`ISSUE-0183`).
+    let database_schema_version = read_database_schema_version(&pool).await;
     pool.close().await;
     let payload = serde_json::json!({
         "version": version_string(),
-        "schema_version": llmroller_store::migrations::SCHEMA_VERSION,
+        "schema_version": database_schema_version,
+        "binary_schema_version": llmroller_store::migrations::SCHEMA_VERSION,
         "providers": providers,
     });
     let serialized = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());

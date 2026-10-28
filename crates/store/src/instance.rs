@@ -37,6 +37,12 @@ pub enum InstanceError {
         /// Identifier stored in `instance_meta`.
         active: String,
     },
+    /// The database has a schema but no initialised instance row.
+    ///
+    /// Distinct from [`InstanceError::CorruptMetadata`] because the remedy differs: this is
+    /// an uninitialised (or partially restored) database, not a damaged one.
+    #[error("database is not an initialized LLMRoller instance (instance_meta is empty)")]
+    NotInitialized,
     /// The metadata row or its 16-byte instance id is malformed.
     #[error("instance_meta is missing or corrupt")]
     CorruptMetadata,
@@ -75,6 +81,7 @@ impl InstanceError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Sqlx(_) => 13,
+            Self::NotInitialized => 10,
             Self::RotationInProgress
             | Self::MasterKeyIdMismatch { .. }
             | Self::CorruptMetadata
@@ -144,6 +151,98 @@ pub async fn load_or_initialize(
             return Err(InstanceError::CorruptMetadata);
         }
         return initialize(pool, key_id, master_key, entropy, now_ms).await;
+    };
+
+    if rotation_state != "idle" {
+        return Err(InstanceError::RotationInProgress);
+    }
+    if active_master_key_id != key_id {
+        return Err(InstanceError::MasterKeyIdMismatch {
+            provided: key_id.to_owned(),
+            active: active_master_key_id,
+        });
+    }
+
+    let instance_id = decode_instance_id(&instance_id_bytes)?;
+    let sealer = XChaCha20Poly1305Sealer::new(master_key.clone(), instance_id, entropy);
+    let rows: Vec<(String, Vec<u8>, String)> =
+        sqlx::query_as("SELECT name, sealed, master_key_id FROM instance_secrets ORDER BY name")
+            .fetch_all(pool)
+            .await?;
+
+    let mut session_hmac_secret = None;
+    let mut audit_hmac_key = None;
+    for (name, sealed, row_key_id) in rows {
+        if row_key_id != active_master_key_id {
+            return Err(InstanceError::SecretKeyIdMismatch {
+                name,
+                found: row_key_id,
+                expected: active_master_key_id,
+            });
+        }
+        let plain = sealer.open(
+            "instance_secret",
+            &[active_master_key_id.as_bytes(), name.as_bytes()],
+            &sealed,
+        )?;
+        let length = plain.expose_secret().len();
+        let target = match name.as_str() {
+            SESSION_SECRET => &mut session_hmac_secret,
+            AUDIT_SECRET => &mut audit_hmac_key,
+            _ => return Err(InstanceError::CorruptMetadata),
+        };
+        if length != INSTANCE_SECRET_LEN {
+            return Err(InstanceError::InvalidSecretLength { name, length });
+        }
+        *target = Some(plain);
+    }
+
+    let session_hmac_secret = session_hmac_secret.ok_or(InstanceError::MissingSecret {
+        name: SESSION_SECRET,
+    })?;
+    let audit_hmac_key =
+        audit_hmac_key.ok_or(InstanceError::MissingSecret { name: AUDIT_SECRET })?;
+
+    Ok(InstanceState {
+        instance_id,
+        active_master_key_id,
+        session_hmac_secret,
+        audit_hmac_key,
+    })
+}
+
+/// Load existing instance state **without ever creating it**.
+///
+/// This is the read-only sibling of [`load_or_initialize`]: identical verification (rotation
+/// guard, master-key id agreement, per-secret AAD check, exact 32-byte length), but an absent
+/// `instance_meta` row is [`InstanceError::NotInitialized`] rather than a bootstrap.
+///
+/// It exists because a *diagnostic* must not initialise the thing it is diagnosing. Before
+/// this, `llmroller doctor` had to call [`load_or_initialize`] to obtain an
+/// [`InstanceState`] (and with it the `audit_hmac_key`), so on a database missing
+/// `instance_meta` the diagnostic silently *created* the row it was supposed to report as
+/// missing (`ISSUE-0183`). Splitting the read from the bootstrap is what lets the
+/// initialiser stay strict and the diagnostic stay read-only.
+///
+/// # Errors
+///
+/// Returns [`InstanceError::NotInitialized`] when `instance_meta` has no row, plus every
+/// verification failure [`load_or_initialize`] can return.
+pub async fn load_instance_state(
+    pool: &SqlitePool,
+    key_id: &str,
+    master_key: &MasterKey,
+    entropy: Arc<dyn EntropySource>,
+) -> Result<InstanceState, InstanceError> {
+    let meta: Option<(Vec<u8>, String, String)> = sqlx::query_as(
+        "SELECT instance_id, active_master_key_id, rotation_state \
+         FROM instance_meta WHERE singleton = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((instance_id_bytes, active_master_key_id, rotation_state)) = meta else {
+        return Err(InstanceError::NotInitialized);
     };
 
     if rotation_state != "idle" {

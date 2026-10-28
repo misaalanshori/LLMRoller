@@ -48,16 +48,10 @@ async fn create_live_database(data_dir: &Path) {
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
     let admin_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let admin_port = admin_listener
-        .local_addr()
-        .expect("local addr")
-        .port();
+    let admin_port = admin_listener.local_addr().expect("local addr").port();
     drop(admin_listener);
     let metrics_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let metrics_port = metrics_listener
-        .local_addr()
-        .expect("local addr")
-        .port();
+    let metrics_port = metrics_listener.local_addr().expect("local addr").port();
     drop(metrics_listener);
 
     let mut child = tokio::process::Command::new(llmroller_binary())
@@ -96,7 +90,10 @@ async fn create_live_database(data_dir: &Path) {
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
-    assert!(ready, "serve must become ready before the fixture database exists");
+    assert!(
+        ready,
+        "serve must become ready before the fixture database exists"
+    );
 
     // `serve` holds a flock; it exits on kill, but the lock file lingers harmlessly.
     let lock = data_dir.join("llmroller.lock");
@@ -250,10 +247,7 @@ async fn doctor_does_not_initialize_a_bare_database() {
         .await
         .expect("count secrets");
     conn.close().await.expect("close");
-    assert_eq!(
-        meta_rows, 0,
-        "doctor must not create instance_meta; it did"
-    );
+    assert_eq!(meta_rows, 0, "doctor must not create instance_meta; it did");
     assert_eq!(
         secret_rows, 0,
         "doctor must not create instance_secrets; it did"
@@ -269,7 +263,10 @@ async fn doctor_still_exits_10_for_a_missing_file() {
     std::fs::create_dir_all(data_dir).expect("data dir");
 
     let (code, _stdout, stderr) = run_cli(&["doctor"], data_dir).await;
-    assert_eq!(code, 10, "a missing database must exit 10; stderr: {stderr}");
+    assert_eq!(
+        code, 10,
+        "a missing database must exit 10; stderr: {stderr}"
+    );
 }
 
 /// `export-diagnostics` has the identical constant and must read the same version.

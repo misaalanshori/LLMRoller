@@ -582,6 +582,59 @@ pub(crate) fn parse_catalog_prices(
     (model_costs, catalog_aliases)
 }
 
+/// Read a catalog body in bounded chunks, refusing anything over `SEC-8`'s ceiling.
+///
+/// The ceiling is [`llmroller_proto::discovery::MAX_DISCOVERY_BYTES`] -- the same 2 MiB
+/// `SEC-8` applies to every remote catalog this codebase reads (`/models`, `/usage`). One
+/// number for "upstream body too large", not a second locally-tuned constant.
+///
+/// The `.timeout(...)` on the request bounds *time*, not *bytes*: a fast CDN-hosted
+/// multi-hundred-megabyte JSON arrives comfortably inside ten seconds. This bounds bytes
+/// (`ISSUE-0179`).
+///
+/// Generic over the chunk source so the ceiling is testable without a network, a TLS
+/// endpoint, or a hostile server.
+///
+/// # Errors
+///
+/// Returns `Err` with an actionable message when the body exceeds the ceiling or the
+/// transport fails mid-stream. A truncated body must never be returned as if complete: a
+/// partial catalog that parsed would import partial prices and report success.
+pub(crate) async fn read_catalog_body<S>(source: &mut S) -> Result<Vec<u8>, String>
+where
+    S: CatalogChunkSource,
+{
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = source.next_chunk().await? {
+        if body.len().saturating_add(chunk.len()) > llmroller_proto::discovery::MAX_DISCOVERY_BYTES
+        {
+            return Err(format!(
+                "price catalog response exceeded {} bytes; refusing to read further",
+                llmroller_proto::discovery::MAX_DISCOVERY_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A source of body chunks for [`read_catalog_body`].
+///
+/// Implemented for `reqwest::Response` so the production path and the tests exercise the
+/// same ceiling logic.
+pub(crate) trait CatalogChunkSource {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String>;
+}
+
+impl CatalogChunkSource for reqwest::Response {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.chunk()
+            .await
+            .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub(crate) async fn post_admin_prices_sync_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -604,17 +657,24 @@ pub(crate) async fn post_admin_prices_sync_handler(
 
     let client = llmroller_proxy::ssrf::create_guarded_client(false)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let catalog: serde_json::Value = client
+    let mut response = client
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?
         .error_for_status()
-        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?
-        .json()
+        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?;
+    // Byte-bounded read: the request timeout bounds time, not size (`ISSUE-0179`).
+    let body = read_catalog_body(&mut response)
         .await
         .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?;
+    let catalog: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        map_price_error(
+            StatusCode::BAD_GATEWAY,
+            format!("price catalog response is not valid JSON: {e}"),
+        )
+    })?;
 
     let (model_costs, catalog_aliases) = parse_catalog_prices(&catalog);
 
@@ -703,7 +763,7 @@ pub(crate) async fn post_admin_prices_sync_handler(
                 tiers: template.tiers.clone(),
                 schedules: template.schedules.clone(),
                 source: "synced".to_string(),
-                now_ms: chrono_like_now_ms(),
+                now_ms: state.auth.clock.now_ms(),
             },
         )
         .await

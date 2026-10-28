@@ -163,7 +163,9 @@ impl FakeChunks {
             delivered: 0,
         }
     }
+}
 
+impl super::settings::CatalogChunkSource for FakeChunks {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.remaining == 0 {
             return Ok(None);
@@ -190,8 +192,7 @@ async fn price_sync_rejects_an_oversized_catalog_body() {
     let mut source = FakeChunks::new(MAX_DISCOVERY_BYTES + 1, 64 * 1024);
     let err = super::settings::read_catalog_body(&mut source)
         .await
-        .err()
-        .expect("a body over the ceiling must be refused, not returned");
+        .expect_err("a body over the ceiling must be refused, not returned");
     assert!(
         err.contains("exceed"),
         "the error must say the body was too large; got {err:?}"
@@ -236,15 +237,14 @@ async fn price_sync_passes_a_small_catalog_body_through() {
 #[doc = "Spec: SEC-8"]
 async fn price_sync_surfaces_a_mid_stream_error() {
     struct Broken;
-    impl Broken {
+    impl super::settings::CatalogChunkSource for Broken {
         async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
             Err("connection reset".to_string())
         }
     }
     let err = super::settings::read_catalog_body(&mut Broken)
         .await
-        .err()
-        .expect("a transport failure must not look like a complete body");
+        .expect_err("a transport failure must not look like a complete body");
     assert!(err.contains("connection reset"), "got {err:?}");
 }
 

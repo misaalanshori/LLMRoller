@@ -35,6 +35,49 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`doctor` reported a schema version it never read, and price sync had no response cap
+  (ISSUE-0183, ISSUE-0179).** Both are "a command reports something it did not actually
+  check".
+
+  `llmroller doctor` printed `migrations::SCHEMA_VERSION`, which is the version the *binary*
+  was compiled against, and always said `"status": "ok"`. Run against an older database — the
+  exact situation the command exists to diagnose — it reported its own number and claimed
+  health, so it could not detect schema drift between binary and file at all. It now reads
+  `_llmroller_schema.version`, compares it to the compiled constant, and on a mismatch exits
+  **`15`** with a message naming both numbers and `"status": "schema_mismatch"`. `15` because
+  `0..=14` are all assigned in SRDD §5.5.1 — `12`, the slot the issue proposed, is the
+  SQLite-writer-panic code — so the new row is `15`. `export-diagnostics` carried the
+  identical constant and got the same treatment; both now also emit
+  `binary_schema_version` alongside the file's `schema_version`.
+
+  Separately, `doctor` called `load_or_initialize` to obtain a sealer, and that function's
+  first act on a database missing `instance_meta` is to *create* it. A diagnostic must not
+  initialise the thing it diagnoses: on a partially restored database it either failed
+  confusingly (exit 13, `attempt to write a readonly database`) or, if the pool role were
+  ever relaxed, would have silently written. A read-only sibling,
+  `store::instance::load_instance_state`, now performs the same verification (rotation guard,
+  master-key id agreement, per-secret AAD unseal, 32-byte length check) and returns
+  `InstanceError::NotInitialized` (exit 10) instead of bootstrapping. The initialiser stays
+  strict; the diagnostic stays read-only. That the initialiser was the *only* way to get a
+  sealer is why the diagnostic reached for it, and is the structural gap this closes. Also
+  fixed in passing: `PRAGMA integrity_check` failing to *run* is now reported as "could not
+  run" rather than being flattened into "integrity failed", which sent operators hunting for
+  corruption when SQLite had simply refused the query.
+
+  The price-catalog sync called `.json()` on the response, reading an unbounded body. Its
+  10 s request timeout bounds *time*, not *bytes*: a fast CDN-hosted multi-hundred-megabyte
+  JSON arrives comfortably inside ten seconds. An admin-supplied `price_sync_catalog_url`
+  pointing at the wrong bucket could therefore OOM the process, and "only admins can trigger
+  it" is not a memory bound. The body is now read in chunks against
+  `MAX_DISCOVERY_BYTES` — `SEC-8`'s existing 2 MiB ceiling for `/models` and `/usage`
+  responses — so there is one number for "upstream body too large" rather than a second
+  locally-tuned constant. Oversize is `502` with an actionable message, and the refusal
+  happens before any row is touched, so a rejected sync cannot partially import prices. A
+  mid-stream transport error surfaces as an error rather than a short body, because a
+  truncated catalog that parsed would import partial prices and report success. The sync also
+  stamped written rows from `chrono_like_now_ms()` (`SystemTime::now()`) rather than the
+  injected clock the rest of the crate uses, which made its timestamps untestable.
+
 - **First-run setup hashed Argon2id while holding SQLite's write lock, and the admin user
   API silently coerced roles (ISSUE-0180, ISSUE-0181).** Two Argon2id-under-concurrency
   defects in the control plane, batched because both are about a permit that does not cover
