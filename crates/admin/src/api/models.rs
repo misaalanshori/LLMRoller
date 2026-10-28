@@ -84,6 +84,34 @@ pub(crate) async fn post_admin_model_alias_handler(
     Ok(StatusCode::CREATED)
 }
 
+/// Accepted `models.distribution` values, from the schema's CHECK constraint.
+const MODEL_DISTRIBUTIONS: [&str; 2] = ["weighted", "strict"];
+
+/// `PATCH /admin/api/models/{model_pk}` — partial update of one canonical model.
+///
+/// Replaces an eleven-line handler that accepted one field, discarded the SQL result, and
+/// wrote outside a transaction (`ISSUE-0170`):
+///
+/// - **Validation, not a CHECK violation.** `distribution` and `routing_strategy` are
+///   CHECK-constrained in `0001_initial.sql`, so an unchecked value surfaced as a `500` from
+///   SQLite. Both are validated here first and rejected with `422`, mirroring the
+///   `default_routing_scope` / `ui_locale` checks in `users_and_auth` — the house pattern.
+///
+/// - **`COALESCE`, not three `SET`s.** Every field is optional, so the statement keeps the
+///   stored value when the request omitted the field. Writing `SET exposed = ?, distribution =
+///   ?, routing_strategy = ?` from possibly-`None` values would null `routing_strategy` on
+///   every `{"exposed":0}` PATCH, and 500 on `distribution` (it is `NOT NULL`).
+///
+/// - **`execute_atomic_mutation`, not a bare `UPDATE`.** The handler runs inside one
+///   `BEGIN IMMEDIATE` on the writer actor, so the row, the audit entry, the
+///   `ConfigDomain::Models` publish and the version bump are one unit. A bare `UPDATE` on the
+///   reader-facing pool changed the database and left the data plane on the old snapshot.
+///
+/// - **`404` on zero rows.** A PATCH naming a `model_pk` that does not exist used to return
+///   `200 OK` having changed nothing; the same shape cycle 18 fixed for the price delete.
+///
+/// The `routing_strategy` sentinel is documented on [`PatchModelRequest`]: `null` means
+/// "unchanged", and `""` means "clear to inherit".
 pub(crate) async fn patch_admin_model_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -91,11 +119,69 @@ pub(crate) async fn patch_admin_model_handler(
     Json(payload): Json<PatchModelRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, true).await?;
-    let _ = sqlx::query("UPDATE models SET exposed = ? WHERE model_pk = ?")
-        .bind(payload.exposed)
-        .bind(id.to_string())
-        .execute(&state.auth.pool)
-        .await;
+
+    // --- Validate before touching SQL, so a bad value is a 422 and not a 500 ---------------
+    if let Some(distribution) = &payload.distribution
+        && !MODEL_DISTRIBUTIONS.contains(&distribution.as_str())
+    {
+        return Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "invalid distribution: {distribution:?}; expected one of {}",
+                MODEL_DISTRIBUTIONS.join(", ")
+            ),
+        ));
+    }
+    // `Some("")` is the explicit "clear to inherit" request; anything else must parse as a
+    // real strategy. The parse error already lists the six valid names, so its message is
+    // passed through rather than duplicated here.
+    let routing_strategy: Option<Option<String>> = match payload.routing_strategy.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(value) => match value.parse::<llmroller_core::strategy::RoutingStrategy>() {
+            Ok(parsed) => Some(Some(parsed.as_str().to_string())),
+            Err(error) => {
+                return Err(map_price_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid routing_strategy: {value:?}; {error}"),
+                ));
+            }
+        },
+    };
+
+    let id_str = id.to_string();
+    execute_atomic_mutation(&state, vec![ConfigDomain::Models], move |tx| {
+        Box::pin(async move {
+            // `COALESCE` needs a flag per field: `None` means "keep the stored value", and for
+            // `routing_strategy` an explicit clear is `Some(None)`, which must write `NULL`
+            // rather than fall through to the stored value. Two bound booleans express that
+            // without a second statement.
+            let set_routing = routing_strategy.is_some();
+            let routing_value = routing_strategy.flatten();
+
+            let res = sqlx::query(
+                "UPDATE models SET
+                     exposed = COALESCE(?, exposed),
+                     distribution = COALESCE(?, distribution),
+                     routing_strategy = CASE WHEN ? THEN ? ELSE routing_strategy END
+                 WHERE model_pk = ?",
+            )
+            .bind(payload.exposed)
+            .bind(payload.distribution.as_deref())
+            .bind(set_routing)
+            .bind(routing_value.as_deref())
+            .bind(&id_str)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            if res.rows_affected() == 0 {
+                return Err(map_price_error(StatusCode::NOT_FOUND, "model not found"));
+            }
+            Ok(())
+        })
+    })
+    .await?;
     Ok(StatusCode::OK)
 }
 

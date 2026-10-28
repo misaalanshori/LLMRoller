@@ -324,28 +324,61 @@ async fn patch_model_returns_404_for_an_unknown_model_pk() {
 // 4. Partial update must not wipe the other columns
 // ---------------------------------------------------------------------------
 
-/// The guard against "SET three columns from possibly-None values". Without a COALESCE-style
-/// statement, a body of `{"exposed":0}` writes `NULL` over `distribution`, which is
-/// `NOT NULL` (so it 500s) and would silently clear `routing_strategy` (which is nullable).
+/// The guard against "SET three columns from possibly-`None` values", asserted **per column**.
+///
+/// A naive `SET exposed = ?, distribution = ?, routing_strategy = ?` bound from the three
+/// `Option`s does three different bad things depending on which field the body omitted:
+///
+/// - `routing_strategy` (nullable) is silently **nulled** — the model stops inheriting and no
+///   test that only patches `exposed` would notice, because the body it checks supplies it;
+/// - `distribution` is `NOT NULL`, so the statement **500s**;
+/// - `exposed` (nullable, `NULL` = "automatic rule") is silently nulled, changing the model
+///   from force-on/force-off to automatic.
+///
+/// So this drives three separate PATCHes, each omitting exactly one field, and checks all
+/// three columns after each. Asserting only on the field the body *did* send is the trap: the
+/// mutant that makes `exposed = ?` naive survives that version of this test, which is what
+/// happened on my first cut of it.
 #[tokio::test]
-#[doc = "Spec: MDL-3, MDL-4 — ISSUE-0170 patching only exposed leaves the other fields alone"]
-async fn patch_model_of_only_exposed_leaves_the_other_fields_alone() {
+#[doc = "Spec: MDL-3, MDL-4 — ISSUE-0170 a partial patch never writes over an absent field"]
+async fn patch_model_partial_update_never_wipes_an_absent_field() {
     let harness = setup().await;
-    // Put a non-default routing strategy in place first, so "unchanged" is distinguishable
-    // from "reset to the default".
-    let (status, _) = patch(&harness, r#"{"routing_strategy":"power_of_two_choices"}"#).await;
-    assert_eq!(status, StatusCode::OK);
+    let original = read_row(&harness).await;
+    assert_eq!(original, (Some(1), "weighted".to_string(), None));
+    assert_ne!(
+        original.0, None,
+        "the fixture must start with exposed set, or nulling it is undetectable"
+    );
 
-    let (status, body) = patch(&harness, r#"{"exposed":0}"#).await;
+    // --- omit `distribution`: the other two must survive -------------------------------
+    let (status, body) = patch(&harness, r#"{"exposed":0,"routing_strategy":"naive_rr"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-
-    let (exposed, distribution, routing) = read_row(&harness).await;
-    assert_eq!(exposed, Some(0), "exposed must be updated");
-    assert_eq!(distribution, "weighted", "distribution must be untouched");
     assert_eq!(
-        routing.as_deref(),
-        Some("power_of_two_choices"),
-        "routing_strategy must be untouched, not reset to NULL"
+        read_row(&harness).await,
+        (
+            Some(0),
+            "weighted".to_string(),
+            Some("naive_rr".to_string())
+        ),
+        "omitting distribution must leave it at `weighted`"
+    );
+
+    // --- omit `exposed`: it must not be nulled back to the automatic rule --------------
+    let (status, body) = patch(&harness, r#"{"distribution":"strict"}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        read_row(&harness).await,
+        (Some(0), "strict".to_string(), Some("naive_rr".to_string())),
+        "omitting exposed must keep the forced-off value, not null it to 'automatic'"
+    );
+
+    // --- omit `routing_strategy`: it must not be cleared -------------------------------
+    let (status, body) = patch(&harness, r#"{"exposed":1}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        read_row(&harness).await,
+        (Some(1), "strict".to_string(), Some("naive_rr".to_string())),
+        "omitting routing_strategy must keep it, not clear it to inherit"
     );
 }
 
@@ -353,57 +386,70 @@ async fn patch_model_of_only_exposed_leaves_the_other_fields_alone() {
 // 5. Audit row and snapshot publish
 // ---------------------------------------------------------------------------
 
-/// The mutation must be audited — but the audit row comes from `control_mutation_barrier`,
-/// **not** from the handler.
+/// The mutation must stay audited — a **regression guard**, not a red test for this issue.
 ///
-/// This is a correction to the issue's premise: defect 3 says bypassing
-/// `execute_atomic_mutation` means "no `audit_log` row". That is not true. The barrier
-/// middleware inspects every PATCH/POST/PUT/DELETE, and unless the handler sets
-/// `MUTATION_HANDLED` (which only `execute_atomic_mutation` does), it publishes the domains
-/// **and** appends the audit row itself. So this assertion passes before and after the fix.
+/// This corrects the issue's defect 3, which says bypassing `execute_atomic_mutation` means
+/// "no `audit_log` row". It does not: `control_mutation_barrier` inspects every
+/// POST/PUT/PATCH/DELETE and, unless the handler sets `MUTATION_HANDLED` (which only
+/// `execute_atomic_mutation` does), publishes the domains **and** appends the audit row
+/// itself. So this passes before the fix as well.
 ///
-/// It is kept because the *pairing* still matters: a handler that both bypasses the standard
-/// path **and** sets `MUTATION_HANDLED` would write no audit row at all. What the fix actually
-/// changes is the `detail_json` — the handler's own mutation record names the changed fields,
-/// where the barrier's generic record only names method and path. Asserted below.
+/// It is kept, and deliberately written to pass either way, because the property is worth
+/// holding: a future handler that bypasses the standard path *and* sets `MUTATION_HANDLED`
+/// would silently write no audit row at all, and this is the only test watching that route.
+///
+/// **What the barrier's record does not contain** (reported, not fixed here): its fallback
+/// `detail_json` is `{"method":"PATCH","path":"…"}` — identical for every handler that has not
+/// been migrated. So migrating to `execute_atomic_mutation` currently buys atomicity and the
+/// version bump, but not a more informative audit record. Enriching it needs a task-local the
+/// handler can write to before the row is appended, which is a mechanism rather than part of
+/// these four defects.
 #[tokio::test]
-#[doc = "Spec: AUD-1, MDL-3 — ISSUE-0170 patch is audited with the changed fields recorded"]
+#[doc = "Spec: AUD-1 — ISSUE-0170 patch stays audited"]
 async fn patch_model_writes_an_audit_row() {
     let harness = setup().await;
     let (status, body) = patch(&harness, r#"{"distribution":"strict"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    let rows: Vec<(String, String, Option<String>, String)> =
-        sqlx::query_as("SELECT action, target_type, target_id, detail_json FROM audit_log")
+    let rows: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT action, target_type, target_id FROM audit_log")
             .fetch_all(&harness.pool)
             .await
             .expect("audit rows");
 
+    let model_pk = harness.model_pk.to_string();
     let row = rows
         .iter()
-        .find(|(_, target_type, target_id, _)| {
-            target_type == "model"
-                && target_id.as_deref() == Some(harness.model_pk.to_string().as_str())
+        .find(|(_, target_type, target_id)| {
+            target_type == "model" && target_id.as_deref() == Some(model_pk.as_str())
         })
         .unwrap_or_else(|| panic!("no audit row targeting the model: {rows:?}"));
-
     assert_eq!(
         row.0, "admin.model.updated",
         "action must name the operation"
     );
-    // The barrier's fallback detail is just `{"method":..,"path":..}`. A handler-routed
-    // mutation records what changed, which is what an auditor needs.
-    assert!(
-        row.3.contains("strict") || row.3.contains("distribution"),
-        "the audit detail must record what changed, not only the method and path; \
-         got {}",
-        row.3
-    );
 }
 
-/// The data plane must see the change without waiting for an unrelated reload.
+/// The data plane sees the change — a **regression guard**, and a correction to defect 3.
+///
+/// The issue says bypassing `execute_atomic_mutation` means "no `ConfigDomain::Models`
+/// publish, and no version bump. An operator changes model exposure and the data plane keeps
+/// the old snapshot." **That is false**, and I verified it rather than assuming: replacing the
+/// whole handler body with a bare `UPDATE` on the reader-facing pool still produces a published
+/// snapshot, because `control_mutation_barrier` publishes for *every* successful
+/// POST/PUT/PATCH/DELETE it sees.
+///
+/// So this test cannot discriminate `execute_atomic_mutation` from a bare `UPDATE` — a mutant
+/// that drops the atomic path entirely passes it (two different re-cuts both survived). It is
+/// kept as a regression guard for the property itself, and reported as a mutant that the suite
+/// does not kill.
+///
+/// What `execute_atomic_mutation` actually buys here, which a bare `UPDATE` does not:
+/// the row write, the audit append and the version bump share one `BEGIN IMMEDIATE`, so a
+/// refusal inside the closure (the `404` path) rolls back rather than leaving a partial write,
+/// and the read-your-writes barrier waits for the version the *handler* produced.
 #[tokio::test]
-#[doc = "Spec: MDL-3, CLK-3 — ISSUE-0170 patch publishes the Models domain"]
+#[doc = "Spec: MDL-3, CLK-3 — ISSUE-0170 the published snapshot reflects the patch"]
 async fn patch_model_publishes_the_models_domain() {
     let harness = setup().await;
     let before = harness
@@ -412,11 +458,25 @@ async fn patch_model_publishes_the_models_domain() {
         .models
         .get(&harness.model_pk)
         .map(|m| m.distribution.clone());
+    assert_eq!(
+        before.as_deref(),
+        Some("weighted"),
+        "the fixture must start on the default so the change is visible"
+    );
 
     let (status, body) = patch(&harness, r#"{"distribution":"strict"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    // The reloader is a background task; poll briefly rather than sleep a fixed duration.
+    // Read the DB too, so "the write never happened" and "the publish failed" stay
+    // distinguishable in the failure message.
+    let db_distribution: String =
+        sqlx::query_scalar("SELECT distribution FROM models WHERE model_pk = ?")
+            .bind(harness.model_pk.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .expect("distribution");
+    assert_eq!(db_distribution, "strict", "the row must be written");
+
     let mut observed = None;
     for _ in 0..100 {
         observed = harness
@@ -430,21 +490,70 @@ async fn patch_model_publishes_the_models_domain() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    // Distinguish "not published" from "published but the write never happened": read the
-    // DB row too. If the DB has `strict` and the snapshot does not, the publish is broken.
-    // If the DB still has `weighted`, the *write* never happened, so this test is really
-    // asserting the same thing as the update test.
-    let db_distribution: String =
-        sqlx::query_scalar("SELECT distribution FROM models WHERE model_pk = ?")
-            .bind(harness.model_pk.to_string())
-            .fetch_one(&harness.pool)
-            .await
-            .expect("distribution");
     assert_eq!(
         observed.as_deref(),
         Some("strict"),
-        "the published snapshot must reflect the change (before: {before:?}, db now: \
-         {db_distribution:?}); without the publish the data plane keeps serving the old value"
+        "the published snapshot must reflect the change (db: {db_distribution:?})"
+    );
+}
+
+/// A refused patch must not leave a partial write behind.
+///
+/// This is the property `execute_atomic_mutation` actually buys that a bare `UPDATE` on the
+/// reader pool does not: the row write and the `404` decision share one transaction, so a
+/// handler that updates first and then decides the target was invalid cannot half-commit.
+///
+/// Driven by patching a **different, existing** model to prove the transaction does not leak
+/// across targets: the refused request must leave the untouched model's row byte-identical,
+/// and must leave no audit row claiming it succeeded.
+#[tokio::test]
+#[doc = "Spec: REL-4, AUD-1 — ISSUE-0170 a refused patch commits nothing"]
+async fn patch_model_refusal_leaves_no_partial_write() {
+    let harness = setup().await;
+    // A second real model, so the refusal has a neighbour that must stay untouched.
+    let neighbour = ModelPk::generate();
+    sqlx::query(
+        "INSERT INTO models (model_pk, canonical_id, exposed, distribution) \
+         VALUES (?, 'patch-neighbour-model', 1, 'weighted')",
+    )
+    .bind(neighbour.to_string())
+    .execute(&harness.pool)
+    .await
+    .expect("insert neighbour");
+
+    let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("audit count");
+
+    // Unknown model_pk: 404, and nothing written anywhere.
+    let missing = ModelPk::generate();
+    let response = harness
+        .app
+        .clone()
+        .oneshot(patch_request(&missing, r#"{"distribution":"strict"}"#))
+        .await
+        .expect("patch response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let neighbour_distribution: String =
+        sqlx::query_scalar("SELECT distribution FROM models WHERE model_pk = ?")
+            .bind(neighbour.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .expect("neighbour row");
+    assert_eq!(
+        neighbour_distribution, "weighted",
+        "a refused patch must not touch any other row"
+    );
+
+    let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("audit count");
+    assert_eq!(
+        audit_after, audit_before,
+        "a 404 must not append an audit row claiming the mutation happened"
     );
 }
 

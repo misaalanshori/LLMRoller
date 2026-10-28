@@ -463,9 +463,37 @@ pub(crate) struct AddAliasRequest {
     pub alias: String,
 }
 
+/// Partial update for one canonical model (`ISSUE-0170`).
+///
+/// Every field is `Option` so a PATCH of one field leaves the others alone; the handler uses
+/// `COALESCE` so an absent field never writes `NULL` over stored data.
+///
+/// **Three fields, deliberately.** The issue that opened this asked for five. Two are declined
+/// because they do not exist as model columns and should not:
+///
+/// - `headroom_scaling` is the instance-wide runtime setting `headroom_scaling_enabled` in the
+///   14-key registry — it is not a per-model property, so a column for it would be a second
+///   source of truth for a global switch.
+/// - `max_context_tokens` must stay upstream-discovered. The real column is `context_window`
+///   (migration `0002`), and that migration's own comment says *"NULL means the upstream never
+///   advertised a context length. The proxy must omit the field rather than fabricate a
+///   capability value (audit F-031)"*. An admin-writable context window is a mechanism for
+///   fabricating exactly the capability `F-031` forbids.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchModelRequest {
+    /// `NULL` = automatic global exposure rule, `0` = forced off, `1` = forced on.
     pub exposed: Option<i64>,
+    /// `"weighted"` or `"strict"` (`models.distribution`, CHECK-constrained).
+    pub distribution: Option<String>,
+    /// One of the six `RoutingStrategy` names, or `""` to clear back to inherit.
+    ///
+    /// The column is nullable and `NULL` means "inherit `settings.default_routing_strategy`".
+    /// JSON `null` deserialises to `None`, which a partial update cannot tell apart from
+    /// "field absent" — so `null` is *ignored* rather than treated as a clear, and the empty
+    /// string is the explicit way to ask for `NULL`. This is the one sentinel in the request;
+    /// it is documented here, in the handler, and covered by
+    /// `patch_model_can_clear_routing_strategy_to_inherit`.
+    pub routing_strategy: Option<String>,
 }
 
 pub(crate) async fn post_user_password_handler(
