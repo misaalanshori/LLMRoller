@@ -4,7 +4,7 @@
 //! endpoints that were left: CSV export (`#143`), the admin audit log (`#144`), and the usage
 //! ledger's `initiator` (`#142`).
 //!
-//! Spec: `AUD-2`, `SEC-6`/`SEC-20`, `USG-1`, `USG-3`, `14.n.2`.
+//! Spec: `AUD-2`, `SEC-6, `USG-1`, `USG-3`, `14.n.2`.
 use super::*;
 
 use llmroller_core::ids::{RequestId, UsageEventId};
@@ -484,8 +484,8 @@ async fn csv_export_reports_truncation_when_capped() {
     );
 }
 
-/// Status-quo pin: the `SEC-20` formula-injection defence must survive a rewrite of this path.
-#[doc = "Spec: SEC-20; ISSUE-0143"]
+/// Status-quo pin: the `SEC-6` formula-injection defence must survive a rewrite of this path.
+#[doc = "Spec: SEC-6; ISSUE-0143"]
 #[tokio::test]
 async fn csv_export_still_sanitises_formulas() {
     let (_dir, pool, app, cookie, admin_id, _hmac) = setup().await;
