@@ -71,6 +71,36 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
         .is_ok()
 }
 
+/// How long a caller waits for an Argon2id permit before giving up.
+///
+/// Matches the control plane's login bound so both paths refuse at the same point. Kept
+/// here because the permit is taken here.
+pub const ARGON2_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Acquire one Argon2id permit, bounded by `timeout`.
+///
+/// The permit is held across the blocking hash and dropped immediately after, so it
+/// bounds concurrent Argon2id CPU work and never database work (`ISSUE-0180`,
+/// `ISSUE-0181`). Returns `None` when the caller supplied no pool, meaning "hash
+/// unbounded".
+///
+/// # Errors
+///
+/// Returns [`UserError::HashingBusy`] when no permit frees up inside `timeout`.
+pub async fn acquire_hash_permit(
+    semaphore: Option<&tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, UserError> {
+    let Some(semaphore) = semaphore else {
+        return Ok(None);
+    };
+    tokio::time::timeout(timeout, semaphore.acquire())
+        .await
+        .map_err(|_| UserError::HashingBusy)?
+        .map(Some)
+        .map_err(|_| UserError::HashingBusy)
+}
+
 /// Generate a cryptographically random temporary password shown once.
 #[must_use]
 pub fn generate_temporary_password(entropy: &dyn EntropySource) -> SecretString {

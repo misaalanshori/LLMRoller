@@ -419,10 +419,7 @@ impl std::fmt::Debug for AuthAppState {
 
 impl AuthAppState {
     pub fn new(pool: SqlitePool, config: AuthConfig) -> Self {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2)
-            .max(2);
+        let parallelism = argon2_permit_count();
         let entropy = OsEntropy::new();
         let mut fallback_key = [0_u8; 32];
         entropy.fill_bytes(&mut fallback_key);
@@ -703,15 +700,37 @@ async fn log_login_failed(
 /// wait is bounded rather than unbounded; when the bound is reached the caller
 /// receives `503 login_busy` and can retry. Five seconds matches the historical
 /// outer bound and is long enough to absorb a full queue of realistic logins.
-const ARGON2_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ARGON2_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of permits in the shared Argon2id pool.
+///
+/// One Argon2id hash saturates one core, so the pool is sized from the available
+/// parallelism with a floor of two. Both [`AuthAppState::new`] and first-run setup use
+/// this, so setup cannot introduce a second, differently-sized hashing pool.
 #[must_use]
 pub fn argon2_permit_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
         .max(2)
+}
+
+/// Acquire one Argon2id permit, bounded by [`ARGON2_PERMIT_TIMEOUT`].
+///
+/// Callers hold the permit across the blocking hash and drop it immediately after, so
+/// the permit bounds CPU work and never database work (`ISSUE-0001`, `ISSUE-0180`,
+/// `ISSUE-0181`).
+///
+/// # Errors
+///
+/// Returns [`AuthError::LoginBusy`] when no permit frees up inside the bound.
+pub async fn acquire_argon2_permit(
+    semaphore: &Semaphore,
+) -> Result<tokio::sync::SemaphorePermit<'_>, AuthError> {
+    tokio::time::timeout(ARGON2_PERMIT_TIMEOUT, semaphore.acquire())
+        .await
+        .map_err(|_| AuthError::LoginBusy)?
+        .map_err(|_| AuthError::Internal)
 }
 
 /// Verify a password while holding exactly one Argon2id permit.
@@ -728,10 +747,7 @@ async fn verify_password_with_permit(
     password: String,
     password_hash: String,
 ) -> Result<bool, AuthError> {
-    let _permit = tokio::time::timeout(ARGON2_PERMIT_TIMEOUT, state.argon2_semaphore.acquire())
-        .await
-        .map_err(|_| AuthError::LoginBusy)?
-        .map_err(|_| AuthError::Internal)?;
+    let _permit = acquire_argon2_permit(&state.argon2_semaphore).await?;
     tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
         .await
         .map_err(|_| AuthError::Internal)

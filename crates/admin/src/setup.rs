@@ -55,6 +55,9 @@ pub enum SetupError {
     /// Setup race conflict.
     #[error("setup conflict")]
     Conflict,
+    /// The shared Argon2id pool stayed exhausted past the permit bound.
+    #[error("password hashing capacity is exhausted")]
+    Busy,
     /// Invalid request payload.
     #[error("invalid payload: {0}")]
     InvalidPayload(String),
@@ -72,6 +75,7 @@ impl IntoResponse for SetupError {
                 StatusCode::CONFLICT,
                 "setup conflict; instance already initialized",
             ),
+            Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "server busy"),
             Self::InvalidPayload(_) => (StatusCode::BAD_REQUEST, "invalid payload"),
             Self::User(UserError::WeakPassword) => (StatusCode::BAD_REQUEST, "password too weak"),
             Self::User(UserError::InvalidUsername(_)) => {
@@ -155,7 +159,14 @@ pub struct SetupAppState {
     pub clock: Arc<dyn Clock>,
     pub entropy: Arc<dyn EntropySource>,
     pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
-    /// Shared Argon2id pool. Unused on the red commit; the fix wires it in.
+    /// Shared Argon2id pool, the same one the login path uses.
+    ///
+    /// Setup runs an Argon2id hash and is reachable unauthenticated (apart from the
+    /// token) before any admin exists, so leaving it unpooled let N concurrent attempts
+    /// each start a hash (`ISSUE-0180`). Production supplies the instance's login pool so
+    /// there is exactly one hashing pool; [`SetupAppState::new`] otherwise creates a
+    /// correctly sized one, so a fixture that builds a setup state in isolation still gets
+    /// a real bound.
     pub argon2_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -185,7 +196,8 @@ impl SetupAppState {
     }
 }
 
-/// A correctly sized Argon2id pool for a setup state.
+/// A correctly sized Argon2id pool for a setup state that was not given the instance's
+/// shared login pool.
 #[must_use]
 pub fn new_argon2_pool() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(crate::auth::argon2_permit_count()))
@@ -306,7 +318,37 @@ async fn post_setup(
         }
     }
 
-    // 3. Serialized writer transaction per AUTH-1: BEGIN IMMEDIATE
+    // 3. Hash the password BEFORE taking SQLite's write lock (`ISSUE-0180`).
+    //
+    // `BEGIN IMMEDIATE` takes SQLite's single write lock immediately, and Argon2id is
+    // deliberately tens of milliseconds of CPU. Hashing inside that transaction blocked
+    // the entire data-plane writer — every usage-event enqueue, pin write, and key-health
+    // flush — for the duration of the hash, and because concurrent setup attempts
+    // serialised on the lock, the hold time was unbounded.
+    //
+    // The permit bounds concurrent hashing, matching the login path. It is dropped before
+    // the transaction opens, so it covers CPU work only and never database work. The same
+    // `state.entropy` source the old code used feeds the salt; only the timing moved.
+    //
+    // A losing concurrent request now wastes one hash before its in-transaction
+    // `COUNT(*)` re-check refuses it. That is the correct trade: an orphaned hash costs
+    // CPU, while a lock held across the hash costs the whole data plane.
+    let username = validate_username(&payload.username)?;
+    let pw_clone = payload.password.clone();
+    let entropy_clone = Arc::clone(&state.entropy);
+    let password_hash = {
+        let _permit = crate::auth::acquire_argon2_permit(&state.argon2_semaphore)
+            .await
+            .map_err(|_| SetupError::Busy)?;
+        tokio::task::spawn_blocking(move || hash_password(&pw_clone, entropy_clone.as_ref()))
+            .await
+            .map_err(|_| SetupError::InvalidPayload("password hashing failed".to_string()))??
+    };
+
+    // 4. Serialized writer transaction per AUTH-1: BEGIN IMMEDIATE.
+    //
+    // The in-transaction re-check below is what actually makes concurrent setup safe;
+    // moving the hash earlier must not move this check out of the transaction.
     let mut connection = state.pool.acquire().await?;
     let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -318,13 +360,6 @@ async fn post_setup(
         return Err(SetupError::Conflict);
     }
 
-    let username = validate_username(&payload.username)?;
-    let pw_clone = payload.password.clone();
-    let entropy_clone = Arc::clone(&state.entropy);
-    let password_hash =
-        tokio::task::spawn_blocking(move || hash_password(&pw_clone, entropy_clone.as_ref()))
-            .await
-            .map_err(|_| SetupError::InvalidPayload("password hashing failed".to_string()))??;
     let id = UserId::generate();
     let now_ms = state.clock.now_ms();
 
@@ -374,7 +409,7 @@ async fn post_setup(
     transaction.commit().await?;
     drop(connection);
 
-    // 4. Delete setup token file on completion per AUTH-2
+    // 5. Delete setup token file on completion per AUTH-2
     delete_setup_token_file(&state.data_dir);
 
     let is_json = content_type.contains("application/json");

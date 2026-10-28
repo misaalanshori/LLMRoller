@@ -127,6 +127,35 @@ pub(crate) async fn patch_user_preferences_handler(
     })))
 }
 
+/// Parse a requested `role` from a control-plane payload, refusing anything unknown.
+///
+/// Both role-accepting handlers (`POST /admin/api/users` and `PATCH /admin/api/users/{id}`)
+/// go through this, so the two cannot drift (`ISSUE-0181`).
+///
+/// The accepted spellings are exactly `admin` and `user`. Case is **not** normalised: an
+/// operator who sends `"Admin"` gets a `422` naming the accepted values instead of an
+/// account that silently is not an admin. Being strict is the point — the previous code
+/// mapped every unrecognised string to `Role::User`, turning a typo into a silent
+/// privilege downgrade. `Role::from_str` accepts case variants because it parses stored
+/// database values; request payloads get the stricter contract.
+///
+/// # Errors
+///
+/// Returns `422` with the accepted values when `role` is present but unrecognised.
+fn parse_requested_role(
+    role: Option<&str>,
+) -> Result<Option<llmroller_core::rbac::Role>, (StatusCode, Json<serde_json::Value>)> {
+    match role {
+        None => Ok(None),
+        Some("admin") => Ok(Some(llmroller_core::rbac::Role::Admin)),
+        Some("user") => Ok(Some(llmroller_core::rbac::Role::User)),
+        Some(other) => Err(map_price_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid role: {other:?}; accepted values are admin, user"),
+        )),
+    }
+}
+
 async fn write_user_preferences_tx(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -269,27 +298,46 @@ pub(crate) async fn post_admin_user_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_admin(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
-    let role = match payload.role.as_deref().unwrap_or("user") {
-        "admin" => llmroller_core::rbac::Role::Admin,
-        _ => llmroller_core::rbac::Role::User,
-    };
+    // Validate the role before doing any work, so a typo costs nothing and cannot reach
+    // the store: otherwise a refused role would still hash a password and insert a row
+    // for an account the caller did not ask for (`ISSUE-0181`).
+    let role = parse_requested_role(payload.role.as_deref())?
+        .unwrap_or(llmroller_core::rbac::Role::User);
 
-    let _permit = state
-        .auth
-        .argon2_semaphore
-        .acquire()
+    // The hash happens here, under a bounded permit, and the permit is released before
+    // `create_user_with_hash` opens its transaction. `create_user` hashes internally, so a
+    // permit acquired in this scope and held across *that* call would cover the SQL insert
+    // too — and moving it later would release it before the CPU work. Hoisting the hash is
+    // the only shape where the permit bounds the hash and nothing else (`ISSUE-0181`).
+    let new_user = llmroller_store::users::NewUser {
+        username: &payload.username,
+        password: &payload.password,
+        role,
+        must_change_password: payload.must_change_password.unwrap_or(false),
+    };
+    // Validate up front so a weak password never consumes a permit.
+    llmroller_store::users::validate_password(&payload.password)
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let entropy = state.auth.entropy.clone();
+    let pw_clone = payload.password.clone();
+    let password_hash = {
+        let _permit = crate::auth::acquire_argon2_permit(&state.auth.argon2_semaphore)
+            .await
+            .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+        tokio::task::spawn_blocking(move || {
+            llmroller_store::users::hash_password(&pw_clone, entropy.as_ref())
+        })
         .await
-        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
-    let user = llmroller_store::users::create_user(
+        .map_err(|_| {
+            map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed")
+        })?
+        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?
+    };
+    let user = llmroller_store::users::create_user_with_hash(
         &state.auth.pool,
         &actor,
-        llmroller_store::users::NewUser {
-            username: &payload.username,
-            password: &payload.password,
-            role,
-            must_change_password: payload.must_change_password.unwrap_or(false),
-        },
-        state.auth.entropy.as_ref(),
+        new_user,
+        &password_hash,
         now_ms,
     )
     .await
@@ -314,10 +362,9 @@ pub(crate) async fn patch_admin_user_handler(
     let actor = authenticate_admin(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
 
-    let role = payload.role.as_deref().map(|role_str| match role_str {
-        "admin" => llmroller_core::rbac::Role::Admin,
-        _ => llmroller_core::rbac::Role::User,
-    });
+    // Same parser as `POST /admin/api/users`, so the two role paths cannot disagree
+    // (`ISSUE-0181`). `None` (field absent) leaves the stored role untouched.
+    let role = parse_requested_role(payload.role.as_deref())?;
     let patch = llmroller_store::users::UserPatch {
         role,
         disabled: payload.disabled,
@@ -408,20 +455,21 @@ pub(crate) async fn post_admin_reset_password_handler(
         format!("Temp-{}", &hex_suffix[..16])
     });
 
-    let _permit = state
-        .auth
-        .argon2_semaphore
-        .acquire()
-        .await
-        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+    // Bounded permit around the hash only. It is dropped before the mutation below, so it
+    // bounds CPU work and never database work (`ISSUE-0181`).
     let entropy = state.auth.entropy.clone();
     let pw_clone = temp_password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || {
-        llmroller_store::users::hash_password(&pw_clone, entropy.as_ref())
-    })
-    .await
-    .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed"))?
-    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let password_hash = {
+        let _permit = crate::auth::acquire_argon2_permit(&state.auth.argon2_semaphore)
+            .await
+            .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+        tokio::task::spawn_blocking(move || {
+            llmroller_store::users::hash_password(&pw_clone, entropy.as_ref())
+        })
+        .await
+        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed"))?
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+    };
 
     execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
         Box::pin(async move {
@@ -511,22 +559,28 @@ pub(crate) async fn post_user_password_handler(
         crate::auth::session_token_from_cookie_header(cookie_header).unwrap_or_default();
     let id_hash = llmroller_store::crypto::sha256_hex(session_token.as_bytes());
 
-    let _permit = state
-        .auth
-        .argon2_semaphore
-        .acquire()
-        .await
-        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+    // No permit here: `change_password` hashes twice (verify the current password, then
+    // hash the new one) and takes its own permit around each hash. Holding one across the
+    // whole call would serialise database work and could deadlock a one-permit pool
+    // (`ISSUE-0001`, `ISSUE-0181`).
     llmroller_store::users::change_password(
         &state.auth.pool,
         &actor,
         &payload.current_password,
         &payload.new_password,
         state.auth.entropy.as_ref(),
+        Some(&state.auth.argon2_semaphore),
         Some(&id_hash),
     )
     .await
-    .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?;
+    .map_err(|e| {
+        let status = if matches!(e, llmroller_store::users::UserError::HashingBusy) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        map_price_error(status, format!("{e}"))
+    })?;
 
     Ok(StatusCode::OK)
 }
@@ -669,17 +723,20 @@ pub(crate) async fn post_user_totp_disable_handler(
     let password_hash =
         password_hash.ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "user not found"))?;
 
-    let _permit = state
-        .auth
-        .argon2_semaphore
-        .acquire()
+    // The permit must cover the Argon2id verify and nothing else. Scoping it to this
+    // block releases it before `execute_atomic_mutation` below; leaving it in the
+    // function scope (as it was) held an Argon2id permit across the database write
+    // (`ISSUE-0181`).
+    let verified = {
+        let _permit = crate::auth::acquire_argon2_permit(&state.auth.argon2_semaphore)
+            .await
+            .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
+        tokio::task::spawn_blocking(move || {
+            llmroller_store::users::verify_password(&password, &password_hash)
+        })
         .await
-        .map_err(|_| map_price_error(StatusCode::SERVICE_UNAVAILABLE, "server busy"))?;
-    let verified = tokio::task::spawn_blocking(move || {
-        llmroller_store::users::verify_password(&password, &password_hash)
-    })
-    .await
-    .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "verification failed"))?;
+        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "verification failed"))?
+    };
     if !verified {
         return Err(map_price_error(
             StatusCode::UNAUTHORIZED,

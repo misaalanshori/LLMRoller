@@ -363,6 +363,7 @@ async fn password_change_requires_current_password_and_revokes_other_sessions() 
         "wrong password",
         "new correct horse battery",
         &entropy,
+        None,
         Some("keep"),
     )
     .await;
@@ -373,6 +374,7 @@ async fn password_change_requires_current_password_and_revokes_other_sessions() 
         "correct horse battery",
         "new correct horse battery",
         &entropy,
+        None,
         Some("keep"),
     )
     .await

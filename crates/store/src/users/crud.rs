@@ -8,7 +8,10 @@ use llmroller_core::snapshot::UserRecord;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Connection as _, Row, SqlitePool, Transaction};
 
-use super::password::{generate_temporary_password, hash_password, verify_password};
+use super::password::{
+    ARGON2_PERMIT_TIMEOUT, acquire_hash_permit, generate_temporary_password, hash_password,
+    validate_password, verify_password,
+};
 use super::types::{
     NewUser, ResetAdminResult, User, UserError, UserLoginRecord, UserPatch, actor_user,
     ensure_admin, ensure_self_or_admin, role_from_str, user_from_row, validate_username,
@@ -30,6 +33,10 @@ fn map_insert_error(error: sqlx::Error) -> UserError {
 ///
 /// Spec: AUTH-4, AUTH-5, SEC-4
 ///
+/// Hashes the password itself. A caller that must bound Argon2id with its own permit
+/// should hash first and call [`create_user_with_hash`], because a permit held across
+/// this function would also cover the SQL insert (`ISSUE-0181`).
+///
 /// # Errors
 ///
 /// Returns validation, duplicate-username, permission, entropy, or SQLite failures.
@@ -40,23 +47,43 @@ pub async fn create_user(
     entropy: &dyn EntropySource,
     now_ms: i64,
 ) -> Result<User, UserError> {
+    let password_hash = hash_password(new_user.password, entropy)?;
+    create_user_with_hash(pool, actor, new_user, &password_hash, now_ms).await
+}
+
+/// Create a user from a password hash the caller already computed.
+///
+/// This is the shape a permit-bounded caller needs: hash under the permit, drop it, then
+/// call this. Splitting the write out is what makes the permit cover the CPU work only
+/// (`ISSUE-0181`).
+///
+/// # Errors
+///
+/// Returns validation, duplicate-username, permission, or SQLite failures.
+pub async fn create_user_with_hash(
+    pool: &SqlitePool,
+    actor: &ActorScope,
+    new_user: NewUser<'_>,
+    password_hash: &str,
+    now_ms: i64,
+) -> Result<User, UserError> {
     let mut tx = pool.begin().await?;
-    let user = create_user_tx(&mut tx, actor, new_user, entropy, now_ms).await?;
+    let user = create_user_tx(&mut tx, actor, new_user, password_hash, now_ms).await?;
     tx.commit().await?;
     Ok(user)
 }
 
-/// Create a standard user or administrator inside an active transaction.
+/// Create a standard user or administrator inside an active transaction, from a
+/// pre-computed password hash.
 pub async fn create_user_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
     actor: &ActorScope,
     new_user: NewUser<'_>,
-    entropy: &dyn EntropySource,
+    password_hash: &str,
     now_ms: i64,
 ) -> Result<User, UserError> {
     ensure_admin(actor)?;
     let username = validate_username(new_user.username)?;
-    let password_hash = hash_password(new_user.password, entropy)?;
     let id = UserId::generate();
     let result = sqlx::query(
         "INSERT INTO users (
@@ -541,6 +568,7 @@ pub async fn set_password(
     new_password: &str,
     must_change_password: bool,
     entropy: &dyn EntropySource,
+    argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
     let mut tx = pool.begin().await?;
@@ -551,6 +579,7 @@ pub async fn set_password(
         new_password,
         must_change_password,
         entropy,
+        argon2_semaphore,
         keep_session,
     )
     .await?;
@@ -566,10 +595,17 @@ pub async fn set_password_tx(
     new_password: &str,
     must_change_password: bool,
     entropy: &dyn EntropySource,
+    argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
     ensure_self_or_admin(actor, user_id)?;
-    let password_hash = hash_password(new_password, entropy)?;
+    // Validate before waiting for capacity, then hold the permit across the hash only —
+    // never across the UPDATE below (`ISSUE-0181`).
+    validate_password(new_password)?;
+    let password_hash = {
+        let _permit = acquire_hash_permit(argon2_semaphore, ARGON2_PERMIT_TIMEOUT).await?;
+        hash_password(new_password, entropy)?
+    };
     let result =
         sqlx::query("UPDATE users SET password_hash = ?, must_change_password = ? WHERE id = ?")
             .bind(password_hash)
@@ -607,6 +643,7 @@ pub async fn change_password(
     current_password: &str,
     new_password: &str,
     entropy: &dyn EntropySource,
+    argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
     let mut tx = pool.begin().await?;
@@ -616,6 +653,7 @@ pub async fn change_password(
         current_password,
         new_password,
         entropy,
+        argon2_semaphore,
         keep_session,
     )
     .await?;
@@ -630,12 +668,18 @@ pub async fn change_password_tx(
     current_password: &str,
     new_password: &str,
     entropy: &dyn EntropySource,
+    argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
     let user_id = actor_user(actor)?;
     let record = find_login_record_by_id_tx(tx, user_id).await?;
-    if !verify_password(current_password, &record.password_hash) {
-        return Err(UserError::InvalidCredentials);
+    // Verify and re-hash each take their own permit sequentially, never two at once, so a
+    // one-permit pool cannot deadlock on itself (`ISSUE-0001`).
+    {
+        let _permit = acquire_hash_permit(argon2_semaphore, ARGON2_PERMIT_TIMEOUT).await?;
+        if !verify_password(current_password, &record.password_hash) {
+            return Err(UserError::InvalidCredentials);
+        }
     }
     set_password_tx(
         tx,
@@ -644,6 +688,7 @@ pub async fn change_password_tx(
         new_password,
         false,
         entropy,
+        argon2_semaphore,
         keep_session,
     )
     .await
@@ -669,6 +714,7 @@ pub async fn reset_password_temporary(
         temporary_password.expose_secret(),
         true,
         entropy,
+        None,
         None,
     )
     .await?;

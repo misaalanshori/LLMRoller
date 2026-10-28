@@ -202,6 +202,9 @@ pub enum UserError {
     /// Password hashing failed.
     #[error("password hashing failed: {0}")]
     PasswordHash(String),
+    /// The shared Argon2id pool stayed exhausted past the permit bound.
+    #[error("password hashing capacity is exhausted")]
+    HashingBusy,
     /// Username already exists.
     #[error("username already exists")]
     DuplicateUsername,
