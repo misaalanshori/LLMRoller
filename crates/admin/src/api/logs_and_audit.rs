@@ -468,6 +468,48 @@ pub(crate) async fn get_admin_log_detail_handler(
     get_log_detail_internal(&state, &actor, &request_id).await
 }
 
+/// Shape the sanitized `request_headers_json` for the drawer's headers grid.
+///
+/// `SEC-6`/`USG-9` guarantee the stored blob is an allow-list of diagnostic headers, never
+/// credentials — so this is not a confidentiality boundary, only a parsing one.
+///
+/// Two decisions:
+///
+/// - **A corrupt blob is not emptied.** Returning `{}` (the `unwrap_or_default()` reflex) would
+///   render "no headers recorded" for a value that exists and is damaged, which is the
+///   silent-empty failure mode this project keeps having to fix. Instead the raw text is preserved
+///   and `parse_error` is set, so the damage is visible in the UI.
+/// - **Pairs, not a map.** The grid renders `name → value` rows; an array of pairs keeps document
+///   order (JSON objects are unordered, and a user scanning headers expects the order they were
+///   captured in) and avoids the "what if two keys differ only by case" question.
+///
+/// `None` (never captured) and the empty string are genuinely "no headers" and yield an empty
+/// pair list with `parse_error: false` — absent is not corrupt.
+fn parse_headers_blob(raw: Option<&str>) -> serde_json::Value {
+    let Some(text) = raw.filter(|t| !t.trim().is_empty()) else {
+        return serde_json::json!({ "pairs": [], "parse_error": false, "raw": null });
+    };
+
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(map)) => {
+            let pairs: Vec<(String, String)> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let rendered = match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, rendered)
+                })
+                .collect();
+            serde_json::json!({ "pairs": pairs, "parse_error": false, "raw": null })
+        }
+        // Valid JSON but not an object, or not JSON at all: both are corruption from this
+        // renderer's point of view, and both keep the raw text.
+        _ => serde_json::json!({ "pairs": [], "parse_error": true, "raw": text }),
+    }
+}
+
 pub(crate) async fn get_log_detail_internal(
     state: &ApiAppState,
     actor: &ActorScope,
@@ -585,8 +627,32 @@ pub(crate) async fn get_log_detail_internal(
         },
         "session_hash": row.try_get::<Option<String>, _>("session_hash").unwrap_or_default(),
         "client_user_agent": row.try_get::<Option<String>, _>("client_user_agent").unwrap_or_default(),
-        "request_headers_json": row.try_get::<Option<String>, _>("request_headers_json").unwrap_or_default(),
+        // `14.m` section 5 "Location". Geo headers are gated on trusted proxies (`#158`), so this
+        // is legitimately absent for most deployments; the renderer shows a dash, never an
+        // invented value.
+        "client_location": row.try_get::<Option<String>, _>("client_location").unwrap_or_default(),
+        // Enum-valued, CHECK-constrained columns, returned as the **stored strings**
+        // (`0001_initial.sql:419-420`, `:432-433`, `:442-443`). No remapping to display labels:
+        // the vocabulary is the column's, and a consumer comparing against it must not see our
+        // invented synonyms.
+        "termination": row.try_get::<String, _>("termination").unwrap_or_else(|_| "completed".to_string()),
+        "cost_source": row.try_get::<String, _>("cost_source").unwrap_or_default(),
+        "pin_outcome": row.try_get::<Option<String>, _>("pin_outcome").unwrap_or_default(),
+        // `incomplete` is `INTEGER` 0/1; a JSON boolean is what a renderer wants.
+        "incomplete": row.try_get::<i64, _>("incomplete").unwrap_or(0) != 0,
+        "failovers": row.try_get::<i64, _>("failovers").unwrap_or(0),
+        "error_code": row.try_get::<Option<String>, _>("error_code").unwrap_or_default(),
+        "request_headers": parse_headers_blob(
+            row.try_get::<Option<String>, _>("request_headers_json")
+                .unwrap_or_default()
+                .as_deref(),
+        ),
         "metadata_json": row.try_get::<Option<String>, _>("metadata_json").unwrap_or_default(),
+        // `trace_records.usage_event_id` is the PK referencing `usage_events(id)`
+        // (`0001_initial.sql:529`), and its `request_id` is UNIQUE, so this is the same single
+        // lookup `has_trace` already does. Traces are opt-in (`ADR-9`), so `null` is the common
+        // case and an honest one: a dead link in an inspector is worse than no link.
+        "trace_href": has_trace.then(|| format!("/admin/api/traces/{request_id}")),
         "attempts": attempts,
         "has_trace": has_trace,
     })))

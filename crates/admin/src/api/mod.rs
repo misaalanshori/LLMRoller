@@ -66,6 +66,7 @@ tokio::task_local! {
 pub(crate) mod budgets;
 pub(crate) mod client_keys;
 pub(crate) mod common;
+pub(crate) mod log_detail_drawer;
 pub(crate) mod logs_and_audit;
 pub(crate) mod models;
 pub(crate) mod partials;
@@ -83,6 +84,7 @@ pub(crate) use budgets::*;
 pub(crate) use client_keys::*;
 pub use common::ApiAppState;
 pub(crate) use common::*;
+pub(crate) use log_detail_drawer::*;
 pub(crate) use logs_and_audit::*;
 pub(crate) use models::*;
 pub(crate) use partials::*;
