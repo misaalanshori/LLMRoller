@@ -61,10 +61,15 @@ async fn harness() -> Harness {
     seed_defaults(&pool, None, 1).await.expect("seed settings");
 
     let master_key = MasterKey::from_bytes([0xD2; 32]);
-    let instance_state =
-        load_or_initialize(&pool, "key-0", &master_key, Arc::new(DeterministicRng::new(7)), 1)
-            .await
-            .expect("instance load");
+    let instance_state = load_or_initialize(
+        &pool,
+        "key-0",
+        &master_key,
+        Arc::new(DeterministicRng::new(7)),
+        1,
+    )
+    .await
+    .expect("instance load");
 
     let now = SystemClock::new().now_ms();
     let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
@@ -154,7 +159,10 @@ async fn harness() -> Harness {
     let mut api_state =
         ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     api_state.writer = Some(writer);
-    api_state.attach_reloader(published.notification_sender(), published.version_receiver());
+    api_state.attach_reloader(
+        published.notification_sender(),
+        published.version_receiver(),
+    );
     let pin_store = Arc::new(PinStore::new(10_000));
     api_state.attach_pin_store(Arc::clone(&pin_store));
 
@@ -170,12 +178,7 @@ async fn harness() -> Harness {
 
 impl Harness {
     async fn send(&self, request: Request<Body>) -> (StatusCode, Vec<u8>) {
-        let response = self
-            .app
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("response");
+        let response = self.app.clone().oneshot(request).await.expect("response");
         let status = response.status();
         let body = response
             .into_body()
@@ -260,7 +263,10 @@ async fn price_row_count(harness: &Harness, provider_id: &str, model_id: &str) -
 async fn delete_price_returns_404_when_no_row_matches() {
     let h = harness().await;
     let (status, body) = h
-        .send(admin_delete_price("provider-that-has-no-price", "model-never-priced"))
+        .send(admin_delete_price(
+            "provider-that-has-no-price",
+            "model-never-priced",
+        ))
         .await;
     assert_eq!(
         status,
@@ -336,7 +342,10 @@ impl ChainClockNow {
     }
 }
 
-async fn create_service_account_with_child_key(harness: &Harness, name: &str) -> (String, ClientKeyId) {
+async fn create_service_account_with_child_key(
+    harness: &Harness,
+    name: &str,
+) -> (String, ClientKeyId) {
     let now = SystemClock::new().now_ms();
     let sa = llmroller_store::service_accounts::create_service_account(
         &harness.pool,
@@ -504,7 +513,9 @@ async fn disabling_a_service_account_evicts_its_child_key_pins() {
                 .header(header::COOKIE, format!("llmroller_session={USER_SESSION}"))
                 .header("x-csrf-token", USER_CSRF)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::json!({"disabled": true}).to_string()))
+                .body(Body::from(
+                    serde_json::json!({"disabled": true}).to_string(),
+                ))
                 .expect("patch sa request"),
         )
         .await;
@@ -537,7 +548,9 @@ async fn ui_only_preference_update_does_not_bump_the_snapshot_version() {
     let before = h.config_version();
 
     let (status, body) = h
-        .send(user_patch_preferences(serde_json::json!({"ui_theme": "dark"})))
+        .send(user_patch_preferences(
+            serde_json::json!({"ui_theme": "dark"}),
+        ))
         .await;
     assert_eq!(
         status,

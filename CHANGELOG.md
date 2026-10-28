@@ -9,6 +9,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Deleting a price that does not exist no longer reports success (ISSUE-0192).**
+  `DELETE /admin/api/prices` and `DELETE /api/user/providers/{id}/prices` discarded
+  `delete_price_tx`'s `bool` and returned `204` unconditionally, so an operator removing a
+  stale price had no way to learn it was never there. Both now return `404` when the delete
+  matched no row. No helper change was needed: `execute_atomic_mutation` is already generic
+  over its closure's return type, so the `bool` travels back through it.
+- **Disabling a service account evicts its child keys' pins (ISSUE-0193).** Deleting was
+  already correct — both delete handlers collect the child key ids before the mutation (the
+  `ON DELETE CASCADE` would take them inside it) and evict after the commit. Disabling was
+  not: `patch_admin_`/`patch_user_service_account_handler` published `ServiceAccounts` and
+  returned, leaving in-memory pins live for a principal that is now off. Gate G2 refuses a
+  disabled service account on the *next* request, so no traffic escaped, but a pin held for
+  a disabled principal is stale routing state. One `evict_service_account_child_pins`
+  helper now serves both PATCH handlers, reusing the existing
+  `collect_service_account_client_keys_tx` and `PinStore::invalidate_client_keys`.
+- **UI-only preference updates no longer trigger a full snapshot rebuild (ISSUE-0182).** The
+  handler published nothing itself, but `domains_for_path` has no branch for
+  `/api/user/preferences`, so the control-mutation barrier fell through to "unknown domain,
+  rebuild everything" and every theme change rebuilt all nine slices. The split now happens
+  at the writer boundary: `default_routing_scope` in the payload goes through
+  `execute_atomic_mutation(vec![ConfigDomain::Users])` — which also fixes a real staleness
+  bug, since the data plane's `resolve_caller_scope` reads that column from the snapshot and
+  a scope change that never published left the caller on the old routing — while a
+  UI-only update writes directly and marks the mutation handled so the barrier does not
+  publish for it.
 - **The client-key TPM window no longer resets at wall-clock minute boundaries
   (follow-up found during ISSUE-0171's CI run).** `try_consume_client_key_tpm` keyed its
   window on `now_ms.div_euclid(60_000)`, so two requests a millisecond apart could straddle
