@@ -4,22 +4,6 @@
 
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
-/// Parameters governing data retention sweeping.
-#[derive(Debug, Clone)]
-pub struct RetentionPolicy {
-    pub usage_events_retention_days: i64,
-    pub usage_events_max_rows: i64,
-}
-
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        Self {
-            usage_events_retention_days: 30,
-            usage_events_max_rows: 50_000_000,
-        }
-    }
-}
-
 /// Deletes expired usage_events in bounded chunks using portable subqueries (REL-3).
 pub async fn sweep_expired_usage_events_chunk(
     tx: &mut Transaction<'_, Sqlite>,
@@ -263,152 +247,32 @@ pub async fn sweep_orphaned_trace_blocks(
     Ok(result.rows_affected())
 }
 
-/// Deletes expired control_plane_logs rows older than `cutoff_ms` (`USG-8`, `REL-1`).
+/// Deletes expired `control_plane_logs` rows older than `cutoff_ms`, in bounded chunks.
+///
+/// The chunk bound is not an optimisation. This runs on the 30 s maintenance tick against a
+/// live table, so a single `DELETE` over a long-accumulated backlog would hold the SQLite write
+/// lock for the whole scan — which `REL-3` forbids: *"a slow or locked SQLite writer must never
+/// block or fail an inference request"*. Every other sweeper in this module takes a limit for
+/// the same reason; this one was the exception, and was safe only while nothing called it
+/// (`ISSUE-0230`).
+///
+/// Repeated calls drain the backlog: each removes at most `chunk_limit` rows, so the tick makes
+/// steady progress without ever holding the lock for long.
 pub async fn sweep_expired_control_plane_logs(
     pool: &SqlitePool,
     cutoff_ms: i64,
+    chunk_limit: i64,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM control_plane_logs WHERE ts < ?")
-        .bind(cutoff_ms)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM control_plane_logs WHERE id IN (
+             SELECT id FROM control_plane_logs WHERE ts < ? ORDER BY ts LIMIT ?
+         )",
+    )
+    .bind(cutoff_ms)
+    .bind(chunk_limit)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
-}
-
-/// Deletes expired upstream_usage_snapshots rows older than `cutoff_ms` (`USG-4`, `REL-1`).
-pub async fn sweep_expired_usage_snapshots(
-    pool: &SqlitePool,
-    cutoff_ms: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM upstream_usage_snapshots WHERE fetched_at < ?")
-        .bind(cutoff_ms)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
-
-/// Executes a unified periodic retention sweep across all ephemeral and time-bounded tables (`TRC-4`, `USG-8`, `REL-1`).
-pub async fn run_retention_pass(
-    pool: &SqlitePool,
-    now_ms: i64,
-    policy: &RetentionPolicy,
-) -> Result<(), sqlx::Error> {
-    let raw_cutoff = now_ms.saturating_sub(policy.usage_events_retention_days * 86_400_000);
-    let rollup_cutoff =
-        now_ms.saturating_sub(policy.usage_events_retention_days.max(31) * 86_400_000);
-    let seven_days_cutoff = now_ms.saturating_sub(7 * 86_400_000);
-    let ninety_days_cutoff = now_ms.saturating_sub(90 * 86_400_000);
-
-    if let Ok(mut tx) = pool.begin().await {
-        let _ = sweep_expired_web_sessions(&mut tx, now_ms).await?;
-        let _ = sweep_expired_response_links(&mut tx, now_ms).await?;
-        let _ = tx.commit().await;
-    }
-    let _ = sweep_expired_usage_events(pool, raw_cutoff, 1_000).await?;
-    let _ = enforce_max_usage_events_rows_pool(pool, policy.usage_events_max_rows, 1_000).await?;
-    let _ = sweep_expired_usage_rollups_5min(pool, rollup_cutoff, 1_000).await?;
-    let _ = sweep_expired_usage_rollups_hourly(pool, ninety_days_cutoff, 1_000).await?;
-    let _ = sweep_expired_pins(pool, now_ms).await?;
-    let _ = sweep_expired_trace_records(pool, now_ms).await?;
-    let _ = sweep_orphaned_trace_blocks(pool, raw_cutoff, 1_000).await?;
-    let _ = sweep_expired_auth_failure_counters(pool, seven_days_cutoff).await?;
-    let _ = sweep_expired_control_plane_logs(pool, ninety_days_cutoff).await?;
-    let _ = sweep_expired_usage_snapshots(pool, seven_days_cutoff).await?;
-    run_incremental_vacuum(pool, 64).await?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::migrations::migrate;
-    use crate::pool::{Role, open_pool};
-
-    #[tokio::test]
-    #[doc = "Spec: TRC-4, USG-8, REL-1, REL-3"]
-    async fn retention_pass_prunes_expired_control_plane_logs_pins_and_response_links() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pool = open_pool(&dir.path().join("retention.db"), Role::Writer)
-            .await
-            .expect("open pool");
-        migrate(&pool).await.expect("migrate");
-
-        sqlx::query(
-            "INSERT INTO control_plane_logs (id, ts, request_id, workspace_scope, method, path, status, latency_ms)
-             VALUES ('cpl_1', 1000, 'req_cpl_1', 'global', 'GET', '/admin/api/settings', 200, 5)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert cpl");
-
-        let now_ms = 100 * 86_400_000;
-        run_retention_pass(&pool, now_ms, &RetentionPolicy::default())
-            .await
-            .expect("run retention pass");
-
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_plane_logs")
-            .fetch_one(&pool)
-            .await
-            .expect("count cpl");
-        assert_eq!(remaining, 0);
-    }
-}
-
-#[cfg(test)]
-mod fnd021_tests {
-    use super::*;
-    use crate::migrations::migrate;
-    use crate::pool::{Role, open_pool};
-
-    #[tokio::test]
-    #[doc = "Spec: REL-3, TRC-5, PERF-4"]
-    async fn retention_pass_prunes_expired_sessions_links_rollups_and_orphan_blocks() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pool = open_pool(&dir.path().join("retention_traces.db"), Role::Writer)
-            .await
-            .expect("open pool");
-        migrate(&pool).await.expect("migrate");
-
-        sqlx::query(
-            "INSERT INTO users (id, username, password_hash, role, created_at)
-             VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'u1', 'h', 'user', 1000)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert user");
-
-        sqlx::query(
-            "INSERT INTO web_sessions (id_hash, user_id, csrf_hash, created_at, last_seen_at, expires_at)
-             VALUES ('sess_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'csrf_1', 1000, 1000, 2000)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert web_session");
-
-        sqlx::query(
-            "INSERT INTO trace_blocks (block_hash, owner_user_id, payload_enc, master_key_id, byte_len, last_referenced_at)
-             VALUES ('blk_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', X'00', 'mk_1', 16, 1000)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert trace_block");
-
-        let now_ms = 100 * 86_400_000;
-        run_retention_pass(&pool, now_ms, &RetentionPolicy::default())
-            .await
-            .expect("retention pass");
-
-        let remaining_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
-            .fetch_one(&pool)
-            .await
-            .expect("remaining sessions");
-        let remaining_blocks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks")
-            .fetch_one(&pool)
-            .await
-            .expect("remaining blocks");
-        assert_eq!(remaining_sessions, 0);
-        assert_eq!(remaining_blocks, 0);
-    }
 }
 
 #[cfg(test)]

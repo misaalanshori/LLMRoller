@@ -590,33 +590,19 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map_or(0, |d| d.as_millis() as i64);
-                                if let Ok(mut tx) = bg_pool.begin().await {
-                                    let _ = llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await;
-                                    let _ = llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await;
-                                    let _ = tx.commit().await;
-                                }
-                                let _ = llmroller_store::retention::sweep_expired_pins(&bg_pool, now_ms).await;
+                                let snapshot = bg_snapshot.load();
+                                let _ = run_maintenance_retention_sweep(
+                                    &bg_pool,
+                                    now_ms,
+                                    &snapshot.settings,
+                                )
+                                .await;
+                                // In-memory housekeeping that needs no database work; kept
+                                // beside the sweep because it shares the tick, not because it
+                                // shares the SQL contract.
                                 bg_pin_store.sweep(now_ms);
                                 bg_runtime_state.constant_session_detector.sweep_idle(now_ms);
                                 bg_runtime_state.accumulators.prune_old_months(now_ms);
-                                let _ = llmroller_store::retention::sweep_expired_trace_records(&bg_pool, now_ms).await;
-                                let snapshot = bg_snapshot.load();
-                                let retention_days = snapshot.settings.usage_events_retention_days.max(1);
-                                let max_rows = snapshot.settings.usage_events_max_rows.max(1);
-                                let cutoff = now_ms - retention_days.saturating_mul(86_400_000);
-                                let _ = llmroller_store::retention::sweep_expired_usage_events(&bg_pool, cutoff, 5_000).await;
-                                let _ = llmroller_store::retention::enforce_max_usage_events_rows_pool(&bg_pool, max_rows, 5_000).await;
-                                // Derived data and side tables share the same tick (F038):
-                                // rollups keep at least 31 days for long-range charts,
-                                // usage snapshots 90 days, abuse counters one day, and
-                                // content-addressed trace blocks one full trace window.
-                                let rollup_cutoff = now_ms - retention_days.max(31).saturating_mul(86_400_000);
-                                let _ = llmroller_store::retention::sweep_expired_usage_rollups_5min(&bg_pool, rollup_cutoff, 5_000).await;
-                                let _ = llmroller_store::retention::sweep_expired_usage_rollups_hourly(&bg_pool, rollup_cutoff, 5_000).await;
-                                let _ = llmroller_store::retention::sweep_expired_upstream_usage_snapshots(&bg_pool, now_ms - 90_i64 * 86_400_000, 1_000).await;
-                                let _ = llmroller_store::retention::sweep_expired_auth_failure_counters(&bg_pool, now_ms - 86_400_000).await;
-                                let _ = llmroller_store::retention::sweep_orphaned_trace_blocks(&bg_pool, cutoff, 1_000).await;
-                                let _ = llmroller_store::retention::run_incremental_vacuum(&bg_pool, 500).await;
 
                                 // Auto-disable traceability if expiry timestamp reached (TRC-1, AUD-1, F-093)
                                 if llmroller_core::trace_config::check_auto_disable_expired(
@@ -702,6 +688,74 @@ async fn wait_for_shutdown_signal() {
 
 /// Atomically disables expired content traceability in `settings.value_json`, writes the
 /// `traceability.auto_disabled` audit entry, increments `config_version`, and notifies `Reloader` (`TRC-1`, `AUD-1`, `F-093`).
+/// One maintenance tick's retention sweep over every time-bounded table.
+///
+/// Extracted from the tick closure so it is reachable from a test (`ISSUE-0230`). The sweep
+/// used to be ~25 statements inline inside a closure passed to `JobSupervisor::run_supervised`
+/// → `tokio::spawn` → `run_serve`, which no test could drive. That unreachability is exactly
+/// why `control_plane_logs` was silently omitted from it: nothing asserted what the tick did,
+/// so an omission looked identical to coverage.
+///
+/// Windows, each for a stated reason:
+///
+/// - `usage_events` and `control_plane_logs` — the configured `usage_events_retention_days`.
+///   `AUD-2` specifies *"retained for 30 days"* for control-plane logs and `14.l` names the
+///   setting (`usage_events_retention_days = 30`), so the window is configured, not fixed. The
+///   uncalled `run_retention_pass` used 90 days for this table, which is a divergence from both
+///   the spec and the live tick.
+/// - rollups — `max(31)` days, so long-range charts always have history (`F038`).
+/// - `upstream_usage_snapshots` — a fixed 90 days.
+/// - `auth_failure_counters` — one day; they exist for recent abuse detection only.
+/// - `trace_blocks` — one full trace window, keyed on the raw cutoff.
+///
+/// Every sweep is bounded, so one tick can never hold the write lock for a long backlog
+/// (`REL-3`).
+pub(crate) async fn run_maintenance_retention_sweep(
+    pool: &sqlx::SqlitePool,
+    now_ms: i64,
+    settings: &llmroller_core::settings::RuntimeSettings,
+) -> Result<(), sqlx::Error> {
+    const DAY_MS: i64 = 86_400_000;
+    const CHUNK: i64 = 5_000;
+
+    let retention_days = settings.usage_events_retention_days.max(1);
+    let max_rows = settings.usage_events_max_rows.max(1);
+    let cutoff = now_ms - retention_days.saturating_mul(DAY_MS);
+
+    // Expiry is the row's own timestamp, so these two share one transaction.
+    let mut tx = pool.begin().await?;
+    llmroller_store::retention::sweep_expired_web_sessions(&mut tx, now_ms).await?;
+    llmroller_store::retention::sweep_expired_response_links(&mut tx, now_ms).await?;
+    tx.commit().await?;
+
+    llmroller_store::retention::sweep_expired_pins(pool, now_ms).await?;
+    llmroller_store::retention::sweep_expired_trace_records(pool, now_ms).await?;
+
+    llmroller_store::retention::sweep_expired_usage_events(pool, cutoff, CHUNK).await?;
+    llmroller_store::retention::enforce_max_usage_events_rows_pool(pool, max_rows, CHUNK).await?;
+
+    // Derived data and side tables share the same tick (`F038`).
+    let rollup_cutoff = now_ms - retention_days.max(31).saturating_mul(DAY_MS);
+    llmroller_store::retention::sweep_expired_usage_rollups_5min(pool, rollup_cutoff, CHUNK)
+        .await?;
+    llmroller_store::retention::sweep_expired_usage_rollups_hourly(pool, rollup_cutoff, CHUNK)
+        .await?;
+    llmroller_store::retention::sweep_expired_upstream_usage_snapshots(
+        pool,
+        now_ms - 90 * DAY_MS,
+        1_000,
+    )
+    .await?;
+    llmroller_store::retention::sweep_expired_auth_failure_counters(pool, now_ms - DAY_MS).await?;
+    llmroller_store::retention::sweep_orphaned_trace_blocks(pool, cutoff, 1_000).await?;
+    // `control_plane_logs` — the omission this issue is about. Same configured window as
+    // `usage_events`, because `AUD-2`/`14.l` say control-plane logs are kept for exactly that
+    // long, and bounded for the same `REL-3` reason as every other sweep.
+    llmroller_store::retention::sweep_expired_control_plane_logs(pool, cutoff, CHUNK).await?;
+    llmroller_store::retention::run_incremental_vacuum(pool, 500).await?;
+    Ok(())
+}
+
 pub(crate) async fn auto_disable_expired_traceability(
     pool: &sqlx::SqlitePool,
     current_config: &llmroller_core::settings::TraceabilityConfig,

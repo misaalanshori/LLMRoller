@@ -123,3 +123,40 @@ async fn sweep_keeps_rows_at_or_after_the_cutoff() {
     assert_eq!(deleted, 1, "only the row strictly before the cutoff goes");
     assert_eq!(count_logs(&pool).await, 2);
 }
+
+/// Each call must remove the *oldest* expired rows, so a backlog drains front-to-back.
+///
+/// With `ORDER BY ts DESC` this survives my earlier tests, because they only count rows. It
+/// matters in production: the table has been growing for months, the tick removes at most
+/// `chunk_limit` rows every 30 s, and if each call takes the newest expired rows the oldest
+/// ones are the last to go — which is backwards for a retention sweep whose purpose is to
+/// forget the distant past first. Under a sustained write rate the eviction order decides
+/// which data outlives its window.
+#[tokio::test]
+#[doc = "Spec: AUD-2, REL-3 — ISSUE-0230 the sweep drains the backlog oldest-first"]
+async fn sweep_removes_the_oldest_expired_rows_first() {
+    let (_dir, pool) = fresh_pool("cpl_order.db").await;
+
+    // Times 100..105, all expired. `LIMIT 2` must take ts=100 and ts=101.
+    for (n, ts) in (100..106).enumerate() {
+        insert_log(&pool, n, ts).await;
+    }
+
+    let deleted = sweep_expired_control_plane_logs(&pool, 10_000, 2)
+        .await
+        .expect("sweep");
+    assert_eq!(deleted, 2);
+
+    let remaining: Vec<i64> =
+        sqlx::query_scalar("SELECT ts FROM control_plane_logs ORDER BY ts ASC")
+            .fetch_all(&pool)
+            .await
+            .expect("remaining ts");
+
+    assert_eq!(
+        remaining,
+        vec![102, 103, 104, 105],
+        "the two oldest rows (100, 101) must be gone; if 104/105 are gone instead, the sweep \
+         takes the newest expired rows and the oldest are starved under a sustained backlog"
+    );
+}

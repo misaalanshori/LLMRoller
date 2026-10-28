@@ -20,6 +20,7 @@
 use super::*;
 use llmroller_store::migrations::migrate;
 use llmroller_store::pool::{Role, open_pool};
+use sqlx::SqlitePool;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -67,7 +68,7 @@ async fn live_retention_loop_sweeps_control_plane_logs() {
     // Older than the 30-day default window.
     insert_log(&pool, "cpl_expired", now_ms - 40 * DAY_MS).await;
     // Well inside it.
-    insert_log(&pool, "cpl_live", now_ms - 1 * DAY_MS).await;
+    insert_log(&pool, "cpl_live", now_ms - DAY_MS).await;
 
     run_maintenance_retention_sweep(&pool, now_ms, &settings_with(30))
         .await
@@ -78,10 +79,11 @@ async fn live_retention_loop_sweeps_control_plane_logs() {
             .fetch_one(&pool)
             .await
             .expect("count expired");
-    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_plane_logs WHERE id = 'cpl_live'")
-        .fetch_one(&pool)
-        .await
-        .expect("count live");
+    let live: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM control_plane_logs WHERE id = 'cpl_live'")
+            .fetch_one(&pool)
+            .await
+            .expect("count live");
 
     assert_eq!(
         expired, 0,
@@ -142,9 +144,12 @@ async fn the_dead_codes_ninety_day_window_is_not_used() {
     // `run_retention_pass` used.
     insert_log(&pool, "cpl_45d", now_ms - 45 * DAY_MS).await;
 
-    let default_days = llmroller_core::settings::RuntimeSettings::default()
-        .usage_events_retention_days;
-    assert_eq!(default_days, 30, "the registry's default must be 30 (`AUD-2`)");
+    let default_days =
+        llmroller_core::settings::RuntimeSettings::default().usage_events_retention_days;
+    assert_eq!(
+        default_days, 30,
+        "the registry's default must be 30 (`AUD-2`)"
+    );
 
     run_maintenance_retention_sweep(&pool, now_ms, &settings_with(default_days))
         .await
@@ -159,4 +164,55 @@ async fn the_dead_codes_ninety_day_window_is_not_used() {
         "a 45-day-old row must be gone under the default window; if it survives, the sweep is \
          using the dead code's 90-day cutoff instead of the configured 30"
     );
+}
+
+/// The tick's other time-bounded sweeps still run.
+///
+/// These replaced `retention.rs`'s two `run_retention_pass` tests when that dead function was
+/// deleted (`ISSUE-0230`). They asserted that an expired `web_session`, an orphaned
+/// `trace_block` and a `response_link` were removed "by the retention pass" — which is exactly
+/// the coverage that was misleading, because the pass they called never ran in production. The
+/// same assertions now run against the function the tick actually calls.
+#[tokio::test]
+#[doc = "Spec: TRC-4, TRC-5, PERF-4, REL-3 — ISSUE-0230 the tick sweeps sessions, links and blocks"]
+async fn maintenance_tick_sweeps_sessions_links_and_orphaned_blocks() {
+    let (_dir, pool) = fresh_pool("tick_sessions.db").await;
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, created_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'u1', 'h', 'user', 1000)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert user");
+    sqlx::query(
+        "INSERT INTO web_sessions (id_hash, user_id, csrf_hash, created_at, last_seen_at, expires_at)
+         VALUES ('sess_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'csrf_1', 1000, 1000, 2000)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert web_session");
+    sqlx::query(
+        "INSERT INTO trace_blocks (block_hash, owner_user_id, payload_enc, master_key_id, byte_len, last_referenced_at)
+         VALUES ('blk_1', '01ARZ3NDEKTSV4RRFFQ69G5FAV', X'00', 'mk_1', 16, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert trace_block");
+
+    let now_ms = 100 * DAY_MS;
+    run_maintenance_retention_sweep(&pool, now_ms, &settings_with(30))
+        .await
+        .expect("maintenance sweep");
+
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+        .fetch_one(&pool)
+        .await
+        .expect("count sessions");
+    let blocks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trace_blocks")
+        .fetch_one(&pool)
+        .await
+        .expect("count blocks");
+    assert_eq!(sessions, 0, "expired web sessions must be swept");
+    assert_eq!(blocks, 0, "orphaned trace blocks must be swept");
 }
