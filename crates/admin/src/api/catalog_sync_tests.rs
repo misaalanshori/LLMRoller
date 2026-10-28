@@ -136,3 +136,140 @@ fn ignores_entries_without_cost_and_tolerates_unknown_shapes() {
     assert_eq!(aliases.len(), 1);
     assert_eq!(aliases["unpriced"], vec!["u".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// ISSUE-0179 — the catalog fetch must bound bytes, not just time, and must stamp
+// written rows from the injected clock.
+// ---------------------------------------------------------------------------
+
+/// A source of body chunks: yields `Ok(Some(chunk))`, then `Ok(None)` at end.
+///
+/// Fed to the bounded reader so the byte-ceiling logic is exercised without a network, a
+/// TLS endpoint, or a hostile server. The reader's contract is "stop at the ceiling", and
+/// that is exactly what these fakes measure.
+struct FakeChunks {
+    remaining: usize,
+    chunk_len: usize,
+    /// Total bytes actually handed to the reader, so a test can prove the reader stopped
+    /// early rather than draining the body and checking afterwards.
+    delivered: usize,
+}
+
+impl FakeChunks {
+    fn new(total: usize, chunk_len: usize) -> Self {
+        Self {
+            remaining: total,
+            chunk_len,
+            delivered: 0,
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let take = self.remaining.min(self.chunk_len);
+        self.remaining -= take;
+        self.delivered += take;
+        Ok(Some(vec![b'x'; take]))
+    }
+}
+
+/// A catalog body larger than `SEC-8`'s ceiling must be refused, not parsed (`ISSUE-0179`).
+///
+/// The ceiling is [`llmroller_proto::discovery::MAX_DISCOVERY_BYTES`] — `SEC-8`'s "2 MiB max
+/// `/models` or `/usage` response size". One number for every remote catalog this codebase
+/// reads, rather than a locally-tuned second constant.
+#[tokio::test]
+#[doc = "Spec: SEC-8"]
+async fn price_sync_rejects_an_oversized_catalog_body() {
+    use llmroller_proto::discovery::MAX_DISCOVERY_BYTES;
+
+    // One byte over the ceiling, in 64 KiB chunks, so the reader must decide mid-stream
+    // rather than trusting a `content-length` it may not have been given.
+    let mut source = FakeChunks::new(MAX_DISCOVERY_BYTES + 1, 64 * 1024);
+    let err = super::settings::read_catalog_body(&mut source)
+        .await
+        .err()
+        .expect("a body over the ceiling must be refused, not returned");
+    assert!(
+        err.contains("exceed"),
+        "the error must say the body was too large; got {err:?}"
+    );
+    assert!(
+        source.delivered <= MAX_DISCOVERY_BYTES + 64 * 1024,
+        "the reader must stop near the ceiling instead of draining the whole body; \
+         delivered {} bytes",
+        source.delivered
+    );
+}
+
+/// A body exactly at the ceiling is accepted — the bound must not be off by one.
+#[tokio::test]
+#[doc = "Spec: SEC-8"]
+async fn price_sync_accepts_a_catalog_body_at_the_ceiling() {
+    use llmroller_proto::discovery::MAX_DISCOVERY_BYTES;
+
+    let mut source = FakeChunks::new(MAX_DISCOVERY_BYTES, 64 * 1024);
+    let body = super::settings::read_catalog_body(&mut source)
+        .await
+        .expect("a body at the ceiling must be accepted");
+    assert_eq!(body.len(), MAX_DISCOVERY_BYTES);
+}
+
+/// A small body is returned unchanged, so the bound cannot corrupt normal payloads.
+#[tokio::test]
+#[doc = "Spec: SEC-8"]
+async fn price_sync_passes_a_small_catalog_body_through() {
+    let mut source = FakeChunks::new(1024, 256);
+    let body = super::settings::read_catalog_body(&mut source)
+        .await
+        .expect("a small body must be accepted");
+    assert_eq!(body.len(), 1024);
+    assert!(body.iter().all(|b| *b == b'x'));
+}
+
+/// A mid-stream transport error must surface as an error, never as a short body.
+///
+/// A truncated body that parsed would import partial prices and report success.
+#[tokio::test]
+#[doc = "Spec: SEC-8"]
+async fn price_sync_surfaces_a_mid_stream_error() {
+    struct Broken;
+    impl Broken {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+            Err("connection reset".to_string())
+        }
+    }
+    let err = super::settings::read_catalog_body(&mut Broken)
+        .await
+        .err()
+        .expect("a transport failure must not look like a complete body");
+    assert!(err.contains("connection reset"), "got {err:?}");
+}
+
+/// The sync must stamp written price rows from the injected clock (`ISSUE-0179`).
+///
+/// `chrono_like_now_ms()` reads `SystemTime::now()`, so a row written by the sync carries
+/// wall-clock time regardless of the `Clock` the handler was handed. Every other handler in
+/// this file uses `state.auth.clock`. Asserted by source scan because a live sync's
+/// wall-clock stamp is indistinguishable from a fake-clock one without the seam, and the
+/// seam does not exist for this handler.
+#[test]
+#[doc = "Spec: USG-3"]
+fn price_sync_stamps_rows_from_the_injected_clock() {
+    let source = include_str!("settings.rs");
+    let sync_handler = source
+        .split("pub(crate) async fn post_admin_prices_sync_handler")
+        .nth(1)
+        .and_then(|rest| rest.split("pub(crate) fn chrono_like_now_ms").next())
+        .expect("sync handler body");
+    assert!(
+        !sync_handler.contains("chrono_like_now_ms"),
+        "the price sync must use `state.auth.clock.now_ms()`, not the wall-clock helper"
+    );
+    assert!(
+        sync_handler.contains("state.auth.clock.now_ms()"),
+        "the price sync must stamp rows from the injected clock"
+    );
+}
