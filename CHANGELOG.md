@@ -9,6 +9,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **A zero `instance_id` derived the wrong encryption key (ISSUE-0229).** `instance_id` is the
+  **HKDF salt**, not AAD — `store/src/crypto.rs:303` builds every sealer subkey from
+  `Hkdf::new(Some(instance_id), master_key)`. Three readers substituted `[0u8; 16]` when the id was
+  unreachable, so a seal under the fallback produced bytes a real sealer can never open: lost
+  upstream credentials or locked-out TOTP accounts, silently, because the seal itself succeeded.
+  `reloader::load_instance_id` was the worst of the three — it swallowed both the query error
+  (`.ok()`) and a length mismatch (`try_into().ok()`) and fed a zero salt into the initial snapshot,
+  which every sealer built from that snapshot then inherited. All three now fail closed, through a
+  single `load_sealer`/`load_instance_id` accessor that uses `fetch_one` and validates the length.
+  The schema already forbids the state they tolerated (`instance_id BLOB NOT NULL CHECK
+  (length(instance_id) = 16)`, `0001_initial.sql:11`), and `load_or_initialize` already propagated —
+  so these sites were bypassing a guarantee the codebase enforces, not handling a legal one.
 - **One canonical session-hash fallback (ISSUE-0137).** The product had **two** secret-less
   fallbacks for the same concept, and they disagreed: `orchestrator::session::session_hash` used a
   domain-separated SHA-256 scoped by `client_key_id`, while `usage_passthrough` used
