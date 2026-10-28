@@ -877,27 +877,23 @@ async fn totp_fixture() -> TotpFixture {
         Arc::new(llmroller_core::seams::OsEntropy),
     );
     let actor = ActorScope::user(user.id, Role::Admin);
-    let enrollment = enroll_totp(
-        &pool,
-        &actor,
-        &sealer,
-        "key-0",
-        &DeterministicRng::new(22),
-    )
-    .await
-    .expect("enroll totp");
+    let enrollment = enroll_totp(&pool, &actor, &sealer, "key-0", &DeterministicRng::new(22))
+        .await
+        .expect("enroll totp");
     let recovery_codes: Vec<String> = enrollment
         .recovery_codes
         .iter()
         .map(|c| c.expose_secret().to_string())
         .collect();
 
-    let totp = totp_from_secret(&enrollment.secret_base32.expose_secret().to_string());
+    let totp = totp_from_secret(enrollment.secret_base32.expose_secret());
     let now_ms = now_ms();
     confirm_totp(
         &pool,
         &actor,
-        &totp.generate(u64::try_from(now_ms).unwrap_or(0) / 1000).to_string(),
+        &totp
+            .generate(u64::try_from(now_ms).unwrap_or(0) / 1000)
+            .to_string(),
         &sealer,
         "key-0",
         now_ms,
@@ -911,11 +907,8 @@ async fn totp_fixture() -> TotpFixture {
         master_key.clone(),
         "key-0".to_string(),
     );
-    let app = llmroller_admin::control_plane_router_full(
-        setup_state,
-        auth_state.clone(),
-        api_state,
-    );
+    let app =
+        llmroller_admin::control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
     let page = app
         .clone()
@@ -986,7 +979,12 @@ async fn login_with_a_recovery_code_succeeds() {
     let fx = totp_fixture().await;
     let code = fx.recovery_codes[0].clone();
 
-    let response = fx.app.clone().oneshot(fx.login(&code)).await.expect("login");
+    let response = fx
+        .app
+        .clone()
+        .oneshot(fx.login(&code))
+        .await
+        .expect("login");
     let status = status_of(response).await;
     assert_eq!(
         status,
@@ -1004,10 +1002,24 @@ async fn a_recovery_code_is_single_use() {
     let fx = totp_fixture().await;
     let code = fx.recovery_codes[1].clone();
 
-    let first = status_of(fx.app.clone().oneshot(fx.login(&code)).await.expect("first")).await;
+    let first = status_of(
+        fx.app
+            .clone()
+            .oneshot(fx.login(&code))
+            .await
+            .expect("first"),
+    )
+    .await;
     assert_eq!(first, StatusCode::SEE_OTHER, "the first use must succeed");
 
-    let second = status_of(fx.app.clone().oneshot(fx.login(&code)).await.expect("second")).await;
+    let second = status_of(
+        fx.app
+            .clone()
+            .oneshot(fx.login(&code))
+            .await
+            .expect("second"),
+    )
+    .await;
     assert_eq!(
         second,
         StatusCode::UNAUTHORIZED,
@@ -1016,13 +1028,12 @@ async fn a_recovery_code_is_single_use() {
 
     // And it must be gone from the persisted set, not merely blocked by the in-memory
     // replay cache: the DB row is the durable record of consumption.
-    let stored: String = sqlx::query_scalar(
-        "SELECT totp_recovery_hashes_json FROM users WHERE id = ?",
-    )
-    .bind(fx.user_id.to_string())
-    .fetch_one(&fx.pool)
-    .await
-    .expect("recovery hashes");
+    let stored: String =
+        sqlx::query_scalar("SELECT totp_recovery_hashes_json FROM users WHERE id = ?")
+            .bind(fx.user_id.to_string())
+            .fetch_one(&fx.pool)
+            .await
+            .expect("recovery hashes");
     let hashes: Vec<String> = serde_json::from_str(&stored).expect("json");
     assert_eq!(
         hashes.len(),
@@ -1054,8 +1065,22 @@ async fn recovery_code_cannot_be_used_twice_in_a_row() {
     let fx = totp_fixture().await;
     let code = fx.recovery_codes[2].clone();
 
-    let first = status_of(fx.app.clone().oneshot(fx.login(&code)).await.expect("first")).await;
-    let second = status_of(fx.app.clone().oneshot(fx.login(&code)).await.expect("second")).await;
+    let first = status_of(
+        fx.app
+            .clone()
+            .oneshot(fx.login(&code))
+            .await
+            .expect("first"),
+    )
+    .await;
+    let second = status_of(
+        fx.app
+            .clone()
+            .oneshot(fx.login(&code))
+            .await
+            .expect("second"),
+    )
+    .await;
 
     assert_eq!(first, StatusCode::SEE_OTHER, "the first use must succeed");
     assert_eq!(
@@ -1065,13 +1090,12 @@ async fn recovery_code_cannot_be_used_twice_in_a_row() {
     );
 
     // Exactly one consumption landed in the durable set.
-    let stored: String = sqlx::query_scalar(
-        "SELECT totp_recovery_hashes_json FROM users WHERE id = ?",
-    )
-    .bind(fx.user_id.to_string())
-    .fetch_one(&fx.pool)
-    .await
-    .expect("recovery hashes");
+    let stored: String =
+        sqlx::query_scalar("SELECT totp_recovery_hashes_json FROM users WHERE id = ?")
+            .bind(fx.user_id.to_string())
+            .fetch_one(&fx.pool)
+            .await
+            .expect("recovery hashes");
     let hashes: Vec<String> = serde_json::from_str(&stored).expect("json");
     assert_eq!(
         hashes.len(),
@@ -1086,30 +1110,35 @@ async fn recovery_code_cannot_be_used_twice_in_a_row() {
 #[doc = "Spec: AUTH-9 — ISSUE-0190 an unissued recovery code is rejected"]
 async fn unenrolled_recovery_code_is_rejected() {
     let fx = totp_fixture().await;
-    let before: String = sqlx::query_scalar(
-        "SELECT totp_recovery_hashes_json FROM users WHERE id = ?",
-    )
-    .bind(fx.user_id.to_string())
-    .fetch_one(&fx.pool)
-    .await
-    .expect("recovery hashes");
+    let before: String =
+        sqlx::query_scalar("SELECT totp_recovery_hashes_json FROM users WHERE id = ?")
+            .bind(fx.user_id.to_string())
+            .fetch_one(&fx.pool)
+            .await
+            .expect("recovery hashes");
 
     // Same shape as a real code (XXXX-XXXX-XXXX-XXXX) but never issued.
     let bogus = "DEAD-BEEF-DEAD-BEEF";
-    let status = status_of(fx.app.clone().oneshot(fx.login(bogus)).await.expect("login")).await;
+    let status = status_of(
+        fx.app
+            .clone()
+            .oneshot(fx.login(bogus))
+            .await
+            .expect("login"),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
         "a well-formed but unissued code must not log anyone in"
     );
 
-    let after: String = sqlx::query_scalar(
-        "SELECT totp_recovery_hashes_json FROM users WHERE id = ?",
-    )
-    .bind(fx.user_id.to_string())
-    .fetch_one(&fx.pool)
-    .await
-    .expect("recovery hashes");
+    let after: String =
+        sqlx::query_scalar("SELECT totp_recovery_hashes_json FROM users WHERE id = ?")
+            .bind(fx.user_id.to_string())
+            .fetch_one(&fx.pool)
+            .await
+            .expect("recovery hashes");
     assert_eq!(
         before, after,
         "a rejected attempt must not mutate the stored recovery set"
@@ -1263,7 +1292,12 @@ async fn re_enrolling_a_pending_account_replaces_the_pending_secret() {
         .generate(u64::try_from(now_ms()).unwrap_or(0) / 1000 + 30)
         .to_string();
     let err = llmroller_store::users::verify_login_totp(
-        &pool, user.id, &stale, &sealer, "key-0", now_ms(),
+        &pool,
+        user.id,
+        &stale,
+        &sealer,
+        "key-0",
+        now_ms(),
     )
     .await
     .expect_err("the replaced secret must no longer verify");

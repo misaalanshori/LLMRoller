@@ -9,6 +9,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **TOTP recovery codes and re-enrollment refusal verified, not changed (ISSUE-0189,
+  ISSUE-0190, ISSUE-0221).** Both reported defects turned out to be already implemented, so
+  this is a test-only change. Recovery codes are accepted at login, consumed single-use, and
+  the consumption is compare-and-swapped on the stored hash set; a second enrollment on an
+  already-enabled account is refused outright, so the "clicks Enroll, closes the tab, silently
+  loses 2FA" scenario cannot occur. Six tests now prove it: accepting a recovery code,
+  rejecting its second use, rejecting a never-issued code, refusing re-enrollment of an
+  enabled account (asserting the row survives the refusal), and pinning that a *pending*
+  account's secret is replaced by a second enroll — recorded as known-benign behaviour since
+  pending-enrollment state does not exist. No production code changed.
 - **Deleting a price that does not exist no longer reports success (ISSUE-0192).**
   `DELETE /admin/api/prices` and `DELETE /api/user/providers/{id}/prices` discarded
   `delete_price_tx`'s `bool` and returned `204` unconditionally, so an operator removing a
