@@ -29,6 +29,8 @@ pub(crate) use llmroller_store::users::{NewUser, create_user};
 
 #[path = "e2e_dashboard_htmx/dashboards_and_partials.rs"]
 mod dashboards_and_partials;
+#[path = "e2e_dashboard_htmx/log_detail_fields.rs"]
+mod log_detail_fields;
 #[path = "e2e_dashboard_htmx/logs_and_analytics.rs"]
 mod logs_and_analytics;
 #[path = "e2e_dashboard_htmx/remaining_filters.rs"]
