@@ -93,11 +93,15 @@ where
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| writer_busy_error())?;
-        op(&mut tx).await.map_err(|_| writer_busy_error())?;
-        llmroller_store::writer::bump_config_version_tx(&mut tx)
-            .await
-            .map_err(|_| writer_busy_error())?;
-        tx.commit().await.map_err(|_| writer_busy_error())?;
+        // A closure error carries the meaningful status (404/400/409). It is parked in `slot`
+        // by `op`, so fall through to the slot read below rather than turning every refusal
+        // into `writer_busy` — the earlier `?` here discarded it.
+        if op(&mut tx).await.is_ok() {
+            llmroller_store::writer::bump_config_version_tx(&mut tx)
+                .await
+                .map_err(|_| writer_busy_error())?;
+            tx.commit().await.map_err(|_| writer_busy_error())?;
+        }
     }
 
     slot.lock()

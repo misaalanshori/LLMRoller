@@ -131,11 +131,8 @@ async fn harness() -> Harness {
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
     };
-    let mut api_state = ApiAppState::new(
-        auth_state.clone(),
-        master_key.clone(),
-        "key-0".to_string(),
-    );
+    let mut api_state =
+        ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     api_state.audit_hmac_key = Some(llmroller_core::seams::secret_bytes(vec![0x31; 32]));
     let app = control_plane_router_full(setup_state, auth_state, api_state);
 
@@ -322,7 +319,9 @@ async fn approving_a_custom_share_succeeds_and_grants_eligibility() {
 
     // Before approval the data plane refuses it — this is the state the approval changes.
     let mut tx = h.pool.begin().await.expect("begin");
-    let cfg = get_provider_share_tx(&mut tx, &share_id).await.expect("share");
+    let cfg = get_provider_share_tx(&mut tx, &share_id)
+        .await
+        .expect("share");
     assert_eq!(
         is_share_eligible(&cfg, ProviderKind::Custom, &fingerprint, false, None),
         Err(IneligibleReason::CustomProviderNeedsAdminApproval),
@@ -333,7 +332,9 @@ async fn approving_a_custom_share_succeeds_and_grants_eligibility() {
     assert_eq!(h.approve(share_id).await, StatusCode::OK);
 
     let mut tx = h.pool.begin().await.expect("begin");
-    let cfg = get_provider_share_tx(&mut tx, &share_id).await.expect("share");
+    let cfg = get_provider_share_tx(&mut tx, &share_id)
+        .await
+        .expect("share");
     assert!(
         is_share_eligible(&cfg, ProviderKind::Custom, &fingerprint, false, None).is_ok(),
         "after approval the share must be eligible, or the approval granted nothing"

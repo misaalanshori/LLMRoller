@@ -17,6 +17,14 @@ pub enum ShareError {
     Forbidden,
     #[error("share overlap")]
     ShareOverlap,
+    /// Approval was requested for a share whose provider is not `custom`.
+    ///
+    /// `SHR-3` requires `admin_approved_at` only for custom providers — `is_share_eligible`
+    /// gates on `provider_kind == Custom` — so approving a built-in provider's share sets a
+    /// column nothing reads: an approval that granted nothing, and a false trail entry
+    /// (`ISSUE-0191`).
+    #[error("share is not on a custom provider")]
+    NotCustom,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -188,6 +196,25 @@ pub async fn approve_provider_share_tx(
     now_ms: i64,
 ) -> Result<(), ShareError> {
     let share_str = share_id.to_string();
+
+    // The kind check lives here rather than in the handler: it is a share invariant, and
+    // keeping it beside `is_share_eligible`'s `provider_kind == Custom` gate is what stops the
+    // two from drifting apart (`ISSUE-0191`, and the same class as `ISSUE-0171`).
+    //
+    // A missing row falls through to the UPDATE below, so the not-found path keeps its single
+    // source of truth.
+    let is_custom: Option<bool> = sqlx::query_scalar(
+        r#"SELECT p.kind = 'custom' FROM provider_shares s
+           JOIN providers p ON p.id = s.provider_id
+           WHERE s.id = ?"#,
+    )
+    .bind(&share_str)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if is_custom == Some(false) {
+        return Err(ShareError::NotCustom);
+    }
+
     let rows_affected = sqlx::query(
         r#"UPDATE provider_shares SET admin_approved_at = ? WHERE id = ? AND revoked_at IS NULL"#,
     )

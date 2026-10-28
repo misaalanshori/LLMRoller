@@ -104,6 +104,11 @@ pub(crate) async fn post_user_share_handler(
         llmroller_store::shares::ShareError::ShareOverlap => {
             map_price_error(StatusCode::CONFLICT, "overlapping share already exists")
         }
+        // Creation never applies the approval rule, so this is unreachable here; mapped
+        // rather than panicked so the match stays total.
+        llmroller_store::shares::ShareError::NotCustom => {
+            map_price_error(StatusCode::BAD_REQUEST, "share is not on a custom provider")
+        }
         llmroller_store::shares::ShareError::Database(err) => {
             map_price_error(StatusCode::INTERNAL_SERVER_ERROR, err)
         }
@@ -246,20 +251,38 @@ pub(crate) async fn post_admin_share_approve_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
     let now_ms = state.auth.clock.now_ms();
 
-    let mut tx = state
-        .auth
-        .pool
-        .begin()
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    llmroller_store::shares::approve_provider_share_tx(&mut tx, &id, now_ms)
-        .await
-        .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Through the standard mutation path rather than a hand-rolled transaction: that is what
+    // publishes `ConfigDomain::Shares`, so the data plane stops believing the share is still
+    // unapproved (`ISSUE-0191`, the same class as cycle 18's `ISSUE-0182`). The audit row was
+    // already being written by `control_mutation_barrier`, which runs regardless — so the cost
+    // of the raw transaction here was the publish, not the trail.
+    execute_atomic_mutation(&state, vec![ConfigDomain::Shares], move |tx| {
+        Box::pin(async move {
+            llmroller_store::shares::approve_provider_share_tx(tx, &id, now_ms)
+                .await
+                .map_err(share_approval_error)
+        })
+    })
+    .await?;
 
     Ok(StatusCode::OK)
+}
+
+/// Map a store `ShareError` from an approval to the status the endpoint should return.
+///
+/// `NotCustom` is a `400`: the request is well-formed but asks for something that grants
+/// nothing. `NotFound` stays `404`, so approving a revoked or absent share does not leak the
+/// difference (`SHR-5`).
+fn share_approval_error(error: llmroller_store::shares::ShareError) -> MutationResponseError {
+    use llmroller_store::shares::ShareError;
+    match error {
+        ShareError::NotFound => map_price_error(StatusCode::NOT_FOUND, "share not found"),
+        ShareError::NotCustom => map_price_error(
+            StatusCode::BAD_REQUEST,
+            "only a share of a custom provider requires admin approval",
+        ),
+        ShareError::Forbidden => map_price_error(StatusCode::FORBIDDEN, "forbidden"),
+        ShareError::ShareOverlap => map_price_error(StatusCode::CONFLICT, "share overlap"),
+        ShareError::Database(err) => map_price_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
 }
