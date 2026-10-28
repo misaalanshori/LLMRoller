@@ -9,6 +9,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`control_plane_logs` is swept in production, and the sweep is bounded (ISSUE-0230).** The table
+  recording every control-plane HTTP request grew without bound: the live maintenance tick swept
+  eleven tables and omitted this one, while `run_retention_pass` — the function written to trim it —
+  had no production caller and was exercised only by its own tests. Two defects, fixed together
+  because either alone is a regression: an unbounded sweep that runs, or a bound on a sweep that
+  never runs. `sweep_expired_control_plane_logs` now takes a chunk limit like every other sweeper in
+  the module (`REL-3`: *"a slow or locked SQLite writer must never block or fail an inference
+  request"*), ordered `ts ASC` so a backlog drains oldest-first rather than starving the rows furthest
+  past their window. The maintenance tick's retention block was extracted into
+  `run_maintenance_retention_sweep` so it is reachable from a test — its previous home, a closure
+  inside `tokio::spawn` inside `run_serve`, is why the omission survived. The window follows
+  `usage_events_retention_days`, which `AUD-2` (*"retained for 30 days"*) and `14.l` name explicitly;
+  the uncalled `run_retention_pass` used 90 days for this table, a third divergence. That function is
+  now deleted, after a table-by-table comparison showed `control_plane_logs` was the only sweep it
+  uniquely performed (its snapshot entry was an unbounded duplicate at 7 days of a table the tick
+  already sweeps at 90). Its two tests, which asserted the behaviour of a function nothing called,
+  were re-pointed at the function production actually runs.
 - **The state-bound pass-through path uses the provider's billing plan (ISSUE-0130).**
   `forward_state_bound_response_op` attributed usage on two paths and they disagreed: the
   decode-failure path called `provider_billing(&snapshot, &key.provider_id)` (cycle 16's fix for
