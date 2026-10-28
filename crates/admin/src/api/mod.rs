@@ -93,7 +93,11 @@ pub(crate) use sessions_and_traces::*;
 pub(crate) use settings::*;
 pub(crate) use shares::*;
 pub(crate) use usage::*;
-pub(crate) use usage_filters::{bind_usage_filters, canonical_total, event_query, rollup_query};
+pub(crate) use usage_filters::{
+    api_logs_export_query, audit_log_query, bind_api_logs_export_filters, bind_audit_log_filters,
+    bind_ledger_filters, bind_logs_export_filters, bind_usage_filters, canonical_total,
+    event_query, ledger_query, logs_export_query, rollup_query,
+};
 pub(crate) use users_and_auth::*;
 
 #[cfg(test)]

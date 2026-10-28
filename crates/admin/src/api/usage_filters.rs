@@ -125,6 +125,152 @@ macro_rules! bind_usage_filters {
 }
 pub(crate) use bind_usage_filters;
 
+/// The ledger's predicate: `model` + `initiator` on raw `usage_events`.
+///
+/// `LedgerQuery` has no `provider_id`, so it cannot reuse [`event_query!`] — that macro binds
+/// provider_id as well. Rather than widen `LedgerQuery`'s public API to make the reuse cosmetic,
+/// the ledger gets its own clause, still defined here so every `WHERE` fragment for a read
+/// endpoint lives in one file.
+///
+/// `initiator` is the same three-way union cycle 23 settled on (`14.n.2`, `ISSUE-0142`):
+/// `usage_events` carries `client_key_id`, `owner_user_id`, and `service_account_id` directly, so
+/// no join is needed here.
+macro_rules! ledger_query {
+    ($base:literal) => {
+        ledger_query!($base, "")
+    };
+    ($base:literal, $tail:literal) => {
+        concat!(
+            $base,
+            "
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR service_account_id = ? OR client_key_id = ? OR owner_user_id = ?)",
+            $tail
+        )
+    };
+}
+pub(crate) use ledger_query;
+
+/// Bind `model` then `initiator` for [`ledger_query!`]: **2 + 4 = 6** placeholders.
+macro_rules! bind_ledger_filters {
+    ($query:expr, $query_struct:expr) => {
+        $query
+            .bind($query_struct.model.as_deref())
+            .bind($query_struct.model.as_deref())
+            .bind($query_struct.initiator.as_deref())
+            .bind($query_struct.initiator.as_deref())
+            .bind($query_struct.initiator.as_deref())
+            .bind($query_struct.initiator.as_deref())
+    };
+}
+pub(crate) use bind_ledger_filters;
+
+/// The inference CSV's predicate: `model`, `client_key_id`, `service_account_id`, `status` on
+/// `usage_events`.
+///
+/// This is the same table as [`event_query!`] but a different filter set: the export is driven by
+/// `LogsQuery`, which has no `initiator`/`provider_id` but does have `client_key_id`,
+/// `service_account_id`, and `status`. `model` and `initiator` are not interchangeable with those,
+/// so a distinct clause is honest rather than clever.
+macro_rules! logs_export_query {
+    ($base:literal) => {
+        logs_export_query!($base, "")
+    };
+    ($base:literal, $tail:literal) => {
+        concat!(
+            $base,
+            "
+           AND (? IS NULL OR canonical_id = ?)
+           AND (? IS NULL OR client_key_id = ?)
+           AND (? IS NULL OR service_account_id = ?)
+           AND (? IS NULL OR status = ?)",
+            $tail
+        )
+    };
+}
+pub(crate) use logs_export_query;
+
+/// Bind `model`, `client_key_id`, `service_account_id`, `status`: **2 × 4 = 8** placeholders.
+macro_rules! bind_logs_export_filters {
+    ($query:expr, $query_struct:expr) => {
+        $query
+            .bind($query_struct.model.as_deref())
+            .bind($query_struct.model.as_deref())
+            .bind($query_struct.client_key_id.as_deref())
+            .bind($query_struct.client_key_id.as_deref())
+            .bind($query_struct.service_account_id.as_deref())
+            .bind($query_struct.service_account_id.as_deref())
+            .bind($query_struct.status)
+            .bind($query_struct.status)
+    };
+}
+pub(crate) use bind_logs_export_filters;
+
+/// The API-stream CSV's predicate: `method` and `status` on `control_plane_logs`.
+///
+/// `control_plane_logs` has no `canonical_id`, `client_key_id`, or `service_account_id`
+/// (`0001_initial.sql:572`), so this branch genuinely cannot share the inference export's clause.
+macro_rules! api_logs_export_query {
+    ($base:literal) => {
+        api_logs_export_query!($base, "")
+    };
+    ($base:literal, $tail:literal) => {
+        concat!(
+            $base,
+            "
+           AND (? IS NULL OR method = ?)
+           AND (? IS NULL OR status = ?)",
+            $tail
+        )
+    };
+}
+pub(crate) use api_logs_export_query;
+
+/// Bind `method`, `status`: **2 × 2 = 4** placeholders.
+macro_rules! bind_api_logs_export_filters {
+    ($query:expr, $query_struct:expr) => {
+        $query
+            .bind($query_struct.method.as_deref())
+            .bind($query_struct.method.as_deref())
+            .bind($query_struct.status)
+            .bind($query_struct.status)
+    };
+}
+pub(crate) use bind_api_logs_export_filters;
+
+/// The admin audit log's predicate: `action` and `target_type` on `audit_log`.
+///
+/// Time bounds and the `seq` cursor are added by the handler inline, because the audit log is
+/// ordered by `seq DESC` rather than by a timestamp — its cursor is a simple `seq < ?`
+/// (`ISSUE-0144`), unlike the composite cursors elsewhere.
+macro_rules! audit_log_query {
+    ($base:literal) => {
+        audit_log_query!($base, "")
+    };
+    ($base:literal, $tail:literal) => {
+        concat!(
+            $base,
+            "
+           AND (? IS NULL OR action = ?)
+           AND (? IS NULL OR target_type = ?)",
+            $tail
+        )
+    };
+}
+pub(crate) use audit_log_query;
+
+/// Bind `action`, `target_type`: **2 × 2 = 4** placeholders.
+macro_rules! bind_audit_log_filters {
+    ($query:expr, $query_struct:expr) => {
+        $query
+            .bind($query_struct.action.as_deref())
+            .bind($query_struct.action.as_deref())
+            .bind($query_struct.target_type.as_deref())
+            .bind($query_struct.target_type.as_deref())
+    };
+}
+pub(crate) use bind_audit_log_filters;
+
 /// The canonical token total: the four priced classes.
 ///
 /// The same definition the Overview KPI, the Usage Ledger, `calculate_cost_micro_usd`, and cycle
@@ -141,4 +287,109 @@ pub(crate) const fn canonical_total(
     output: i64,
 ) -> i64 {
     input + cache_read + cache_write + output
+}
+
+#[cfg(test)]
+mod tests {
+    //! Placeholder-count tests for every clause above.
+    //!
+    //! These exist because cycle 23 shipped a `(? IS NULL OR a = ? OR b = ? OR c = ?)` clause bound
+    //! with only three values. sqlx binds positionally, so that did not fail to compile — it
+    //! surfaced as a runtime `no such column` on SQL whose text looked correct. A count assertion
+    //! turns that class of mistake into a test failure with no database required.
+
+    /// Number of `?` placeholders a clause declares.
+    fn placeholders(sql: &str) -> usize {
+        sql.matches('?').count()
+    }
+
+    /// Number of `.bind(` calls a binder macro expands to.
+    ///
+    /// The binder macros are invoked against a recording stand-in that counts calls, so this
+    /// measures the real expansion rather than a transcribed number.
+    macro_rules! count_binds {
+        ($binder:ident, $query_struct:expr) => {{
+            struct Counter(usize);
+            #[allow(dead_code)]
+            impl Counter {
+                fn bind<T>(&mut self, _v: T) -> &mut Self {
+                    self.0 += 1;
+                    self
+                }
+            }
+            let mut c = Counter(0);
+            $binder!(&mut c, $query_struct).0
+        }};
+    }
+
+    #[derive(Default)]
+    struct Filters {
+        provider_id: Option<String>,
+        model: Option<String>,
+        initiator: Option<String>,
+        client_key_id: Option<String>,
+        service_account_id: Option<String>,
+        method: Option<String>,
+        action: Option<String>,
+        target_type: Option<String>,
+        status: Option<i64>,
+    }
+
+    #[test]
+    fn every_clause_declares_the_number_of_binds_its_binder_supplies() {
+        let f = Filters::default();
+
+        let rollup = rollup_query!("SELECT 1 FROM usage_rollups_hourly WHERE 1 = 1");
+        assert_eq!(
+            placeholders(rollup),
+            count_binds!(bind_usage_filters, &f),
+            "rollup clause vs bind_usage_filters!:\n{rollup}"
+        );
+
+        let event = event_query!("SELECT 1 FROM usage_events WHERE 1 = 1");
+        assert_eq!(
+            placeholders(event),
+            count_binds!(bind_usage_filters, &f),
+            "event clause vs bind_usage_filters!:\n{event}"
+        );
+
+        let ledger = ledger_query!("SELECT 1 FROM usage_events WHERE 1 = 1");
+        assert_eq!(
+            placeholders(ledger),
+            count_binds!(bind_ledger_filters, &f),
+            "ledger clause vs bind_ledger_filters!:\n{ledger}"
+        );
+
+        let export = logs_export_query!("SELECT 1 FROM usage_events WHERE 1 = 1");
+        assert_eq!(
+            placeholders(export),
+            count_binds!(bind_logs_export_filters, &f),
+            "export clause vs bind_logs_export_filters!:\n{export}"
+        );
+
+        let api = api_logs_export_query!("SELECT 1 FROM control_plane_logs WHERE 1 = 1");
+        assert_eq!(
+            placeholders(api),
+            count_binds!(bind_api_logs_export_filters, &f),
+            "api export clause vs bind_api_logs_export_filters!:\n{api}"
+        );
+
+        let audit = audit_log_query!("SELECT 1 FROM audit_log WHERE 1 = 1");
+        assert_eq!(
+            placeholders(audit),
+            count_binds!(bind_audit_log_filters, &f),
+            "audit clause vs bind_audit_log_filters!:\n{audit}"
+        );
+    }
+
+    #[test]
+    fn the_tail_is_spliced_after_the_predicate() {
+        let sql = rollup_query!("BASE", "GROUP BY x");
+        let group_at = sql.find("GROUP BY").expect("tail present");
+        let clause_at = sql.find("provider_id").expect("clause present");
+        assert!(
+            clause_at < group_at,
+            "the predicate must precede the trailing clause, else SQL is malformed:\n{sql}"
+        );
+    }
 }

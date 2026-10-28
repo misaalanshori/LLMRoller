@@ -1086,7 +1086,8 @@ pub(crate) async fn get_usage_ledger_internal(
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
 
     let agg_sql = if owner_user_id.is_some() {
-        "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
+        ledger_query!(
+            "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
                 COALESCE(SUM(cache_read_tokens), 0) as cache_read,
                 COALESCE(SUM(cache_write_tokens), 0) as cache_write,
                 COALESCE(SUM(output_tokens), 0) as output,
@@ -1096,10 +1097,11 @@ pub(crate) async fn get_usage_ledger_internal(
          FROM usage_events
          WHERE owner_user_id = ?
            AND (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)"
+           AND (? IS NULL OR ts <= ?)"
+        )
     } else {
-        "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
+        ledger_query!(
+            "SELECT COALESCE(SUM(input_uncached_tokens), 0) as input_uncached,
                 COALESCE(SUM(cache_read_tokens), 0) as cache_read,
                 COALESCE(SUM(cache_write_tokens), 0) as cache_write,
                 COALESCE(SUM(output_tokens), 0) as output,
@@ -1108,31 +1110,33 @@ pub(crate) async fn get_usage_ledger_internal(
                 COALESCE(SUM(list_cost_micro_usd), 0) as list_cost_micro_usd
          FROM usage_events
          WHERE (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)"
+           AND (? IS NULL OR ts <= ?)"
+        )
     };
 
     let agg_row = if let Some(ref uid) = owner_user_id {
-        sqlx::query(agg_sql)
-            .bind(uid)
-            .bind(query.from)
-            .bind(query.from)
-            .bind(query.to)
-            .bind(query.to)
-            .bind(query.model.as_deref())
-            .bind(query.model.as_deref())
-            .fetch_one(&state.auth.reader_pool)
-            .await
+        bind_ledger_filters!(
+            sqlx::query(agg_sql)
+                .bind(uid)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .fetch_one(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(agg_sql)
-            .bind(query.from)
-            .bind(query.from)
-            .bind(query.to)
-            .bind(query.to)
-            .bind(query.model.as_deref())
-            .bind(query.model.as_deref())
-            .fetch_one(&state.auth.reader_pool)
-            .await
+        bind_ledger_filters!(
+            sqlx::query(agg_sql)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .fetch_one(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1150,51 +1154,55 @@ pub(crate) async fn get_usage_ledger_internal(
     let plan_covered_savings = list_cost.saturating_sub(billed_cost);
 
     let row_sql = if owner_user_id.is_some() {
-        "SELECT id, ts, request_id, client_key_id, canonical_id,
+        ledger_query!(
+            "SELECT id, ts, request_id, client_key_id, canonical_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE owner_user_id = ?
            AND (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)
-         ORDER BY id DESC LIMIT ?"
+           AND (? IS NULL OR ts <= ?)",
+            "ORDER BY id DESC LIMIT ?"
+        )
     } else {
-        "SELECT id, ts, request_id, client_key_id, canonical_id,
+        ledger_query!(
+            "SELECT id, ts, request_id, client_key_id, canonical_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR canonical_id = ?)
-         ORDER BY id DESC LIMIT ?"
+           AND (? IS NULL OR ts <= ?)",
+            "ORDER BY id DESC LIMIT ?"
+        )
     };
 
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(row_sql)
-            .bind(uid)
-            .bind(query.from)
-            .bind(query.from)
-            .bind(query.to)
-            .bind(query.to)
-            .bind(query.model.as_deref())
-            .bind(query.model.as_deref())
-            .bind(limit)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_ledger_filters!(
+            sqlx::query(row_sql)
+                .bind(uid)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .bind(limit)
+        .fetch_all(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(row_sql)
-            .bind(query.from)
-            .bind(query.from)
-            .bind(query.to)
-            .bind(query.to)
-            .bind(query.model.as_deref())
-            .bind(query.model.as_deref())
-            .bind(limit)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_ledger_filters!(
+            sqlx::query(row_sql)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .bind(limit)
+        .fetch_all(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

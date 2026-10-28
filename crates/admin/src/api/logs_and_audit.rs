@@ -75,13 +75,34 @@ pub(crate) async fn get_user_audit_log_handler(
 pub(crate) async fn get_admin_audit_log_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AuditLogQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
     let _actor = authenticate_admin(&state, &headers, false).await?;
 
-    let rows = sqlx::query(
-        "SELECT seq, ts, actor_user_id, action, target_type, target_id, detail_json, hash AS hash_hex FROM audit_log ORDER BY seq DESC LIMIT 100"
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    // The audit chain is ordered by `seq DESC`, so its cursor is a plain `seq < ?` — the newest
+    // row of the previous page is the exclusive upper bound of the next. No composite key and no
+    // timestamp tie-breaking, unlike the usage endpoints (`ISSUE-0144`).
+    let rows = bind_audit_log_filters!(
+        sqlx::query(audit_log_query!(
+            "SELECT seq, ts, actor_user_id, ip_addr, action, target_type, target_id, detail_json,
+                    hash AS hash_hex
+             FROM audit_log
+             WHERE (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)
+               AND (? IS NULL OR seq < ?)",
+            "ORDER BY seq DESC LIMIT ?"
+        ))
+        .bind(query.from)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.to)
+        .bind(query.cursor)
+        .bind(query.cursor),
+        query
     )
-    .fetch_all(&state.auth.pool)
+    .bind(limit)
+    .fetch_all(&state.auth.reader_pool)
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -91,11 +112,13 @@ pub(crate) async fn get_admin_audit_log_handler(
             "seq": r.try_get::<i64, _>("seq").unwrap_or_default(),
             "ts": r.try_get::<i64, _>("ts").unwrap_or_default(),
             "actor_user_id": r.try_get::<Option<String>, _>("actor_user_id").unwrap_or_default(),
+            // Nullable `TEXT` (`0001_initial.sql:561`), so it renders as-is or as `None`.
+            "ip_addr": r.try_get::<Option<String>, _>("ip_addr").unwrap_or_default(),
             "action": r.try_get::<String, _>("action").unwrap_or_default(),
             "target_type": r.try_get::<String, _>("target_type").unwrap_or_default(),
             "target_id": r.try_get::<Option<String>, _>("target_id").unwrap_or_default(),
-            "payload_json": r.try_get::<String, _>("detail_json").unwrap_or_default(),
-            "detail_json": r.try_get::<String, _>("detail_json").unwrap_or_default(),
+            "payload_json": r.try_get::<Option<String>, _>("detail_json").unwrap_or_default(),
+            "detail_json": r.try_get::<Option<String>, _>("detail_json").unwrap_or_default(),
             "hash": r.try_get::<String, _>("hash_hex").unwrap_or_default(),
         }));
     }
@@ -569,6 +592,24 @@ pub(crate) async fn get_log_detail_internal(
     })))
 }
 
+/// Append the truncation footer to a CSV body when the row cap was hit.
+///
+/// A `#`-prefixed line is not a data row for any spreadsheet importer or `pandas.read_csv` with
+/// comment handling, so it cannot be mistaken for a record. It is written **last** so a streaming
+/// consumer that stops early still sees the data, and its presence is the only signal an operator
+/// gets that the file is a prefix rather than the whole filtered set (`ISSUE-0143`).
+///
+/// Silent truncation is the same class of defect as an ignored filter: the artefact claims a
+/// completeness it does not have, and acts on that claim elsewhere.
+fn push_truncation_footer(csv: &mut String, truncated: bool, cap: i64) {
+    if truncated {
+        csv.push_str(&format!(
+            "# TRUNCATED: export limited to {cap} rows; more rows matched the filter. \
+             Narrow the date range or filters to retrieve the remainder.\r\n"
+        ));
+    }
+}
+
 pub(crate) async fn get_user_logs_export_csv_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -598,26 +639,64 @@ pub(crate) async fn export_logs_csv_internal(
     use llmroller_proto::headers::sanitize_csv_cell;
 
     let is_api = query.stream.as_deref() == Some("api");
+    // The cap stays: an uncapped export is a memory and disk hazard. It is now *reported* rather
+    // than silent, because a filtered export that quietly stops at N rows claims a completeness it
+    // does not have (`ISSUE-0143`).
+    //
+    // One extra row is fetched beyond the cap so truncation is detected exactly — a result of
+    // precisely `cap` rows is complete, and fetching `cap` alone could not distinguish the two.
+    let cap = query.limit.unwrap_or(5_000).clamp(1, 5_000);
+    let fetch = cap.saturating_add(1);
     if is_api {
         let sql = if owner_user_id.is_some() {
-            "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
-             FROM control_plane_logs WHERE actor_user_id = ? ORDER BY ts DESC LIMIT 5000"
+            api_logs_export_query!(
+                "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
+                 FROM control_plane_logs
+                 WHERE actor_user_id = ?
+                   AND (? IS NULL OR ts >= ?)
+                   AND (? IS NULL OR ts <= ?)",
+                "ORDER BY ts DESC LIMIT ?"
+            )
         } else {
-            "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
-             FROM control_plane_logs ORDER BY ts DESC LIMIT 5000"
+            api_logs_export_query!(
+                "SELECT id, ts, request_id, method, path, status, latency_ms, ip_addr
+                 FROM control_plane_logs
+                 WHERE (? IS NULL OR ts >= ?)
+                   AND (? IS NULL OR ts <= ?)",
+                "ORDER BY ts DESC LIMIT ?"
+            )
         };
         let rows = if let Some(ref uid) = owner_user_id {
-            sqlx::query(sql)
-                .bind(uid)
-                .fetch_all(&state.auth.reader_pool)
-                .await
+            bind_api_logs_export_filters!(
+                sqlx::query(sql)
+                    .bind(uid)
+                    .bind(query.from)
+                    .bind(query.from)
+                    .bind(query.to)
+                    .bind(query.to),
+                query
+            )
+            .bind(fetch)
+            .fetch_all(&state.auth.reader_pool)
+            .await
         } else {
-            sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
+            bind_api_logs_export_filters!(
+                sqlx::query(sql)
+                    .bind(query.from)
+                    .bind(query.from)
+                    .bind(query.to)
+                    .bind(query.to),
+                query
+            )
+            .bind(fetch)
+            .fetch_all(&state.auth.reader_pool)
+            .await
         }
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+        let truncated = rows.len() > cap as usize;
         let mut csv = String::from("id,ts,request_id,method,path,status,duration_ms,ip_addr\r\n");
-        for r in rows {
+        for r in rows.into_iter().take(cap as usize) {
             let id: String = r.try_get("id").unwrap_or_default();
             let ts: i64 = r.try_get("ts").unwrap_or(0);
             let req_id: String = r.try_get("request_id").unwrap_or_default();
@@ -642,6 +721,7 @@ pub(crate) async fn export_logs_csv_internal(
             );
             csv.push_str(&line);
         }
+        push_truncation_footer(&mut csv, truncated, cap);
 
         return axum::response::Response::builder()
             .status(StatusCode::OK)
@@ -655,29 +735,59 @@ pub(crate) async fn export_logs_csv_internal(
     }
 
     let sql = if owner_user_id.is_some() {
-        "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
+        logs_export_query!(
+            "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
                 input_uncached_tokens, output_tokens, error_code
-         FROM usage_events WHERE owner_user_id = ? ORDER BY id DESC LIMIT 5000"
+             FROM usage_events
+             WHERE owner_user_id = ?
+               AND (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)",
+            "ORDER BY id DESC LIMIT ?"
+        )
     } else {
-        "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
+        logs_export_query!(
+            "SELECT id, ts, request_id, canonical_id, status, cost_micro_usd,
                 input_uncached_tokens, output_tokens, error_code
-         FROM usage_events ORDER BY id DESC LIMIT 5000"
+             FROM usage_events
+             WHERE (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)",
+            "ORDER BY id DESC LIMIT ?"
+        )
     };
 
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(sql)
-            .bind(uid)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_logs_export_filters!(
+            sqlx::query(sql)
+                .bind(uid)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .bind(fetch)
+        .fetch_all(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(sql).fetch_all(&state.auth.reader_pool).await
+        bind_logs_export_filters!(
+            sqlx::query(sql)
+                .bind(query.from)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.to),
+            query
+        )
+        .bind(fetch)
+        .fetch_all(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    let truncated = rows.len() > cap as usize;
     let mut csv = String::from(
         "id,ts,request_id,canonical_id,status,cost_micro_usd,input_tokens,output_tokens,error_code\r\n",
     );
-    for r in rows {
+    for r in rows.into_iter().take(cap as usize) {
         let id: String = r.try_get("id").unwrap_or_default();
         let ts: i64 = r.try_get("ts").unwrap_or(0);
         let req_id: String = r.try_get("request_id").unwrap_or_default();
@@ -713,6 +823,7 @@ pub(crate) async fn export_logs_csv_internal(
         );
         csv.push_str(&line);
     }
+    push_truncation_footer(&mut csv, truncated, cap);
 
     axum::response::Response::builder()
         .status(StatusCode::OK)
@@ -726,7 +837,6 @@ pub(crate) async fn export_logs_csv_internal(
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct LedgerQuery {
     pub from: Option<i64>,
     pub to: Option<i64>,

@@ -7,7 +7,7 @@
 //! Spec: `AUD-2`, `SEC-6`/`SEC-20`, `USG-1`, `USG-3`, `14.n.2`.
 use super::*;
 
-use llmroller_core::ids::{ClientKeyId, RequestId, UsageEventId};
+use llmroller_core::ids::{RequestId, UsageEventId};
 
 /// A usage row for the inference-CSV and ledger fixtures.
 struct UsageRow {
@@ -91,15 +91,20 @@ async fn seed_cp_log(
     .expect("control plane log");
 }
 
+/// `(ts, action, target_type, target_id, ip_addr)` for one audit row.
+type AuditRow = (
+    i64,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
 /// Append audit rows through the real chained-hash writer, so `seq` is monotonic.
 ///
 /// Writing the table directly would be simpler but would bypass the hash chain; using the store
 /// helper keeps the fixture honest about how audit rows come into existence.
-async fn seed_audit(
-    pool: &sqlx::SqlitePool,
-    hmac: &[u8],
-    entries: &[(i64, &str, &str, Option<&str>, Option<&str>)],
-) {
+async fn seed_audit(pool: &sqlx::SqlitePool, hmac: &[u8], entries: &[AuditRow]) {
     for (ts, action, target_type, target_id, ip) in entries {
         let mut tx = pool.begin().await.expect("tx");
         let id = llmroller_core::ids::UsageEventId::generate().to_string();
