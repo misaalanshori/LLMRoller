@@ -410,3 +410,7 @@ mod fnd021_tests {
         assert_eq!(remaining_blocks, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "retention/control_plane_sweep.rs"]
+mod control_plane_sweep;

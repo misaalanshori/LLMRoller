@@ -105,3 +105,6 @@ async fn traceability_auto_disable_updates_value_json_reloads_snapshot_and_audit
             .contains(&llmroller_core::snapshot::ConfigDomain::Settings)
     );
 }
+
+#[path = "phase7_tests/maintenance_sweep.rs"]
+mod maintenance_sweep;
