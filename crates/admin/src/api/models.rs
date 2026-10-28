@@ -219,6 +219,21 @@ pub(crate) struct DeleteAliasParams {
     pub alias: Option<String>,
 }
 
+/// `DELETE /admin/api/model-aliases?alias=…` — remove one confirmed alias.
+///
+/// Was a bare `DELETE` on the reader-facing pool (`ISSUE-0232`), which meant:
+///
+/// - **`204` even when zero rows matched**, so a caller deleting a typo'd alias was told it
+///   worked;
+/// - no `ConfigDomain::Models` publish, so the data plane kept resolving the deleted alias —
+///   `SnapshotModel` aliases are projected into `ConfigSnapshot::aliases` and read by
+///   `resolve_model`, so the stale entry is live, not cosmetic (`reloader.rs:167,197`);
+/// - the write was not atomic with its audit decision.
+///
+/// Now the same shape as `patch_admin_model_handler` above: one transaction, `404` on zero
+/// rows. (The audit row and publish come from `control_mutation_barrier` either way — verified,
+/// see the cycle-33 report; what the atomic path adds is that the `rows_affected` decision and
+/// the delete cannot disagree.)
 pub(crate) async fn delete_admin_model_alias_handler(
     State(state): State<ApiAppState>,
     headers: HeaderMap,
@@ -231,11 +246,20 @@ pub(crate) async fn delete_admin_model_alias_handler(
             "missing alias parameter",
         ));
     };
-    sqlx::query("DELETE FROM model_aliases WHERE alias = ?")
-        .bind(alias)
-        .execute(&state.auth.pool)
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    execute_atomic_mutation(&state, vec![ConfigDomain::Models], move |tx| {
+        Box::pin(async move {
+            let res = sqlx::query("DELETE FROM model_aliases WHERE alias = ?")
+                .bind(&alias)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            if res.rows_affected() == 0 {
+                return Err(map_price_error(StatusCode::NOT_FOUND, "alias not found"));
+            }
+            Ok(())
+        })
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

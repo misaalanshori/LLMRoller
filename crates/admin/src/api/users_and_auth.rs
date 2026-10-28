@@ -540,26 +540,39 @@ pub async fn load_sealer(
     state: &ApiAppState,
 ) -> Result<llmroller_store::crypto::XChaCha20Poly1305Sealer, (StatusCode, Json<serde_json::Value>)>
 {
-    // `fetch_one`, not `fetch_optional`: a missing `instance_meta` row is a configuration fault and
-    // must surface, never become a `[0u8; 16]` HKDF salt (`ISSUE-0229`).
+    Ok(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
+        state.master_key.clone(),
+        load_instance_id(state).await?,
+        state.auth.entropy.clone(),
+    ))
+}
+
+/// Read `instance_meta.instance_id` once, for both the sealer and the token manager.
+///
+/// `instance_id` is the HKDF **salt** (`store/src/crypto.rs:303`), so a substitute is not a
+/// cosmetic default — a zero salt derives a different key set, making every row sealed under the
+/// real id permanently unreadable (`ISSUE-0229`). Both failure modes the old code swallowed now
+/// propagate:
+///
+/// - `fetch_one`, not `fetch_optional`: a missing `instance_meta` row is a configuration fault
+///   and must surface rather than become `[0u8; 16]`;
+/// - the length is checked explicitly because the schema's
+///   `CHECK (length(instance_id) = 16)` (`0001_initial.sql:11`) can be bypassed by a direct
+///   writer or a partial restore.
+pub(crate) async fn load_instance_id(
+    state: &ApiAppState,
+) -> Result<[u8; 16], (StatusCode, Json<serde_json::Value>)> {
     let instance_id_vec: Vec<u8> =
         sqlx::query_scalar("SELECT instance_id FROM instance_meta WHERE singleton = 1")
             .fetch_one(&state.auth.pool)
             .await
             .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    // The schema guarantees `length(instance_id) = 16` (`0001_initial.sql:11`), so a mismatch means
-    // the database was written by something that bypassed the constraint. Error, do not substitute.
-    let instance_id: [u8; 16] = instance_id_vec.try_into().map_err(|_| {
+    instance_id_vec.try_into().map_err(|_| {
         map_price_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "corrupt instance_id: expected 16 bytes",
         )
-    })?;
-    Ok(llmroller_store::crypto::XChaCha20Poly1305Sealer::new(
-        state.master_key.clone(),
-        instance_id,
-        state.auth.entropy.clone(),
-    ))
+    })
 }
 
 pub(crate) async fn post_user_totp_enroll_handler(

@@ -277,6 +277,21 @@ pub struct ApiAppState {
     /// Live data-plane session pins, shared with `ProxyAuthState` so control-plane
     /// unpin actions take effect before the next proxied request (SEC-17).
     pub pin_store: Option<std::sync::Arc<llmroller_core::pins::PinStore>>,
+    /// OAuth/refresh-token resolver, shared with the data plane so a control-plane probe
+    /// sends the same credential a proxied request would (`PRV-6`, `ISSUE-0178`).
+    ///
+    /// The admin crate cannot build this from scratch the way `discovery_poller` does, because
+    /// the probe must use the *same* token cache as the data plane — otherwise a probe can
+    /// refresh a token the data plane then has to refresh again, and the two can disagree
+    /// about which credential is live. Optional so the many CLI/test constructions of this
+    /// state stay valid; the probe falls back to a private instance when it is absent, which is
+    /// correct for a single-shot probe but does not share the cache.
+    pub token_manager: Option<std::sync::Arc<llmroller_proxy::token_manager::TokenManager>>,
+    /// The instance HKDF salt, for the token manager's persist path (`ISSUE-0229`).
+    ///
+    /// Read once by the caller that wires this state; never defaulted to zeros, because a
+    /// zero salt derives a different key set.
+    pub instance_id: Option<[u8; 16]>,
 }
 
 impl ApiAppState {
@@ -292,6 +307,8 @@ impl ApiAppState {
             audit_hmac_key: None,
             discovery_tx: None,
             pin_store: None,
+            token_manager: None,
+            instance_id: None,
         }
     }
 

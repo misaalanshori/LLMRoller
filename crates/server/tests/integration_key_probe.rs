@@ -27,7 +27,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
@@ -57,8 +57,6 @@ const SEALED_REFRESH_TOKEN: &str = "refresh-token-must-not-be-sent-verbatim";
 /// What a correctly refreshed credential looks like. The `dynamic://` spec below is the
 /// supported way to carry a refresh token, and `TokenManager::parse_dynamic_spec` is what turns
 /// `SEALED_REFRESH_TOKEN` into something the manager will exchange.
-const DYNAMIC_SPEC: &str = "dynamic://oauth";
-
 // ---------------------------------------------------------------------------
 // Mock upstream: records Authorization headers, answers a configurable status
 // ---------------------------------------------------------------------------
@@ -177,7 +175,7 @@ async fn seed_provider_and_key(
     let key_id = UpstreamKeyId::generate();
     let key_id_text = key_id.to_string();
     let provider_id_text = provider_id.to_string();
-    let aad = vec![
+    let aad = [
         b"key-0".to_vec(),
         key_id_text.as_bytes().to_vec(),
         provider_id_text.as_bytes().to_vec(),

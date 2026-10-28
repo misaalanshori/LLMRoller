@@ -431,7 +431,7 @@ pub(crate) async fn post_test_upstream_key_handler(
             &secret_enc,
         )
         .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot open key"))?;
-    let secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
+    let raw_secret = String::from_utf8_lossy(secret.expose_secret()).to_string();
 
     // Probe the provider's configured discovery endpoint with its configured auth
     // scheme instead of assuming `Bearer` against `/models` (`PRV-6`, F044).
@@ -447,6 +447,49 @@ pub(crate) async fn post_test_upstream_key_handler(
             "provider URL is not allowed",
         ));
     }
+    let client = llmroller_proxy::ssrf::create_guarded_client(allow_private)
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Resolve the credential the way the **data plane** does (`PRV-6`, `ISSUE-0178`).
+    //
+    // For `auth_kind = oauth` the sealed secret is the *refresh token*, so using it directly
+    // sent a refresh token as a bearer credential: the probe failed and reported a perfectly
+    // healthy OAuth key as broken. `resolve_and_persist_secret` returns the secret unchanged for
+    // a static key and a real access token for an OAuth one.
+    //
+    // The shared manager is preferred so a probe and a proxied request cannot hold different
+    // live credentials; the private fallback is correct for a single-shot probe but does not
+    // share the cache. `instance_id` is the HKDF salt (`ISSUE-0229`) — read, never defaulted.
+    let instance_id = load_instance_id(&state).await?;
+    // Preferred: the shared manager, so a probe and a proxied request cannot hold different
+    // live credentials. Fallback: a private one, correct for a single-shot probe.
+    let owned_manager;
+    let token_manager: &llmroller_proxy::token_manager::TokenManager =
+        if let Some(shared) = state.token_manager.as_deref() {
+            shared
+        } else {
+            owned_manager = llmroller_proxy::token_manager::TokenManager::new();
+            &owned_manager
+        };
+    let parsed_provider_id = llmroller_core::ids::ProviderId::parse(&provider_id)
+        .unwrap_or_else(|_| llmroller_core::ids::ProviderId::generate());
+    let secret = token_manager
+        .resolve_and_persist_secret(
+            id,
+            parsed_provider_id,
+            &raw_secret,
+            &client,
+            allow_private,
+            state.auth.clock.now_ms(),
+            state.writer.as_ref(),
+            Some(&state.master_key),
+            Some(&state.master_key_id),
+            Some(instance_id),
+            &state.auth.entropy,
+        )
+        .await
+        .map_err(|e| map_price_error(StatusCode::BAD_GATEWAY, e))?;
+
     let client = llmroller_proxy::ssrf::create_guarded_client(allow_private)
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let started = std::time::Instant::now();
@@ -479,18 +522,86 @@ pub(crate) async fn post_test_upstream_key_handler(
         Err(_) => ("error", None, "Upstream unreachable"),
     };
 
-    let health = if status == "ok" { "healthy" } else { "invalid" };
-    let _ = sqlx::query("UPDATE upstream_keys SET health = ? WHERE id = ?")
-        .bind(health)
-        .bind(&key_id_text)
-        .execute(&state.auth.pool)
-        .await;
+    // Classify by **what the status means**, not by success/failure (`ISSUE-0178`, `PRV-6`).
+    //
+    // This used to be `if status == "ok" { "healthy" } else { "invalid" }`, so a `429` or a
+    // transient `503` **permanently marked a working key invalid** — an operator clicking
+    // "Test" during a rate-limit window silently disabled a good key.
+    //
+    // The schema's CHECK already has the vocabulary the issue asked for
+    // (`0001_initial.sql:181`): `healthy | cooling_down | exhausted | invalid`. `exhausted` is
+    // "quota/rate", `cooling_down` is "the provider failed, recoverable", and only a rejected
+    // credential is `invalid`. No migration is needed.
+    //
+    // The `until` companion matters: `KeyHealthEntry::is_routable` only consults
+    // `cooldown_until_ms` / `exhausted_until_ms`, so a bare `exhausted` with no timestamp routes
+    // as normal — the classification would be decorative. `invalid` deliberately carries none,
+    // because it is an indefinite state and a leftover `until` would make it look recoverable.
+    const PROBE_COOLDOWN_MS: i64 = 60_000;
+    const PROBE_EXHAUSTED_MS: i64 = 300_000;
+    let now_ms = state.auth.clock.now_ms();
+    let (health, health_until) = match http_status {
+        Some(code) if (200..300).contains(&code) => ("healthy", None),
+        Some(401 | 403) => ("invalid", None),
+        Some(429) => ("exhausted", Some(now_ms.saturating_add(PROBE_EXHAUSTED_MS))),
+        // 5xx, or no status at all (timeout / connect error): the provider failed, not the key.
+        Some(code) if (500..600).contains(&code) => (
+            "cooling_down",
+            Some(now_ms.saturating_add(PROBE_COOLDOWN_MS)),
+        ),
+        None => (
+            "cooling_down",
+            Some(now_ms.saturating_add(PROBE_COOLDOWN_MS)),
+        ),
+        // Any other 4xx is a malformed request, which means the credential or its config is
+        // wrong rather than the provider being unavailable.
+        Some(_) => ("invalid", None),
+    };
+
+    // Through the standard mutation path, so the audit row, the `ConfigDomain::UpstreamKeys`
+    // publish and the version bump all happen. The same shape as
+    // `post_reset_upstream_key_health_handler` above, which is the canonical version.
+    let key_id_for_write = key_id_text.clone();
+    execute_atomic_mutation_with_invalidations(
+        &state,
+        vec![ConfigDomain::UpstreamKeys],
+        vec![llmroller_core::snapshot::CacheInvalidationEvent::UpstreamKeyChanged(id)],
+        move |tx| {
+            Box::pin(async move {
+                let res = sqlx::query(
+                    "UPDATE upstream_keys
+                     SET health = ?, health_until = ?, health_version = health_version + 1
+                     WHERE id = ?",
+                )
+                .bind(health)
+                .bind(health_until)
+                .bind(&key_id_for_write)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                // The key was read from this same database moments ago, so zero rows means it
+                // was deleted between the read and the write. Report that rather than claiming
+                // success on a row that no longer exists.
+                if res.rows_affected() == 0 {
+                    return Err(map_price_error(
+                        StatusCode::NOT_FOUND,
+                        "upstream key not found",
+                    ));
+                }
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({
         "status": status,
         "http_status": http_status,
         "latency_ms": latency_ms,
         "message": message,
+        // Report the classified health, so a caller can tell "the key is fine, it is rate
+        // limited" from "the credential is rejected" without re-deriving the mapping.
+        "health": health,
         "key_id": key_id_text,
     })))
 }
