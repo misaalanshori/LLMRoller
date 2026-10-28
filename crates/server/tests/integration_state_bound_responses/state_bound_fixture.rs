@@ -21,7 +21,7 @@ pub(super) use axum::routing::get;
 pub(super) use llmroller_core::ids::{ModelPk, UpstreamKeyId, UserId};
 pub(super) use llmroller_core::provider::ProviderKind;
 pub(super) use llmroller_core::rbac::{ActorScope, OwnershipScope, SystemSeal, SystemTask};
-pub(super) use llmroller_core::seams::{ExposeSecret as _, OsEntropy, secret_string};
+pub(super) use llmroller_core::seams::{OsEntropy, secret_string};
 pub(super) use llmroller_proxy::auth::ProxyAuthState;
 pub(super) use llmroller_proxy::listeners::data_plane_router;
 pub(super) use llmroller_server::reloader::load_initial_snapshot;

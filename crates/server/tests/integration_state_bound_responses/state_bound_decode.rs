@@ -19,7 +19,7 @@
 //! nothing to smuggle through, so the two tests at the bottom of this file pin that
 //! status quo: a saturated preflight budget must **not** reject a state-bound op.
 
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tower::ServiceExt as _;

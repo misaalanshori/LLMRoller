@@ -640,6 +640,13 @@ pub(crate) async fn forward_state_bound_response_op(
         }
     }
 
+    // Resolved once, before either terminal path, so the decode-failure and pass-through
+    // rows cannot drift apart again. Cycle 16 fixed only the decode branch, which left one
+    // handler reporting a subscription plan on a corrupt body and pay-as-you-go on a normal
+    // upstream error (`ISSUE-0130`, `USG-10`).
+    let (billing_coverage_mode, plan_multiplier_bps) =
+        provider_billing(&snapshot, &key.provider_id);
+
     let raw_secret = match unseal_upstream_key(state, &snapshot, &key) {
         Ok(secret) => secret,
         Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -801,8 +808,6 @@ pub(crate) async fn forward_state_bound_response_op(
             // The linked key really did answer, so the row is attributed to it. A row
             // credited to "none" while a real key answered is a row that exists but is
             // wrong, which is not an improvement over a missing row (`ISSUE-0149`).
-            let (billing_coverage_mode, plan_multiplier_bps) =
-                provider_billing(&snapshot, &key.provider_id);
             enqueue_terminal_usage(
                 state,
                 TerminalUsageFacts {
@@ -949,9 +954,15 @@ pub(crate) async fn forward_state_bound_response_op(
                 } else {
                     Some("upstream_error".to_string())
                 },
+                // No token cost on a bodyless pass-through, so list cost is genuinely
+                // zero — but the *plan* still applies: `apply_effective_upstream_cost`
+                // uses the mode to decide whether the multiplier means anything, and
+                // `billing_coverage_mode` is what the ledger and the coverage UI group by
+                // (`USG-10`). Reporting the defaults here made a subscription provider's
+                // pass-through rows indistinguishable from pay-as-you-go ones.
                 list_cost_micro_usd: 0,
-                plan_multiplier_bps: 10_000,
-                billing_coverage_mode: "pay_as_you_go".to_string(),
+                plan_multiplier_bps,
+                billing_coverage_mode: billing_coverage_mode.clone(),
                 service_account_id: caller.service_account_id.clone().map(|sa| sa.to_string()),
                 stop_reason: None,
                 request_headers_json: None,

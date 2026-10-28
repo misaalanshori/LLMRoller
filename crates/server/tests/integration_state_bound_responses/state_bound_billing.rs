@@ -20,10 +20,18 @@
 use super::state_bound_fixture::*;
 use llmroller_store::providers::set_provider_billing_plan;
 
-/// A provider on a 0.5x subscription plan. Half list price is distinctive enough that no
-/// default (`10_000` / `pay_as_you_go`) can be mistaken for it.
-const PLAN_MULTIPLIER_BPS: i64 = 5_000;
+/// A provider on a subscription plan at 0.7321x list.
+///
+/// Both values are deliberately *implausible as constants*: `5_000` (a clean "0.5x") turned
+/// out to let a mutant survive, because a hardcoded `5_000` is indistinguishable from a
+/// correctly-read `5_000`. A value nobody would type kills that class of mutant.
+const PLAN_MULTIPLIER_BPS: i64 = 7_321;
 const PLAN_COVERAGE_MODE: &str = "subscription_plan";
+
+/// A second, deliberately different plan, used to prove the value is read *per provider*
+/// rather than being one shared constant.
+const OTHER_PLAN_MULTIPLIER_BPS: i64 = 3_117;
+const OTHER_PLAN_COVERAGE_MODE: &str = "free_tier";
 
 /// Put the harness's provider on a subscription plan.
 async fn set_subscription_plan(harness: &Harness, provider_id: llmroller_core::ids::ProviderId) {
@@ -163,5 +171,69 @@ async fn state_bound_decode_and_pass_through_agree_on_billing() {
     assert_eq!(
         pass_multiplier, PLAN_MULTIPLIER_BPS,
         "both paths must report the provider's plan, not the default"
+    );
+}
+
+/// The billing fields must come from the serving provider's row, not from any constant.
+///
+/// This is the test that separates "reads the setting" from "happens to write the right
+/// number". Two providers are given different plans; each request's row must carry its own
+/// provider's plan. A single shared constant — even a plausible one — fails here.
+#[tokio::test]
+#[doc = "Spec: USG-10 — ISSUE-0130 billing is read per provider, not from a constant"]
+async fn state_bound_billing_is_read_per_provider() {
+    let mut observed = Vec::new();
+
+    for (index, (mode, multiplier)) in [
+        (PLAN_COVERAGE_MODE, PLAN_MULTIPLIER_BPS),
+        (OTHER_PLAN_COVERAGE_MODE, OTHER_PLAN_MULTIPLIER_BPS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let harness = harness().await;
+        let user = insert_user(&harness.pool, &format!("billing-per-prov-{index}")).await;
+        let token =
+            create_client_key(&harness, user, &format!("billing-per-prov-key-{index}")).await;
+        let (id, key_id, _mock) = create_link(&harness, &token, false).await;
+        let provider_id: String =
+            sqlx::query_scalar("SELECT provider_id FROM upstream_keys WHERE id = ?")
+                .bind(key_id.to_string())
+                .fetch_one(&harness.pool)
+                .await
+                .expect("provider id");
+        set_provider_billing_plan(
+            &harness.pool,
+            &harness.system_actor,
+            provider_id.parse().expect("parses"),
+            mode,
+            multiplier,
+        )
+        .await
+        .expect("set plan");
+
+        let app = build_app(&harness).await;
+        let (status, _body) = get_response(app, &token, &id).await;
+        assert_eq!(status, StatusCode::OK);
+        flush(&harness).await;
+        let (got_mode, got_multiplier, _err) = newest_billing(&harness).await;
+        observed.push((mode, multiplier, got_mode, got_multiplier));
+    }
+
+    for (want_mode, want_multiplier, got_mode, got_multiplier) in &observed {
+        assert_eq!(
+            got_multiplier, want_multiplier,
+            "provider on {want_mode} at {want_multiplier} bps was recorded at {got_multiplier} bps"
+        );
+        assert_eq!(
+            got_mode, want_mode,
+            "provider on {want_mode} was recorded as {got_mode}"
+        );
+    }
+
+    // The two providers really were told apart, so this cannot pass with one shared value.
+    assert_ne!(
+        observed[0].3, observed[1].3,
+        "the two providers' multipliers must differ in the ledger, or the value is a constant"
     );
 }
