@@ -9,6 +9,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **CSV export honours every filter and reports truncation (ISSUE-0143).** `export_logs_csv_internal`
+  issued a bare `LIMIT 5000` on both branches, so an operator who asked for "last week's errors on
+  model X" received up to 5,000 unfiltered rows — in a file that leaves the system, where a wrong
+  screen gets noticed but a wrong export gets acted on elsewhere. The inference branch now filters on
+  `model`, `client_key_id`, `service_account_id`, `status`, and `from`/`to`; the API branch on
+  `method`, `status`, and `from`/`to` (it reads `control_plane_logs`, which has none of the
+  inference columns). The 5,000-row cap stays, but one row beyond it is fetched so truncation is
+  detected exactly, and a capped export ends with a `# TRUNCATED: …` line — silently truncating a
+  correctly-filtered export is the same class of defect as ignoring the filter.
+- **The admin audit log is interrogable (ISSUE-0144).** `get_admin_audit_log_handler` took no query
+  parameters at all and always returned the newest 100 rows, so "every admin action on shares last
+  week" was unanswerable through the API. It now binds `action`, `target_type`, `from`/`to`,
+  `cursor`, and `limit`, and returns `ip_addr` (nullable plain `TEXT`, not packed). The cursor is a
+  plain `seq < ?`, which is all a `seq DESC` chain needs. The **user** audit handler was already
+  correct — filters, `ip_addr`, and cursor included.
+- **The usage ledger honours `initiator` (ISSUE-0142).** `LedgerQuery::initiator` was declared with
+  `#[allow(dead_code)]` and never bound, so the ledger answered the unfiltered question regardless.
+  It now uses cycle 23's settled three-way union from `14.n.2` — `client_key_id`, `owner_user_id`,
+  `service_account_id` — applied directly to `usage_events`, which carries all three, so no join.
+- **A placeholder-count test closes the class of bug that bit cycle 23.** That cycle shipped a
+  four-placeholder `initiator` clause bound with three values; sqlx binds positionally, so it
+  compiled and failed at runtime. `every_clause_declares_the_number_of_binds_its_binder_supplies`
+  counts `?` in each clause and counts the `.bind(` calls each binder macro actually expands to,
+  asserting equality with no database needed.
 - **The four usage endpoints honour the filters they accept (ISSUE-0175).** `UsageFilterParams`
   deserialised `provider_id`, `model`, and `initiator`, and `summary`/`timeseries`/`breakdown`/
   `events` bound only `since`/`until` — so a filtered request returned the unfiltered number with no
