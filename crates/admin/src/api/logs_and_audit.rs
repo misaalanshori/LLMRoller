@@ -233,6 +233,25 @@ pub(crate) async fn get_logs_internal(
     let is_api = query.stream.as_deref() == Some("api");
     let limit = query.limit.unwrap_or(50).clamp(1, 1000);
 
+    // The retention window each stream may claim, loaded once so the two branches cannot
+    // disagree (`ISSUE-0133`).
+    //
+    // The two streams describe *different tables*, and only one of them is pruned:
+    //
+    // - `inference` reads `usage_events`, which the live maintenance loop sweeps at exactly
+    //   `usage_events_retention_days` (`cli/serve.rs`, `retention.rs:296`).
+    // - `api` reads `control_plane_logs`, which **nothing prunes in the live path**. The
+    //   maintenance loop does not touch it, and `run_retention_pass` — which does, at a fixed
+    //   90 days — has no production caller. So its window is unbounded, and `None` says that.
+    //
+    // Reporting `30` (the old hardcoded value) claimed a policy that was not in force. The
+    // `.max(31)` in `run_retention_pass` clamps the *rollup* cutoff, not this table, so it is
+    // not the number this response should carry either.
+    let settings = llmroller_store::settings::load_settings(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let usage_events_retention_days = Some(settings.usage_events_retention_days.max(1));
+
     if is_api {
         let sql = if actor_user_id.is_some() {
             "SELECT id, ts, request_id, actor_user_id, workspace_scope, method, path, status, latency_ms, ip_addr, user_agent
@@ -315,7 +334,12 @@ pub(crate) async fn get_logs_internal(
 
         return Ok(Json(serde_json::json!({
             "stream": "api",
-            "retention_days": 30,
+            // Nothing prunes `control_plane_logs` in the live maintenance loop, so there is
+            // no window to report. `null` is the honest value; `retention_scope` names which
+            // table the window would apply to, so the absence cannot be mistaken for a
+            // missing field.
+            "retention_days": serde_json::Value::Null,
+            "retention_scope": "control_plane_logs",
             "rows": logs,
         })));
     }
@@ -445,7 +469,8 @@ pub(crate) async fn get_logs_internal(
 
     Ok(Json(serde_json::json!({
         "stream": "inference",
-        "retention_days": 30,
+        "retention_days": usage_events_retention_days,
+        "retention_scope": "usage_events",
         "rows": logs,
     })))
 }
