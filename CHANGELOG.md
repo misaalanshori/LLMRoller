@@ -9,6 +9,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **No invented model id on an unresolvable response link (ISSUE-0129).** `state_bound.rs` resolved
+  the ledger's model with `snapshot.models.get(&link.model_pk).map_or_else(|| "gpt-4o".to_string(),
+  ..)` — `gpt-4o` chosen for no reason beyond being the first plausible string, added by cycle 16's
+  fix for #156. A ledger row naming a model that did not serve the request is wrong data, the failure
+  cycle 10 established the rule against. It is now a `502` with an actionable message, mirroring the
+  unresolvable-`upstream_key_id` and unresolvable-provider lookups immediately above it. **The branch
+  is dead code today** — `hard_route_checks` refuses a link whose model has left the snapshot with
+  `403` before attribution runs, which mutation confirmed (restoring the fallback leaves the new test
+  green). The guard is defence in depth against a snapshot/model disagreement, which is reachable via
+  a partially restored database or the snapshot loader skipping a `model_pk` that fails
+  `ModelPk::parse`.
+- **The metric label allowlist actually gates emission (ISSUE-0128).** Thirteen call sites did
+  `let _ = validate_metric_labels(&labels);`, so the closed-allowlist check was consulted and its
+  answer discarded — a new call site could introduce an unbounded-cardinality label
+  (`("user_id", …)`) and nothing would notice. One shared `labels_ok()` now does the gate:
+  `debug_assert!` so a test build catches a bad key at the first call, and the sample is **dropped**
+  in release rather than emitted unvalidated. `debug_assert!` rather than `panic!` because a metrics
+  path must never take the process down. The key guard and `TOKEN_REASON_ALLOWLIST`'s value guard
+  remain separate — a legal key set can carry an illegal `reason` value. A source-inspection test
+  (`include_str!`) asserts no site goes back to discarding the result, so a fourteenth call site
+  cannot silently reintroduce the defect.
 - **A zero `instance_id` derived the wrong encryption key (ISSUE-0229).** `instance_id` is the
   **HKDF salt**, not AAD — `store/src/crypto.rs:303` builds every sealer subkey from
   `Hkdf::new(Some(instance_id), master_key)`. Three readers substituted `[0u8; 16]` when the id was
