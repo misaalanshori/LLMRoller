@@ -488,3 +488,136 @@ async fn state_bound_response_op_is_not_smuggling_gated() {
         "with no request body there is nothing for the smuggling check to adjudicate"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #129 — an unresolvable `model_pk` must not invent a model id
+// ---------------------------------------------------------------------------
+
+/// A `response_links` row whose `model_pk` is no longer in the snapshot must **not** produce a
+/// usage row attributed to an invented model.
+///
+/// `state_bound.rs:765-768` does:
+///
+/// ```ignore
+/// snapshot.models.get(&link.model_pk)
+///     .map_or_else(|| "gpt-4o".to_string(), |m| m.canonical_id.clone())
+/// ```
+///
+/// `gpt-4o` was not chosen for any reason — it was the first plausible string. A ledger row naming
+/// a model that did not serve the request is wrong data, which is the failure cycle 10 established
+/// the rule against ("a row attributed to `none` when a real key answered is a row that exists but
+/// is wrong"). An empty string would be equally wrong and less visible.
+///
+/// **Reachability.** `response_links.model_pk` is `REFERENCES models(model_pk) ON DELETE RESTRICT`
+/// (`0001_initial.sql:387`) and the snapshot loader selects `FROM models` with no predicate, so in
+/// production the lookup cannot miss. This is a latent hazard: the snapshot loader also **skips**
+/// rows whose `model_pk` fails to parse (`let Ok(pk) = ModelPk::parse(..) else { continue }`,
+/// `store/src/models.rs:650`), so a snapshot can legitimately be missing a model the DB still has.
+/// The fixture reaches the state by deleting the model with the FK disabled — which is what a
+/// partially restored database or an out-of-band writer does.
+#[tokio::test]
+#[doc = "Spec: USG-1, USG-3, RTE-12 — ISSUE-0129 no invented model id on an unresolvable link"]
+async fn state_bound_decode_failure_does_not_invent_a_model_id() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "sb129-user").await;
+    let token = create_client_key(&harness, user, "sb129-key").await;
+    let (id, _key_id, _mock) = create_link(&harness, &token, true).await;
+
+    // The link is written through the coalescing writer queue, so drain it before reading.
+    flush(&harness).await;
+
+    // Remove the model the link points at, leaving the link's `model_pk` dangling. `RESTRICT`
+    // forbids this normally, so lift the constraint for the fixture — the point is that the code
+    // must not paper over the resulting inconsistency with a plausible-looking string.
+    let model_pk: String =
+        sqlx::query_scalar("SELECT model_pk FROM response_links WHERE response_id = ?")
+            .bind(&id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("link model_pk");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&harness.pool)
+        .await
+        .expect("disable fk");
+    sqlx::query("DELETE FROM model_routes WHERE model_pk = ?")
+        .bind(&model_pk)
+        .execute(&harness.pool)
+        .await
+        .expect("delete route");
+    sqlx::query("DELETE FROM models WHERE model_pk = ?")
+        .bind(&model_pk)
+        .execute(&harness.pool)
+        .await
+        .expect("delete model");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&harness.pool)
+        .await
+        .expect("enable fk");
+
+    let app = build_app(&harness).await;
+    let (status, body) = get_response(app, &token, &id).await;
+    flush(&harness).await;
+
+    // Whatever the handler does, the ledger must never claim `gpt-4o` or an empty model for a
+    // request whose real model no longer exists.
+    let recorded: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT canonical_id, error_code FROM usage_events \
+         WHERE endpoint = 'responses' ORDER BY ts DESC, rowid DESC LIMIT 5",
+    )
+    .fetch_all(&harness.pool)
+    .await
+    .expect("usage events");
+
+    for (canonical_id, error_code) in &recorded {
+        assert_ne!(
+            canonical_id.as_deref(),
+            Some("gpt-4o"),
+            "no usage row may be attributed to the invented fallback model; row: {canonical_id:?} / \
+             {error_code:?}"
+        );
+        assert_ne!(
+            canonical_id.as_deref(),
+            Some(""),
+            "an empty canonical_id is as wrong as an invented one, just less visible"
+        );
+    }
+
+    // And the request must fail loudly rather than proceed on a link it cannot attribute.
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "an unresolvable model on the link is a stale-link fault; got {status} with body {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Non-regression: a resolvable link still produces the real `canonical_id`.
+///
+/// Without this, "always error" would satisfy the test above.
+#[tokio::test]
+#[doc = "Spec: USG-1, USG-3, RTE-12 — ISSUE-0129 a resolvable link still attributes the real model"]
+async fn state_bound_decode_failure_attributes_the_real_model_when_resolvable() {
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "sb129-ok-user").await;
+    let token = create_client_key(&harness, user, "sb129-ok-key").await;
+    let (id, _key_id, _mock) = create_link(&harness, &token, true).await;
+
+    let app = build_app(&harness).await;
+    let (status, _body) = get_response(app, &token, &id).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    flush(&harness).await;
+
+    let canonical_id: Option<String> = sqlx::query_scalar(
+        "SELECT canonical_id FROM usage_events \
+         WHERE endpoint = 'responses' ORDER BY ts DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("usage event");
+    assert_eq!(
+        canonical_id.as_deref(),
+        Some("gpt-4o"),
+        "a resolvable link must still be attributed to its real model — here the fixture's model \
+         genuinely *is* gpt-4o, so this asserts the lookup ran rather than that the fallback fired"
+    );
+}
