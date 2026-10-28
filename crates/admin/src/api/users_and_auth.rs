@@ -83,23 +83,41 @@ pub(crate) async fn patch_user_preferences_handler(
         ));
     }
 
-    sqlx::query(
-        "UPDATE users SET
-            ui_theme = COALESCE(?, ui_theme),
-            ui_nav_layout = COALESCE(?, ui_nav_layout),
-            ui_locale = COALESCE(?, ui_locale),
-            default_routing_scope = COALESCE(?, default_routing_scope)
-         WHERE id = ?",
-    )
-    .bind(payload.ui_theme.as_deref())
-    .bind(payload.ui_nav_layout.as_deref())
-    .bind(payload.ui_locale.as_deref())
-    .bind(payload.default_routing_scope.as_deref())
-    .bind(user_id.to_string())
-    .execute(&state.auth.pool)
-    .await
-    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // `default_routing_scope` is not presentation: the data plane's `resolve_caller_scope`
+    // reads `snapshot.users[..].default_routing_scope`, so a change must reach the snapshot
+    // or the caller keeps the old scope until something unrelated bumps it (`CLK-3`).
+    // The three UI fields need no publish at all (`ISSUE-0182`).
+    //
+    // The split has to be at the *writer* boundary, not the domain list.
+    // `execute_single_control_task` bumps `config_version` unconditionally in the same
+    // transaction, so routing a UI-only update through `execute_atomic_mutation` (even with
+    // an empty domain list) still rebuilds. A UI-only update therefore writes directly and
+    // marks the mutation handled so the control-mutation barrier does not publish for it
+    // either — the barrier is what was doing it, because `/api/user/preferences` matches no
+    // `ConfigDomain` in `domains_for_path` and the empty result means "rebuild everything".
+    let ui_only = payload.default_routing_scope.is_none();
+    let theme = payload.ui_theme.clone();
+    let layout = payload.ui_nav_layout.clone();
+    let locale = payload.ui_locale.clone();
+    let scope_change = payload.default_routing_scope.clone();
+    let user_id_str = user_id.to_string();
 
+    if ui_only {
+        write_user_preferences(&state, &user_id_str, theme, layout, locale, scope_change).await?;
+        // Suppress the barrier's fallback publish: nothing in this payload changes a
+        // snapshot slice.
+        let _ = MUTATION_HANDLED.try_with(|flag| {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    } else {
+        execute_atomic_mutation(&state, vec![ConfigDomain::Users], move |tx| {
+            Box::pin(async move {
+                write_user_preferences_tx(tx, &user_id_str, theme, layout, locale, scope_change)
+                    .await
+            })
+        })
+        .await?;
+    }
     Ok(Json(serde_json::json!({
         "status": "updated",
         "ui_theme": payload.ui_theme,
@@ -108,6 +126,56 @@ pub(crate) async fn patch_user_preferences_handler(
         "default_routing_scope": payload.default_routing_scope,
     })))
 }
+
+async fn write_user_preferences_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    theme: Option<String>,
+    layout: Option<String>,
+    locale: Option<String>,
+    scope: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query(UPDATE_PREFERENCES_SQL)
+        .bind(theme.as_deref())
+        .bind(layout.as_deref())
+        .bind(locale.as_deref())
+        .bind(scope.as_deref())
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(())
+}
+
+/// Apply a preferences update outside the writer, for the presentation-only case
+/// (`ISSUE-0182`). Kept adjacent to [`write_user_preferences_tx`] so the two statements
+/// cannot drift.
+async fn write_user_preferences(
+    state: &ApiAppState,
+    user_id: &str,
+    theme: Option<String>,
+    layout: Option<String>,
+    locale: Option<String>,
+    scope: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query(UPDATE_PREFERENCES_SQL)
+        .bind(theme.as_deref())
+        .bind(layout.as_deref())
+        .bind(locale.as_deref())
+        .bind(scope.as_deref())
+        .bind(user_id)
+        .execute(&state.auth.pool)
+        .await
+        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(())
+}
+
+const UPDATE_PREFERENCES_SQL: &str = "UPDATE users SET
+        ui_theme = COALESCE(?, ui_theme),
+        ui_nav_layout = COALESCE(?, ui_nav_layout),
+        ui_locale = COALESCE(?, ui_locale),
+        default_routing_scope = COALESCE(?, default_routing_scope)
+     WHERE id = ?";
 
 /// `GET /api/user/web-sessions` (`AUTH-7`, `F011`).
 pub(crate) async fn get_user_web_sessions_handler(
