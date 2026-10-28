@@ -9,6 +9,45 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The state-bound pass-through path uses the provider's billing plan (ISSUE-0130).**
+  `forward_state_bound_response_op` attributed usage on two paths and they disagreed: the
+  decode-failure path called `provider_billing(&snapshot, &key.provider_id)` (cycle 16's fix for
+  #156) while the pass-through path wrote `plan_multiplier_bps: 10_000` and
+  `billing_coverage_mode: "pay_as_you_go"` — the *defaults*. So one handler reported a subscription
+  plan on a corrupt body and pay-as-you-go on a normal upstream error, which is worse than a plain
+  hardcode because a reader of the fixed branch would conclude the handler honours provider billing.
+  The lookup now happens once, immediately after the upstream key is in hand and before either
+  terminal branch, so the two rows cannot drift apart again. `list_cost_micro_usd: 0` is kept and
+  documented: a bodyless pass-through has no token cost, but the *plan* still matters because
+  `apply_effective_upstream_cost` consults the mode and the ledger groups by it.
+- **The usage-by-model breakdown emits a real provider badge (ISSUE-0131).** The overview emitted
+  `"badge": "[LLR]"` for every model — the *custom/internal* mark from `14.g.2` — so the field said
+  "house model" about OpenRouter-served models too. `14.g.4` types the projection as
+  `provider_badge_kind: &'static str // "go" | "cc" | "od" | "or" | "llr"`, and those five are
+  exactly `ProviderKind`'s five variants, so the badge is derived (`ProviderKind::badge_kind()`)
+  rather than invented. **The aggregation rule the issue did not raise:** the breakdown groups by
+  `canonical_id`, but one model can be served by several providers in one window — the header's
+  "`<N>` models · `<M>` providers" counts exactly that — so a row needs a rule, not a lookup. It is
+  "the provider that served the most of this model's requests", ties broken on `provider_id`, via a
+  correlated subquery over the same filtered set.
+- **The overview reports the configured retention figures (ISSUE-0132).** `max_usage_events_rows`
+  was the literal `50_000_000`, and `retention_days` was derived from
+  `traceability_config.retention_days` — the *traceability* window, default 14 — rather than
+  `usage_events_retention_days`, default 30. The second was the consequential one: `A6` reads
+  `daily_requests * retention_days * 750 B * 1.3` for raw `usage_events`, and the sweeper prunes
+  those rows at `usage_events_retention_days`, so both the reported window and the
+  `projected_disk_mb` figure derived from it described a policy nothing was enforcing — in the one
+  card an operator sizes a volume from.
+- **Both log streams report the retention window actually in force (ISSUE-0133).**
+  `get_logs_internal` emitted `"retention_days": 30` at two sites while the policy lives in
+  `RetentionPolicy.usage_events_retention_days`. Both now change together — fixing one leaves the
+  two streams disagreeing about the same policy. The `inference` stream reads `usage_events`, which
+  the live maintenance loop sweeps at `usage_events_retention_days`. The `api` stream reads
+  `control_plane_logs`, which **nothing prunes in the live path** (the maintenance loop does not
+  touch it, and `run_retention_pass` — which does, at a fixed 90 days — has no production caller),
+  so it now reports `"retention_days": null` with `"retention_scope": "control_plane_logs"` rather
+  than claiming a window nothing enforces. The sweeper's `.max(31)` clamps the *rollup* cutoff, not
+  this table, so it is not the number this response should carry either.
 - **No invented model id on an unresolvable response link (ISSUE-0129).** `state_bound.rs` resolved
   the ledger's model with `snapshot.models.get(&link.model_pk).map_or_else(|| "gpt-4o".to_string(),
   ..)` — `gpt-4o` chosen for no reason beyond being the first plausible string, added by cycle 16's
