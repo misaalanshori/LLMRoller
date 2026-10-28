@@ -9,6 +9,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Share approval is kind-checked and reaches the data plane (ISSUE-0191).** `SHR-3` requires
+  `admin_approved_at` only for **custom** providers — `is_share_eligible` gates on
+  `provider_kind == Custom` — so approving a built-in provider's share set a column nothing read:
+  an approval that granted nothing. `approve_provider_share_tx` now joins `providers` and returns
+  a new `ShareError::NotCustom`, and the handler maps it to `400`. The handler also now goes
+  through `execute_atomic_mutation(vec![ConfigDomain::Shares])` instead of opening its own
+  transaction, so the approval reaches the snapshot: previously the data plane kept believing the
+  share was unapproved, the same class as cycle 18's `ISSUE-0182`. The audit row was already being
+  written by the `control_mutation_barrier` middleware, so the cost of the raw transaction was the
+  publish, not the trail. The pre-existing `revoked_at IS NULL` guard is unchanged.
+- **`execute_atomic_mutation`'s no-writer fallback no longer swallows the closure's error.** It
+  returned `503 writer_busy` for every refusal on that path, discarding the parked
+  `Result<T, MutationResponseError>` that carried the meaningful status. Surfaced while adding the
+  share-approval kind check, whose `400` was arriving as `503`.
+- **Lowering trace retention now actually purges (ISSUE-0194).** The handler counted the rows a
+  purge would affect — to fill `affected_rows` in the `409` confirmation body — and then only
+  rewrote the settings row: zero `DELETE`s executed, so records older than the new window survived
+  indefinitely. The periodic sweep cannot cover this, because it deletes on `expires_at`, which was
+  stamped from the retention in force when each record was written. On a reduction with
+  `confirm_purge: true` the handler now deletes the expired records and then collects blocks with
+  zero remaining references, reusing the existing batched `sweep_orphaned_trace_blocks` (an indexed
+  `NOT EXISTS` against the `trace_record_blocks` join table, not a JSON walk). Widening the window
+  still deletes nothing.
 - **The admin cookies now follow the request's actual scheme (ISSUE-0188).** The login CSRF
   cookie, the session cookie and the logout clear-cookie all set `Secure` — and used the
   `__Host-` name prefix — unless `--dev-insecure-cookies` was passed. Because this server has
