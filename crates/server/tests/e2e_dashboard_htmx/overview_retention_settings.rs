@@ -42,7 +42,7 @@ async fn overview(
         require_tls: false,
         trusted_proxies: vec![],
     };
-    let mut auth_state = AuthAppState::new(pool.clone(), auth_config);
+    let auth_state = AuthAppState::new(pool.clone(), auth_config);
     let now_ms = llmroller_core::seams::SystemClock::new().now_ms();
     let admin: String = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
         .fetch_one(pool)

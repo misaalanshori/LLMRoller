@@ -11,7 +11,19 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
     let settings = llmroller_store::settings::load_settings(&state.auth.pool)
         .await
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let retention_days = settings.traceability_config.retention_days;
+    // The `A6` window is the **usage_events** one, not traceability's.
+    //
+    // `A6` reads `daily_requests * retention_days * 750 B * 1.3` for raw `usage_events`, and
+    // the sweeper enforces `usage_events_retention_days` on exactly those rows
+    // (`cli/serve.rs`). This handler previously reported `traceability_config.retention_days`
+    // — a *different* policy for a different table, defaulting to 14 rather than 30 — so the
+    // figure an operator sizes a volume from described a window nothing was enforcing
+    // (`ISSUE-0132`, `ISSUE-0133`).
+    //
+    // Trace bytes are added separately below and are *measured*, not projected, so they do
+    // not need a retention multiplier here.
+    let retention_days = settings.usage_events_retention_days.max(1);
+    let max_usage_events_rows = settings.usage_events_max_rows.max(1);
 
     let daily_requests: i64 =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE ts >= ?")
@@ -73,7 +85,7 @@ pub(crate) async fn get_admin_overview_telemetry_handler(
     );
     map.insert(
         "max_usage_events_rows".to_string(),
-        serde_json::json!(50_000_000i64),
+        serde_json::json!(max_usage_events_rows),
     );
     map.insert(
         "retention_days".to_string(),
