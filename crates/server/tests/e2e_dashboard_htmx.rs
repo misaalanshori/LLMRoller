@@ -31,6 +31,8 @@ pub(crate) use llmroller_store::users::{NewUser, create_user};
 mod dashboards_and_partials;
 #[path = "e2e_dashboard_htmx/logs_and_analytics.rs"]
 mod logs_and_analytics;
+#[path = "e2e_dashboard_htmx/remaining_filters.rs"]
+mod remaining_filters;
 #[path = "e2e_dashboard_htmx/setup.rs"]
 pub(crate) mod setup;
 #[path = "e2e_dashboard_htmx/token_class_projections.rs"]
