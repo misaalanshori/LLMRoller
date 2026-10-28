@@ -76,6 +76,7 @@ pub(crate) mod sessions_and_traces;
 pub(crate) mod settings;
 pub(crate) mod shares;
 pub(crate) mod usage;
+pub(crate) mod usage_filters;
 pub(crate) mod users_and_auth;
 
 pub(crate) use budgets::*;
@@ -92,6 +93,7 @@ pub(crate) use sessions_and_traces::*;
 pub(crate) use settings::*;
 pub(crate) use shares::*;
 pub(crate) use usage::*;
+pub(crate) use usage_filters::{bind_usage_filters, canonical_total, event_query, rollup_query};
 pub(crate) use users_and_auth::*;
 
 #[cfg(test)]

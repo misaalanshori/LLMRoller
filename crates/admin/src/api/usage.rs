@@ -136,98 +136,130 @@ pub(crate) async fn get_usage_summary_internal(
     // `usage_events`; the rollups carry the same token/cost columns and are
     // written in the same transaction batch as the raw rows (`REL-3`).
     let rollup_sql = if owner_user_id.is_some() {
-        "SELECT COALESCE(SUM(requests), 0) as total_requests,
+        rollup_query!(
+            "SELECT COALESCE(SUM(requests), 0) as total_requests,
                 COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
                 COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
                 COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
          FROM usage_rollups_hourly
          WHERE owner_user_id = ?
            AND (? IS NULL OR hour_ms >= ?)
            AND (? IS NULL OR hour_ms <= ?)"
+        )
     } else {
-        "SELECT COALESCE(SUM(requests), 0) as total_requests,
+        rollup_query!(
+            "SELECT COALESCE(SUM(requests), 0) as total_requests,
                 COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
                 COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
                 COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
          FROM usage_rollups_hourly
          WHERE (? IS NULL OR hour_ms >= ?)
            AND (? IS NULL OR hour_ms <= ?)"
+        )
     };
 
     let row = if let Some(ref uid) = owner_user_id {
-        sqlx::query(rollup_sql)
-            .bind(uid)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_one(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(rollup_sql)
+                .bind(uid)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_one(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(rollup_sql)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_one(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(rollup_sql)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_one(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let mut total_requests: i64 = row.try_get("total_requests").unwrap_or(0);
     let mut input_tokens: i64 = row.try_get("input_tokens").unwrap_or(0);
     let mut cached_tokens: i64 = row.try_get("cached_tokens").unwrap_or(0);
+    let mut cache_write_tokens: i64 = row.try_get("cache_write_tokens").unwrap_or(0);
     let mut output_tokens: i64 = row.try_get("output_tokens").unwrap_or(0);
+    let mut reasoning_tokens: i64 = row.try_get("reasoning_tokens").unwrap_or(0);
     let mut total_cost_micro_usd: i64 = row.try_get("total_cost_micro_usd").unwrap_or(0);
 
     if total_requests == 0 {
         // Synthetic fixtures and freshly restored databases may have raw events
         // without rollups; keep the endpoint useful instead of returning zero.
         let event_sql = if owner_user_id.is_some() {
-            "SELECT COUNT(*) as total_requests,
+            event_query!(
+                "SELECT COUNT(*) as total_requests,
                     COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                     COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                    COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
                     COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
              FROM usage_events
              WHERE owner_user_id = ?
                AND (? IS NULL OR ts >= ?)
                AND (? IS NULL OR ts <= ?)"
+            )
         } else {
-            "SELECT COUNT(*) as total_requests,
+            event_query!(
+                "SELECT COUNT(*) as total_requests,
                     COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                     COALESCE(SUM(cache_read_tokens), 0) as cached_tokens,
+                    COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
                     COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens,
                     COALESCE(SUM(cost_micro_usd), 0) as total_cost_micro_usd
              FROM usage_events
              WHERE (? IS NULL OR ts >= ?)
                AND (? IS NULL OR ts <= ?)"
+            )
         };
         let fallback = if let Some(ref uid) = owner_user_id {
-            sqlx::query(event_sql)
-                .bind(uid)
-                .bind(params.since)
-                .bind(params.since)
-                .bind(params.until)
-                .bind(params.until)
-                .fetch_one(&state.auth.reader_pool)
-                .await
+            bind_usage_filters!(
+                sqlx::query(event_sql)
+                    .bind(uid)
+                    .bind(params.since)
+                    .bind(params.since)
+                    .bind(params.until)
+                    .bind(params.until),
+                params
+            )
+            .fetch_one(&state.auth.reader_pool)
+            .await
         } else {
-            sqlx::query(event_sql)
-                .bind(params.since)
-                .bind(params.since)
-                .bind(params.until)
-                .bind(params.until)
-                .fetch_one(&state.auth.reader_pool)
-                .await
+            bind_usage_filters!(
+                sqlx::query(event_sql)
+                    .bind(params.since)
+                    .bind(params.since)
+                    .bind(params.until)
+                    .bind(params.until),
+                params
+            )
+            .fetch_one(&state.auth.reader_pool)
+            .await
         }
         .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         total_requests = fallback.try_get("total_requests").unwrap_or(0);
         input_tokens = fallback.try_get("input_tokens").unwrap_or(0);
         cached_tokens = fallback.try_get("cached_tokens").unwrap_or(0);
+        cache_write_tokens = fallback.try_get("cache_write_tokens").unwrap_or(0);
         output_tokens = fallback.try_get("output_tokens").unwrap_or(0);
+        reasoning_tokens = fallback.try_get("reasoning_tokens").unwrap_or(0);
         total_cost_micro_usd = fallback.try_get("total_cost_micro_usd").unwrap_or(0);
     }
 
@@ -238,8 +270,17 @@ pub(crate) async fn get_usage_summary_internal(
         "total_requests": total_requests,
         "input_tokens": input_tokens,
         "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": canonical_total(
+            input_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            output_tokens,
+        ),
         "total_cost_micro_usd": total_cost_micro_usd,
+        "cost_micro_usd": total_cost_micro_usd,
         "cache_hit_rate": cache_hit_rate,
     })))
 }
@@ -274,60 +315,81 @@ pub(crate) async fn get_usage_timeseries_internal(
     // Hourly buckets keep the payload small enough for the uPlot consumer while
     // still covering multi-week ranges (`USG-1`, `REL-3`).
     let sql = if owner_user_id.is_some() {
-        "SELECT hour_ms AS bucket_ms,
+        rollup_query!(
+            "SELECT hour_ms AS bucket_ms,
                 COALESCE(SUM(requests), 0) AS requests,
                 COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
                 COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
          FROM usage_rollups_hourly
          WHERE owner_user_id = ?
            AND (? IS NULL OR hour_ms >= ?)
-           AND (? IS NULL OR hour_ms <= ?)
-         GROUP BY hour_ms ORDER BY hour_ms ASC"
+           AND (? IS NULL OR hour_ms <= ?)",
+            "GROUP BY hour_ms ORDER BY hour_ms ASC"
+        )
     } else {
-        "SELECT hour_ms AS bucket_ms,
+        rollup_query!(
+            "SELECT hour_ms AS bucket_ms,
                 COALESCE(SUM(requests), 0) AS requests,
                 COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
                 COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
          FROM usage_rollups_hourly
          WHERE (? IS NULL OR hour_ms >= ?)
-           AND (? IS NULL OR hour_ms <= ?)
-         GROUP BY hour_ms ORDER BY hour_ms ASC"
+           AND (? IS NULL OR hour_ms <= ?)",
+            "GROUP BY hour_ms ORDER BY hour_ms ASC"
+        )
     };
 
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(sql)
-            .bind(uid)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(sql)
+                .bind(uid)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_all(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(sql)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(sql)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_all(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let series = rows
         .into_iter()
         .map(|row| {
+            let input: i64 = row.try_get("input_tokens").unwrap_or(0);
+            let cache_read: i64 = row.try_get("cached_tokens").unwrap_or(0);
+            let cache_write: i64 = row.try_get("cache_write_tokens").unwrap_or(0);
+            let output: i64 = row.try_get("output_tokens").unwrap_or(0);
             serde_json::json!({
                 "bucket_ms": row.try_get::<i64, _>("bucket_ms").unwrap_or(0),
                 "requests": row.try_get::<i64, _>("requests").unwrap_or(0),
                 "cost_micro_usd": row.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
-                "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or(0),
-                "cached_tokens": row.try_get::<i64, _>("cached_tokens").unwrap_or(0),
-                "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or(0),
+                "input_tokens": input,
+                "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "output_tokens": output,
+                "reasoning_tokens": row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0),
+                "total_tokens": canonical_total(input, cache_read, cache_write, output),
             })
         })
         .collect::<Vec<_>>();
@@ -363,60 +425,81 @@ pub(crate) async fn get_usage_breakdown_internal(
     params: UsageFilterParams,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let sql = if owner_user_id.is_some() {
-        "SELECT canonical_id,
+        rollup_query!(
+            "SELECT canonical_id,
                 COALESCE(SUM(requests), 0) AS requests,
                 COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
                 COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
          FROM usage_rollups_hourly
          WHERE owner_user_id = ?
            AND (? IS NULL OR hour_ms >= ?)
-           AND (? IS NULL OR hour_ms <= ?)
-         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+           AND (? IS NULL OR hour_ms <= ?)",
+            "GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+        )
     } else {
-        "SELECT canonical_id,
+        rollup_query!(
+            "SELECT canonical_id,
                 COALESCE(SUM(requests), 0) AS requests,
                 COALESCE(SUM(cost_micro_usd), 0) AS cost_micro_usd,
                 COALESCE(SUM(input_uncached_tokens), 0) AS input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cached_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens
          FROM usage_rollups_hourly
          WHERE (? IS NULL OR hour_ms >= ?)
-           AND (? IS NULL OR hour_ms <= ?)
-         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+           AND (? IS NULL OR hour_ms <= ?)",
+            "GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
+        )
     };
 
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(sql)
-            .bind(uid)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(sql)
+                .bind(uid)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_all(&state.auth.reader_pool)
+        .await
     } else {
-        sqlx::query(sql)
-            .bind(params.since)
-            .bind(params.since)
-            .bind(params.until)
-            .bind(params.until)
-            .fetch_all(&state.auth.reader_pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(sql)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .fetch_all(&state.auth.reader_pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let breakdown = rows
         .into_iter()
         .map(|row| {
+            let input: i64 = row.try_get("input_tokens").unwrap_or(0);
+            let cache_read: i64 = row.try_get("cached_tokens").unwrap_or(0);
+            let cache_write: i64 = row.try_get("cache_write_tokens").unwrap_or(0);
+            let output: i64 = row.try_get("output_tokens").unwrap_or(0);
             serde_json::json!({
                 "canonical_id": row.try_get::<String, _>("canonical_id").unwrap_or_default(),
                 "requests": row.try_get::<i64, _>("requests").unwrap_or(0),
                 "cost_micro_usd": row.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
-                "input_tokens": row.try_get::<i64, _>("input_tokens").unwrap_or(0),
-                "cached_tokens": row.try_get::<i64, _>("cached_tokens").unwrap_or(0),
-                "output_tokens": row.try_get::<i64, _>("output_tokens").unwrap_or(0),
+                "input_tokens": input,
+                "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "output_tokens": output,
+                "reasoning_tokens": row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0),
+                "total_tokens": canonical_total(input, cache_read, cache_write, output),
             })
         })
         .collect::<Vec<_>>();
@@ -684,38 +767,62 @@ pub(crate) async fn get_usage_events_internal(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50).clamp(1, 5000);
 
+    // The cursor filter and the limit come **after** the shared predicate, because sqlx binds
+    // positionally: `after`/`limit` must stay last or every filter bind shifts by one.
     let query_str = if owner_user_id.is_some() {
-        "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
-                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+        event_query!(
+            "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens, error_code
          FROM usage_events
          WHERE owner_user_id = ?
-           AND (? IS NULL OR id < ?)
-         ORDER BY id DESC
-         LIMIT ?"
+           AND (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)",
+            "AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?"
+        )
     } else {
-        "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
-                input_uncached_tokens, cache_read_tokens, output_tokens, error_code
+        event_query!(
+            "SELECT id, ts, request_id, client_key_id, canonical_id, status, cost_micro_usd,
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens, error_code
          FROM usage_events
-         WHERE (? IS NULL OR id < ?)
-         ORDER BY id DESC
-         LIMIT ?"
+         WHERE (? IS NULL OR ts >= ?)
+           AND (? IS NULL OR ts <= ?)",
+            "AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?"
+        )
     };
-
+    // Bind order follows placeholder order exactly: owner, since, until, the three filters, then
+    // the cursor and limit. Binding `after` before the filters would shift every later value by one
+    // and silently return the unfiltered page.
     let rows = if let Some(ref uid) = owner_user_id {
-        sqlx::query(query_str)
-            .bind(uid)
-            .bind(&params.after)
-            .bind(&params.after)
-            .bind(limit)
-            .fetch_all(&state.auth.pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(query_str)
+                .bind(uid)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .bind(&params.after)
+        .bind(&params.after)
+        .bind(limit)
+        .fetch_all(&state.auth.pool)
+        .await
     } else {
-        sqlx::query(query_str)
-            .bind(&params.after)
-            .bind(&params.after)
-            .bind(limit)
-            .fetch_all(&state.auth.pool)
-            .await
+        bind_usage_filters!(
+            sqlx::query(query_str)
+                .bind(params.since)
+                .bind(params.since)
+                .bind(params.until)
+                .bind(params.until),
+            params
+        )
+        .bind(&params.after)
+        .bind(&params.after)
+        .bind(limit)
+        .fetch_all(&state.auth.pool)
+        .await
     }
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -725,6 +832,21 @@ pub(crate) async fn get_usage_events_internal(
     for r in rows {
         let id: String = r.try_get("id").unwrap_or_default();
         last_id = Some(id.clone());
+        // The token columns are nullable; a row with none recorded reports `total_tokens: null`
+        // rather than a misleading zero, matching cycle 22's zero-vs-absent rule.
+        let input: Option<i64> = r.try_get("input_uncached_tokens").unwrap_or(None);
+        let cache_read: Option<i64> = r.try_get("cache_read_tokens").unwrap_or(None);
+        let cache_write: Option<i64> = r.try_get("cache_write_tokens").unwrap_or(None);
+        let output: Option<i64> = r.try_get("output_tokens").unwrap_or(None);
+        let total_tokens = [input, cache_read, cache_write, output]
+            .iter()
+            .any(Option::is_some)
+            .then(|| {
+                [input, cache_read, cache_write, output]
+                    .iter()
+                    .flatten()
+                    .sum::<i64>()
+            });
         events.push(serde_json::json!({
             "id": id,
             "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
@@ -733,9 +855,12 @@ pub(crate) async fn get_usage_events_internal(
             "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
             "status": r.try_get::<i64, _>("status").unwrap_or(0),
             "cost_micro_usd": r.try_get::<i64, _>("cost_micro_usd").unwrap_or(0),
-            "input_tokens": r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or_default(),
-            "cached_tokens": r.try_get::<Option<i64>, _>("cache_read_tokens").unwrap_or_default(),
-            "output_tokens": r.try_get::<Option<i64>, _>("output_tokens").unwrap_or_default(),
+            "input_tokens": input.unwrap_or(0),
+            "cached_tokens": cache_read.unwrap_or(0),
+            "cache_write_tokens": cache_write.unwrap_or(0),
+            "output_tokens": output.unwrap_or(0),
+            "reasoning_tokens": r.try_get::<Option<i64>, _>("reasoning_tokens").unwrap_or(None).unwrap_or(0),
+            "total_tokens": total_tokens,
             "error_code": r.try_get::<Option<String>, _>("error_code").unwrap_or_default(),
         }));
     }

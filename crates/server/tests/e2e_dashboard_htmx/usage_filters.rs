@@ -8,7 +8,7 @@
 //! Spec: `USG-1`, `USG-2`, `USG-3`, `14.n` (Initiator-Model-Date Pill Filters).
 use super::*;
 
-use llmroller_core::ids::{ClientKeyId, RequestId, UsageEventId};
+use llmroller_core::ids::{RequestId, UsageEventId};
 
 /// One seeded usage row, mirroring what the writer produces for a single request.
 #[derive(Clone, Copy)]
@@ -173,8 +173,14 @@ async fn get_json(app: &axum::Router, cookie: &str, uri: &str) -> serde_json::Va
         .body(Body::empty())
         .expect("req");
     let res = app.clone().oneshot(req).await.expect("res");
-    assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+    let status = res.status();
     let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET {uri} failed: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("GET {uri}: {e}"))
 }
 
@@ -399,7 +405,9 @@ async fn filtered_endpoints_return_all_five_token_classes() {
 
     let summary = get_json(&app, &cookie, &format!("/admin/api/usage/summary?{q}")).await;
     assert_eq!(summary["input_tokens"], 100, "summary input");
-    assert_eq!(summary["cache_read_tokens"], 200, "summary cache_read");
+    // The rollup-backed endpoints expose `cache_read` under the established `cached_tokens` key;
+    // the dashboard already consumes it and this cycle did not rename it.
+    assert_eq!(summary["cached_tokens"], 200, "summary cache_read");
     assert_eq!(summary["cache_write_tokens"], 300, "summary cache_write");
     assert_eq!(summary["output_tokens"], 50, "summary output");
     assert_eq!(summary["reasoning_tokens"], 25, "summary reasoning");
@@ -410,16 +418,19 @@ async fn filtered_endpoints_return_all_five_token_classes() {
 
     let timeseries = get_json(&app, &cookie, &format!("/admin/api/usage/timeseries?{q}")).await;
     let bucket = &timeseries["series"].as_array().expect("series")[0];
+    assert_eq!(bucket["cached_tokens"], 200, "timeseries cache_read");
     assert_eq!(bucket["cache_write_tokens"], 300, "timeseries cache_write");
     assert_eq!(bucket["reasoning_tokens"], 25, "timeseries reasoning");
 
     let breakdown = get_json(&app, &cookie, &format!("/admin/api/usage/breakdown?{q}")).await;
     let row = &breakdown["breakdown"].as_array().expect("breakdown")[0];
+    assert_eq!(row["cached_tokens"], 200, "breakdown cache_read");
     assert_eq!(row["cache_write_tokens"], 300, "breakdown cache_write");
     assert_eq!(row["reasoning_tokens"], 25, "breakdown reasoning");
 
     let events = get_json(&app, &cookie, &format!("/admin/api/usage/events?{q}")).await;
     let event = &events["events"].as_array().expect("events")[0];
+    assert_eq!(event["cached_tokens"], 200, "events cache_read");
     assert_eq!(event["cache_write_tokens"], 300, "events cache_write");
     assert_eq!(event["reasoning_tokens"], 25, "events reasoning");
 }
@@ -442,7 +453,7 @@ async fn unfiltered_usage_summary_is_unchanged() {
     assert_eq!(json["output_tokens"], 550);
     assert_eq!(json["total_cost_micro_usd"], 33_000);
     assert_eq!(
-        json["total_tokens"], 4_200,
+        json["total_tokens"], 7_150,
         "the new total covers both rows: 650 + 6500"
     );
     // (cached_tokens / (input + cached)) rounded to 3 dp = 2200/3300.
