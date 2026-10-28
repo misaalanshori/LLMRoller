@@ -9,6 +9,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The four usage endpoints honour the filters they accept (ISSUE-0175).** `UsageFilterParams`
+  deserialised `provider_id`, `model`, and `initiator`, and `summary`/`timeseries`/`breakdown`/
+  `events` bound only `since`/`until` — so a filtered request returned the unfiltered number with no
+  signal. The predicate now lives in one place (`api/usage_filters.rs`) and is spliced into all four
+  by `rollup_query!` / `event_query!`, with `bind_usage_filters!` as the only binder; four
+  hand-written `WHERE` fragments is precisely how `provider_id` came to be used in zero queries. The
+  rollup flavour resolves the service-account half of the initiator union through `client_keys`,
+  since `usage_rollups_hourly` has no `service_account_id`. All four also gained `cache_write_tokens`,
+  `reasoning_tokens`, and a `total_tokens` computed with the canonical four-class definition, and
+  the events listing gained the `since`/`until` it never had.
+- **`initiator` matches any identity kind, per `14.n.2`.** The Initiator Filter Pill lists "all
+  users, service accounts, and individual client keys" in one dropdown, so the predicate is a union
+  over `client_key_id`, the owning `owner_user_id`, and `service_account_id` rather than a single
+  column: filtering by user X returns everything X did, by key K returns only K.
 - **The admin log projection sums every token class and stops hiding charged rejections
   (ISSUE-0173).** `get_logs_internal` computed `total_tokens` as `input_uncached + output`, dropping
   `cache_read`, `cache_write`, and `reasoning`, while the query already selected all five columns.
