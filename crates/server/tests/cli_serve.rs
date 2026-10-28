@@ -337,3 +337,197 @@ async fn test_serve_fails_closed_when_master_key_id_is_missing_or_empty() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ISSUE-0227 — a documented TLS listener that is silently ignored
+// ---------------------------------------------------------------------------
+
+/// How long a `serve` invocation under test may run before it is considered "still serving".
+///
+/// A rejected startup exits in milliseconds; a started server runs forever. This bound turns the
+/// second case into a fast, loud failure instead of a hang — an unbounded `.output().await` waits
+/// for exit, and the pre-fix behaviour is precisely "never exits".
+const SERVE_EXIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Outcome of running `serve` with extra environment.
+enum ServeOutcome {
+    /// The process exited within the budget, with this code and stderr.
+    Exited(Option<i32>, String),
+    /// The process was still running when the budget expired — i.e. the server started.
+    StillRunning(String),
+}
+
+/// Run `serve` with the given extra environment and report how it ended.
+///
+/// The listener ports are real and ephemeral, the master key is a dummy, and stderr is captured to
+/// a file rather than a pipe: a piped stderr would need draining to avoid a full-pipe deadlock on a
+/// child that keeps logging, and `kill_on_drop(true)` makes the timeout path clean up either way.
+async fn serve_with_env(extra: &[(&str, &str)]) -> ServeOutcome {
+    let dir = tempdir().expect("temp dir");
+    let stderr_path = dir.path().join("serve.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let mut command = tokio::process::Command::new(llmroller_binary());
+    command
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .arg("--admin-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .arg("--metrics-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .env("LLMROLLER_MASTER_KEY", BASE64.encode([0x47; 32]))
+        .env("LLMROLLER_MASTER_KEY_ID", "key-tls-test")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file));
+    for (name, value) in extra {
+        command.env(name, value);
+    }
+
+    let read_stderr = |path: &std::path::Path| {
+        std::fs::read_to_string(path).unwrap_or_else(|_| String::from("<no stderr captured>"))
+    };
+
+    match tokio::time::timeout(SERVE_EXIT_BUDGET, command.output()).await {
+        // stderr goes to the file, so it is read back here rather than taken from `output`.
+        Ok(Ok(output)) => ServeOutcome::Exited(output.status.code(), read_stderr(&stderr_path)),
+        Ok(Err(error)) => panic!("could not run serve: {error}"),
+        // Dropping the future drops the child (kill_on_drop) before this returns.
+        Err(_elapsed) => ServeOutcome::StillRunning(read_stderr(&stderr_path)),
+    }
+}
+
+/// `LLMROLLER_TLS_CERT` must be rejected at startup, not ignored (`ISSUE-0227`).
+///
+/// Four spec documents promise a native TLS listener; the binary never reads these variables. A
+/// deployment that sets them therefore gets **plaintext with no warning** — the worst failure
+/// mode for a security-relevant option, because it is indistinguishable from one that works.
+///
+/// The decision (owner, cycle 38) is upstream-only termination, so the correct behaviour is to
+/// refuse to start and say what to do instead. Pre-fix this starts plaintext and exits 0.
+#[doc = "Spec: SEC-9, Section 5.5.1 — ISSUE-0227"]
+#[tokio::test]
+async fn serve_rejects_tls_cert_at_startup() {
+    let stderr =
+        match serve_with_env(&[("LLMROLLER_TLS_CERT", "/etc/llmroller/tls/cert.pem")]).await {
+            ServeOutcome::Exited(Some(2), stderr) => stderr,
+            ServeOutcome::Exited(code, stderr) => panic!(
+                "LLMROLLER_TLS_CERT must be rejected with exit 2 (§5.5.1 'invalid environment \
+             variable'); got exit {code:?}, stderr: {stderr}"
+            ),
+            ServeOutcome::StillRunning(stderr) => panic!(
+                "serve did not exit within {SERVE_EXIT_BUDGET:?} — it is still running, so \
+             LLMROLLER_TLS_CERT was silently ignored and the operator is serving plaintext while \
+             believing TLS is configured. stderr: {stderr}"
+            ),
+        };
+    let lower = stderr.to_ascii_lowercase();
+    assert!(
+        lower.contains("tls"),
+        "the rejection must name the variable's subject; stderr: {stderr}"
+    );
+    assert!(
+        lower.contains("trusted_proxies") || lower.contains("reverse proxy"),
+        "the rejection must say what to do instead — terminate TLS at the reverse proxy — or an \
+         operator is left with a dead configuration and no path forward; stderr: {stderr}"
+    );
+}
+
+/// `LLMROLLER_TLS_KEY` alone must also be rejected.
+///
+/// Rejecting only the cert would let a half-configured deployment through, which is the same bug
+/// in a smaller size.
+#[doc = "Spec: SEC-9, Section 5.5.1 — ISSUE-0227"]
+#[tokio::test]
+async fn serve_rejects_tls_key_at_startup() {
+    let stderr = match serve_with_env(&[("LLMROLLER_TLS_KEY", "/etc/llmroller/tls/key.pem")]).await
+    {
+        ServeOutcome::Exited(Some(2), stderr) => stderr,
+        ServeOutcome::Exited(code, stderr) => panic!(
+            "LLMROLLER_TLS_KEY must be rejected with exit 2; got exit {code:?}, stderr: {stderr}"
+        ),
+        ServeOutcome::StillRunning(stderr) => panic!(
+            "serve did not exit within {SERVE_EXIT_BUDGET:?} — LLMROLLER_TLS_KEY was silently \
+             ignored. stderr: {stderr}"
+        ),
+    };
+    assert!(
+        stderr.to_ascii_lowercase().contains("tls"),
+        "the rejection must name the variable; stderr: {stderr}"
+    );
+}
+
+/// An **empty** `LLMROLLER_TLS_CERT` must be rejected, not treated as absent.
+///
+/// `LLMROLLER_TLS_CERT=""` is "set but meaningless". An operator who exported an empty variable
+/// believes they configured something, and `env::var` returning `Ok("")` is not the same fact as
+/// `Err(NotPresent)` — collapsing them with `unwrap_or_default()` is exactly the silent-ignore
+/// defect this cycle is about. So presence, not usefulness, is the test.
+#[doc = "Spec: SEC-9, Section 5.5.1 — ISSUE-0227"]
+#[tokio::test]
+async fn serve_rejects_an_empty_tls_cert() {
+    match serve_with_env(&[("LLMROLLER_TLS_CERT", "")]).await {
+        ServeOutcome::Exited(Some(2), _stderr) => {}
+        ServeOutcome::Exited(code, stderr) => panic!(
+            "an exported-but-empty LLMROLLER_TLS_CERT must be rejected with exit 2 rather than \
+             treated as absent; got exit {code:?}, stderr: {stderr}"
+        ),
+        ServeOutcome::StillRunning(stderr) => panic!(
+            "serve did not exit within {SERVE_EXIT_BUDGET:?} — an empty LLMROLLER_TLS_CERT was \
+             treated as absent, so the operator's belief and the binary's behaviour differ. \
+             stderr: {stderr}"
+        ),
+    }
+}
+
+/// Without the TLS variables, `serve` must still start — the rejection must not reject everything.
+#[doc = "Spec: SEC-9 — ISSUE-0227 status-quo pin"]
+#[tokio::test]
+async fn serve_starts_normally_without_tls_vars() {
+    let dir = tempdir().expect("temp dir");
+    let listen = format!("127.0.0.1:{}", get_available_port());
+    let admin = format!("127.0.0.1:{}", get_available_port());
+    let metrics = format!("127.0.0.1:{}", get_available_port());
+    let mut child = tokio::process::Command::new(llmroller_binary())
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--admin-listen")
+        .arg(&admin)
+        .arg("--metrics-listen")
+        .arg(&metrics)
+        .env("LLMROLLER_MASTER_KEY", BASE64.encode([0x48; 32]))
+        .env("LLMROLLER_MASTER_KEY_ID", "key-no-tls-test")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = client
+            .get(format!("http://{listen}/readyz"))
+            .timeout(std::time::Duration::from_millis(500))
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    assert!(
+        ready,
+        "serve must still start normally when neither TLS variable is set"
+    );
+}
