@@ -33,6 +33,8 @@ mod dashboards_and_partials;
 mod log_detail_fields;
 #[path = "e2e_dashboard_htmx/logs_and_analytics.rs"]
 mod logs_and_analytics;
+#[path = "e2e_dashboard_htmx/overview_retention_settings.rs"]
+mod overview_retention_settings;
 #[path = "e2e_dashboard_htmx/provider_badge.rs"]
 mod provider_badge;
 #[path = "e2e_dashboard_htmx/remaining_filters.rs"]
