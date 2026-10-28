@@ -457,6 +457,7 @@ pub(crate) async fn get_usage_event_breakdown_internal(
     let sql = if owner_user_id.is_some() {
         "SELECT id, ts, request_id, canonical_id, upstream_key_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE (id = ? OR request_id = ?) AND owner_user_id = ?
@@ -464,6 +465,7 @@ pub(crate) async fn get_usage_event_breakdown_internal(
     } else {
         "SELECT id, ts, request_id, canonical_id, upstream_key_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE (id = ? OR request_id = ?)
@@ -577,12 +579,20 @@ pub(crate) async fn get_usage_event_breakdown_internal(
         }
     }
 
+    // `reasoning` is a diagnostic subset of `output`, so it is carried for display but is not
+    // part of `total_input()` or any priced line item: `calculate_cost_micro_usd` prices exactly
+    // input_uncached, cache_read, cache_write, and output (`12. SRDD:133-134`). Reading it here
+    // instead of hardcoding 0 is what lets the breakdown popover show it (`ISSUE-0176`).
+    let reasoning: i64 = row
+        .try_get::<Option<i64>, _>("reasoning_tokens")
+        .unwrap_or(None)
+        .unwrap_or(0);
     let tokens = TokenUsage {
         input_uncached: in_uncached,
         cache_read,
         cache_write,
         output,
-        reasoning: 0,
+        reasoning,
     };
     let total_input = tokens.total_input();
     let active_tier = tiers.iter().find(|t| t.matches(total_input));
@@ -635,6 +645,9 @@ pub(crate) async fn get_usage_event_breakdown_internal(
                 "subtotal_micro_usd": output_cost,
             },
         },
+        // Diagnostic only, deliberately *not* a `line_items` entry: reasoning is a subset of
+        // `output`, so a fifth priced line would imply a charge that does not exist.
+        "reasoning_tokens": tokens.reasoning,
         "list_cost_micro_usd": list_cost_micro_usd,
         "cost_micro_usd": cost_micro_usd,
         "plan_multiplier_bps": plan_multiplier_bps,
@@ -952,6 +965,7 @@ pub(crate) async fn get_usage_ledger_internal(
                 COALESCE(SUM(cache_read_tokens), 0) as cache_read,
                 COALESCE(SUM(cache_write_tokens), 0) as cache_write,
                 COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning,
                 COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
                 COALESCE(SUM(list_cost_micro_usd), 0) as list_cost_micro_usd
          FROM usage_events
@@ -964,6 +978,7 @@ pub(crate) async fn get_usage_ledger_internal(
                 COALESCE(SUM(cache_read_tokens), 0) as cache_read,
                 COALESCE(SUM(cache_write_tokens), 0) as cache_write,
                 COALESCE(SUM(output_tokens), 0) as output,
+                COALESCE(SUM(reasoning_tokens), 0) as reasoning,
                 COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
                 COALESCE(SUM(list_cost_micro_usd), 0) as list_cost_micro_usd
          FROM usage_events
@@ -1000,6 +1015,10 @@ pub(crate) async fn get_usage_ledger_internal(
     let cache_read: i64 = agg_row.try_get("cache_read").unwrap_or(0);
     let cache_write: i64 = agg_row.try_get("cache_write").unwrap_or(0);
     let output: i64 = agg_row.try_get("output").unwrap_or(0);
+    let reasoning: i64 = agg_row.try_get("reasoning").unwrap_or(0);
+    // Same definition as the Logs Explorer (`logs_and_audit::TokenClasses::total`), the overview
+    // KPI, and `calculate_cost_micro_usd`: the four priced classes. `reasoning` is a subset of
+    // `output` and is reported alongside the total, never added to it (`12. SRDD:133-134`).
     let total_tokens = input + cache_read + cache_write + output;
     let billed_cost: i64 = agg_row.try_get("cost_micro_usd").unwrap_or(0);
     let list_cost: i64 = agg_row.try_get("list_cost_micro_usd").unwrap_or(0);
@@ -1008,6 +1027,7 @@ pub(crate) async fn get_usage_ledger_internal(
     let row_sql = if owner_user_id.is_some() {
         "SELECT id, ts, request_id, client_key_id, canonical_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE owner_user_id = ?
@@ -1018,6 +1038,7 @@ pub(crate) async fn get_usage_ledger_internal(
     } else {
         "SELECT id, ts, request_id, client_key_id, canonical_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
          FROM usage_events
          WHERE (? IS NULL OR ts >= ?)
@@ -1061,6 +1082,7 @@ pub(crate) async fn get_usage_ledger_internal(
             let u_cr: i64 = r.try_get::<Option<i64>, _>("cache_read_tokens").unwrap_or(None).unwrap_or(0);
             let u_cw: i64 = r.try_get::<Option<i64>, _>("cache_write_tokens").unwrap_or(None).unwrap_or(0);
             let u_out: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
+            let u_reasoning: i64 = r.try_get::<Option<i64>, _>("reasoning_tokens").unwrap_or(None).unwrap_or(0);
 
             serde_json::json!({
                 "id": r.try_get::<String, _>("id").unwrap_or_default(),
@@ -1072,6 +1094,7 @@ pub(crate) async fn get_usage_ledger_internal(
                 "cache_read_tokens": u_cr,
                 "cache_write_tokens": u_cw,
                 "output_tokens": u_out,
+                "reasoning_tokens": u_reasoning,
                 "cost_micro_usd": u_cost,
                 "list_cost_micro_usd": l_cost,
                 "plan_multiplier_bps": r.try_get::<i64, _>("plan_multiplier_bps").unwrap_or(10_000),
@@ -1092,6 +1115,8 @@ pub(crate) async fn get_usage_ledger_internal(
             "cache_read_tokens_formatted": format_tokens_compact(cache_read),
             "cache_write_tokens": cache_write,
             "cache_write_tokens_formatted": format_tokens_compact(cache_write),
+            "reasoning_tokens": reasoning,
+            "reasoning_tokens_formatted": format_tokens_compact(reasoning),
             "billed_cost_micro_usd": billed_cost,
             "billed_cost_formatted": format_cost_usd(billed_cost),
             "list_cost_micro_usd": list_cost,
