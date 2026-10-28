@@ -257,12 +257,24 @@ async fn overview_badge_distinguishes_every_provider_kind() {
 #[doc = "Spec: UI-6, 14.g.2 — ISSUE-0131 the badge names the provider that served the most requests"]
 async fn overview_badge_names_the_provider_with_the_most_requests() {
     let h = build_states().await;
-    seed_provider(&h.pool, "prov-minor", "openrouter").await;
-    seed_provider(&h.pool, "prov-major", "opencode_go").await;
+    // Ids chosen so the *dominant* provider sorts **last** alphabetically. With the ids
+    // reversed ("prov-major"/"prov-minor") the mutant that drops the `requests DESC` ordering
+    // survives, because `ORDER BY provider_id ASC` happens to return the same row — an inert
+    // mutant, which would leave this test looking stronger than it is.
+    seed_provider(&h.pool, "prov-a-minor", "openrouter").await;
+    seed_provider(&h.pool, "prov-z-major", "opencode_go").await;
 
     // Same canonical model, two providers, one clearly dominant.
-    seed_rollup(&h.pool, h.hour_ms, "prov-minor", "shared-model", 3, 100).await;
-    seed_rollup(&h.pool, h.hour_ms, "prov-major", "shared-model", 97, 9_900).await;
+    seed_rollup(&h.pool, h.hour_ms, "prov-a-minor", "shared-model", 3, 100).await;
+    seed_rollup(
+        &h.pool,
+        h.hour_ms,
+        "prov-z-major",
+        "shared-model",
+        97,
+        9_900,
+    )
+    .await;
 
     let json = overview_json(h.api_state, h.setup_state, &h.cookie).await;
     let models = json["models"].as_array().expect("models array");

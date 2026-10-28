@@ -1281,6 +1281,23 @@ pub(crate) async fn get_user_overview_handler(
     Ok(Json(body))
 }
 
+/// The badge kind for a stored `providers.kind` value (`14.g.4`, `ISSUE-0131`).
+///
+/// Returns the bare `"go" | "cc" | "od" | "or" | "llr"` that `14.g.4` types as
+/// `provider_badge_kind: &'static str` — the bracketed `[GO]` form is the *rendered* mark,
+/// so the API emits the kind and the view adds the brackets. The vocabulary lives on
+/// [`llmroller_core::provider::ProviderKind`] so the data plane and the UI cannot disagree
+/// about which mark a provider gets.
+///
+/// An empty or unrecognized kind (a rollup row whose provider was since deleted) maps to
+/// `llr`, which is `14.g.2`'s "custom/internal" case and the honest answer for "we no longer
+/// know who served this".
+fn provider_badge_mark(kind: &str) -> &'static str {
+    kind.parse::<llmroller_core::provider::ProviderKind>()
+        .unwrap_or(llmroller_core::provider::ProviderKind::Custom)
+        .badge_kind()
+}
+
 pub(crate) async fn get_overview_internal(
     state: &ApiAppState,
     owner_user_id: Option<String>,
@@ -1379,32 +1396,48 @@ pub(crate) async fn get_overview_internal(
         })
         .collect::<Vec<_>>();
 
-    let models_sql = if owner_user_id.is_some() {
-        "SELECT canonical_id,
+    // `badge` names the provider that served the most of this model's requests in the
+    // window (`ISSUE-0131`).
+    //
+    // The breakdown groups by `canonical_id`, but one model can be served by several
+    // providers in the same window — which is what the header's "`<N>` models · `<M>`
+    // providers" counts. A single badge therefore needs a rule, and "the dominant provider"
+    // is the only stable one: picking whichever row SQL happened to return first would let
+    // the badge change between two identical queries. Ties break on `provider_id`, so even
+    // an exactly-equal split is deterministic.
+    //
+    // The owner filter is `(? IS NULL OR owner_user_id = ?)` rather than a second copy of
+    // this query, so the dominant-provider subquery exists exactly once. Binding `None` for
+    // the workspace-wide read is what the unscoped branch used to mean.
+    let models_sql = "SELECT canonical_id,
                 COALESCE(SUM(requests), 0) as requests,
                 COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
                 COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
-                COALESCE(SUM(output_tokens), 0) as output_tokens
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE((
+                    SELECT p.kind
+                    FROM usage_rollups_hourly d
+                    JOIN providers p ON p.id = d.provider_id
+                    WHERE d.canonical_id = usage_rollups_hourly.canonical_id
+                      AND (? IS NULL OR d.owner_user_id = ?)
+                      AND d.hour_ms >= ? AND d.hour_ms <= ?
+                    GROUP BY d.provider_id, p.kind
+                    ORDER BY SUM(d.requests) DESC, d.provider_id ASC
+                    LIMIT 1
+                ), '') as provider_kind
          FROM usage_rollups_hourly
-         WHERE owner_user_id = ? AND hour_ms >= ? AND hour_ms <= ?
-         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
-    } else {
-        "SELECT canonical_id,
-                COALESCE(SUM(requests), 0) as requests,
-                COALESCE(SUM(cost_micro_usd), 0) as cost_micro_usd,
-                COALESCE(SUM(input_uncached_tokens), 0) as input_tokens,
-                COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
-                COALESCE(SUM(cache_write_tokens), 0) as cache_write_tokens,
-                COALESCE(SUM(output_tokens), 0) as output_tokens
-         FROM usage_rollups_hourly
-         WHERE hour_ms >= ? AND hour_ms <= ?
-         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50"
-    };
+         WHERE (? IS NULL OR owner_user_id = ?) AND hour_ms >= ? AND hour_ms <= ?
+         GROUP BY canonical_id ORDER BY cost_micro_usd DESC LIMIT 50";
 
     let model_rows = if let Some(ref uid) = owner_user_id {
         sqlx::query(models_sql)
+            .bind(uid)
+            .bind(uid)
+            .bind(since_ms)
+            .bind(until_ms)
+            .bind(uid)
             .bind(uid)
             .bind(since_ms)
             .bind(until_ms)
@@ -1412,6 +1445,12 @@ pub(crate) async fn get_overview_internal(
             .await
     } else {
         sqlx::query(models_sql)
+            .bind(None::<String>)
+            .bind(None::<String>)
+            .bind(since_ms)
+            .bind(until_ms)
+            .bind(None::<String>)
+            .bind(None::<String>)
             .bind(since_ms)
             .bind(until_ms)
             .fetch_all(&state.auth.reader_pool)
@@ -1423,6 +1462,9 @@ pub(crate) async fn get_overview_internal(
         .into_iter()
         .map(|r| {
             let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
+            // An empty/unknown kind (a rollup row whose provider has since been deleted)
+            // renders the house mark, matching `14.g.2`'s "custom/internal" case.
+            let kind = r.try_get::<String, _>("provider_kind").unwrap_or_default();
             serde_json::json!({
                 "canonical_id": r.try_get::<String, _>("canonical_id").unwrap_or_default(),
                 "requests": r.try_get::<i64, _>("requests").unwrap_or(0),
@@ -1432,7 +1474,7 @@ pub(crate) async fn get_overview_internal(
                 "cache_read_tokens": r.try_get::<i64, _>("cache_read_tokens").unwrap_or(0),
                 "cache_write_tokens": r.try_get::<i64, _>("cache_write_tokens").unwrap_or(0),
                 "output_tokens": r.try_get::<i64, _>("output_tokens").unwrap_or(0),
-                "badge": "[LLR]",
+                "badge": provider_badge_mark(&kind),
             })
         })
         .collect::<Vec<_>>();

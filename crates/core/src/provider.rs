@@ -40,6 +40,39 @@ impl ProviderKind {
         }
     }
 
+    /// The provider's mark in the usage-by-model breakdown (`14.g.2`, `14.g.4`).
+    ///
+    /// `14.g.2` names exactly five marks — `[GO]` `opencode_go`, `[CC]` `command_code`,
+    /// `[OD]` `open_design_amr`, `[OR]` `openrouter`, and the rectangular `[LLR]` logo for
+    /// custom/internal models — and `14.g.4` types the projection as
+    /// `provider_badge_kind: &'static str // "go" | "cc" | "od" | "or" | "llr"`.
+    ///
+    /// The five kinds here are the spec's five, so the badge derives from the kind rather
+    /// than being chosen per call site. Before `ISSUE-0131` the breakdown emitted `[LLR]`
+    /// for every row, which said "house model" about OpenRouter-served models too.
+    #[must_use]
+    pub const fn badge_kind(self) -> &'static str {
+        match self {
+            Self::OpencodeGo => "go",
+            Self::CommandCode => "cc",
+            Self::OpenDesignAmr => "od",
+            Self::Openrouter => "or",
+            Self::Custom => "llr",
+        }
+    }
+
+    /// The provider's mark, in rendered form (`[GO]`, `[CC]`, `[OD]`, `[OR]`, `[LLR]`).
+    #[must_use]
+    pub const fn badge_mark(self) -> &'static str {
+        match self {
+            Self::OpencodeGo => "[GO]",
+            Self::CommandCode => "[CC]",
+            Self::OpenDesignAmr => "[OD]",
+            Self::Openrouter => "[OR]",
+            Self::Custom => "[LLR]",
+        }
+    }
+
     /// Authoritative preset definition document embedded at compile time (PRV-2).
     #[must_use]
     pub fn preset_toml(self) -> &'static str {
