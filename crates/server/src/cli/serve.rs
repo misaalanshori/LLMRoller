@@ -433,6 +433,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         clock: clock.clone(),
         entropy: entropy.clone(),
         audit_hmac_key: Some(instance_state.audit_hmac_key.clone()),
+        argon2_semaphore: auth_state.argon2_semaphore.clone(),
     };
     let mut api_state = llmroller_admin::ApiAppState::new(
         auth_state.clone(),

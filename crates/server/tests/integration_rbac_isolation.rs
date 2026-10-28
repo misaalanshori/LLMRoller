@@ -396,6 +396,7 @@ async fn test_user_routing_matrix_and_self_service_security() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);

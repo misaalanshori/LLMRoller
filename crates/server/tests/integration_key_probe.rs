@@ -305,6 +305,7 @@ async fn setup_inner(base_url: &str, sealed_secret: &str) -> ProbeHarness {
         clock: Arc::new(SystemClock::new()),
         entropy: Arc::new(DeterministicRng::new(33)),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let mut api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     api_state.writer = Some(writer);

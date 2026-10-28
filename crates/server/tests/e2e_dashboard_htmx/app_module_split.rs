@@ -37,6 +37,7 @@ async fn every_app_module_is_served_as_javascript() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state, master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, api_state.auth.clone(), api_state);

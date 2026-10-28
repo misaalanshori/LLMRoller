@@ -74,6 +74,7 @@ async fn logs_json(
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state, master_key, "key-0".to_string());
     let app =

@@ -19,6 +19,7 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
@@ -208,6 +209,7 @@ async fn test_admin_share_approval_catalog_ops_and_a6_telemetry() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
@@ -365,6 +367,7 @@ async fn test_htmx_partial_endpoints_and_live_swapping() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
@@ -672,6 +675,7 @@ async fn test_provider_preset_creation_partial_refetch_and_light_mode_styles() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);

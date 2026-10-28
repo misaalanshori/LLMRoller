@@ -87,6 +87,7 @@ async fn test_traceability_settings_confirm_purge_guard_and_auto_disable() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
 
@@ -236,6 +237,7 @@ async fn test_rbac_isolated_sessions_and_preview() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
@@ -500,6 +502,7 @@ async fn test_chat_preview_timeline_reconstruction_and_trace_purge() {
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: Arc::new(OsEntropy),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
     let api_state = ApiAppState::new(auth_state.clone(), master_key.clone(), "key-0".to_string());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);

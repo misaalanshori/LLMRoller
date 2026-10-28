@@ -44,6 +44,7 @@ async fn setup_test_env() -> (TempDir, sqlx::SqlitePool, SetupAppState, AuthAppS
         clock: Arc::new(llmroller_core::seams::SystemClock::new()),
         entropy: entropy.clone(),
         audit_hmac_key: None,
+        argon2_semaphore: llmroller_admin::setup::new_argon2_pool(),
     };
 
     let auth_config = AuthConfig {

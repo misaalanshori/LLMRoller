@@ -155,6 +155,8 @@ pub struct SetupAppState {
     pub clock: Arc<dyn Clock>,
     pub entropy: Arc<dyn EntropySource>,
     pub audit_hmac_key: Option<llmroller_core::seams::SecretBytes>,
+    /// Shared Argon2id pool. Unused on the red commit; the fix wires it in.
+    pub argon2_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for SetupAppState {
@@ -178,8 +180,15 @@ impl SetupAppState {
             clock: Arc::new(SystemClock::new()),
             entropy: Arc::new(OsEntropy::new()),
             audit_hmac_key: None,
+            argon2_semaphore: new_argon2_pool(),
         }
     }
+}
+
+/// A correctly sized Argon2id pool for a setup state.
+#[must_use]
+pub fn new_argon2_pool() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(crate::auth::argon2_permit_count()))
 }
 
 /// Payload for `POST /admin/api/setup`.

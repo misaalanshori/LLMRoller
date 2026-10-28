@@ -705,6 +705,15 @@ async fn log_login_failed(
 /// outer bound and is long enough to absorb a full queue of realistic logins.
 const ARGON2_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Number of permits in the shared Argon2id pool.
+#[must_use]
+pub fn argon2_permit_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .max(2)
+}
+
 /// Verify a password while holding exactly one Argon2id permit.
 ///
 /// The permit bounds concurrent Argon2id work, which is the whole point of the
