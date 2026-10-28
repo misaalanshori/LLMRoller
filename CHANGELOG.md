@@ -9,6 +9,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The log detail drawer projects and renders every `14.m` field (ISSUE-0174).**
+  `get_log_detail_internal` uses `SELECT *`, so every inspector column was already in the row and
+  the hand-written projection discarded seven of them: `client_location`, `termination`,
+  `incomplete`, `cost_source`, `pin_outcome`, `failovers`, `error_code`. All are now returned.
+  Enum-valued columns keep their **stored vocabulary** (`termination`, `cost_source`,
+  `pin_outcome` are CHECK-constrained; remapping them to display labels at the API boundary would
+  break any consumer comparing against the column's own values), and `incomplete` is a JSON boolean
+  rather than `0`/`1`.
+- **`request_headers_json` becomes a name → value grid, and a corrupt blob is not emptied.** The
+  blob was already in the JSON as a raw string; `14.m` section 6 wants a grid, so it is now shaped
+  into `{pairs, parse_error, raw}`. A valid blob becomes an ordered array of pairs (JSON objects are
+  unordered, and a user scanning headers expects capture order). A **corrupt** blob keeps its raw
+  text with `parse_error: true` instead of collapsing to `{}` — emptying it would render "no headers
+  recorded" for a value that exists and is damaged, the silent-empty failure mode cycles 10–16 kept
+  fixing. Absent and corrupt remain distinct states.
+- **The trace link is resolved only when a trace exists.** `trace_records.usage_event_id` is the PK
+  referencing `usage_events(id)` and its `request_id` is `UNIQUE`, so the link is the same single
+  lookup the existing `has_trace` flag already did. `trace_href` is `null` when no trace row exists:
+  traces are opt-in (`ADR-9`) so most rows have none, and a dead link in an inspector is worse than
+  an honest `null`.
+- **`partials.rs` was split rather than grown.** The drawer renderer moved to
+  `api/log_detail_drawer.rs` (370 lines) when `partials.rs` crossed the 1600-line `MNT-3` ceiling at
+  1,634, leaving it at 1,278. The drawer is the only renderer that interpolates attacker-influenced
+  text (allow-listed request header values), so isolating it makes the escaping auditable in one
+  file. Every name and value in the grid is escaped.
 - **CSV export honours every filter and reports truncation (ISSUE-0143).** `export_logs_csv_internal`
   issued a bare `LIMIT 5000` on both branches, so an operator who asked for "last week's errors on
   model X" received up to 5,000 unfiltered rows — in a file that leaves the system, where a wrong
