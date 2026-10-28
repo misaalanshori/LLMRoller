@@ -127,6 +127,81 @@ pub(crate) async fn get_admin_logs_handler(
     get_logs_internal(&state, None, query).await
 }
 
+/// The five token classes a `usage_events` row can carry, each preserved as `Option`.
+///
+/// `None` means the column was SQL `NULL` — the provider never reported it. `Some(0)` means it
+/// reported zero. The distinction is load-bearing for display: a rejected request that consumed
+/// nothing is worth showing as zero, while a row with no recorded counts must render `—`
+/// (`ISSUE-0173`).
+#[derive(Debug, Clone, Copy, Default)]
+struct TokenClasses {
+    input_uncached: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    output: Option<i64>,
+    reasoning: Option<i64>,
+}
+
+impl TokenClasses {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Self {
+        let get = |col: &str| row.try_get::<Option<i64>, _>(col).unwrap_or(None);
+        Self {
+            input_uncached: get("input_uncached_tokens"),
+            cache_read: get("cache_read_tokens"),
+            cache_write: get("cache_write_tokens"),
+            output: get("output_tokens"),
+            reasoning: get("reasoning_tokens"),
+        }
+    }
+
+    /// The canonical token total: `input_uncached + cache_read + cache_write + output`.
+    ///
+    /// This is the number the rest of the control plane already reports — the Usage Ledger's
+    /// aggregate, the overview KPI query, and `llmroller_core::pricing::calculate_cost_micro_usd`,
+    /// which prices exactly these four classes. Reusing it is the point: the bug was two
+    /// projections each owning their own sum (`ISSUE-0173`).
+    ///
+    /// **`reasoning` is excluded on purpose.** It is a *subset of* `output`, not a fifth class:
+    /// `TokenUsage::reasoning` is documented as a "diagnostic subset of `output`", and
+    /// `12. SRDD:133-134` records that `output_tokens` "includes reasoning". Adding it would
+    /// double-count and overstate volume.
+    ///
+    /// `None` propagates when no class was recorded at all, so an absent row stays absent rather
+    /// than becoming a zero.
+    fn total(&self) -> Option<i64> {
+        let classes = [
+            self.input_uncached,
+            self.cache_read,
+            self.cache_write,
+            self.output,
+        ];
+        classes
+            .iter()
+            .any(Option::is_some)
+            .then(|| classes.iter().flatten().sum())
+    }
+
+    /// Render the total, or `—` when the row recorded no token data at all.
+    fn formatted_or_dash(&self, format: impl FnOnce(i64) -> String) -> String {
+        self.total()
+            .map_or_else(|| "—".to_string(), |total| format(total))
+    }
+}
+
+/// Human label for the status column.
+///
+/// A 5xx is an **upstream fault**, not a decision about the caller's request, so it is `Failed`
+/// rather than `Rejected` (`ISSUE-0173`). `14.l` groups both under one colour but leaves the
+/// wording to the host; conflating them sends an operator looking at policy when the provider is
+/// the problem.
+fn status_badge(status: i64) -> String {
+    match status {
+        200 => "200".to_string(),
+        500..=599 => format!("{status} Failed"),
+        _ => format!("{status} Rejected"),
+    }
+}
+
 pub(crate) async fn get_logs_internal(
     state: &ApiAppState,
     actor_user_id: Option<String>,
@@ -306,16 +381,25 @@ pub(crate) async fn get_logs_internal(
             let status: i64 = r.try_get("status").unwrap_or(200);
             let cost: i64 = r.try_get("cost_micro_usd").unwrap_or(0);
             let latency_ms: Option<i64> = r.try_get("latency_ms").unwrap_or(None);
-            let input: i64 = r.try_get::<Option<i64>, _>("input_uncached_tokens").unwrap_or(None).unwrap_or(0);
-            let output: i64 = r.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0);
-            let total_tokens = input + output;
+            // Kept as `Option` all the way from the row: the token columns are nullable
+            // `INTEGER`s, so `NULL` ("the provider never told us") is a different fact from `0`
+            // ("the provider told us zero"). Collapsing them here is what forced the old
+            // `status == 200` guard, which then hid every charged rejection (`ISSUE-0173`).
+            let tokens = TokenClasses::from_row(&r);
+            let total_tokens = tokens.total();
+            let status_badge = status_badge(status);
+            let tokens_formatted = tokens
+                .formatted_or_dash(|t| format_tokens_compact(t));
+            // `cost_micro_usd` is `NOT NULL` in the schema, so there is no absent case to
+            // distinguish: a zero here is a real zero and renders as `$0.00000`.
+            let cost_formatted = format_cost_usd(cost);
 
             serde_json::json!({
                 "id": r.try_get::<String, _>("id").unwrap_or_default(),
                 "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
                 "ts": r.try_get::<i64, _>("ts").unwrap_or(0),
                 "status": status,
-                "status_badge": if status == 200 { "200".to_string() } else { format!("{status} Rejected") },
+                "status_badge": status_badge,
                 "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
                 "model": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
                 "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
@@ -328,9 +412,12 @@ pub(crate) async fn get_logs_internal(
                 "latency_ms": latency_ms,
                 "duration_formatted": latency_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "—".to_string()),
                 "total_tokens": total_tokens,
-                "tokens_formatted": if status == 200 { format_tokens_compact(total_tokens) } else { "—".to_string() },
+                "tokens_formatted": tokens_formatted,
+                "cache_read_tokens": tokens.cache_read,
+                "cache_write_tokens": tokens.cache_write,
+                "reasoning_tokens": tokens.reasoning,
                 "cost_micro_usd": cost,
-                "cost_formatted": if status == 200 { format_cost_usd(cost) } else { "—".to_string() },
+                "cost_formatted": cost_formatted,
                 "error_code": r.try_get::<Option<String>, _>("error_code").unwrap_or_default(),
                 "stop_reason": r.try_get::<Option<String>, _>("stop_reason").unwrap_or_default(),
             })

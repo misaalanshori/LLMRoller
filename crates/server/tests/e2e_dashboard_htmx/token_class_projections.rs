@@ -27,10 +27,13 @@ async fn seed_client_key(pool: &sqlx::SqlitePool, owner: UserId) -> ClientKeyId 
     key_id
 }
 
+/// The four priced token classes, in the order the canonical sum uses.
+type Tokens = (i64, i64, i64, i64);
+
 /// Insert one `usage_events` row with every token class under the caller's control.
 ///
-/// Token columns are `INTEGER` (nullable) in the schema, so `None` writes a real SQL `NULL` — which
-/// is how the "absent" half of the zero-vs-absent distinction is exercised.
+/// Token columns are `INTEGER` (nullable) in the schema. This helper always writes numbers; the
+/// `NULL` ("absent") case is written inline by the test that needs it.
 #[allow(clippy::too_many_arguments)]
 async fn insert_event(
     pool: &sqlx::SqlitePool,
@@ -38,9 +41,11 @@ async fn insert_event(
     client_key_id: &ClientKeyId,
     ts: i64,
     status: i64,
+    tokens: Tokens,
     reasoning: i64,
     cost_micro_usd: i64,
 ) -> String {
+    let (input, cache_read, cache_write, output) = tokens;
     let id = UsageEventId::generate().to_string();
     sqlx::query(
         "INSERT INTO usage_events (
@@ -51,7 +56,7 @@ async fn insert_event(
             plan_multiplier_bps, billing_coverage_mode, failovers)
          VALUES (?, ?, ?, ?, ?, 'deepseek-v4.1-flash', 'chat', 'chat',
                  ?, 0, 0, 'completed',
-                 100, 200, 300, 50,
+                 ?, ?, ?, ?,
                  ?, ?, 'price_book', ?, 10000, 'pay_as_you_go', 0)",
     )
     .bind(&id)
@@ -60,6 +65,10 @@ async fn insert_event(
     .bind(client_key_id.to_string())
     .bind(owner.to_string())
     .bind(status)
+    .bind(input)
+    .bind(cache_read)
+    .bind(cache_write)
+    .bind(output)
     .bind(reasoning)
     .bind(cost_micro_usd)
     .bind(cost_micro_usd)
@@ -154,7 +163,17 @@ async fn logs_event_total_tokens_sums_every_class() {
     let (_dir, pool, app, cookie, admin_id) = setup().await;
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
-    insert_event(&pool, admin_id, &key, now, 200, 25, 5000).await;
+    insert_event(
+        &pool,
+        admin_id,
+        &key,
+        now,
+        200,
+        (100, 200, 300, 50),
+        25,
+        5000,
+    )
+    .await;
 
     let json = get_json(&app, &cookie, "/admin/api/logs").await;
     let rows = json["rows"].as_array().expect("rows");
@@ -179,7 +198,17 @@ async fn logs_event_shows_cost_on_a_rejected_row() {
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
     // 20000 micro-USD = $0.02, which `format_cost_usd` renders as "$0.0200".
-    insert_event(&pool, admin_id, &key, now, 429, 25, 20_000).await;
+    insert_event(
+        &pool,
+        admin_id,
+        &key,
+        now,
+        429,
+        (100, 200, 300, 50),
+        25,
+        20_000,
+    )
+    .await;
 
     let json = get_json(&app, &cookie, "/admin/api/logs").await;
     let row = &json["rows"].as_array().expect("rows")[0];
@@ -219,7 +248,7 @@ async fn logs_event_renders_dash_only_when_the_column_is_absent() {
     let now = llmroller_core::seams::SystemClock::new().now_ms();
 
     // (a) A genuine zero on a rejected row: informative, must render as zero.
-    insert_event(&pool, admin_id, &key, now, 403, 0, 0).await;
+    insert_event(&pool, admin_id, &key, now, 403, (0, 0, 0, 0), 0, 0).await;
 
     // (b) A row whose token columns are SQL NULL: genuinely absent, must render `—`.
     let null_id = UsageEventId::generate().to_string();
@@ -290,7 +319,17 @@ async fn usage_breakdown_reports_reasoning_tokens() {
     let (_dir, pool, app, cookie, admin_id) = setup().await;
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
-    let event_id = insert_event(&pool, admin_id, &key, now, 200, 25, 5000).await;
+    let event_id = insert_event(
+        &pool,
+        admin_id,
+        &key,
+        now,
+        200,
+        (100, 200, 300, 50),
+        25,
+        5000,
+    )
+    .await;
 
     let json = get_json(
         &app,
@@ -325,7 +364,17 @@ async fn usage_ledger_reports_reasoning_tokens() {
     let (_dir, pool, app, cookie, admin_id) = setup().await;
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
-    insert_event(&pool, admin_id, &key, now, 200, 25, 5000).await;
+    insert_event(
+        &pool,
+        admin_id,
+        &key,
+        now,
+        200,
+        (100, 200, 300, 50),
+        25,
+        5000,
+    )
+    .await;
 
     let json = get_json(&app, &cookie, "/admin/api/usage/ledger").await;
 
@@ -354,7 +403,17 @@ async fn usage_ledger_totals_match_the_logs_projection() {
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
     // A reasoning-heavy, cache-heavy row: exactly the shape that exposed the divergence.
-    let event_id = insert_event(&pool, admin_id, &key, now, 200, 25, 5000).await;
+    let event_id = insert_event(
+        &pool,
+        admin_id,
+        &key,
+        now,
+        200,
+        (100, 200, 300, 50),
+        25,
+        5000,
+    )
+    .await;
 
     let logs = get_json(&app, &cookie, "/admin/api/logs").await;
     let logs_total = logs["rows"][0]["total_tokens"]
@@ -409,13 +468,20 @@ async fn logs_event_labels_upstream_failure_as_failed_not_rejected() {
     let key = seed_client_key(&pool, admin_id).await;
     let now = llmroller_core::seams::SystemClock::new().now_ms();
 
-    insert_event(&pool, admin_id, &key, now, 502, 0, 0).await; // upstream failure
-    insert_event(&pool, admin_id, &key, now + 1, 429, 0, 0).await; // admission rejection
+    insert_event(&pool, admin_id, &key, now, 502, (0, 0, 0, 0), 0, 0).await; // upstream failure
+    insert_event(&pool, admin_id, &key, now + 1, 429, (0, 0, 0, 0), 0, 0).await; // admission rejection
 
     let json = get_json(&app, &cookie, "/admin/api/logs").await;
     let rows = json["rows"].as_array().expect("rows");
-    let recent = &rows[0]; // 429
-    let older = &rows[1]; // 502
+    // Select by timestamp: the cursor orders on ULID `id`, which does not track `ts`.
+    let recent = rows
+        .iter()
+        .find(|r| r["ts"].as_i64() == Some(now + 1))
+        .expect("the 429 row");
+    let older = rows
+        .iter()
+        .find(|r| r["ts"].as_i64() == Some(now))
+        .expect("the 502 row");
 
     assert_eq!(
         recent["status_badge"], "429 Rejected",
