@@ -144,14 +144,18 @@ fn request_from(
         builder = builder.header("accept", "text/html");
     }
     let mut request = builder.body(body).expect("request");
-    request.extensions_mut().insert(axum::extract::ConnectInfo(
-        addr(peer),
-    ));
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr(peer)));
     request
 }
 
 fn addr(ip: &str) -> SocketAddr {
-    SocketAddr::new(ip.parse::<IpAddr>().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), 41234)
+    SocketAddr::new(
+        ip.parse::<IpAddr>()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        41234,
+    )
 }
 
 fn set_cookie_header(response: &axum::response::Response) -> String {
@@ -256,7 +260,14 @@ async fn session_cookie_and_csrf_cookie_agree() {
     let page = h
         .app
         .clone()
-        .oneshot(request_from("GET", "/login", LOOPBACK_PEER, None, None, Body::empty()))
+        .oneshot(request_from(
+            "GET",
+            "/login",
+            LOOPBACK_PEER,
+            None,
+            None,
+            Body::empty(),
+        ))
         .await
         .expect("login page");
     let csrf = page
@@ -340,7 +351,14 @@ async fn login_succeeds_over_plain_http_loopback() {
     let page = h
         .app
         .clone()
-        .oneshot(request_from("GET", "/login", LOOPBACK_PEER, None, None, Body::empty()))
+        .oneshot(request_from(
+            "GET",
+            "/login",
+            LOOPBACK_PEER,
+            None,
+            None,
+            Body::empty(),
+        ))
         .await
         .expect("login page");
     let csrf = page
@@ -349,6 +367,16 @@ async fn login_succeeds_over_plain_http_loopback() {
         .and_then(|v| v.to_str().ok())
         .expect("csrf token")
         .to_string();
+    // The login POST must echo the CSRF cookie: the check is a double submit (form token vs
+    // cookie), so omitting the cookie fails `invalid_csrf` regardless of scheme.
+    let csrf_cookie = page
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
 
     let login = h
         .app
@@ -358,25 +386,31 @@ async fn login_succeeds_over_plain_http_loopback() {
             "/api/auth/login",
             LOOPBACK_PEER,
             None,
-            None,
+            Some(&csrf_cookie),
             Body::from(format!(
                 "username=scheme_user&password=Password12345!%23&csrf_token={csrf}"
             )),
         ))
         .await
         .expect("login");
+    // A test HTTP client echoes whatever cookie it was given, so the redirect alone cannot
+    // distinguish "usable by a browser" from "silently discarded". Assert the attribute too:
+    // this is what a real browser keys on, and it is what makes this test fail if the
+    // resolver regresses to always-Secure.
+    let issued = set_cookie_header(&login);
+    let login_status = login.status();
+    let login_body =
+        String::from_utf8_lossy(&login.into_body().collect().await.expect("body").to_bytes())
+            .to_string();
+    assert!(
+        !issued.to_ascii_lowercase().contains("secure"),
+        "the session cookie handed to an http client must not be Secure, or the browser drops \
+         it and this redirect is unreachable in practice; got {issued:?}"
+    );
     assert_eq!(
-        login.status(),
+        login_status,
         StatusCode::SEE_OTHER,
-        "a correct password over http must log in; body was {}",
-        String::from_utf8_lossy(
-            &login
-                .into_body()
-                .collect()
-                .await
-                .expect("body")
-                .to_bytes()
-        )
+        "a correct password over http must log in; body was {login_body}"
     );
 
     // And the store now holds a session for the user, which is the durable receipt.
@@ -385,5 +419,8 @@ async fn login_succeeds_over_plain_http_loopback() {
         .fetch_one(&h.pool)
         .await
         .expect("count sessions");
-    assert_eq!(sessions, 1, "a session row must exist after a successful login");
+    assert_eq!(
+        sessions, 1,
+        "a session row must exist after a successful login"
+    );
 }

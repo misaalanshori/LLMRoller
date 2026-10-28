@@ -156,23 +156,102 @@ impl Default for AuthConfig {
     }
 }
 
-impl AuthConfig {
+/// The cookie attributes a given request's scheme allows (`ISSUE-0188`, `SEC-4`).
+///
+/// Name and `Secure` are decided **together** and must never be split. The `__Host-` prefix is
+/// a browser-enforced contract: a cookie named `__Host-…` must carry `Secure` (and no `Domain`,
+/// with `Path=/`), and one that does not is rejected outright. So dropping `Secure` while
+/// keeping the prefix produces an invalid cookie, and keeping `Secure` while dropping the
+/// prefix gives up a defence the browser would otherwise enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookiePolicy {
+    /// Whether the cookie must be marked `Secure`, and whether the `__Host-` names are usable.
+    pub secure: bool,
+    /// The prefix the request's scheme supports.
+    pub prefix: &'static str,
+}
+
+impl CookiePolicy {
+    /// Name for the session cookie under this policy.
     #[must_use]
-    pub fn session_cookie_name(&self) -> &'static str {
-        if self.dev_insecure_cookies {
-            DEV_SESSION_COOKIE_NAME
-        } else {
+    pub const fn session_cookie_name(self) -> &'static str {
+        if self.secure {
             SESSION_COOKIE_NAME
+        } else {
+            DEV_SESSION_COOKIE_NAME
         }
     }
 
+    /// Name for the login CSRF cookie under this policy.
     #[must_use]
-    pub fn login_csrf_cookie_name(&self) -> &'static str {
-        if self.dev_insecure_cookies {
-            DEV_LOGIN_CSRF_COOKIE_NAME
-        } else {
+    pub const fn login_csrf_cookie_name(self) -> &'static str {
+        if self.secure {
             LOGIN_CSRF_COOKIE_NAME
+        } else {
+            DEV_LOGIN_CSRF_COOKIE_NAME
         }
+    }
+
+    /// The `; Secure` fragment, or empty for a plaintext request.
+    #[must_use]
+    pub const fn secure_flag(self) -> &'static str {
+        if self.secure { "; Secure" } else { "" }
+    }
+}
+
+/// Read the session token from a cookie header, accepting **either** name.
+///
+/// Writes are scheme-dependent (`__Host-llmroller_session` over TLS, `llmroller_session`
+/// otherwise), but reads must not be: a user who established a session over https and then
+/// reaches the instance over http — or the reverse, during a proxy cutover — must not be
+/// silently logged out because the reader only knew one name (`ISSUE-0188`).
+#[must_use]
+pub fn session_token_from_cookie_header(cookie_header: &str) -> Option<String> {
+    parse_cookie_value(cookie_header, SESSION_COOKIE_NAME)
+        .or_else(|| parse_cookie_value(cookie_header, DEV_SESSION_COOKIE_NAME))
+        .map(ToString::to_string)
+}
+
+/// Resolve the cookie policy for one request (`ISSUE-0188`).
+///
+/// **The rule is: `Secure` iff the request actually arrived over TLS.** There is no TLS
+/// listener in this product — `serve.rs` binds a plain `TcpListener` and calls plain
+/// `axum::serve`, with `rustls` used only as reqwest's outbound client — so in practice TLS is
+/// always terminated upstream and the only signal available is `X-Forwarded-Proto` from a
+/// peer we trust (`docs/srdd/22`'s Caddyfile sends it to the plaintext listener).
+///
+/// The trust check is load-bearing: an untrusted peer asserting `https` must not be believed,
+/// or any client could talk the server into a cookie it cannot use. This reuses the same
+/// trusted-peer CIDR matching as [`extract_client_ip`] rather than introducing a second one.
+#[must_use]
+pub fn cookie_policy_for(
+    config: &AuthConfig,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> CookiePolicy {
+    // An explicit dev override still wins: it exists to make a deliberately insecure local
+    // setup usable, and it is what the Compose dev profile sets.
+    if config.dev_insecure_cookies {
+        return CookiePolicy {
+            secure: false,
+            prefix: "",
+        };
+    }
+    let secure = peer_is_trusted_proxy(peer_addr.ip(), &config.trusted_proxies)
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|proto| {
+                // Proxies may append, e.g. `https,http`; the first entry is the client-facing
+                // scheme.
+                proto
+                    .split(',')
+                    .next()
+                    .is_some_and(|first| first.trim().eq_ignore_ascii_case("https"))
+            });
+    CookiePolicy {
+        secure,
+        prefix: if secure { "__Host-" } else { "" },
     }
 }
 
@@ -196,6 +275,33 @@ pub fn check_admin_listener_address(
     }
 }
 
+/// The connecting peer's address, defaulting to loopback when the router was built without
+/// `ConnectInfo` (in-process tests).
+#[must_use]
+pub fn peer_addr_from(extensions: &axum::http::Extensions) -> SocketAddr {
+    extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(
+            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
+            |ci| ci.0,
+        )
+}
+
+/// Whether `peer_ip` is inside `trusted_proxies` (`SEC-12`).
+///
+/// One matcher for both forwarded-header readers — [`extract_client_ip`] for
+/// `X-Forwarded-For` and [`cookie_policy_for`] for `X-Forwarded-Proto` — so the two can never
+/// disagree about who is trusted.
+fn peer_is_trusted_proxy(peer_ip: IpAddr, trusted_proxies: &[String]) -> bool {
+    if trusted_proxies.is_empty() {
+        return false;
+    }
+    let peer_str = peer_ip.to_string();
+    trusted_proxies
+        .iter()
+        .any(|p| p.trim() == peer_str || cidr_contains(p.trim(), peer_ip))
+}
+
 /// Extract the effective client IP honoring trusted proxies per `SEC-12`.
 #[must_use]
 pub fn extract_client_ip(
@@ -204,16 +310,7 @@ pub fn extract_client_ip(
     trusted_proxies: &[String],
 ) -> IpAddr {
     let peer_ip = peer_addr.ip();
-    if trusted_proxies.is_empty() {
-        return peer_ip;
-    }
-
-    // Verify peer is in trusted proxies
-    let peer_str = peer_ip.to_string();
-    let is_trusted_peer = trusted_proxies
-        .iter()
-        .any(|p| p.trim() == peer_str || cidr_contains(p.trim(), peer_ip));
-    if !is_trusted_peer {
+    if !peer_is_trusted_proxy(peer_ip, trusted_proxies) {
         return peer_ip;
     }
 
@@ -501,17 +598,18 @@ pub struct LoginTemplate {
 }
 
 #[doc = "Spec: SEC-5"]
-async fn get_login_page(State(state): State<AuthAppState>) -> Response {
+async fn get_login_page(State(state): State<AuthAppState>, parts: Parts) -> Response {
     let mut raw_csrf = [0_u8; 32];
     state.entropy.fill_bytes(&mut raw_csrf);
     let csrf_token = URL_SAFE_NO_PAD.encode(raw_csrf);
 
-    let cookie_name = state.config.login_csrf_cookie_name();
-    let secure_flag = if state.config.dev_insecure_cookies {
-        ""
-    } else {
-        "; Secure"
-    };
+    let policy = cookie_policy_for(
+        &state.config,
+        peer_addr_from(&parts.extensions),
+        &parts.headers,
+    );
+    let cookie_name = policy.login_csrf_cookie_name();
+    let secure_flag = policy.secure_flag();
     let cookie_header = format!(
         "{cookie_name}={csrf_token}; HttpOnly{secure_flag}; SameSite=Strict; Path=/; Max-Age={LOGIN_CSRF_MAX_AGE_SECS}"
     );
@@ -605,13 +703,7 @@ async fn post_login(
     body: Bytes,
 ) -> Result<Response, AuthError> {
     let now_ms = state.clock.now_ms();
-    let peer_addr = parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map_or_else(
-            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
-            |ci| ci.0,
-        );
+    let peer_addr = peer_addr_from(&parts.extensions);
     let client_ip = extract_client_ip(peer_addr, &parts.headers, &state.config.trusted_proxies);
 
     let content_type = parts
@@ -645,13 +737,14 @@ async fn post_login(
         };
 
     // 1. Validate Login CSRF token per SEC-5
-    let login_csrf_cookie_name = state.config.login_csrf_cookie_name();
     let cookie_header = parts
         .headers
         .get(COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let expected_csrf = parse_cookie_value(cookie_header, login_csrf_cookie_name);
+    // Accept either name: the cookie may have been issued before a scheme change.
+    let expected_csrf = parse_cookie_value(cookie_header, LOGIN_CSRF_COOKIE_NAME)
+        .or_else(|| parse_cookie_value(cookie_header, DEV_LOGIN_CSRF_COOKIE_NAME));
 
     let header_csrf = parts
         .headers
@@ -832,12 +925,9 @@ async fn post_login(
     .await
     .map_err(|_| AuthError::Internal)?;
 
-    let cookie_name = state.config.session_cookie_name();
-    let secure_flag = if state.config.dev_insecure_cookies {
-        ""
-    } else {
-        "; Secure"
-    };
+    let policy = cookie_policy_for(&state.config, peer_addr, &parts.headers);
+    let cookie_name = policy.session_cookie_name();
+    let secure_flag = policy.secure_flag();
     let cookie_header = format!(
         "{cookie_name}={session_token}; HttpOnly{secure_flag}; SameSite=Strict; Path=/; Max-Age={}",
         SESSION_ABSOLUTE_TIMEOUT_MS / 1000
@@ -876,14 +966,14 @@ async fn post_login(
 #[doc = "Spec: AUTH-7"]
 async fn post_logout(
     State(state): State<AuthAppState>,
-    headers: HeaderMap,
+    parts: Parts,
 ) -> Result<Response, AuthError> {
-    let cookie_name = state.config.session_cookie_name();
+    let headers = parts.headers.clone();
     let cookie_header = headers
         .get(COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(token) = parse_cookie_value(cookie_header, cookie_name) {
+    if let Some(token) = session_token_from_cookie_header(cookie_header) {
         let id_hash = sha256_hex(token.as_bytes());
         let session = load_web_session(&state.reader_pool, &id_hash)
             .await
@@ -917,13 +1007,12 @@ async fn post_logout(
         }
     }
 
-    let secure_flag = if state.config.dev_insecure_cookies {
-        ""
-    } else {
-        "; Secure"
-    };
-    let clear_cookie =
-        format!("{cookie_name}=; HttpOnly{secure_flag}; SameSite=Strict; Path=/; Max-Age=0");
+    let policy = cookie_policy_for(&state.config, peer_addr_from(&parts.extensions), &headers);
+    let clear_cookie = format!(
+        "{}=; HttpOnly{}; SameSite=Strict; Path=/; Max-Age=0",
+        policy.session_cookie_name(),
+        policy.secure_flag()
+    );
 
     Ok((
         StatusCode::OK,
@@ -947,12 +1036,11 @@ pub async fn authenticate_session(
     state: &AuthAppState,
     headers: &HeaderMap,
 ) -> Result<SessionWithUser, AuthError> {
-    let cookie_name = state.config.session_cookie_name();
     let cookie_header = headers
         .get(COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let Some(token) = parse_cookie_value(cookie_header, cookie_name) else {
+    let Some(token) = session_token_from_cookie_header(cookie_header) else {
         return Err(AuthError::Unauthorized);
     };
 

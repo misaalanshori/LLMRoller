@@ -278,11 +278,24 @@ async fn login_csrf_and_security_headers() {
     let app = control_plane_router(setup_state, auth_state);
 
     // 1. GET /login issues login CSRF cookie and meta tag
-    let request = Request::builder()
+    //
+    // The request is modelled as arriving over TLS the way the shipped deployment does it: the
+    // admin listener is plain HTTP and a trusted reverse proxy terminates TLS and forwards
+    // `X-Forwarded-Proto: https` (`docs/srdd/22`). Since `ISSUE-0188` the `__Host-` name and
+    // the `Secure` attribute are both decided by that, so without this the cookie is correctly
+    // issued unprefixed and without `Secure` — previously this test asserted the unconditional
+    // behaviour that made plain-http logins impossible.
+    let mut request = Request::builder()
         .method("GET")
         .uri("/login")
+        .header("x-forwarded-proto", "https")
         .body(Body::empty())
         .expect("request");
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "172.28.1.10:8081"
+            .parse::<SocketAddr>()
+            .expect("proxy addr"),
+    ));
 
     let response = app.clone().oneshot(request).await.expect("response");
     assert_eq!(response.status(), StatusCode::OK);

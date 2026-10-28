@@ -9,6 +9,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The admin cookies now follow the request's actual scheme (ISSUE-0188).** The login CSRF
+  cookie, the session cookie and the logout clear-cookie all set `Secure` — and used the
+  `__Host-` name prefix — unless `--dev-insecure-cookies` was passed. Because this server has
+  no TLS listener (it binds a plain `TcpListener`; TLS is always terminated upstream, and
+  `docs/srdd/22`'s Caddyfile forwards `X-Forwarded-Proto`), that meant a plaintext deployment
+  received cookies a browser silently discards: **login was impossible** over plain http,
+  including on the documented loopback admin listener. `X-Forwarded-Proto` was never
+  consulted, contrary to what the issue reported — the defect was the mirror image of the
+  issue's premise.
+  A new `cookie_policy_for` resolves `Secure` **and** the `__Host-` prefix together, since the
+  prefix is a browser-enforced contract that requires `Secure`: `Secure` iff a *trusted* peer
+  (same CIDR matching as `extract_client_ip`, now factored into one `peer_is_trusted_proxy`)
+  reported `X-Forwarded-Proto: https`, else neither. Reads accept both cookie names, so a
+  session established over one scheme is not lost when the other is used.
 - **TOTP recovery codes and re-enrollment refusal verified, not changed (ISSUE-0189,
   ISSUE-0190, ISSUE-0221).** Both reported defects turned out to be already implemented, so
   this is a test-only change. Recovery codes are accepted at login, consumed single-use, and

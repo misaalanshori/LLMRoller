@@ -193,8 +193,7 @@ pub(crate) async fn get_user_web_sessions_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let current_token =
-        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
-            .unwrap_or("");
+        crate::auth::session_token_from_cookie_header(cookie_header).unwrap_or_default();
     let current_hash = llmroller_store::crypto::sha256_hex(current_token.as_bytes());
 
     let rows = sqlx::query(
@@ -481,8 +480,7 @@ pub(crate) async fn post_user_password_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let session_token =
-        crate::auth::parse_cookie_value(cookie_header, state.auth.config.session_cookie_name())
-            .unwrap_or("");
+        crate::auth::session_token_from_cookie_header(cookie_header).unwrap_or_default();
     let id_hash = llmroller_store::crypto::sha256_hex(session_token.as_bytes());
 
     let _permit = state
