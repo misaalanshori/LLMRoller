@@ -35,6 +35,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`PATCH /admin/api/models/{id}` accepts its documented fields, validates them, and answers
+  truthfully (ISSUE-0170).** The handler was eleven lines with four defects. It accepted only
+  `exposed` — `distribution` and `routing_strategy` could not be sent at all, because
+  `PatchModelRequest` had one field and serde drops unknown keys silently. It discarded the SQL
+  result, so a PATCH naming a `model_pk` that does not exist returned `200 OK` having changed
+  nothing. It validated nothing, so a bad enum value surfaced as a `500` from the schema's CHECK
+  constraint instead of a `422`. And it wrote a bare `UPDATE` on the reader-facing pool. Now:
+  both fields are optional members of the request; `distribution` and `routing_strategy` are
+  validated first and rejected with `422` listing the accepted values (the
+  `default_routing_scope`/`ui_locale` house pattern), with `routing_strategy` reusing
+  `RoutingStrategy`'s own `FromStr` error so the six valid names live in one place; zero rows
+  affected returns `404`; and the whole thing runs through
+  `execute_atomic_mutation(vec![ConfigDomain::Models])`, so the row and the audit entry share one
+  transaction and a refusal cannot half-commit. The partial update is `COALESCE` per column plus
+  a `CASE` for `routing_strategy`, which has a third state: absent (keep), `""` (clear to `NULL`
+  so the model inherits `default_routing_strategy`), or a value. `null` in JSON cannot express
+  the clear because it deserialises the same as an absent field, so it is ignored and the empty
+  string is the explicit sentinel — documented on the struct and pinned by a test. **Two of the
+  issue's requested fields are declined rather than implemented:** `headroom_scaling` is the
+  instance-wide runtime setting `headroom_scaling_enabled`, not a per-model property, and
+  `max_context_tokens` must stay upstream-discovered — the real column is `context_window`
+  (migration `0002`), whose own comment says NULL means the upstream never advertised a length
+  and the proxy *"must omit the field rather than fabricate a capability value (audit
+  F-031)"*. A test asserts a `context_window` key in the PATCH body is ignored, so the field
+  cannot quietly become writable later. **Also documented, from running it:** the issue's claim
+  that bypassing `execute_atomic_mutation` loses the audit row and the snapshot publish is
+  **false** — `control_mutation_barrier` does both for every successful mutation, which a mutant
+  replacing the handler with a bare `UPDATE` confirmed. Those two assertions are therefore
+  regression guards; what the atomic path uniquely buys is rollback, now pinned separately.
 - **`control_plane_logs` is swept in production, and the sweep is bounded (ISSUE-0230).** The table
   recording every control-plane HTTP request grew without bound: the live maintenance tick swept
   eleven tables and omitted this one, while `run_retention_pass` — the function written to trim it —
