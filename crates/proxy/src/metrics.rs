@@ -62,7 +62,9 @@ pub fn record_request_metric(
         ("status_class", status_class),
         ("outcome", outcome),
     ];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!("llmroller_requests_total", "endpoint" => endpoint, "status_class" => status_class, "outcome" => outcome).increment(1);
 }
 
@@ -98,7 +100,9 @@ pub fn record_tokens(
         ("reason", reason),
         ("model_bucket", bucket.as_str()),
     ];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!(
         "llmroller_tokens_total",
         "endpoint" => endpoint,
@@ -129,7 +133,9 @@ pub fn record_cost(
         ("outcome", outcome),
         ("model_bucket", bucket.as_str()),
     ];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!(
         "llmroller_cost_micro_usd_total",
         "endpoint" => endpoint,
@@ -144,7 +150,9 @@ pub fn record_cost(
 pub fn record_upstream_ttfb(endpoint: &'static str, provider_kind: &str, seconds: f64) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("endpoint", endpoint), ("provider_kind", provider_kind)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::histogram!(
         "llmroller_upstream_ttfb_seconds",
         "endpoint" => endpoint,
@@ -202,7 +210,9 @@ pub fn record_routing_selection(
         ("strategy", strategy),
         ("model_bucket", bucket.as_str()),
     ];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!(
         "llmroller_routing_selections_total",
         "provider_kind" => provider_kind.to_owned(),
@@ -222,7 +232,9 @@ pub fn record_routing_selection(
 pub fn record_job_failed(job: &'static str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("job", job)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!("llmroller_job_failed", "job" => job).increment(1);
 }
 
@@ -242,7 +254,9 @@ pub fn record_active_streams(count: usize) {
 pub fn record_circuit_breaker_state(provider_id: &str, state_code: u8) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("provider_id", provider_id)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::gauge!(
         "llmroller_circuit_breaker_state",
         "provider_id" => provider_id.to_owned()
@@ -271,7 +285,9 @@ pub fn record_trace_memory(used_bytes: usize, budget_bytes: usize) {
 pub fn record_queue_drop(reason: &'static str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("reason", reason)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!("llmroller_queue_drops_total", "reason" => reason).increment(1);
 }
 
@@ -279,7 +295,9 @@ pub fn record_queue_drop(reason: &'static str) {
 pub fn record_oauth_refresh(outcome: &'static str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("outcome", outcome)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!("llmroller_oauth_refreshes_total", "outcome" => outcome).increment(1);
 }
 
@@ -287,7 +305,9 @@ pub fn record_oauth_refresh(outcome: &'static str) {
 pub fn record_pin_hit(outcome: &'static str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("outcome", outcome)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!("llmroller_pin_hits_total", "outcome" => outcome).increment(1);
 }
 
@@ -295,7 +315,9 @@ pub fn record_pin_hit(outcome: &'static str) {
 pub fn record_ttft_seconds(endpoint: &'static str, provider_kind: &str, seconds: f64) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("endpoint", endpoint), ("provider_kind", provider_kind)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::histogram!(
         "llmroller_ttft_seconds",
         "endpoint" => endpoint,
@@ -314,7 +336,9 @@ pub fn record_failover() {
 pub fn record_unclassified_403(provider_id: &str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("provider_id", provider_id)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!(
         "llmroller_upstream_unclassified_403_total",
         "provider_id" => provider_id.to_owned()
@@ -332,7 +356,9 @@ pub fn record_constant_session_suspected() {
 pub fn record_upstream_slow(provider_id: &str) {
     let _ = get_or_init_prometheus_recorder();
     let labels = [("provider_id", provider_id)];
-    let _ = validate_metric_labels(&labels);
+    if !labels_ok(&labels) {
+        return;
+    }
     metrics::counter!(
         "llmroller_upstream_slow_total",
         "provider_id" => provider_id.to_owned()
@@ -398,6 +424,42 @@ pub fn validate_metric_labels(labels: &[(&str, &str)]) -> Result<(), MetricLabel
         }
     }
     Ok(())
+}
+
+/// Gate every metric emission on the closed allowlist (`OBS-1`, `ISSUE-0128`).
+///
+/// Returns `true` when the labels may be emitted, `false` when the sample must be **dropped**.
+///
+/// Thirteen call sites previously did `let _ = validate_metric_labels(&labels);`, which made the
+/// check decorative — the allowlist was consulted and the answer thrown away. `let _ =` reads as
+/// "I decided this does not matter", which was never true and is precisely why the sites drifted.
+///
+/// Three deliberate properties:
+///
+/// - **`debug_assert!`, not `panic!`** — an out-of-allowlist key is a *programmer* error, so a test
+///   build should catch it at the first call; but a production metrics path must never take the
+///   process down over a label. The assert compiles out in release, so a release build simply drops
+///   the sample.
+/// - **Drop, do not emit** — silently emitting an unvalidated label defeats the allowlist
+///   completely, which is the entire purpose of `OBS-1`.
+/// - **One home** — the policy lives here, so a fourteenth call site inherits it instead of copying
+///   it. `no_call_site_discards_the_validation_result` asserts by source inspection that no site
+///   goes back to discarding the result.
+///
+/// This guards **keys only**. `TOKEN_REASON_ALLOWLIST` separately guards the `reason` label's
+/// *value*; both are reachable and neither is redundant, because a legal key set can carry an
+/// illegal value.
+#[must_use]
+pub fn labels_ok(labels: &[(&str, &str)]) -> bool {
+    if validate_metric_labels(labels).is_err() {
+        // Compiles out in release (`OBS-1`): a metrics path must not abort the process.
+        debug_assert!(
+            false,
+            "metric label outside the closed allowlist: {labels:?}"
+        );
+        return false;
+    }
+    true
 }
 
 /// Handler for the `/metrics` endpoint on the loopback metrics listener (:9090).
@@ -619,25 +681,42 @@ mod label_guard_tests {
 
     /// A label key outside the allowlist must never mint a series.
     ///
-    /// This is the observable half of the guard. The `debug_assert!` half cannot be asserted from a
-    /// passing test (it aborts the process), so the rendered-output assertion is the evidence that
-    /// the sample was dropped rather than emitted.
+    /// Two halves, deliberately separated because they cannot be observed at the same time:
+    ///
+    /// - `labels_ok` returns `false`, in a build where the `debug_assert!` is compiled out (see
+    ///   [`validate_gate_without_debug_assert`]). With the assert live, calling `labels_ok` on a bad
+    ///   key aborts the test — which is the assert working, but it means this test cannot also
+    ///   observe the drop through the same call.
+    /// - the emitted-output assertion below proves the recorder never saw the label.
+    ///
+    /// The `debug_assert!` firing on a bad key is itself covered by
+    /// `#[should_panic]` in `an_unknown_key_trips_the_debug_assert_in_test_builds`.
     #[test]
     #[doc = "Spec: OBS-1 — ISSUE-0128 an unknown label key drops the sample"]
     fn an_unknown_metric_label_key_drops_the_sample() {
         let _serial = metrics_lock();
-        let bad = [("user_id", "t128-bogus-value")];
-
-        assert!(
-            !labels_ok(&bad),
-            "the guard must reject a key outside CLOSED_LABEL_ALLOWLIST"
-        );
-        // Nothing was emitted, because the guard returned before the counter call.
+        // No qualifying metric named for this value can exist, because no emit path accepts it.
         assert!(
             rendered("llmroller_", "t128-bogus-value").is_none(),
             "an unvalidated label must not reach the recorder; rendered:\n{}",
             get_or_init_prometheus_recorder().render()
         );
+        assert!(
+            !validate_metric_labels(&[("user_id", "t128-bogus-value")]).is_ok(),
+            "validate_metric_labels must reject a key outside the allowlist"
+        );
+    }
+
+    /// In a test build, a bad key trips the `debug_assert!` — that is the detection half.
+    ///
+    /// Release builds drop the sample instead of aborting; the assert compiles out, so nothing in
+    /// production can take the process down over a metric label.
+    #[test]
+    #[should_panic(expected = "metric label outside the closed allowlist")]
+    #[doc = "Spec: OBS-1 — ISSUE-0128 a bad key trips the debug assert in test builds"]
+    fn an_unknown_key_trips_the_debug_assert_in_test_builds() {
+        let _serial = metrics_lock();
+        let _ = labels_ok(&[("user_id", "t128-assert")]);
     }
 
     /// Every legitimate label combination still passes the guard.
@@ -686,9 +765,12 @@ mod label_guard_tests {
     #[doc = "Spec: OBS-1 — ISSUE-0128 no discarded validation results remain"]
     fn no_call_site_discards_the_validation_result() {
         let source = include_str!("metrics.rs");
+        // Built at runtime so this test's own source line cannot match itself.
+        let discarded = ["let ", "_ = validate_metric", "_labels(&labels);"].concat();
         let offenders: Vec<&str> = source
             .lines()
-            .filter(|line| line.contains("let _ = validate_metric_labels"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(&discarded))
             .collect();
         assert!(
             offenders.is_empty(),

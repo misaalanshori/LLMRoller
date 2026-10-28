@@ -526,6 +526,14 @@ async fn state_bound_decode_failure_does_not_invent_a_model_id() {
     // The link is written through the coalescing writer queue, so drain it before reading.
     flush(&harness).await;
 
+    // Count the rows the link-creation call wrote, so the assertion below can distinguish them
+    // from anything the state-bound op writes.
+    let rows_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE endpoint = 'responses'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("count before");
+
     // Remove the model the link points at, leaving the link's `model_pk` dangling. `RESTRICT`
     // forbids this normally, so lift the constraint for the fixture — the point is that the code
     // must not paper over the resulting inconsistency with a plausible-looking string.
@@ -558,36 +566,33 @@ async fn state_bound_decode_failure_does_not_invent_a_model_id() {
     let (status, body) = get_response(app, &token, &id).await;
     flush(&harness).await;
 
-    // Whatever the handler does, the ledger must never claim `gpt-4o` or an empty model for a
-    // request whose real model no longer exists.
-    let recorded: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT canonical_id, error_code FROM usage_events \
-         WHERE endpoint = 'responses' ORDER BY ts DESC, rowid DESC LIMIT 5",
-    )
-    .fetch_all(&harness.pool)
-    .await
-    .expect("usage events");
-
-    for (canonical_id, error_code) in &recorded {
-        assert_ne!(
-            canonical_id.as_deref(),
-            Some("gpt-4o"),
-            "no usage row may be attributed to the invented fallback model; row: {canonical_id:?} / \
-             {error_code:?}"
-        );
-        assert_ne!(
-            canonical_id.as_deref(),
-            Some(""),
-            "an empty canonical_id is as wrong as an invented one, just less visible"
-        );
-    }
-
-    // And the request must fail loudly rather than proceed on a link it cannot attribute.
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "an unresolvable model on the link is a stale-link fault; got {status} with body {}",
+    // The request must fail loudly rather than proceed on a link it cannot attribute. An earlier
+    // guard (`hard_route_checks` → `Forbidden403ModelOrProtocolBlocked`) already refuses a link
+    // whose model has left the snapshot, so the response is `403` and the invented-model branch is
+    // never reached — which is the finding recorded in the report: the `gpt-4o` fallback is
+    // genuinely unreachable, and this fix is defence in depth rather than a behaviour change.
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::BAD_GATEWAY,
+        "an unresolvable model on the link must be refused, not silently attributed; got {status} \
+         with body {}",
         String::from_utf8_lossy(&body)
+    );
+
+    // **The assertion with teeth, stated honestly.** `hard_route_checks` refuses a link whose
+    // model has left the snapshot *before* the attribution code runs, so the op writes no new
+    // ledger row at all. That is the property: an unusable link produces no row rather than a
+    // row naming a guessed model. It is also why `state_bound.rs`'s `gpt-4o` fallback is dead code
+    // — established by mutation, not by reading: restoring the fallback leaves this test green.
+    let rows_now: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE endpoint = 'responses'")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("count after");
+
+    assert_eq!(
+        rows_now, rows_before,
+        "an unusable link must not append a usage row; a new row means the op proceeded to \
+         attribution, where the model would have had to be guessed"
     );
 }
 

@@ -762,10 +762,33 @@ pub(crate) async fn forward_state_bound_response_op(
         }
         Ok(Err(_)) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let canonical_id = snapshot
-        .models
-        .get(&link.model_pk)
-        .map_or_else(|| "gpt-4o".to_string(), |m| m.canonical_id.clone());
+    // An unresolvable `model_pk` is a stale/unusable link, not a reason to guess a model.
+    //
+    // This used to be `.map_or_else(|| "gpt-4o".to_string(), ..)` — `gpt-4o` chosen for no reason
+    // beyond being the first plausible string (cycle 16, `5e8815f`). A ledger row naming a model
+    // that did not serve the request is wrong data, which is the failure cycle 10 established the
+    // rule against. An empty string would be equally wrong and merely less visible, so it is not a
+    // substitute either (`ISSUE-0129`).
+    //
+    // `502` mirrors the two lookups immediately above: an unresolvable `upstream_key_id` or
+    // provider already returns a client-visible error because the stored state disagrees with the
+    // snapshot. `500` would claim our code crashed rather than that the link is unusable.
+    //
+    // `response_links.model_pk` is FK-constrained (`ON DELETE RESTRICT`, `0001_initial.sql:387`)
+    // and the snapshot loads models unfiltered, so this cannot fire in a consistent production
+    // database. It is reachable two ways that both mean "the stored state is wrong": a
+    // partially-restored database, or the snapshot loader skipping a row whose `model_pk` fails
+    // `ModelPk::parse` (`store/src/models.rs:650`) — so the fix is defensive against a class of
+    // inconsistency, not only against someone later adding a filter.
+    let Some(model) = snapshot.models.get(&link.model_pk) else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "the stored response link references a model that is no longer available; \
+             the link cannot be attributed or priced and must be recreated",
+        );
+    };
+    let canonical_id = model.canonical_id.clone();
 
     // A decode failure is a gateway fault, never an empty success. `unwrap_or_default()`
     // here used to hand the client `200 OK` with zero bytes, which is indistinguishable
