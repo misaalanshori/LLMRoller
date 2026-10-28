@@ -64,6 +64,7 @@ pub(crate) async fn patch_admin_service_account_handler(
 ) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
     let actor = authenticate_admin(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
+    let id_for_eviction = id.clone();
     let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
         Box::pin(async move {
             patch_service_account_tx(tx, &actor, &id, payload, now_ms)
@@ -72,6 +73,9 @@ pub(crate) async fn patch_admin_service_account_handler(
         })
     })
     .await?;
+    // A disable toggle leaves the child keys' in-memory pins live, so their sessions keep
+    // routing on a principal that is now off (`ISSUE-0193`).
+    evict_service_account_child_pins(&state, &id_for_eviction).await;
     Ok(Json(account))
 }
 
@@ -117,6 +121,32 @@ pub(crate) async fn collect_service_account_client_keys_tx(
         .filter_map(|r| r.try_get::<String, _>("id").ok())
         .filter_map(|s| ClientKeyId::parse(&s).ok())
         .collect()
+}
+
+/// Evict every child client key's live pins for one service account (`ISSUE-0193`).
+///
+/// Pins are in-memory routing state: a session pinned to a key keeps going to it without
+/// re-consulting eligibility. Deleting or disabling the parent service account changes
+/// nothing in the pin store on its own, so without this the child keys' existing sessions
+/// keep routing on a principal that is gone or off.
+///
+/// Must be called **after** the mutation committed — evicting before a rolled-back write
+/// would drop live pins for keys that still exist.
+async fn evict_service_account_child_pins(state: &ApiAppState, service_account_id: &str) {
+    let Some(store) = &state.pin_store else {
+        return;
+    };
+    let mut tx = match state.auth.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    let child_keys = collect_service_account_client_keys_tx(&mut tx, service_account_id).await;
+    let _ = tx.commit().await;
+    if child_keys.is_empty() {
+        return;
+    }
+    let set: HashSet<ClientKeyId> = child_keys.into_iter().collect();
+    store.invalidate_client_keys(&set);
 }
 
 pub(crate) async fn delete_admin_service_account_handler(
@@ -232,6 +262,7 @@ pub(crate) async fn patch_user_service_account_handler(
 ) -> Result<Json<llmroller_store::service_accounts::ServiceAccount>, MutationResponseError> {
     let actor = authenticate_actor(&state, &headers, true).await?;
     let now_ms = state.auth.clock.now_ms();
+    let id_for_eviction = id.clone();
     let account = execute_atomic_mutation(&state, vec![ConfigDomain::ServiceAccounts], move |tx| {
         Box::pin(async move {
             patch_service_account_tx(tx, &actor, &id, payload, now_ms)
@@ -240,6 +271,9 @@ pub(crate) async fn patch_user_service_account_handler(
         })
     })
     .await?;
+    // A disable toggle leaves the child keys' in-memory pins live, so their sessions keep
+    // routing on a principal that is now off (`ISSUE-0193`).
+    evict_service_account_child_pins(&state, &id_for_eviction).await;
     Ok(Json(account))
 }
 

@@ -428,7 +428,22 @@ async fn deleting_a_service_account_evicts_its_child_key_pins() {
 async fn deleting_a_service_account_does_not_evict_other_keys_pins() {
     let h = harness().await;
     let (sa_id, child_key) = create_service_account_with_child_key(&h, "c18-sa-iso").await;
+    // The unrelated key needs a real `client_keys` row with NO `service_account_id`, or the
+    // guard is unfalsifiable: a query that forgot its `WHERE service_account_id = ?` filter
+    // would still never return a key that is not in the table at all, so the test would
+    // pass for a fix that evicts every key. This was a real weakness in the first version.
     let unrelated = ClientKeyId::generate();
+    sqlx::query(
+        "INSERT INTO client_keys (id, owner_user_id, service_account_id, prefix, key_hash,
+            label, routing_scope, created_at)
+         VALUES (?, ?, NULL, 'llr_unrelated', 'hash-unrelated', 'unrelated-key',
+            'personal_first', 1000)",
+    )
+    .bind(unrelated.to_string())
+    .bind(h.user_id.to_string())
+    .execute(&h.pool)
+    .await
+    .expect("insert unrelated client key");
 
     h.pin_store.upsert_confirmed(
         pin_key(child_key),
