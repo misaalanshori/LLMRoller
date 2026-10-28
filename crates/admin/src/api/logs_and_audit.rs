@@ -127,19 +127,21 @@ pub(crate) async fn get_admin_logs_handler(
     get_logs_internal(&state, None, query).await
 }
 
-/// The five token classes a `usage_events` row can carry, each preserved as `Option`.
+/// The four priced token classes of a `usage_events` row, each preserved as `Option`.
 ///
 /// `None` means the column was SQL `NULL` — the provider never reported it. `Some(0)` means it
 /// reported zero. The distinction is load-bearing for display: a rejected request that consumed
 /// nothing is worth showing as zero, while a row with no recorded counts must render `—`
 /// (`ISSUE-0173`).
+///
+/// `reasoning_tokens` is not a member: it is a subset of `output` (`12. SRDD:133-134`), so it is
+/// never part of a total. The log-detail drawer shows it per row from `usage_events` directly.
 #[derive(Debug, Clone, Copy, Default)]
 struct TokenClasses {
     input_uncached: Option<i64>,
     cache_read: Option<i64>,
     cache_write: Option<i64>,
     output: Option<i64>,
-    reasoning: Option<i64>,
 }
 
 impl TokenClasses {
@@ -150,7 +152,6 @@ impl TokenClasses {
             cache_read: get("cache_read_tokens"),
             cache_write: get("cache_write_tokens"),
             output: get("output_tokens"),
-            reasoning: get("reasoning_tokens"),
         }
     }
 
@@ -183,8 +184,7 @@ impl TokenClasses {
 
     /// Render the total, or `—` when the row recorded no token data at all.
     fn formatted_or_dash(&self, format: impl FnOnce(i64) -> String) -> String {
-        self.total()
-            .map_or_else(|| "—".to_string(), |total| format(total))
+        self.total().map_or_else(|| "—".to_string(), format)
     }
 }
 
@@ -388,8 +388,7 @@ pub(crate) async fn get_logs_internal(
             let tokens = TokenClasses::from_row(&r);
             let total_tokens = tokens.total();
             let status_badge = status_badge(status);
-            let tokens_formatted = tokens
-                .formatted_or_dash(|t| format_tokens_compact(t));
+            let tokens_formatted = tokens.formatted_or_dash(format_tokens_compact);
             // `cost_micro_usd` is `NOT NULL` in the schema, so there is no absent case to
             // distinguish: a zero here is a real zero and renders as `$0.00000`.
             let cost_formatted = format_cost_usd(cost);
