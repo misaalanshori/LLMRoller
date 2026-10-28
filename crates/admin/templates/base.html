@@ -8,7 +8,20 @@
     <link rel="stylesheet" href="/static/app.css">
     <link rel="stylesheet" href="/static/uPlot.min.css">
     <script src="/static/htmx.min.js"></script>
-    <script src="/static/app.js"></script>
+    {# app-*.js share one global scope; load order is significant. Keep in step with
+       APP_JS_MODULES in crates/admin/src/assets.rs. (ISSUE-0013) #}
+    <script src="/static/app-core.js" defer></script>
+    <script src="/static/app-providers.js" defer></script>
+    <script src="/static/app-keys.js" defer></script>
+    <script src="/static/app-catalog.js" defer></script>
+    <script src="/static/app-settings.js" defer></script>
+    <script src="/static/app-charts.js" defer></script>
+    <script src="/static/app-prices.js" defer></script>
+    <script src="/static/app-sessions.js" defer></script>
+    <script src="/static/app-accounts.js" defer></script>
+    <script src="/static/app-shares.js" defer></script>
+    <script src="/static/app-users.js" defer></script>
+    <script src="/static/app-auth.js" defer></script>
     <script src="/static/uPlot.iife.min.js"></script>
 </head>
 <body hx-headers='{"x-csrf-token": "{{ csrf_token }}"}'>

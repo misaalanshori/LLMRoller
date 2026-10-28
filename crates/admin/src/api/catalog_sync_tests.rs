@@ -109,7 +109,7 @@ fn templates_have_zero_inline_handlers_and_correct_data_plane_port() {
 #[doc = "Spec: PRV-2, CLK-7, UI-2"]
 fn web_ui_preset_urls_and_proxy_port_match_presets_and_cli_defaults() {
     let app_html = include_str!("../../templates/app.html");
-    let app_js = include_str!("../../static/app.js");
+    let app_js = crate::assets::APP_JS;
 
     // Verify Quick Connect snippets in app.html use default data-plane port 8080 and zero 8082
     assert!(app_html.contains("export ANTHROPIC_BASE_URL=\"http://127.0.0.1:8080\""));

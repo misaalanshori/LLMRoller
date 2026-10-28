@@ -447,9 +447,10 @@ fn all_rust_files_are_under_1600_lines() {
 /// The same ceiling, applied to the front-end assets it was always meant to cover.
 ///
 /// `all_rust_files_are_under_1600_lines` collected only `.rs`, so `app.js` sat at 1,649 lines
-/// — 49 over — while CI stayed green for months. A gate that names a number and does not
-/// check it manufactures confidence rather than providing it, which is worse than having no
-/// gate: nobody re-measures.
+/// — 49 over — while CI stayed green. A gate that names a number and does not check it
+/// manufactures confidence rather than providing it, which is worse than having no gate:
+/// nobody re-measures. (How long it went unnoticed is not derivable from this repository —
+/// every commit carries the same author date — so no duration is claimed.)
 ///
 /// Scope note: the vendored libraries in the same directory (`htmx.min.js`,
 /// `uPlot.iife.min.js`, `uPlot.min.css`) are single-line minified builds, so a line ceiling
@@ -484,6 +485,84 @@ fn all_static_assets_are_under_1600_lines() {
         "the static-asset ceiling check found no files, so it proves nothing"
     );
     assert_no_file_exceeds(files, MNT3_MAX_LINES, "static/template");
+}
+
+/// The split `app-*.js` modules must load in order in one shared scope without a
+/// `ReferenceError`, and the delegated dispatcher must still reach its handlers.
+///
+/// This is the only executable check of the *behaviour* of the split, and it runs the real
+/// JavaScript in Node rather than reading the source. Two failure modes it catches that no
+/// Rust assertion can: a load-order temporal-dead-zone error (a `let` read by an earlier
+/// file), and a dispatcher calling a function that did not move to the shared scope.
+///
+/// Skips — with a message, not a silent pass — when Node is absent, so the suite still works
+/// in a Rust-only container. It does not use a JS test framework: the repo has none, and
+/// adding one for a single file would be a build-time dependency this project does not take.
+#[test]
+#[doc = "Spec: MNT-3, UI-3 — ISSUE-0013 the split modules load in order and dispatch"]
+fn static_asset_modules_load_in_order_and_dispatch() {
+    let script = workspace_root().join("tests/js/app-modules-smoke.js");
+    assert!(script.is_file(), "{} must exist", script.display());
+
+    let output = match Command::new("node").arg(&script).output() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping: node is not available ({error})");
+            return;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "app module smoke check failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `APP_JS_MODULES` and the `<script>` tags must list the same modules in the same order.
+///
+/// Load order is load-bearing (the files share one global scope), so "same set" is not
+/// enough: `app-core.js` must come before anything that reads a declaration it owns. This
+/// cross-checks the Rust table against the templates' tags, which is the pair that drifts.
+#[test]
+#[doc = "Spec: MNT-3, UI-3 — ISSUE-0013 asset table and template script order agree"]
+fn app_module_order_matches_between_assets_and_templates() {
+    let root = workspace_root();
+    let assets = fs::read_to_string(root.join("crates/admin/src/assets.rs"))
+        .expect("assets.rs must be readable");
+
+    // Parse `("app-x.js", APP_X_JS),` entries in table order.
+    let from_assets: Vec<String> = assets
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("(\"app-")?;
+            let end = rest.find(".js\"")?;
+            Some(format!("app-{}.js", &rest[..end]))
+        })
+        .collect();
+    assert!(
+        !from_assets.is_empty(),
+        "parsed no modules out of APP_JS_MODULES, so this test proves nothing"
+    );
+
+    let template =
+        fs::read_to_string(root.join("crates/admin/templates/base.html")).expect("base.html");
+    let mut from_template: Vec<String> = Vec::new();
+    for line in template.lines() {
+        if let Some(idx) = line.find("src=\"/static/app-") {
+            let rest = &line[idx + "src=\"/static/".len()..];
+            if let Some(end) = rest.find('"') {
+                from_template.push(rest[..end].to_string());
+            }
+        }
+    }
+
+    assert_eq!(
+        from_template, from_assets,
+        "base.html's script order must match APP_JS_MODULES exactly, because the files share \
+         one global scope and `let` declarations are not hoisted across files"
+    );
 }
 
 /// Collect files with `extension` under `directory`, skipping build output and VCS metadata.

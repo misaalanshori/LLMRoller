@@ -27,6 +27,8 @@ use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
 pub(crate) use llmroller_store::users::{NewUser, create_user};
 
+#[path = "e2e_dashboard_htmx/app_module_split.rs"]
+mod app_module_split;
 #[path = "e2e_dashboard_htmx/dashboards_and_partials.rs"]
 mod dashboards_and_partials;
 #[path = "e2e_dashboard_htmx/log_detail_fields.rs"]
@@ -51,3 +53,11 @@ mod usage_filters;
 mod usage_ledger_and_csv;
 
 pub(crate) use setup::*;
+
+/// Absolute path to `crates/admin/templates`.
+pub(crate) fn templates_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("admin")
+        .join("templates")
+}

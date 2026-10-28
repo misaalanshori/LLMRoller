@@ -39,7 +39,7 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
         admin_html.contains("value=\"open_design_amr\""),
         "PRV-2: global provider selector must expose every built-in preset"
     );
-    let app_js = include_str!("../../../../crates/admin/static/app.js");
+    let app_js = llmroller_admin::assets::APP_JS;
     assert!(app_js.contains("open_design_amr"));
     assert!(app_js.contains("https://amr-link.open-design.ai/v1"));
     assert!(app_js.contains("https://api.commandcode.ai/provider/v1"));
@@ -54,7 +54,7 @@ async fn test_htmx_dashboards_key_projection_and_chat_preview() {
     assert!(admin_html.contains("id=\"adm-aliases-body\""));
 
     // 2b. UI-1, UI-2: Admin tabs are populated from the control-plane APIs and uPlot is initialized.
-    let app_js = include_str!("../../../../crates/admin/static/app.js");
+    let app_js = llmroller_admin::assets::APP_JS;
     assert!(app_js.contains("loadAdminSettings"));
     assert!(app_js.contains("loadAdminAliases"));
     assert!(app_js.contains("loadUsageChart"));
@@ -630,7 +630,7 @@ async fn test_provider_preset_creation_partial_refetch_and_light_mode_styles() {
 
     let app_html = include_str!("../../../../crates/admin/templates/app.html");
     let admin_html = include_str!("../../../../crates/admin/templates/admin.html");
-    let app_js = include_str!("../../../../crates/admin/static/app.js");
+    let app_js = llmroller_admin::assets::APP_JS;
     let app_css = include_str!("../../../../crates/admin/static/app.css");
 
     for preset in [
