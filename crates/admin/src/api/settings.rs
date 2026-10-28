@@ -620,8 +620,12 @@ where
 
 /// A source of body chunks for [`read_catalog_body`].
 ///
-/// Implemented for `reqwest::Response` so the production path and the tests exercise the
-/// same ceiling logic.
+/// A trait with one production impl is normally a type parameter looking for a reason. This
+/// one earns it: it is what makes the `SEC-8` ceiling testable without a network, a TLS
+/// endpoint or a hostile server, and the two test impls in `catalog_sync_tests` are the
+/// proof. The alternative -- a generic over `Stream<Item = Result<Bytes, E>>` -- is what
+/// `reqwest::Response` already is, but naming that bound needs `futures-core`, which this
+/// crate does not depend on; adding a dependency to delete a trait is a worse trade.
 pub(crate) trait CatalogChunkSource {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String>;
 }

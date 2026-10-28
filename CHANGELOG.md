@@ -35,6 +35,42 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`doctor` told an operator `15` where `serve` said `14`, and the instance-state
+  security check existed twice (ISSUE-0183).** Both are follow-ups to the `doctor` fix
+  above, found in review.
+
+  The exit code for schema drift was split by **direction**, because §5.5.1 already assigned
+  one of the two. A database *newer* than the binary is row **14** — the code
+  `migrations::MigrationError::SchemaTooNew` returns from `serve`'s own startup path. A
+  database *older* than the binary is **15**. A file with no readable version row at all is
+  also **15**, reported as `"status": "schema_unknown"`. Previously `doctor` answered `15`
+  for every disagreement, so one binary described one database two ways depending on which
+  subcommand an operator ran, and a script written against §5.5.1 read `14`, missed
+  `doctor`'s answer, and concluded the command had failed for a different reason than the
+  server would have. §5.5.1's row 15 was reworded to say *older*; row 14 is unchanged.
+
+  Fixing that surfaced a latent bug in the version read itself. `read_database_schema_version`
+  asked for `SELECT MAX(version)` as a non-nullable `i64`, and decoding SQL `NULL` into a
+  non-nullable integer yields `0` — so an empty `_llmroller_schema` looked like "this file is
+  at version 0", a plausible ancient database, instead of "there is no version row". It is
+  now read as `Option<i64>`, so the unreadable case is reported as `schema_unknown` rather
+  than being silently classified as drift.
+
+  Separately, `load_or_initialize` and `load_instance_state` shared a byte-identical
+  74-line verification body: rotation guard, master-key-id agreement, per-secret key-id
+  check, the AAD-bound unseal, the exact-32-byte length check, and both required-secret
+  checks. Two copies of a security check diverge, and the second copy here existed only
+  because the first had to be written twice. Verification now lives in one function,
+  `verify_instance_state`, and the two entry points differ in exactly one place: what they do
+  when `instance_meta` has no row — `load_or_initialize` bootstraps (refusing if
+  `instance_secrets` is non-empty, so a database with orphaned secrets cannot grow a second
+  identity), `load_instance_state` returns `NotInitialized`. The metadata row is read once
+  and passed down, so the initialised path still issues **two** queries, the same as before
+  the refactor; this runs at every startup, so the query count is part of the contract and
+  was measured before and after rather than assumed. A table-driven test asserts both entry
+  points return the same error variant and exit code for every reachable verification
+  failure, which is what stops the two paths drifting apart again.
+
 - **`doctor` reported a schema version it never read, and price sync had no response cap
   (ISSUE-0183, ISSUE-0179).** Both are "a command reports something it did not actually
   check".

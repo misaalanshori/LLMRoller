@@ -417,3 +417,50 @@ async fn serve_and_doctor_agree_on_a_newer_schema() {
          (stderr: {serve_stderr})"
     );
 }
+
+/// A database whose version row has vanished is not "ok", and not a *newer* or *older* file.
+///
+/// Reachable in practice: a partially restored database, or one whose `_llmroller_schema`
+/// rows were dropped while `instance_meta` survived. The file is not a recognised LLMRoller
+/// database, so it cannot be reported healthy — but it also cannot be called "older", because
+/// there is no version to compare. It keeps code `15` (the not-newer, not-ok bucket) with
+/// `"status": "schema_unknown"`.
+///
+/// This arm is the one a "just report `ok` when in doubt" regression would land on, so it is
+/// asserted rather than left to inspection.
+#[tokio::test]
+#[doc = "Spec: REL-6"]
+async fn doctor_reports_an_unreadable_version_row_as_unknown() {
+    let dir = tempdir().expect("temp dir");
+    let data_dir = dir.path();
+    create_live_database(data_dir).await;
+
+    use sqlx::Connection as _;
+    let db = data_dir.join("llmroller.db");
+    let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
+        .await
+        .expect("open db");
+    sqlx::query("DELETE FROM _llmroller_schema")
+        .execute(&mut conn)
+        .await
+        .expect("clear every schema row");
+    conn.close().await.expect("close");
+
+    let (code, stdout, stderr) = run_cli(&["doctor"], data_dir).await;
+    assert_eq!(
+        code, EXIT_SCHEMA_OLDER,
+        "an unreadable version row must not exit 0; stdout: {stdout} stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor must still emit JSON");
+    assert_eq!(
+        parsed["status"].as_str(),
+        Some("schema_unknown"),
+        "a file with no version row is unknown, not ok"
+    );
+    assert_eq!(
+        parsed["schema_version"],
+        serde_json::Value::Null,
+        "there is no version to report"
+    );
+}

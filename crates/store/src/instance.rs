@@ -125,6 +125,12 @@ impl fmt::Debug for InstanceState {
 /// differs from `instance_meta.active_master_key_id`, or when either secret
 /// fails authentication.
 ///
+/// This function's *only* unique responsibility is the bootstrap branch: everything after
+/// "a row exists" is delegated to [`verify_instance_state`], so the security-critical
+/// verification (rotation guard, key-id agreement, AAD unseal, exact-32-byte check) exists
+/// once. Two copies of a security check diverge -- that is what duplicated validation does,
+/// not a hypothesis (`ISSUE-0183`).
+///
 /// # Errors
 ///
 /// Returns an [`InstanceError`] whose [`InstanceError::exit_code`] is `3` for
@@ -136,14 +142,15 @@ pub async fn load_or_initialize(
     entropy: Arc<dyn EntropySource>,
     now_ms: i64,
 ) -> Result<InstanceState, InstanceError> {
-    let meta: Option<(Vec<u8>, String, String)> = sqlx::query_as(
-        "SELECT instance_id, active_master_key_id, rotation_state \
-         FROM instance_meta WHERE singleton = 1",
-    )
-    .fetch_optional(pool)
-    .await?;
+    // The metadata row is read here and *passed down*, so the initialised path issues the
+    // same two queries it always did and the presence test is not paid for twice. This runs
+    // at every startup, so the query count on this path is part of the contract.
+    let meta = read_instance_meta(pool).await?;
 
-    let Some((instance_id_bytes, active_master_key_id, rotation_state)) = meta else {
+    let Some(row) = meta else {
+        // Without this guard, a database with orphaned secrets silently bootstraps a *second*
+        // identity on top of the first and there is no longer any way to tell which rows
+        // belong to which generation of key material.
         let existing_secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_secrets")
             .fetch_one(pool)
             .await?;
@@ -153,62 +160,7 @@ pub async fn load_or_initialize(
         return initialize(pool, key_id, master_key, entropy, now_ms).await;
     };
 
-    if rotation_state != "idle" {
-        return Err(InstanceError::RotationInProgress);
-    }
-    if active_master_key_id != key_id {
-        return Err(InstanceError::MasterKeyIdMismatch {
-            provided: key_id.to_owned(),
-            active: active_master_key_id,
-        });
-    }
-
-    let instance_id = decode_instance_id(&instance_id_bytes)?;
-    let sealer = XChaCha20Poly1305Sealer::new(master_key.clone(), instance_id, entropy);
-    let rows: Vec<(String, Vec<u8>, String)> =
-        sqlx::query_as("SELECT name, sealed, master_key_id FROM instance_secrets ORDER BY name")
-            .fetch_all(pool)
-            .await?;
-
-    let mut session_hmac_secret = None;
-    let mut audit_hmac_key = None;
-    for (name, sealed, row_key_id) in rows {
-        if row_key_id != active_master_key_id {
-            return Err(InstanceError::SecretKeyIdMismatch {
-                name,
-                found: row_key_id,
-                expected: active_master_key_id,
-            });
-        }
-        let plain = sealer.open(
-            "instance_secret",
-            &[active_master_key_id.as_bytes(), name.as_bytes()],
-            &sealed,
-        )?;
-        let length = plain.expose_secret().len();
-        let target = match name.as_str() {
-            SESSION_SECRET => &mut session_hmac_secret,
-            AUDIT_SECRET => &mut audit_hmac_key,
-            _ => return Err(InstanceError::CorruptMetadata),
-        };
-        if length != INSTANCE_SECRET_LEN {
-            return Err(InstanceError::InvalidSecretLength { name, length });
-        }
-        *target = Some(plain);
-    }
-
-    let session_hmac_secret = session_hmac_secret.ok_or(InstanceError::MissingSecret {
-        name: SESSION_SECRET,
-    })?;
-    let audit_hmac_key =
-        audit_hmac_key.ok_or(InstanceError::MissingSecret { name: AUDIT_SECRET })?;
-
-    Ok(InstanceState {
-        instance_id,
-        active_master_key_id,
-        session_hmac_secret,
-        audit_hmac_key,
-    })
+    verify_instance_state(pool, row, key_id, master_key, entropy).await
 }
 
 /// Load existing instance state **without ever creating it**.
@@ -234,16 +186,41 @@ pub async fn load_instance_state(
     master_key: &MasterKey,
     entropy: Arc<dyn EntropySource>,
 ) -> Result<InstanceState, InstanceError> {
-    let meta: Option<(Vec<u8>, String, String)> = sqlx::query_as(
+    let Some(row) = read_instance_meta(pool).await? else {
+        return Err(InstanceError::NotInitialized);
+    };
+    verify_instance_state(pool, row, key_id, master_key, entropy).await
+}
+
+/// The `instance_meta` singleton row, or `None` when the database is not initialised.
+///
+/// `(instance_id, active_master_key_id, rotation_state)`.
+type MetaRow = (Vec<u8>, String, String);
+
+async fn read_instance_meta(pool: &SqlitePool) -> Result<Option<MetaRow>, InstanceError> {
+    let meta: Option<MetaRow> = sqlx::query_as(
         "SELECT instance_id, active_master_key_id, rotation_state \
          FROM instance_meta WHERE singleton = 1",
     )
     .fetch_optional(pool)
     .await?;
+    Ok(meta)
+}
 
-    let Some((instance_id_bytes, active_master_key_id, rotation_state)) = meta else {
-        return Err(InstanceError::NotInitialized);
-    };
+/// The single security-critical verification body.
+///
+/// Rotation guard, master-key id agreement, per-secret AAD-bound unseal, exact 32-byte length,
+/// and the two required-secret checks. Both public entry points funnel through here; the
+/// *only* difference between them is what they do when [`read_instance_meta`] returns
+/// `None`, decided by the caller before reaching this point.
+async fn verify_instance_state(
+    pool: &SqlitePool,
+    row: MetaRow,
+    key_id: &str,
+    master_key: &MasterKey,
+    entropy: Arc<dyn EntropySource>,
+) -> Result<InstanceState, InstanceError> {
+    let (instance_id_bytes, active_master_key_id, rotation_state) = row;
 
     if rotation_state != "idle" {
         return Err(InstanceError::RotationInProgress);

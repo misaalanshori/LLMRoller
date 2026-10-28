@@ -84,12 +84,21 @@ pub(crate) async fn run_restore_cmd(args: RestoreArgs) -> ExitCode {
     }
 }
 
-/// Exit code for "the file's `_llmroller_schema.version` is not the version this binary was
-/// built for" (`5. SRDD §5.5.1`, `ISSUE-0183`).
+/// Exit code for "the file's `_llmroller_schema.version` is **older** than this binary
+/// supports" (`5. SRDD §5.5.1`, `ISSUE-0183`).
 ///
-/// `0..=14` are all assigned in that table -- `12` is the writer-panic code, so the brief's
-/// suggested slot was already taken -- making `15` the first free value.
-const EXIT_SCHEMA_MISMATCH: u8 = 15;
+/// `0..=14` are all assigned in that table -- `14` is the *newer*-file code and `12` is the
+/// writer-panic code -- making `15` the first free value. The direction matters: `serve`'s
+/// migration path already exits `14` for a newer file, so a single "mismatch" code would
+/// have one binary telling an operator two different things about one database.
+const EXIT_SCHEMA_OLDER: u8 = 15;
+
+/// Exit code for "the file's `_llmroller_schema.version` is **newer** than this binary
+/// supports" (`5. SRDD §5.5.1` row 14).
+///
+/// Deliberately equal to [`llmroller_store::migrations::MigrationError::SchemaTooNew`]'s
+/// code, so `doctor` and `serve` agree on the same database (`ISSUE-0183`).
+const EXIT_SCHEMA_NEWER: u8 = 14;
 
 /// The schema version actually recorded in the database file.
 ///
@@ -98,10 +107,15 @@ const EXIT_SCHEMA_MISMATCH: u8 = 15;
 /// what the binary was compiled against and says nothing about the file on disk, which is
 /// the distinction `doctor` exists to surface (`ISSUE-0183`).
 async fn read_database_schema_version(pool: &sqlx::SqlitePool) -> Option<i64> {
-    sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _llmroller_schema")
+    // The scalar must be `Option<i64>`, not `i64`. `MAX()` over an empty table is SQL NULL,
+    // and decoding that into a non-nullable `i64` yields `Some(0)` -- which reads as "this
+    // file is at version 0", i.e. a very old database, when in fact there is no version row
+    // at all. That is the "unreadable" case, and it must not be mistaken for a drift.
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _llmroller_schema")
         .fetch_optional(pool)
         .await
         .ok()
+        .flatten()
         .flatten()
 }
 
@@ -192,19 +206,31 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
     // Report the version the *file* declares, not the one this binary was built for. Equal
     // is `ok`; anything else is schema drift, which is the condition this command cannot
     // otherwise detect (`ISSUE-0183`).
+    //
+    // The three-way split is deliberate. A *newer* file is §5.5.1's row 14, the code
+    // `serve`'s `SchemaTooNew` already returns -- one binary must not describe one database
+    // two ways. An *older* file is `15`, a drift the table did not previously cover. An
+    // unreadable version row is neither: the file is not a recognised LLMRoller database.
     let compiled = llmroller_store::migrations::SCHEMA_VERSION;
     let (status, exit_code) = match database_schema_version {
         Some(version) if version == compiled => ("ok", ExitCode::SUCCESS),
+        Some(version) if version > compiled => {
+            eprintln!(
+                "error: database schema version is {version}, this binary supports {compiled}; \
+                 this database was written by a newer build -- run the binary that matches it"
+            );
+            ("schema_newer", ExitCode::from(EXIT_SCHEMA_NEWER))
+        }
         Some(version) => {
             eprintln!(
                 "error: database schema version is {version}, this binary supports {compiled}; \
                  run the binary that matches the database, or migrate it"
             );
-            ("schema_mismatch", ExitCode::from(EXIT_SCHEMA_MISMATCH))
+            ("schema_older", ExitCode::from(EXIT_SCHEMA_OLDER))
         }
         None => {
             eprintln!("error: database has no readable _llmroller_schema version row");
-            ("schema_unknown", ExitCode::from(EXIT_SCHEMA_MISMATCH))
+            ("schema_unknown", ExitCode::from(EXIT_SCHEMA_OLDER))
         }
     };
     println!(
