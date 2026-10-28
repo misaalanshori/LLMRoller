@@ -301,8 +301,8 @@ pub(crate) async fn post_admin_user_handler(
     // Validate the role before doing any work, so a typo costs nothing and cannot reach
     // the store: otherwise a refused role would still hash a password and insert a row
     // for an account the caller did not ask for (`ISSUE-0181`).
-    let role = parse_requested_role(payload.role.as_deref())?
-        .unwrap_or(llmroller_core::rbac::Role::User);
+    let role =
+        parse_requested_role(payload.role.as_deref())?.unwrap_or(llmroller_core::rbac::Role::User);
 
     // The hash happens here, under a bounded permit, and the permit is released before
     // `create_user_with_hash` opens its transaction. `create_user` hashes internally, so a
@@ -328,9 +328,7 @@ pub(crate) async fn post_admin_user_handler(
             llmroller_store::users::hash_password(&pw_clone, entropy.as_ref())
         })
         .await
-        .map_err(|_| {
-            map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed")
-        })?
+        .map_err(|_| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, "spawn_blocking failed"))?
         .map_err(|e| map_price_error(StatusCode::BAD_REQUEST, format!("{e}")))?
     };
     let user = llmroller_store::users::create_user_with_hash(

@@ -556,11 +556,32 @@ pub async fn delete_user_tx(
     Ok(())
 }
 
+/// A password replacement that has already been hashed.
+///
+/// Bundling the fields keeps [`set_password_hash_tx`] under the argument-count lint and
+/// makes it obvious at the call site that the expensive part is already done.
+#[derive(Debug)]
+pub struct HashedPassword<'a> {
+    /// The Argon2id PHC string produced by [`hash_password`].
+    pub hash: &'a str,
+    /// Whether the account must choose a new password at next login.
+    pub must_change_password: bool,
+    /// Session `id_hash` to keep alive; every other session for the user is revoked.
+    pub keep_session: Option<&'a str>,
+}
+
 /// Set a password directly and revoke sessions.
+///
+/// Hashes **before** opening the transaction, so SQLite's write lock is never held across
+/// Argon2id (`ISSUE-0180`). The hash itself is not permit-bounded here: the only caller is
+/// `reset_password_temporary`, which is an authenticated single-admin action rather than an
+/// unauthenticated or login-shaped burst. The bounded paths are [`create_user`] and
+/// [`change_password`].
 ///
 /// # Errors
 ///
-/// Returns permission, not-found, validation, entropy, or SQLite failures.
+/// Returns permission, not-found, validation, entropy, hashing-capacity, or SQLite
+/// failures.
 pub async fn set_password(
     pool: &SqlitePool,
     actor: &ActorScope,
@@ -568,55 +589,46 @@ pub async fn set_password(
     new_password: &str,
     must_change_password: bool,
     entropy: &dyn EntropySource,
-    argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
+    let hash = hash_password(new_password, entropy)?;
     let mut tx = pool.begin().await?;
-    let user = set_password_tx(
+    let user = set_password_hash_tx(
         &mut tx,
         actor,
         user_id,
-        new_password,
-        must_change_password,
-        entropy,
-        argon2_semaphore,
-        keep_session,
+        HashedPassword {
+            hash: &hash,
+            must_change_password,
+            keep_session,
+        },
     )
     .await?;
     tx.commit().await?;
     Ok(user)
 }
 
-/// Set a password directly and revoke sessions inside an active transaction.
-pub async fn set_password_tx(
+/// Write a pre-computed password hash and revoke sessions, inside an active transaction.
+///
+/// Contains no CPU work: the caller has already hashed, so the transaction is only writes.
+pub async fn set_password_hash_tx(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
     actor: &ActorScope,
     user_id: UserId,
-    new_password: &str,
-    must_change_password: bool,
-    entropy: &dyn EntropySource,
-    argon2_semaphore: Option<&tokio::sync::Semaphore>,
-    keep_session: Option<&str>,
+    password: HashedPassword<'_>,
 ) -> Result<User, UserError> {
     ensure_self_or_admin(actor, user_id)?;
-    // Validate before waiting for capacity, then hold the permit across the hash only —
-    // never across the UPDATE below (`ISSUE-0181`).
-    validate_password(new_password)?;
-    let password_hash = {
-        let _permit = acquire_hash_permit(argon2_semaphore, ARGON2_PERMIT_TIMEOUT).await?;
-        hash_password(new_password, entropy)?
-    };
     let result =
         sqlx::query("UPDATE users SET password_hash = ?, must_change_password = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(i64::from(must_change_password))
+            .bind(password.hash)
+            .bind(i64::from(password.must_change_password))
             .bind(user_id.to_string())
             .execute(&mut **tx)
             .await?;
     if result.rows_affected() == 0 {
         return Err(UserError::NotFound);
     }
-    if let Some(keep) = keep_session {
+    if let Some(keep) = password.keep_session {
         sqlx::query("DELETE FROM web_sessions WHERE user_id = ? AND id_hash != ?")
             .bind(user_id.to_string())
             .bind(keep)
@@ -633,10 +645,15 @@ pub async fn set_password_tx(
 
 /// Change one's own password after verifying the current password.
 ///
+/// Both Argon2id runs (verify the current password, hash the replacement) happen before
+/// the transaction opens, so no write lock is held across CPU work (`ISSUE-0180`). The
+/// stored hash is read on the pool first; a concurrent change can therefore win the race,
+/// in which case the later write is still a deliberate, authenticated password change.
+///
 /// # Errors
 ///
 /// Returns permission, not-found, invalid-credentials, validation, entropy,
-/// or SQLite failures.
+/// hashing-capacity, or SQLite failures.
 pub async fn change_password(
     pool: &SqlitePool,
     actor: &ActorScope,
@@ -646,52 +663,34 @@ pub async fn change_password(
     argon2_semaphore: Option<&tokio::sync::Semaphore>,
     keep_session: Option<&str>,
 ) -> Result<User, UserError> {
-    let mut tx = pool.begin().await?;
-    let user = change_password_tx(
-        &mut tx,
-        actor,
-        current_password,
-        new_password,
-        entropy,
-        argon2_semaphore,
-        keep_session,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(user)
-}
-
-/// Change one's own password inside an active transaction.
-pub async fn change_password_tx(
-    tx: &mut Transaction<'_, sqlx::Sqlite>,
-    actor: &ActorScope,
-    current_password: &str,
-    new_password: &str,
-    entropy: &dyn EntropySource,
-    argon2_semaphore: Option<&tokio::sync::Semaphore>,
-    keep_session: Option<&str>,
-) -> Result<User, UserError> {
     let user_id = actor_user(actor)?;
-    let record = find_login_record_by_id_tx(tx, user_id).await?;
-    // Verify and re-hash each take their own permit sequentially, never two at once, so a
-    // one-permit pool cannot deadlock on itself (`ISSUE-0001`).
+    // Verify first: a wrong current password must not consume a hash of the new one.
+    let record = find_login_record_by_id(pool, user_id).await?;
     {
         let _permit = acquire_hash_permit(argon2_semaphore, ARGON2_PERMIT_TIMEOUT).await?;
         if !verify_password(current_password, &record.password_hash) {
             return Err(UserError::InvalidCredentials);
         }
     }
-    set_password_tx(
-        tx,
+    validate_password(new_password)?;
+    let hash = {
+        let _permit = acquire_hash_permit(argon2_semaphore, ARGON2_PERMIT_TIMEOUT).await?;
+        hash_password(new_password, entropy)?
+    };
+    let mut tx = pool.begin().await?;
+    let user = set_password_hash_tx(
+        &mut tx,
         actor,
         user_id,
-        new_password,
-        false,
-        entropy,
-        argon2_semaphore,
-        keep_session,
+        HashedPassword {
+            hash: &hash,
+            must_change_password: false,
+            keep_session,
+        },
     )
-    .await
+    .await?;
+    tx.commit().await?;
+    Ok(user)
 }
 
 /// Generate a temporary password, mark the account for change, and revoke sessions.
@@ -714,7 +713,6 @@ pub async fn reset_password_temporary(
         temporary_password.expose_secret(),
         true,
         entropy,
-        None,
         None,
     )
     .await?;

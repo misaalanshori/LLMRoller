@@ -200,7 +200,9 @@ impl SetupAppState {
 /// shared login pool.
 #[must_use]
 pub fn new_argon2_pool() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(crate::auth::argon2_permit_count()))
+    Arc::new(tokio::sync::Semaphore::new(
+        crate::auth::argon2_permit_count(),
+    ))
 }
 
 /// Payload for `POST /admin/api/setup`.

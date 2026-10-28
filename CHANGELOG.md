@@ -35,6 +35,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **First-run setup hashed Argon2id while holding SQLite's write lock, and the admin user
+  API silently coerced roles (ISSUE-0180, ISSUE-0181).** Two Argon2id-under-concurrency
+  defects in the control plane, batched because both are about a permit that does not cover
+  what it exists to bound.
+
+  `post_setup` opened `BEGIN IMMEDIATE` — which takes SQLite's single write lock
+  immediately — and then ran the password hash inside it. Argon2id is deliberately tens of
+  milliseconds of CPU, so a first-run setup blocked the entire data-plane writer: every
+  usage-event enqueue, pin write, and key-health flush waited for the hash. Setup is
+  reachable unauthenticated apart from the token, and it took no Argon2id semaphore at all,
+  so N concurrent attempts each started a hash while queueing behind the lock, which is what
+  made the hold time unbounded. The hash now runs before the transaction opens, under a
+  permit from the instance's shared pool (the same one login uses); the in-transaction
+  `COUNT(*)` re-check stays where it was, because it is what makes concurrent setup safe. A
+  losing request now wastes one hash before being refused — cheaper than a lock held across
+  the hash, which costs the whole data plane.
+
+  Separately, both role-accepting handlers mapped every unrecognised string to `Role::User`,
+  so `"Admin"` or a typo silently produced a downgraded account and a `200`. Both sites now
+  share one `parse_requested_role` helper returning `422` for anything that is not exactly
+  `admin` or `user`. Case is deliberately not normalised: this file already rejects unknown
+  enum values with `422`, and silently accepting `"Admin"` is the same surprise. And
+  `POST /admin/api/users` held its Argon2id permit across `create_user`, which hashes
+  internally — so the permit covered the SQL insert while a permit moved a few lines down
+  would have released before the CPU work and bounded nothing. `create_user` is split into
+  `create_user_with_hash`, and the handler now hashes under a permit before calling it. The
+  same audit moved `change_password` (which hashed twice inside its transaction),
+  `reset-password` (unbounded acquire), and `TOTP disable` (a permit that spanned the
+  mutation) onto the same shape: the permit covers the hash, and the transaction contains
+  only writes.
+
 - **The upstream-key probe resolves a real credential, classifies by status, and writes
   atomically (ISSUE-0178).** Three defects in one handler. It never called `TokenManager`: it
   unsealed `secret_enc` and used it directly, and for an `auth_kind = 'oauth'` key that secret

@@ -195,7 +195,7 @@ async fn setup_does_not_hold_the_write_lock_across_hashing() {
         )
         .await
         {
-            Ok(Ok(mut tx)) => {
+            Ok(Ok(tx)) => {
                 let _ = tx.rollback().await;
                 true
             }
@@ -238,7 +238,11 @@ async fn setup_takes_the_argon2_semaphore() {
     setup_state.argon2_semaphore = semaphore.clone();
     let app = llmroller_admin::control_plane_router(setup_state, auth_state_for(&harness));
 
-    let held = semaphore.clone().acquire_owned().await.expect("hold permit");
+    let held = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("hold permit");
 
     let status = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -287,7 +291,8 @@ async fn concurrent_setups_produce_exactly_one_admin() {
     let batch = async {
         let mut set = tokio::task::JoinSet::new();
         for i in 0..20 {
-            let app = llmroller_admin::control_plane_router(setup_state.clone(), auth_state.clone());
+            let app =
+                llmroller_admin::control_plane_router(setup_state.clone(), auth_state.clone());
             set.spawn(async move {
                 attempt_setup(
                     &app,
@@ -379,15 +384,14 @@ async fn admin_session(harness: &Harness, admin: llmroller_core::ids::UserId) ->
 }
 
 fn build_api(harness: &Harness, auth_state: AuthAppState) -> axum::Router {
-    let mut api_state =
-        ApiAppState::new(auth_state.clone(), harness.master_key.clone(), "key-0".to_owned());
+    let mut api_state = ApiAppState::new(
+        auth_state.clone(),
+        harness.master_key.clone(),
+        "key-0".to_owned(),
+    );
     api_state.audit_hmac_key = Some(llmroller_core::seams::secret_bytes(vec![0x24; 32]));
     api_state.attach_pin_store(Arc::new(llmroller_core::pins::PinStore::new(1_000)));
-    control_plane_router_full(
-        setup_state_for(harness, None),
-        auth_state,
-        api_state,
-    )
+    control_plane_router_full(setup_state_for(harness, None), auth_state, api_state)
 }
 
 fn create_user_request(role: &str, username: &str, session: &AdminSession) -> Request<Body> {
