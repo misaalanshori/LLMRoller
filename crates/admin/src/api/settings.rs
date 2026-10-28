@@ -198,16 +198,17 @@ pub(crate) async fn delete_user_provider_price_handler(
     }
     let provider_id = id.to_string();
     let upstream_model_id = params.upstream_model_id;
-    execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
+    // `execute_atomic_mutation` is generic over its closure's return type, so the affected
+    // flag travels back through it with no helper change and no captured cell.
+    let deleted = execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
         Box::pin(async move {
             llmroller_store::prices::delete_price_tx(tx, &provider_id, &upstream_model_id)
                 .await
-                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            Ok(())
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         })
     })
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_status(deleted))
 }
 
 pub(crate) async fn delete_admin_price_handler(
@@ -218,16 +219,28 @@ pub(crate) async fn delete_admin_price_handler(
     let _actor = authenticate_admin(&state, &headers, true).await?;
     let provider_id = params.provider_id.unwrap_or_default();
     let upstream_model_id = params.upstream_model_id;
-    execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
+    let deleted = execute_atomic_mutation(&state, vec![ConfigDomain::Prices], move |tx| {
         Box::pin(async move {
             llmroller_store::prices::delete_price_tx(tx, &provider_id, &upstream_model_id)
                 .await
-                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            Ok(())
+                .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         })
     })
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_status(deleted))
+}
+
+/// `204` when the delete removed a row, `404` when nothing matched.
+///
+/// Without this a delete of a non-existent `(provider_id, upstream_model_id)` pair reported
+/// success, so an operator removing a stale price had no way to learn it was never there
+/// (`ISSUE-0192`).
+const fn delete_status(deleted: bool) -> StatusCode {
+    if deleted {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 pub(crate) async fn put_admin_price_handler(
