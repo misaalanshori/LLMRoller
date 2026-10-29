@@ -401,11 +401,18 @@ pub(crate) async fn patch_admin_budget_window_handler(
     patch_budget_window_internal(&state, &actor, id, payload).await
 }
 
+/// Body of `POST .../adjustments`.
+///
+/// There is deliberately **no** `window_instance_start` field: `13. SRDD:82` makes applicability
+/// `window_instance_start == window_start_ms`, so the client must not choose it. A caller-supplied
+/// value could scope a calibration to an arbitrary period, and before `ISSUE-0162` nothing
+/// supplied it at all, so every row stored `NULL` and fell through to the rolling lookback. The
+/// server derives it (`llmroller_core::windows::current_instance_start_ms`). A client that still
+/// sends the field is accepted and ignored, which is the backward-compatible behaviour.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateBudgetAdjustmentRequest {
     pub delta_micro_usd: i64,
     pub effective_at: Option<i64>,
-    pub window_instance_start: Option<i64>,
     pub note: Option<String>,
 }
 
@@ -454,12 +461,14 @@ pub(crate) async fn post_budget_window_adjustment_internal(
     id: String,
     payload: CreateBudgetAdjustmentRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let row = sqlx::query("SELECT upstream_key_id FROM budget_windows WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.auth.reader_pool)
-        .await
-        .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
+    let row = sqlx::query(
+        "SELECT upstream_key_id, window_kind, period_ms, anchor_at FROM budget_windows WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.auth.reader_pool)
+    .await
+    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| map_price_error(StatusCode::NOT_FOUND, "window not found"))?;
 
     let upstream_key_id: String = row.try_get("upstream_key_id").unwrap_or_default();
     authorize_budget_window_key(state, actor, &upstream_key_id).await?;
@@ -469,13 +478,28 @@ pub(crate) async fn post_budget_window_adjustment_internal(
     let adj_id = llmroller_core::ids::RequestId::generate().to_string();
     let actor_id = actor.user_id().map(|u| u.to_string());
 
+    // `14.q` says the calibration is "bound to the current `window_instance_start`", and
+    // `13. SRDD:82` makes that binding the whole applicability rule. The client may not stamp it:
+    // a caller-supplied instance start would let a calibration be scoped to an arbitrary period,
+    // and in practice nothing supplied it at all, so every row stored `NULL` and fell through to
+    // the rolling lookback — the `ISSUE-0162` leak. The server derives it (or `None` for the two
+    // kinds that have no instance boundary).
+    let window_kind = row
+        .try_get::<String, _>("window_kind")
+        .map(|raw| llmroller_core::windows::WindowKind::parse(&raw))
+        .unwrap_or(llmroller_core::windows::WindowKind::Rolling);
+    let period_ms: Option<i64> = row.try_get("period_ms").ok().flatten();
+    let anchor_at: Option<i64> = row.try_get("anchor_at").ok().flatten();
+    let window_instance_start =
+        llmroller_core::windows::current_instance_start_ms(window_kind, period_ms, anchor_at, now);
+
     let response = serde_json::json!({
         "id": adj_id.clone(),
         "budget_window_id": id.clone(),
         "actor_user_id": actor_id.clone(),
         "delta_micro_usd": payload.delta_micro_usd,
         "effective_at": effective_at,
-        "window_instance_start": payload.window_instance_start,
+        "window_instance_start": window_instance_start,
         "source": "manual_calibration",
         "note": payload.note.clone(),
         "created_at": now,
@@ -485,7 +509,6 @@ pub(crate) async fn post_budget_window_adjustment_internal(
     let adj_id_clone = adj_id.clone();
     let note_clone = payload.note;
     let delta = payload.delta_micro_usd;
-    let win_inst = payload.window_instance_start;
 
     execute_atomic_mutation(state, vec![ConfigDomain::BudgetWindows], move |tx| {
         Box::pin(async move {
@@ -496,7 +519,7 @@ pub(crate) async fn post_budget_window_adjustment_internal(
                 actor_id.as_deref(),
                 delta,
                 effective_at,
-                win_inst,
+                window_instance_start,
                 note_clone.as_deref(),
                 now,
             )

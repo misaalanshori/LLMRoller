@@ -796,11 +796,19 @@ fn start_reloader_inner(
                     for windows in new_snapshot.budget_windows.values() {
                         for window in windows {
                             let period = window.period_ms.unwrap_or(2_678_400_000);
+                            // The instance start comes from the live counter, which already
+                            // aligns anchored instances to `now_ms` (including backwards for a
+                            // future anchor). Deriving it here instead would be a second
+                            // implementation of the calendar-month rules (`ISSUE-0162`).
+                            let instance_start = runtime_state
+                                .window_counter(&window.id)
+                                .map(|counter| counter.current_window_start_ms(now_ms));
                             if let Ok(offset) = llmroller_store::budgets::active_manual_offset_for_window(
                                 &pool,
                                 &window.id,
                                 period,
                                 now_ms,
+                                instance_start,
                             )
                             .await
                                 && let Some(counter) = runtime_state.window_counter(&window.id)

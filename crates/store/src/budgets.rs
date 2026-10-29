@@ -315,26 +315,63 @@ pub async fn sum_budget_adjustments_for_window(
 
 /// Compute the active manual calibration offset for a budget window in the window instance containing `now_ms` (`LIM-1`, `FND-006`).
 ///
-/// Only sums adjustments whose `effective_at` falls within `[now_ms - period_ms, now_ms]` (or matching `window_instance_start`),
-/// and preserves the authentic `MAX(effective_at)` timestamp so the offset expires at `effective_at + period_ms` rather than
-/// being reset to `now_ms` on restart.
+/// # Which adjustments are active
+///
+/// Two cases, because they are genuinely different questions:
+///
+/// - **Anchored** (`window_instance_start = ?`) — the offset applies **iff it is bound to the
+///   current instance**, exactly as `13. SRDD:82` specifies. The previous implementation filtered
+///   only on `effective_at > now_ms - period_ms`, which for a calendar-month window meant a
+///   calibration applied on 28 March stayed active for the whole of April: a March one-off
+///   silently widened April's budget, in the permissive direction. Selecting by instance is the
+///   only filter that bounds the offset to the period the operator meant (`ISSUE-0162`).
+/// - **Rolling** (`window_instance_start IS NULL`) — a rolling window has no instance boundary, so
+///   the rolling lookback `[now_ms - period_ms, now_ms]` is the correct and unchanged semantics.
+///   Without this branch the fix would silently disable every rolling-window calibration, because
+///   every rolling row stores `NULL` and would never match an instance start.
+///
+/// `effective_at <= now_ms` applies to both: a future-dated adjustment is not yet active.
+///
+/// `MAX(effective_at)` is preserved rather than replaced with `now_ms` so the offset expires on its
+/// own schedule (`effective_at + period_ms`) instead of being revived by a restart.
 pub async fn active_manual_offset_for_window(
     pool: &SqlitePool,
     budget_window_id: &str,
     period_ms: i64,
     now_ms: i64,
+    window_instance_start: Option<i64>,
 ) -> Result<Option<llmroller_core::windows::ManualOffset>, sqlx::Error> {
-    let min_effective = now_ms.saturating_sub(period_ms);
-    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT SUM(delta_micro_usd), MAX(effective_at)
-         FROM budget_adjustments
-         WHERE budget_window_id = ? AND effective_at > ? AND effective_at <= ?",
-    )
-    .bind(budget_window_id)
-    .bind(min_effective)
-    .bind(now_ms)
-    .fetch_one(pool)
-    .await?;
+    let row: (Option<i64>, Option<i64>) = match window_instance_start {
+        // Anchored: exactly the current instance, no wall-clock lookback.
+        Some(instance_start) => {
+            sqlx::query_as(
+                "SELECT SUM(delta_micro_usd), MAX(effective_at)
+                 FROM budget_adjustments
+                 WHERE budget_window_id = ? AND window_instance_start = ? AND effective_at <= ?",
+            )
+            .bind(budget_window_id)
+            .bind(instance_start)
+            .bind(now_ms)
+            .fetch_one(pool)
+            .await?
+        }
+        // Rolling: no instance boundary exists, so the lookback is the window.
+        None => {
+            let min_effective = now_ms.saturating_sub(period_ms);
+            sqlx::query_as(
+                "SELECT SUM(delta_micro_usd), MAX(effective_at)
+                 FROM budget_adjustments
+                 WHERE budget_window_id = ?
+                   AND window_instance_start IS NULL
+                   AND effective_at > ? AND effective_at <= ?",
+            )
+            .bind(budget_window_id)
+            .bind(min_effective)
+            .bind(now_ms)
+            .fetch_one(pool)
+            .await?
+        }
+    };
     match row {
         (Some(delta), Some(effective_at_ms)) if delta != 0 => {
             Ok(Some(llmroller_core::windows::ManualOffset {

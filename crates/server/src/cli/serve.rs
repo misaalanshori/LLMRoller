@@ -289,11 +289,17 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             };
             runtime_state.hydrate_window_counter_from_ring(window, source_ring, clock.now_ms());
             let period = window.period_ms.unwrap_or(2_678_400_000);
+            // Same derivation as the reloader: the counter owns the instance arithmetic, so an
+            // anchored month start is computed once, by `current_window_start_ms` (`ISSUE-0162`).
+            let instance_start = runtime_state
+                .window_counter(&window.id)
+                .map(|counter| counter.current_window_start_ms(clock.now_ms()));
             if let Ok(offset) = llmroller_store::budgets::active_manual_offset_for_window(
                 &pool,
                 &window.id,
                 period,
                 clock.now_ms(),
+                instance_start,
             )
             .await
                 && let Some(counter) = runtime_state.window_counter(&window.id)

@@ -459,3 +459,94 @@ fn effective_used_includes_in_flight_reservations() {
 
     drop(reservation);
 }
+
+// ============================================================================================
+// `ISSUE-0162` — the instance start used to *stamp* an adjustment must equal the one the live
+// counter *compares* against.
+//
+// The write path (`admin::budgets`) records `window_instance_start`; the read path
+// (`store::budgets::active_manual_offset_for_window`) matches it against the current instance.
+// If the two derivations disagree by even one millisecond the operator's calibration silently
+// never applies — the worst failure mode for a budget guard, because the value looks recorded.
+//
+// So the derivation is asserted against `AtomicBudgetCounter::current_window_start_ms`, the
+// counter's own answer, rather than against restated arithmetic.
+// ============================================================================================
+
+#[doc = "Spec: LIM-1, Section 13.2"]
+#[test]
+fn the_stamped_instance_start_matches_the_live_counters_for_every_window_kind() {
+    // 2026-04-17T09:41:00Z-ish; arbitrary but not a boundary, so alignment is actually exercised.
+    let now_ms = 1_776_418_860_000_i64;
+    let period_ms = 3 * 86_400_000_i64;
+    // 2026-01-15T00:00:00Z — an anchor that does not divide the period evenly into now_ms.
+    let anchor_ms = llmroller_core_anchor();
+
+    let cases: [(WindowKind, Option<i64>, Option<i64>); 4] = [
+        (WindowKind::Rolling, Some(period_ms), None),
+        (WindowKind::AnchoredFixed, Some(period_ms), Some(anchor_ms)),
+        (WindowKind::AnchoredCalendarMonth, None, Some(anchor_ms)),
+        (WindowKind::AnchoredProvider, Some(period_ms), None),
+    ];
+
+    for (kind, period, anchor) in cases {
+        let counter =
+            AtomicBudgetCounter::for_window(1, 1_000_000, 2, kind, period, anchor, None, now_ms);
+        let from_counter = counter.current_window_start_ms(now_ms);
+        match current_instance_start_ms(kind, period, anchor, now_ms) {
+            Some(stamped) => assert_eq!(
+                stamped, from_counter,
+                "{kind:?}: the stamped instance start must equal the live counter's, or the \
+                 calibration is recorded and then never matched"
+            ),
+            None => assert!(
+                matches!(kind, WindowKind::Rolling | WindowKind::AnchoredProvider),
+                "{kind:?} has an instance boundary, so a start must be derivable"
+            ),
+        }
+    }
+}
+
+/// 2026-01-15T00:00:00Z, expressed through the public conversion helper.
+fn llmroller_core_anchor() -> i64 {
+    utc_to_epoch_millis(2026, 1, 15, 0)
+}
+
+#[doc = "Spec: LIM-1, Section 13.2"]
+#[test]
+fn a_calendar_month_instance_start_is_the_clamped_month_the_anchor_selects() {
+    // Anchor on the 31st: February must clamp to the 28th, and the instance start for a March
+    // timestamp is March's clamped start — not January's, and not a 31-day rolling offset.
+    let anchor = utc_to_epoch_millis(2026, 1, 31, 0);
+    let march_10 = utc_to_epoch_millis(2026, 3, 10, 0);
+    let start = current_instance_start_ms(
+        WindowKind::AnchoredCalendarMonth,
+        None,
+        Some(anchor),
+        march_10,
+    )
+    .expect("calendar-month windows have an instance start");
+    assert_eq!(
+        start,
+        utc_to_epoch_millis(2026, 2, 28, 0),
+        "a 31 January anchor clamps February to the 28th, so March 10 falls in the \
+         instance that started on 28 February"
+    );
+}
+
+#[doc = "Spec: LIM-1, Section 13.2"]
+#[test]
+fn rolling_and_provider_anchored_windows_report_no_locally_derivable_instance_start() {
+    let now_ms = 1_776_418_860_000_i64;
+    assert_eq!(
+        current_instance_start_ms(WindowKind::Rolling, Some(3_600_000), None, now_ms),
+        None,
+        "a rolling window has no instance boundary, so it must keep the rolling lookback"
+    );
+    assert_eq!(
+        current_instance_start_ms(WindowKind::AnchoredProvider, Some(18_000_000), None, now_ms),
+        None,
+        "an anchored_provider instance is defined by the provider's resets_at, which is not \
+         locally derivable before the first observation"
+    );
+}

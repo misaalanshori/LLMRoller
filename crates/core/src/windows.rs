@@ -487,6 +487,54 @@ pub enum WindowKind {
     AnchoredProvider,
 }
 
+/// The window instance start that a calibration made at `now_ms` must be bound to
+/// (`ISSUE-0162`, `LIM-1`).
+///
+/// Returns `None` for window kinds that have **no instance boundary**, which is exactly the set
+/// whose adjustments must keep the rolling lookback:
+///
+/// - `rolling` — a sliding window is not divided into instances.
+/// - `anchored_provider` — the instance is defined by a `resets_at_ms` the *provider* reports, so
+///   there is no locally-derivable start before the first observation arrives. Inventing one would
+///   bind the adjustment to an interval the provider may immediately redefine.
+///
+/// For `anchored_fixed` and `anchored_calendar_month` the start is derived from the configured
+/// anchor, using the same window types the counters use so the two cannot disagree — a second
+/// implementation of the calendar-month clamping rules is how this kind of drift starts.
+///
+/// `anchor_at_ms` is the billing anchor timestamp from `budget_windows.anchor_at`.
+#[must_use]
+pub fn current_instance_start_ms(
+    kind: WindowKind,
+    period_ms: Option<i64>,
+    anchor_at_ms: Option<i64>,
+    now_ms: i64,
+) -> Option<i64> {
+    match kind {
+        WindowKind::Rolling | WindowKind::AnchoredProvider => None,
+        WindowKind::AnchoredFixed => {
+            let period = period_ms?;
+            if period <= 0 {
+                return None;
+            }
+            // The default mirrors `AtomicBudgetCounter::for_window`, which uses `now_ms` when no
+            // anchor is configured. It must mirror it exactly: the write path stamps this value and
+            // the read path compares against the live counter's `current_window_start_ms`, so any
+            // divergence means the operator's calibration silently never applies.
+            let anchor = anchor_at_ms.unwrap_or(now_ms);
+            let instance = (now_ms - anchor).div_euclid(period);
+            Some(anchor + instance * period)
+        }
+        WindowKind::AnchoredCalendarMonth => {
+            let anchor = anchor_at_ms?;
+            let (year, month, day, minute_of_day) = epoch_millis_to_utc(anchor);
+            let mut window = AnchoredCalendarMonth::new(day, minute_of_day, year, month);
+            window.align_to(now_ms);
+            Some(window.window_start_ms)
+        }
+    }
+}
+
 impl WindowKind {
     /// Parses the schema `window_kind` value. Unknown values degrade to rolling,
     /// which is the safe historical behavior for legacy rows.

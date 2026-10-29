@@ -301,10 +301,11 @@ async fn test_active_manual_offset_preserves_effective_at_and_share_month_cutoff
     .expect("insert adjustment");
 
     // Restart at T = 2_800_000 (halfway through the 1h period): effective_at_ms must remain 1_000_000!
-    let offset = active_manual_offset_for_window(&pool, "win_01", 3_600_000, 2_800_000)
-        .await
-        .expect("active offset")
-        .expect("some offset");
+    let offset =
+        active_manual_offset_for_window(&pool, "win_01", 3_600_000, 2_800_000, Some(1_000_000))
+            .await
+            .expect("active offset")
+            .expect("some offset");
     assert_eq!(offset.effective_at_ms, 1_000_000);
     assert_eq!(offset.delta_micro_usd, 250_000);
     assert_eq!(offset.value_at(2_800_000), 250_000);
@@ -338,5 +339,404 @@ async fn test_active_manual_offset_preserves_effective_at_and_share_month_cutoff
             .monthly_accumulators
             .usage_for(&BudgetScopeId::ProviderShare(share_id), day_28_ms),
         42_000
+    );
+}
+
+// ============================================================================================
+// `ISSUE-0162` — a budget offset must belong to the window *instance* it was calibrated for.
+//
+// `budget_adjustments.window_instance_start` has existed since `0001_initial.sql` and the admin
+// API writes it, but `active_manual_offset_for_window` filtered only on a rolling wall-clock
+// lookback (`effective_at > now - period_ms`). For an anchored window that means an offset applied
+// near the end of one instance stays "active" for the whole of the next one — a March calibration
+// silently widening April's budget. A budget guard that is weaker than the operator configured is
+// worse than no guard, and it fails in the permissive direction.
+//
+// The fix selects by instance rather than by wall clock, and keeps the rolling lookback for rolling
+// windows because those genuinely have no instance boundary.
+// ============================================================================================
+
+const DAY_MS: i64 = 86_400_000;
+
+/// A UTC calendar-month start, using the same helper the window types use.
+fn month_start_ms(year: i32, month: u8) -> i64 {
+    llmroller_core::windows::utc_to_epoch_millis(year, month, 1, 0)
+}
+
+/// Seed one `budget_windows` row of the requested kind, returning its id.
+async fn seed_window(pool: &sqlx::SqlitePool, window_kind: &str, period_ms: Option<i64>) -> String {
+    let provider_id = llmroller_core::ids::ProviderId::generate();
+    let key_id = UpstreamKeyId::generate();
+    sqlx::query(
+        "INSERT INTO providers (id, name, kind, base_url, config_json, ownership_scope, share_config_fingerprint, created_at)
+         VALUES (?, 'P', 'openrouter', 'https://api.com', '{}', 'global', 'fp', 1000)",
+    )
+    .bind(provider_id.to_string())
+    .execute(pool)
+    .await
+    .expect("insert provider");
+    sqlx::query(
+        "INSERT INTO upstream_keys (id, provider_id, label, secret_enc, secret_last4, priority, master_key_id, created_at)
+         VALUES (?, ?, 'K', X'00', '1234', 100, 'key-0', 1000)",
+    )
+    .bind(key_id.to_string())
+    .bind(provider_id.to_string())
+    .execute(pool)
+    .await
+    .expect("insert key");
+
+    let window_id = format!("win_{}", UpstreamKeyId::generate());
+    sqlx::query(
+        "INSERT INTO budget_windows (id, scope_kind, upstream_key_id, window_kind, period_ms, limit_micro_usd, reserve_pct)
+         VALUES (?, 'upstream_key', ?, ?, ?, 1000000, 2)",
+    )
+    .bind(&window_id)
+    .bind(key_id.to_string())
+    .bind(window_kind)
+    .bind(period_ms)
+    .execute(pool)
+    .await
+    .expect("insert window");
+    window_id
+}
+
+/// The current anchored calendar-month instance start at `now_ms`, derived with the same
+/// `AnchoredCalendarMonth` the counters use. This is what the production callers pass, so the
+/// tests exercise the real derivation rather than restating the arithmetic.
+fn anchored_month_start_at(now_ms: i64, anchor_day: u8) -> i64 {
+    let (year, month, _day, minute) = llmroller_core::windows::epoch_millis_to_utc(now_ms);
+    let mut window =
+        llmroller_core::windows::AnchoredCalendarMonth::new(anchor_day, minute, year, month);
+    window.align_to(now_ms);
+    window.window_start_ms
+}
+
+/// Insert one calibration adjustment. `window_instance_start` is the instance it is bound to.
+#[allow(clippy::too_many_arguments)]
+async fn seed_adjustment(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    window_id: &str,
+    delta_micro_usd: i64,
+    effective_at: i64,
+    window_instance_start: Option<i64>,
+) {
+    insert_budget_adjustment(
+        pool,
+        id,
+        window_id,
+        None,
+        delta_micro_usd,
+        effective_at,
+        window_instance_start,
+        None,
+        effective_at,
+    )
+    .await
+    .expect("insert adjustment");
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064, FND-006
+#[tokio::test]
+async fn a_march_offset_does_not_apply_to_april() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let march_start = month_start_ms(2026, 3);
+    let march_28 = march_start + 27 * DAY_MS;
+    let april_10 = month_start_ms(2026, 4) + 9 * DAY_MS;
+
+    // The operator calibrated March's overspend on March 28, bound to March's instance.
+    seed_adjustment(
+        &pool,
+        "adj_march",
+        &window_id,
+        500_000,
+        march_28,
+        Some(march_start),
+    )
+    .await;
+
+    // April 10 is 13 days after the adjustment, well inside a 31-day rolling lookback.
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        april_10,
+        Some(anchored_month_start_at(april_10, 1)),
+    )
+    .await
+    .expect("query must succeed");
+
+    assert!(
+        offset.is_none(),
+        "a March-bound calibration must not reduce April's budget; got {offset:?}"
+    );
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064
+#[tokio::test]
+async fn an_offset_applies_within_its_own_instance() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let april_start = month_start_ms(2026, 4);
+    let april_2 = april_start + DAY_MS;
+    let april_20 = april_start + 19 * DAY_MS;
+
+    seed_adjustment(
+        &pool,
+        "adj_april",
+        &window_id,
+        400_000,
+        april_2,
+        Some(april_start),
+    )
+    .await;
+
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        april_20,
+        Some(anchored_month_start_at(april_20, 1)),
+    )
+    .await
+    .expect("query must succeed")
+    .expect("April's own calibration must apply in April");
+
+    assert_eq!(offset.delta_micro_usd, 400_000);
+    assert_eq!(
+        offset.effective_at_ms, april_2,
+        "the authentic effective_at must be preserved so the offset expires on its own schedule"
+    );
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064
+#[tokio::test]
+async fn a_rolling_window_offset_still_uses_the_rolling_lookback() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "rolling", Some(3_600_000)).await;
+
+    let t0 = 1_000_000;
+    let t_half_hour_later = t0 + 1_800_000;
+
+    // `window_instance_start IS NULL` is what a rolling window stores: no instance boundary.
+    seed_adjustment(&pool, "adj_roll", &window_id, 250_000, t0, None).await;
+
+    let offset =
+        active_manual_offset_for_window(&pool, &window_id, 3_600_000, t_half_hour_later, None)
+            .await
+            .expect("query must succeed")
+            .expect("a rolling window keeps its rolling lookback");
+
+    assert_eq!(offset.delta_micro_usd, 250_000);
+
+    // And it still ages out after `period_ms`, which is the property the lookback provides.
+    let offset_after =
+        active_manual_offset_for_window(&pool, &window_id, 3_600_000, t0 + 3_600_001, None)
+            .await
+            .expect("query must succeed");
+    assert!(offset_after.is_none(), "the rolling offset must age out");
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064
+#[tokio::test]
+async fn a_future_dated_adjustment_is_not_active() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let april_start = month_start_ms(2026, 4);
+    let april_5 = april_start + 4 * DAY_MS;
+    let april_20 = april_start + 19 * DAY_MS;
+
+    // Effective in the future, but bound to the current instance.
+    seed_adjustment(
+        &pool,
+        "adj_future",
+        &window_id,
+        300_000,
+        april_20,
+        Some(april_start),
+    )
+    .await;
+
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        april_5,
+        Some(anchored_month_start_at(april_5, 1)),
+    )
+    .await
+    .expect("query must succeed");
+    assert!(
+        offset.is_none(),
+        "a future-dated adjustment is not yet active; got {offset:?}"
+    );
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064
+#[tokio::test]
+async fn summing_offsets_ignores_other_instances() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let march_start = month_start_ms(2026, 3);
+    let april_start = month_start_ms(2026, 4);
+    let april_20 = april_start + 19 * DAY_MS;
+
+    // Two offsets in the same window, different instances, both inside a 31-day wall-clock
+    // lookback of April 20. Only April's may be summed: a `WHERE` that filtered rows but still
+    // summed across instances would pass a per-row assertion and still return the wrong total.
+    seed_adjustment(
+        &pool,
+        "adj_mar",
+        &window_id,
+        500_000,
+        march_start + 27 * DAY_MS,
+        Some(march_start),
+    )
+    .await;
+    seed_adjustment(
+        &pool,
+        "adj_apr",
+        &window_id,
+        400_000,
+        april_start + DAY_MS,
+        Some(april_start),
+    )
+    .await;
+
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        april_20,
+        Some(anchored_month_start_at(april_20, 1)),
+    )
+    .await
+    .expect("query must succeed")
+    .expect("April's offset must be active");
+
+    assert_eq!(
+        offset.delta_micro_usd, 400_000,
+        "only the current instance's delta may be summed; 900_000 means March leaked in"
+    );
+}
+
+// ============================================================================================
+// `ISSUE-0162` second half — startup hydration.
+//
+// `serve.rs` and `reloader.rs` both call `active_manual_offset_for_window` and push the result
+// into the live counter via `set_manual_offset`. Both call sites exist, so the issue's premise
+// ("serve.rs never loads active manual offsets") is stale. What was not covered is that the pair
+// actually produces a *visible* offset on a live counter — a query that returns the right row and
+// a setter nobody calls would look identical from outside.
+//
+// This exercises the exact pair over a real database: query, then set, then observe through the
+// counter's own `local_used`, which is what budget enforcement reads.
+// ============================================================================================
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064, FND-006
+#[tokio::test]
+async fn a_stored_offset_becomes_visible_on_a_live_counter_after_hydration() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let window = llmroller_core::snapshot::SnapshotBudgetWindow {
+        id: window_id.clone(),
+        scope_kind: "upstream_key".to_string(),
+        upstream_key_id: UpstreamKeyId::generate(),
+        model_pk: None,
+        window_kind: "anchored_calendar_month".to_string(),
+        period_ms: None,
+        anchor_at: Some(month_start_ms(2026, 1)),
+        upstream_window_kind: None,
+        limit_micro_usd: 1_000_000,
+        reserve_pct: 0,
+    };
+    let counter = std::sync::Arc::new(llmroller_core::windows::AtomicBudgetCounter::for_window(
+        1,
+        window.limit_micro_usd,
+        window.reserve_pct,
+        llmroller_core::windows::WindowKind::AnchoredCalendarMonth,
+        window.period_ms,
+        window.anchor_at,
+        None,
+        month_start_ms(2026, 4) + 9 * DAY_MS,
+    ));
+
+    let now_ms = month_start_ms(2026, 4) + 9 * DAY_MS;
+    seed_adjustment(
+        &pool,
+        "adj_hydrate",
+        &window_id,
+        300_000,
+        month_start_ms(2026, 4) + DAY_MS,
+        Some(month_start_ms(2026, 4)),
+    )
+    .await;
+
+    // Before hydration the counter knows nothing about the stored calibration.
+    assert_eq!(counter.local_used(now_ms), 0);
+
+    // The hydrate step, exactly as `serve.rs` and `reloader.rs` perform it.
+    let instance_start = counter.current_window_start_ms(now_ms);
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        now_ms,
+        Some(instance_start),
+    )
+    .await
+    .expect("query must succeed");
+    counter.set_manual_offset(offset);
+
+    assert_eq!(
+        counter.local_used(now_ms),
+        300_000,
+        "the stored calibration must be visible to budget enforcement after hydration"
+    );
+}
+
+// Spec: Section 13.2 | Requirements: LIM-1, F-064
+#[tokio::test]
+async fn an_unbound_adjustment_never_offsets_an_anchored_window() {
+    let (_dir, pool) = setup_budgets_test_db().await;
+    let window_id = seed_window(&pool, "anchored_calendar_month", None).await;
+
+    let april_start = month_start_ms(2026, 4);
+    let april_20 = april_start + 19 * DAY_MS;
+
+    // `window_instance_start IS NULL` on an *anchored* window: what every pre-`ISSUE-0162` row
+    // looks like, because nothing stamped the column. `13. SRDD:82` makes applicability
+    // "`window_instance_start == window_start_ms`", and NULL equals nothing, so such a row must
+    // not apply. The safe direction: a legacy row goes inert rather than staying over-broad.
+    seed_adjustment(
+        &pool,
+        "adj_legacy",
+        &window_id,
+        500_000,
+        april_start + DAY_MS,
+        None,
+    )
+    .await;
+
+    let offset = active_manual_offset_for_window(
+        &pool,
+        &window_id,
+        31 * DAY_MS,
+        april_20,
+        Some(anchored_month_start_at(april_20, 1)),
+    )
+    .await
+    .expect("query must succeed");
+
+    assert!(
+        offset.is_none(),
+        "an adjustment bound to no instance cannot equal the current instance start, so it must \
+         not offset an anchored window; got {offset:?}"
     );
 }
