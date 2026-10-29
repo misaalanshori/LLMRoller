@@ -35,6 +35,59 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The two spec-required periodic tasks were never spawned, so a quiet instance stopped
+  attesting its audit chain and a plaintext deployment stopped saying so (ISSUE-0186,
+  ISSUE-0187).** Both requirements name a clock — `SEC-13`/`AUD-1` want an `audit_anchor` every
+  100 rows **and at least hourly**, `SEC-9` wants the plaintext-listener error **every 10
+  minutes** — and both were satisfied by a single one-shot log line. The audit one is the more
+  serious: the value of an anchor is that its *absence* is detectable, so an anchor that stops
+  appearing because traffic stopped is indistinguishable from a tampered chain. The row counter
+  cannot tell "quiet" from "silent".
+
+  Both are now timers, and both are *wired*: the defect was a missing call, not a wrong body —
+  the same shape as `run_retention_pass` in this repo, which was written, tested, and never
+  invoked. A test of the function alone cannot catch an absent call, so
+  `serve_command_spawns_both_periodic_tasks` reads `serve_command`'s body, and two live-process
+  tests drive a real `serve` binary and assert the lines appear. Labelled honestly: the source
+  assertion is a weaker claim than an execution, and it is still worth having because it fails
+  on exactly the regression that produced the issue.
+
+  **The hourly anchor reuses `format_audit_anchor` through a single `emit_anchor`.** One anchor
+  format is the entire point of having a format; a second JSON shape for the timer would leave an
+  operator with two dialects and a verifier that accepts one. The counter and the timer therefore
+  go through the same function, and a test compares their emissions field by field for the same
+  tip.
+
+  **The duplicate-anchor guard is a shared in-memory register, not a table.** `append`'s counter
+  publishes its emission time; the timer reads it and stands down if the tip was anchored inside
+  the period. Without it a busy instance anchors the same tip twice — which is not more evidence,
+  it makes the stream ambiguous. In memory rather than persisted: a restart forgets the last anchor
+  and therefore anchors *sooner* than an hour, which is harmless, and a table plus a migration
+  would buy nothing. The register is monotonic (`fetch_max`) because audit rows can carry a
+  backdated `ts` after a backward NTP step — the chain verifier has a test for exactly that — and a
+  plain store would let a backdated row rewind the guard and re-enable the duplicate.
+
+  An empty `audit_log` emits **nothing**. `{"seq":0,"hash":""}` would attest a chain that has never
+  been written, which is worse than silence, and `read_chain_tip` returns `Option` rather than a
+  defaulted tip so a caller cannot accidentally do it.
+
+  The plaintext repeater is `None` on a loopback bind and therefore spawns **no task at all** — a
+  timer that wakes every ten minutes only to decide not to log is a wakeup for nothing on every
+  normal deployment. Its level is `error`: the startup line is the warning, the repeater is the
+  heartbeat. Both tasks stop on the existing `stop_tx` watch and are awaited after the listeners
+  join, so "stopped" is observed rather than assumed.
+
+  **Both avoid the `interval` first-tick trap.** `tokio::time::interval` resolves its first tick
+  immediately, so the naive version logs the repeater's error at `t = 0` beside the startup
+  warning, reading as a duplicate rather than a heartbeat. `interval_at` with a start offset of one
+  period is used, rather than discarding the first tick, because a discarded tick is easy to delete
+  by accident and the offset documents itself.
+
+  The two tasks share one small `PeriodicTask` helper in `shutdown.rs` rather than two hand-written
+  loops. It is deliberately not the panic-supervising `JobSupervisor`: these bodies are a log line
+  and one read, so a panic is a bug to surface, not a job to restart with backoff. `serve.rs` went
+  from 855 to 1075 lines, still under the 1,600 MNT-3 ceiling.
+
 - **`llmroller serve` silently ignored the documented TLS variables, and the log-detail
   drawer invented an attempt from no data (ISSUE-0227, ISSUE-0228).** Both are "the system
   states something it has not established".

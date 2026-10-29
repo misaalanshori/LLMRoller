@@ -578,7 +578,11 @@ priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.5"
 partial_subphases = ["5.1", "6.3"]
-tests = ["crates/store/src/audit/tests.rs"]
+tests = [
+    "crates/store/src/audit/tests.rs",
+    "crates/server/src/cli/phase7_tests/periodic_tasks.rs",
+    "crates/server/tests/cli_serve.rs",
+]
 
 [requirements.UI-5]
 priority = "P0"
@@ -805,7 +809,11 @@ priority = "P0"
 milestone = "M1"
 delivering_subphase = "2.2"
 partial_subphases = ["1.4"]
-tests = ["crates/server/tests/integration_client_keys.rs"]
+tests = [
+    "crates/server/tests/integration_client_keys.rs",
+    "crates/server/src/cli/phase7_tests/periodic_tasks.rs",
+    "crates/server/tests/cli_serve.rs",
+]
 
 [requirements.SEC-10]
 priority = "P0"
@@ -832,7 +840,11 @@ tests = ["crates/server/tests/e2e_setup_and_auth.rs", "crates/server/tests/integ
 priority = "P0"
 milestone = "M0"
 delivering_subphase = "1.5"
-tests = ["crates/store/src/audit/tests.rs"]
+tests = [
+    "crates/store/src/audit/tests.rs",
+    "crates/server/src/cli/phase7_tests/periodic_tasks.rs",
+    "crates/server/tests/cli_serve.rs",
+]
 
 [requirements.SEC-14]
 priority = "P0"

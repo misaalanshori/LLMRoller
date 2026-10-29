@@ -205,6 +205,62 @@ impl ShutdownSupervisor {
     }
 }
 
+/// A periodic task that stops on a shutdown watch (`ISSUE-0186`, `ISSUE-0187`).
+///
+/// Both spec-required timers are the same shape — "every N seconds, do something, stop when the
+/// drain signal fires" — so the shape lives here once rather than as two hand-written loops in
+/// `serve.rs`. This is not the panic-supervising [`JobSupervisor`]: these bodies are a log line and
+/// one read, so a panic is a bug to surface, not a job to restart with backoff.
+///
+/// Two properties the naive loop gets wrong, both tested:
+///
+/// - **The first tick is not immediate.** `tokio::time::interval`'s first `tick()` resolves at
+///   once, so the naive version fires at `t = 0` — which for the plaintext repeater means an error
+///   beside the startup warning, reading as a duplicate rather than as a heartbeat. `interval_at`
+///   with a start offset of one period is used instead of "call `tick()` once and throw it away",
+///   because discarding a tick is easy to delete by accident and the offset is self-documenting.
+/// - **The loop is bounded by `stop_rx`**, via `select!`, so a graceful drain does not leave a task
+///   querying the database after the shutdown sequence has completed.
+#[derive(Debug)]
+pub struct PeriodicTask {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl PeriodicTask {
+    /// Spawn `body` once per `period` until `stop_rx` fires.
+    ///
+    /// `body` is a closure returning a future rather than a bare future so each tick builds a fresh
+    /// one; a shared future could not be polled again after completing.
+    pub fn spawn<F, Fut>(period: Duration, mut stop_rx: watch::Receiver<bool>, mut body: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            loop {
+                if *stop_rx.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    _ = interval.tick() => body().await,
+                    _ = stop_rx.changed() => break,
+                }
+            }
+        });
+        Self { handle }
+    }
+
+    /// Wait for the task to finish after the stop signal has been sent.
+    ///
+    /// Bounded by the caller, not here: the only way this hangs is if the stop path is broken, and
+    /// that is exactly what a test should be able to time out on.
+    pub async fn shutdown(self) {
+        let _ = self.handle.await;
+    }
+}
+
 /// Panic supervisor for background tasks (Discovery, UsagePoller, RetentionSweeper, Reloader).
 ///
 /// Restarts panicking jobs with exponential backoff (1 s up to 300 s), marking the job

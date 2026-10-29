@@ -25,6 +25,43 @@ use super::helpers::{CliFailure, acquire_lock, resolve_data_dir};
 const TLS_CERT_ENV: &str = "LLMROLLER_TLS_CERT";
 const TLS_KEY_ENV: &str = "LLMROLLER_TLS_KEY";
 
+/// `SEC-9`: the plaintext-listener error must repeat at this period, in addition to the one-off
+/// startup warning.
+pub(crate) const PLAINTEXT_REPEAT_INTERVAL: Duration = Duration::from_secs(600);
+
+/// `SEC-13`/`AUD-1`: at least one `audit_anchor` per hour, in addition to the 100-row counter.
+pub(crate) const AUDIT_ANCHOR_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Override the two periodic intervals, in seconds.
+///
+/// Test-only plumbing, and deliberately a single variable covering both: the alternative is an
+/// end-to-end test that waits ten minutes for the repeater and an hour for the anchor, which nobody
+/// will keep running. It is read once at startup and has no effect on the documented defaults when
+/// unset — an operator cannot set it by accident because it is not in any documented env table.
+pub(crate) const PERIODIC_INTERVAL_OVERRIDE_ENV: &str = "LLMROLLER_TEST_PERIODIC_INTERVAL_SECS";
+
+/// Resolve the two periodic intervals from an optional override string.
+///
+/// Takes the value rather than reading the environment so the decision is a pure function and
+/// testable without mutating process-global state (`std::env::set_var` is unsafe in edition 2024,
+/// and this crate forbids `unsafe`).
+///
+/// Returns the documented defaults when the override is absent, unparseable, or zero — a bad test
+/// knob must never change production behaviour, and "0" must not silently disable a timer.
+pub(crate) fn periodic_intervals(override_value: Option<&str>) -> (Duration, Duration) {
+    match override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+    {
+        Some(seconds) => (Duration::from_secs(seconds), Duration::from_secs(seconds)),
+        None => (PLAINTEXT_REPEAT_INTERVAL, AUDIT_ANCHOR_INTERVAL),
+    }
+}
+
+/// Log target for the repeating plaintext error. The tests select on this target, so it is a
+/// constant rather than a literal repeated in two places.
+const PLAINTEXT_REPEATER_TARGET: &str = "llmroller::plaintext_repeater";
+
 /// Initializes global `tracing_subscriber` formatting (JSON or compact pretty) and level filtering (`FND-052`, `OBS-2`).
 pub(crate) fn init_tracing(log_level: &str, log_format: &str) {
     let filter_directive = std::env::var("LLMROLLER_LOG")
@@ -109,20 +146,23 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
         ));
     }
     let has_tls_proxy = !trusted_proxies.trim().is_empty();
-    match llmroller_proxy::metrics::check_data_plane_bind_security(
+    // Computed once here, where the bind address is known, and carried into the repeater as a
+    // `bool`. Re-deriving it inside the timer would duplicate the loopback classification in
+    // `check_data_plane_bind_security`, and duplicated classification drifts (`ISSUE-0187`).
+    let non_loopback_plaintext = match llmroller_proxy::metrics::check_data_plane_bind_security(
         &args.listen,
         has_tls_proxy,
         require_tls,
     ) {
-        Ok(true) => {
-            tracing::warn!(
-                "Binding plaintext data-plane on non-loopback address {}; setting llmroller_plaintext_data_plane=1 (SEC-10)",
-                args.listen
-            );
-            llmroller_proxy::metrics::set_plaintext_data_plane(1);
-        }
-        Ok(false) => {
-            llmroller_proxy::metrics::set_plaintext_data_plane(0);
+        Ok(non_loopback_plaintext) => {
+            if non_loopback_plaintext {
+                tracing::warn!(
+                    "Binding plaintext data-plane on non-loopback address {}; setting llmroller_plaintext_data_plane=1 (SEC-10)",
+                    args.listen
+                );
+            }
+            llmroller_proxy::metrics::set_plaintext_data_plane(u8::from(non_loopback_plaintext));
+            non_loopback_plaintext
         }
         Err(code) => {
             return Err(CliFailure::new(
@@ -133,7 +173,7 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
                 ),
             ));
         }
-    }
+    };
     let master_key = load_master_key_from_env().map_err(|e| {
         let code = u8::try_from(e.exit_code()).unwrap_or(3);
         CliFailure::new(code, e.to_string())
@@ -663,6 +703,32 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
             .await;
     });
 
+    // Spec-required periodic tasks (`SEC-13`/`AUD-1` at least hourly, `SEC-9` every 10 minutes).
+    //
+    // Both are spawned here, after the listeners are up, so their first tick lands a full period
+    // after startup rather than racing it. Each stops on `stop_tx`, which the shutdown supervisor
+    // sends below -- so neither survives the drain.
+    //
+    // The plaintext repeater is `None` on a loopback bind and therefore spawns no task at all: a
+    // timer that wakes every ten minutes only to decide not to log is a wakeup for nothing on
+    // every normal deployment.
+    let (repeater_interval, anchor_interval) =
+        periodic_intervals(env::var(PERIODIC_INTERVAL_OVERRIDE_ENV).ok().as_deref());
+    let plaintext_repeater = spawn_plaintext_repeater(
+        stop_tx.subscribe(),
+        non_loopback_plaintext,
+        args.listen.clone(),
+        repeater_interval,
+    );
+    // The anchor ticker reads the chain tip, so it needs the writer pool. It is not supervised like
+    // the maintenance job: its body is one read plus a log line, so a panic is a defect to surface
+    // rather than a job to restart with backoff.
+    let audit_anchor_ticker =
+        spawn_audit_anchor_ticker(Some(pool.clone()), stop_tx.subscribe(), anchor_interval, {
+            let anchor_clock = clock.clone();
+            move || anchor_clock.now_ms()
+        });
+
     wait_for_shutdown_signal().await;
     eprintln!("Shutdown signal received; initiating graceful drain...");
 
@@ -690,11 +756,161 @@ async fn serve_command(args: ServeArgs) -> Result<u8, CliFailure> {
     let _ = listener_stop_tx.send(true);
     let _ = stop_tx.send(true);
     let _ = tokio::join!(data_server, admin_server, metrics_server);
+    // Both periodic tasks observe the same `stop_tx`; awaiting them makes "stopped" an observed
+    // fact rather than an assumption about what the select! arm did.
+    if let Some(repeater) = plaintext_repeater {
+        repeater.shutdown().await;
+    }
+    audit_anchor_ticker.shutdown().await;
     let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&pool)
         .await;
 
     Ok(exit_code)
+}
+
+/// Whether an hourly anchor is due at `now_ms`, given when one was last emitted.
+///
+/// The clock is a parameter rather than a captured instant so tests drive it directly instead of
+/// sleeping for an hour (`ISSUE-0186`); production passes the system clock.
+///
+/// The guard has two halves and both are load-bearing:
+///
+/// - **No previous anchor** ⇒ due. Otherwise a process that starts and then sits idle emits nothing
+///   ever, which is the defect being fixed.
+/// - **Previous anchor at least one period ago** ⇒ due. `>=` not `>`: exactly one period later the
+///   anchor is due, so "at least hourly" holds rather than "hourly plus a tick".
+pub(crate) fn audit_anchor_is_due(
+    now_ms: i64,
+    last_anchor_at_ms: Option<i64>,
+    period: Duration,
+) -> bool {
+    let period_ms = i64::try_from(period.as_millis()).unwrap_or(i64::MAX);
+    match last_anchor_at_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= period_ms,
+    }
+}
+
+/// Run one hourly-anchor pass: attest the chain tip if an anchor is due.
+///
+/// Returns whether an anchor was emitted, so a caller can distinguish "nothing was due" from
+/// "nothing was emitted because the log is empty".
+///
+/// Three negative cases, all deliberate:
+///
+/// - **Empty `audit_log`** ⇒ nothing. `{"seq":0,"hash":""}` would attest a chain that does not
+///   exist, which is worse than silence (`ISSUE-0186`).
+/// - **Tip anchored less than a period ago** ⇒ nothing. Without this the timer re-anchors the tip
+///   the 100-row counter just wrote, and the stream carries two attestations for one event.
+/// - **Read failure** ⇒ propagated, no anchor emitted. Attesting a tip we could not read would be a
+///   fabrication; the next tick retries and the absence of anchors is itself the operator's signal.
+///
+/// # Errors
+///
+/// Propagates the tip-read failure.
+pub(crate) async fn run_audit_anchor_tick(
+    pool: &sqlx::SqlitePool,
+    now_ms: i64,
+    period: Duration,
+    last_anchor_at_ms: Option<i64>,
+) -> Result<bool, llmroller_store::audit::AuditError> {
+    if !audit_anchor_is_due(now_ms, last_anchor_at_ms, period) {
+        return Ok(false);
+    }
+    let Some(tip) = llmroller_store::audit::read_chain_tip(pool).await? else {
+        return Ok(false);
+    };
+    llmroller_store::audit::emit_anchor(tip.seq, &tip.hash, tip.ts, now_ms);
+    Ok(true)
+}
+
+/// Emit one repeating plaintext-listener error line (`SEC-9`).
+///
+/// Split from the task so a test drives the tick body without waiting ten minutes. The level is
+/// `error` because the startup line is already the warning — repeating a warning reads as noise,
+/// and `SEC-9` explicitly asks for an error.
+pub(crate) fn emit_plaintext_repeater_error(listen_addr: &str) {
+    tracing::error!(
+        target: PLAINTEXT_REPEATER_TARGET,
+        listen = %listen_addr,
+        "Data plane is still serving plaintext on non-loopback {}; TLS is not terminated upstream and no trusted proxy is configured (SEC-9, SEC-10). Set LLMROLLER_TRUSTED_PROXIES or LLMROLLER_REQUIRE_TLS.",
+        listen_addr
+    );
+}
+
+/// Spawn the 10-minute plaintext repeater, or nothing at all on a loopback bind.
+///
+/// `None` for a loopback bind is the requirement rather than an optimization: a task that wakes
+/// every ten minutes only to decide not to log is a wakeup for nothing, forever, on every normal
+/// deployment.
+///
+/// The decision arrives as a `bool` computed once at startup where the bind address is known.
+/// Re-deriving it here would duplicate the loopback classification, and duplicated classification
+/// drifts.
+pub(crate) fn spawn_plaintext_repeater(
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+    non_loopback_plaintext: bool,
+    listen_addr: String,
+    period: Duration,
+) -> Option<llmroller_server::shutdown::PeriodicTask> {
+    if !non_loopback_plaintext {
+        return None;
+    }
+    Some(llmroller_server::shutdown::PeriodicTask::spawn(
+        period,
+        stop_rx,
+        move || {
+            // Captured once: the repeater reports the bind it was started for, and a mid-run
+            // environment change is not a configuration path.
+            let listen_addr = listen_addr.clone();
+            async move { emit_plaintext_repeater_error(&listen_addr) }
+        },
+    ))
+}
+
+/// Spawn the hourly audit-anchor ticker.
+///
+/// `now_ms` is a function rather than a captured instant so tests supply a synthetic clock. `pool`
+/// is optional so the shutdown test can exercise the stop path with no database; a `None` pool makes
+/// every tick a no-op. The production call site always passes `Some`.
+pub(crate) fn spawn_audit_anchor_ticker<F>(
+    pool: Option<sqlx::SqlitePool>,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+    period: Duration,
+    now_ms: F,
+) -> llmroller_server::shutdown::PeriodicTask
+where
+    F: Fn() -> i64 + Send + Sync + 'static,
+{
+    let now_ms = Arc::new(now_ms);
+    llmroller_server::shutdown::PeriodicTask::spawn(period, stop_rx, move || {
+        let pool = pool.clone();
+        let now_ms = now_ms.clone();
+        async move {
+            let Some(pool) = pool else {
+                return;
+            };
+            let now = now_ms();
+            match run_audit_anchor_tick(
+                &pool,
+                now,
+                period,
+                llmroller_store::audit::last_anchor_at_ms(),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "llmroller::audit_anchor",
+                        error = %error,
+                        "hourly audit anchor skipped: chain tip could not be read"
+                    );
+                }
+            }
+        }
+    })
 }
 
 async fn wait_for_shutdown_signal() {

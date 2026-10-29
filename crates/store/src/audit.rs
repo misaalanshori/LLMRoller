@@ -5,6 +5,7 @@
 //! Spec: ./docs/srdd/8. SRDD - Security and Privacy.md#82-security-requirements-sec
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,92 @@ pub enum AuditError {
 #[must_use]
 pub fn format_audit_anchor(seq: i64, hash: &str, ts: i64) -> String {
     format!("{{\"event\":\"audit_anchor\",\"seq\":{seq},\"hash\":\"{hash}\",\"ts\":{ts}}}")
+}
+
+/// Emission time in wall-clock milliseconds of the most recent `audit_anchor` this process wrote.
+///
+/// Two producers anchor the chain: the row counter in [`append`] (every 100 rows) and the hourly
+/// timer in `serve` (`SEC-13` requires both). The register is **shared** precisely so the two can
+/// suppress each other — a duplicate anchor for one tip is not extra evidence, it makes the anchor
+/// stream ambiguous.
+///
+/// Deliberately in memory rather than persisted (`ISSUE-0186`): a restart forgets the last anchor
+/// and therefore anchors sooner than an hour. That is harmless — two anchors for one tip written by
+/// different processes are not a contradiction — and a table plus a migration would buy nothing.
+///
+/// `i64::MIN` encodes "never anchored", so a caller cannot mistake "no anchor yet" for "anchored at
+/// the epoch".
+static LAST_ANCHOR_AT_MS: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Record that an anchor was emitted at `emitted_at_ms`.
+///
+/// Monotonic (`fetch_max`) on purpose: audit rows can carry a backdated `ts` after a backward NTP
+/// step — the chain verifier has a test for exactly that — and a plain store would let a backdated
+/// row rewind the register and re-enable the duplicate anchor the guard exists to prevent.
+pub fn mark_anchor_emitted(emitted_at_ms: i64) {
+    LAST_ANCHOR_AT_MS.fetch_max(emitted_at_ms, Ordering::SeqCst);
+}
+
+/// When this process last emitted an anchor, or `None` if it has not emitted one yet.
+#[must_use]
+pub fn last_anchor_at_ms() -> Option<i64> {
+    match LAST_ANCHOR_AT_MS.load(Ordering::SeqCst) {
+        i64::MIN => None,
+        ts => Some(ts),
+    }
+}
+
+/// Emit one `audit_anchor` line and record the emission.
+///
+/// The single place an anchor is logged, so the row counter and the hourly timer cannot drift into
+/// two dialects. `ts` is what the anchor payload attests (the attested row's timestamp) while
+/// `emitted_at_ms` is when it was emitted; they differ for the timer, which attests a tip written
+/// up to an hour earlier. Keeping them separate is what lets the guard stay correct when a tip is
+/// old — deriving the guard from the payload's `ts` would make an idle instance unable to anchor.
+pub fn emit_anchor(seq: i64, hash: &str, ts: i64, emitted_at_ms: i64) {
+    let anchor_json = format_audit_anchor(seq, hash, ts);
+    // Publish before logging: a concurrent tick that observes the log line must also observe the
+    // register, otherwise it would read a stale value and emit a duplicate.
+    mark_anchor_emitted(emitted_at_ms);
+    tracing::info!(
+        target: "llmroller::audit_anchor",
+        seq = seq,
+        entry_hash = %hash,
+        ts = ts,
+        anchor = %anchor_json,
+        "audit log hash chain anchor"
+    );
+}
+
+/// The attestable tip of the audit chain: the highest-`seq` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTip {
+    /// Sequence number of the newest row.
+    pub seq: i64,
+    /// Its chain hash.
+    pub hash: String,
+    /// Its stored UTC epoch milliseconds.
+    pub ts: i64,
+}
+
+/// Read the current chain tip, or `None` when `audit_log` is empty.
+///
+/// `None` and not a zero-valued tip: an anchor asserts that a chain exists at `seq`, and
+/// `{"seq":0,"hash":""}` would be an attestation of a chain that has never been written
+/// (`ISSUE-0186`). Callers must emit nothing in that case.
+///
+/// # Errors
+///
+/// Returns [`AuditError::Sqlx`] when the tip cannot be read.
+pub async fn read_chain_tip(pool: &SqlitePool) -> Result<Option<AuditTip>, AuditError> {
+    let row = sqlx::query("SELECT seq, hash, ts FROM audit_log ORDER BY seq DESC LIMIT 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| AuditTip {
+        seq: row.get("seq"),
+        hash: row.get("hash"),
+        ts: row.get("ts"),
+    }))
 }
 
 /// Audit verification failures with deterministic exit codes.
@@ -340,15 +427,9 @@ pub async fn append(
     .await?;
 
     if seq % 100 == 0 {
-        let anchor_json = format_audit_anchor(seq, &hash, entry.ts);
-        tracing::info!(
-            target: "llmroller::audit_anchor",
-            seq = seq,
-            entry_hash = %hash,
-            ts = entry.ts,
-            anchor = %anchor_json,
-            "audit log hash chain anchor"
-        );
+        // `entry.ts` is the attested row's timestamp and, for the counter, also the best available
+        // emission time -- the writer holds no clock of its own.
+        emit_anchor(seq, &hash, entry.ts, entry.ts);
     }
 
     Ok((seq, hash))

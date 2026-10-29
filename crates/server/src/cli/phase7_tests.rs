@@ -108,3 +108,6 @@ async fn traceability_auto_disable_updates_value_json_reloads_snapshot_and_audit
 
 #[path = "phase7_tests/maintenance_sweep.rs"]
 mod maintenance_sweep;
+
+#[path = "phase7_tests/periodic_tasks.rs"]
+mod periodic_tasks;
