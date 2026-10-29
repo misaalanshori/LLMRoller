@@ -8,6 +8,48 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **Four documentation contradictions, and two exit-code gaps the audit found along the way
+  (ISSUE-0034, ISSUE-0036, ISSUE-0037, ISSUE-0055).** No production behaviour changed; the
+  documents now agree with the code, and the code is the authority in every case.
+
+  **`README.md` documented four runtime settings keys that do not exist** — `timeout_failover`,
+  `retention_usage_events_days`, `retention_usage_rollups_days`, `retention_trace_records_days`. The
+  closed registry is `ALL_SETTINGS_KEYS`, and none of those four are in it. Note the trap: the real
+  key is `usage_events_retention_days`, the words in the *opposite order*, so an operator copying the
+  README got `HTTP 422 unknown_setting_key` with nothing saying the document was wrong. The table now
+  lists all 14 registered keys with their real types, defaults and validation ranges, taken from
+  `crates/core/src/settings.rs` rather than from another document.
+
+  **Five documents cited 31 application tables where the migrations create 33** (`README.md` cited no
+  count at all). Fixed in `0. SRDD`, `15. SRDD`, `17. SRDD` and all four sites in
+  `big-bang-phases-1.md`, then regenerated the bundles. The audit's number was itself stale in the
+  other direction: `9. SRDD` already said 33 and the DDL heading already said "33-table", so the
+  documents disagreed with each other as well as with the schema.
+
+  **`LLMROLLER_MASTER_KEY_ID` was documented as optional with a default in two places**
+  (`5. SRDD:178`, `22. SRDD:451`) while `crates/store/src/crypto.rs` fails closed with exit `3` when
+  it is absent or empty. Both rows now say required, no default, exit `3`. The Compose profiles'
+  `mk_2026_10` (prod) and `mk_dev` (dev) values are **kept distinct and commented**, because they are
+  the deployment choosing a value for two profiles that use different databases — not a binary
+  default — and a shared id would only invite copying one file's key id onto the other's rows.
+
+  **Two exit-code defects surfaced by the census, neither in the audit:** code `1` was returned by
+  three production paths (`healthcheck` failure, setup-token resolve failure, `MigrationError::Sqlx`)
+  and documented nowhere; code `12` (`EXIT_WRITER_PANIC`) was documented and had a constant but **no
+  production path returns it**, because the writer actor is an unsupervised `tokio` task. Row `1` is
+  now documented; row `12` is marked **reserved** so a supervisor is not scripting against a code
+  that never fires. Row `10` was also widened: it covers `doctor` on a missing database and
+  `export-diagnostics` on an uninitialised instance, not only `reset-admin`.
+
+  **The guards are the durable part.** Four doc-vs-code checks now run in the test suite
+  (`crates/server/tests/doc_code_consistency.rs`): every README settings key must be in the
+  registry, every returned exit code must be documented, every documented code must be reachable or
+  marked reserved, every documented table count must equal the migrations', and no document may call
+  the master key id optional. Each reads the code as authority and fails naming the offending key,
+  code or count. Markdown tables drift silently because **nothing compiles against them** — that is
+  what let four invented keys survive review, and these guards are what stops it recurring.
+
+
 - **The per-event cost breakdown priced by the wrong key and invented rates when it missed
   (ISSUE-0164).** `get_usage_event_breakdown_internal` bound `canonical_id` into a column literally
   named `upstream_model_id`. For any provider whose upstream id differs from the canonical id — most

@@ -548,16 +548,27 @@ llmroller healthcheck --url http://127.0.0.1:8080/readyz
 
 Administrators can update runtime settings without downtime via `PATCH /admin/api/settings`:
 
-| Key | Default | Validation & Effect |
-| :--- | :--- | :--- |
-| `default_routing_strategy` | `"smooth_weighted_rr"` | Default algorithm (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `p2c`, etc.). |
-| `global_exposure_mode` | `"union"` | `"union"` (exposed if any key serves) or `"intersection"` (requires all keys). |
-| `price_sync_catalog_url` | `"https://models.dev/api.json"` | Target URL for automated price-book synchronization. |
-| `timeout_failover` | `false` | Whether to trigger failover on upstream request timeouts. |
-| `recovery_repin_min_idle_secs`| `300` | Idle seconds before a session pinned away from personal tier returns home. |
-| `retention_usage_events_days`| `90` | Retention window for individual raw usage event records. |
-| `retention_usage_rollups_days`| `365` | Retention window for aggregated hourly usage rollups. |
-| `retention_trace_records_days`| `30` | Retention window for content traceability records. |
+The registry is **closed**: any key not in the table below is rejected with HTTP `422
+unknown_setting_key`. The 14 keys and their defaults are taken from
+`crates/core/src/settings.rs`, which is the authority — this table is a convenience, not a second
+definition.
+
+| Key | Type | Default | Validation & Effect |
+| :--- | :--- | :--- | :--- |
+| `pin_ttl_secs` | Integer | `86400` | `300..=2592000`. Sliding idle expiration window in seconds for confirmed session pins (`RTE-10`). |
+| `max_active_pins` | Integer | `250000` | `1000..=1000000`. Maximum entries in `PinStore`; overflow routes unpinned (`RTE-10`). |
+| `usage_poll_interval_secs` | Integer | `300` | `60..=3600`. Polling interval for upstream key `/usage` endpoints (`USG-4`). |
+| `default_routing_strategy` | Enum | `"smooth_weighted_rr"` | `smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random` (`random`), `weighted_random`, or `power_of_two_choices` (`p2c`) (`RTE-4`, `RTE-14`). |
+| `headroom_scaling_enabled` | Boolean | `false` | Scales weighted route weights by remaining budget basis points (`RTE-13`). |
+| `repin_on_personal_recovery` | Boolean | `true` | Enables recovery repin from a fallback tier to a higher-priority tier once idle (`RTE-2`). |
+| `recovery_repin_min_idle_secs`  | Integer | `300` | `0..=86400`. Minimum idle seconds before a recovery repin is permitted (`RTE-2`). |
+| `global_exposure_mode` | Enum | `"union"` | `"union"` (exposed if any key serves) or `"intersection"` (requires every key) (`MDL-3`). |
+| `usage_events_retention_days` | Integer | `30` | `1..=365`. Retention window in days for raw `usage_events` and `usage_attempts` rows (`REL-3`). |
+| `usage_events_max_rows` | Integer | `50000000` | `>= 1000000`. Raw `usage_events` row cap before the sweeper prunes oldest rows (`A6`). |
+| `drain_timeout_secs` | Integer | `60` | `0..=3600`. Maximum seconds to wait for open SSE streams after `SIGTERM` (`REL-1`). |
+| `price_sync_catalog_url` | Object | `{"enabled":false,"url":"https://models.dev/api.json"}` | `{enabled, url}`; `url` must be `https://` when `enabled` is true (`PRIV-1`, `USG-3`). |
+| `unpriced_fallback_rates` | Object | `{"input":3000000,"output":15000000,"cache_read":300000,"cache_write":3750000}` | `{input, output, cache_read, cache_write}` in micro-USD per MTok; all non-negative (`USG-3`). |
+| `traceability_config` | Object | `{"enabled":false,"match_filters":{"user_ids":[],"client_key_ids":[],"models":[]},"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability; `retention_days` `1..=90` (`TRC-1`, `TRC-7`). |
 
 ---
 

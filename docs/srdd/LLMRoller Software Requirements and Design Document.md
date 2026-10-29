@@ -88,7 +88,7 @@ The specification is split into twenty-five numbered Markdown files (`0` through
 | `6. SRDD - Functional Requirements.md` | Functional requirements | Testable P0, P1, and P2 functional specifications |
 | `7. SRDD - Non-Functional Requirements.md` | Non-functional requirements | Latency, memory budgets, streaming, compatibility, and operational targets |
 | `8. SRDD - Security and Privacy.md` | Security and privacy | Threat model, key hierarchy, SSRF connector, isolation, and supply-chain controls |
-| `9. SRDD - Data Model.md` | Data model | 31-table SQLite WAL schema, canonical AAD encryption rules, dual-queue writer, and retention policies |
+| `9. SRDD - Data Model.md` | Data model | 33-table SQLite WAL schema, canonical AAD encryption rules, dual-queue writer, and retention policies |
 | `10. SRDD - Routing Design.md` | Routing design | Request gates, candidate checks, pluggable routing strategy engine, pin state machine, error classifier, and failover |
 | `11. SRDD - Session Identification and Hints.md` | Session identification and hints | Eight-step inbound session extraction, response-link inheritance, hashing, and outbound hints |
 | `12. SRDD - Protocol Handling and Transparent Proxying.md` | Protocol handling and transparent proxying | Request and response header policies, surgical body edits, streaming tee, and token extraction |
@@ -609,6 +609,7 @@ Every subcommand uses the following non-overlapping exit codes so supervisors an
 | Exit code | Meaning across all subcommands |
 | --- | --- |
 | `0` | Success (clean drain, verified backup, completed rotation, intact audit log, or completed admin reset) |
+| `1` | `llmroller healthcheck` could not reach `/readyz` or received a non-`200` response (connection error, timeout, or unhealthy target); a setup-token resolve/create failure during `serve` startup; or an unexpected SQLite error during migration (`MigrationError::Sqlx`). A supervisor treating `1` as "unhealthy" rather than "misconfigured" is correct. |
 | `2` | Invalid CLI flag, invalid environment variable, or non-loopback plaintext listener rejected at startup |
 | `3` | Master key missing, decoded length not equal to 32 bytes, insecure key-file permissions, `rotation_state == 'in_progress'`, `LLMROLLER_MASTER_KEY_ID != active_master_key_id`, or failure to unseal `instance_secrets` |
 | `4` | `llmroller.lock` held by another process |
@@ -617,9 +618,9 @@ Every subcommand uses the following non-overlapping exit codes so supervisors an
 | `7` | AEAD authentication failure on an existing row during `rotate-master-key` |
 | `8` | `audit_log` HMAC mismatch or `seq` gap detected |
 | `9` | `audit_log` tail truncation detected against `--anchor-seq` and `--anchor-hash` |
-| `10` | Target username not found (`reset-admin`) |
+| `10` | Target not found: username absent (`reset-admin`), database file absent (`doctor`), or no `instance_meta` row yet (`export-diagnostics`) — i.e. "initialise first" rather than "it is broken" |
 | `11` | Graceful shutdown completed with unflushed items remaining in writer or sealer queues after timeout |
-| `12` | Controlled shutdown triggered by an unrecoverable SQLite writer panic |
+| `12` | Controlled shutdown triggered by an unrecoverable SQLite writer panic. **Reserved:** `EXIT_WRITER_PANIC` is declared and this row documents the intended contract, but the writer actor is currently an unsupervised `tokio` task, so no production path returns `12` yet. Verify before scripting against it (`ISSUE-0055`). |
 | `13` | SQLite migration run failure or `auto_vacuum != INCREMENTAL` |
 | `14` | Database `_llmroller_schema.version` is newer than this binary supports |
 | `15` | Database `_llmroller_schema.version` is **older** than this binary supports; `llmroller doctor` / `export-diagnostics` read a version below the running binary's `SCHEMA_VERSION` (schema drift between binary and file, `ISSUE-0183`) |
@@ -663,7 +664,7 @@ LLMRoller separates static bootstrap parameters from dynamic runtime policies. S
 | --- | --- | --- |
 | `LLMROLLER_MASTER_KEY_FILE` | Filesystem path (`None`, preferred) | Path to a file with `0400` or `0600` permissions (group/other bits rejected with exit `3`) containing the base64 master key; mutually exclusive with `LLMROLLER_MASTER_KEY`. |
 | `LLMROLLER_MASTER_KEY` | Base64 string (mandatory unless `_FILE` set) | Must decode to **exactly** 32 raw bytes (`SEC-2`, exit `3` if shorter or longer). Because `std::env::remove_var` is `unsafe` in Rust 2024 and the workspace enforces `#![forbid(unsafe_code)]`, startup logs a one-time warning when this env var is used instead of `LLMROLLER_MASTER_KEY_FILE`. |
-| `LLMROLLER_MASTER_KEY_ID` | ASCII string (`"mk_default"`) | Identifier checked against `instance_meta.active_master_key_id` at startup (exit `3` on mismatch) and bound into AEAD `AAD` on newly sealed rows (`SEC-1`). |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string (**required**, no default) | Identifier checked against `instance_meta.active_master_key_id` at startup and bound into AEAD `AAD` on newly sealed rows. **Exit `3` if absent, empty, or not equal to the active id** (`SEC-1`, `SEC-2`). |
 | `LLMROLLER_DATA_DIR` | Filesystem path (`"/var/lib/llmroller"`) | Directory holding `llmroller.db`, `llmroller.db-wal`, `llmroller.db-shm`, `llmroller.lock`, and `setup-token`. |
 | `LLMROLLER_LISTEN` | Socket address (`"0.0.0.0:8080"`) | Data-plane HTTP/HTTPS bind address serving `/v1/*`, `/healthz`, and `/readyz`. |
 | `LLMROLLER_ADMIN_LISTEN` | Socket address (`"127.0.0.1:8081"`) | Control-plane HTTP/HTTPS bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login` (`SEC-9`). |
@@ -1772,7 +1773,7 @@ The `settings` table enforces a closed 14-key registry. Any unknown key or out-o
 | `drain_timeout_secs` | Integer `0..=3600` | `60` | Maximum seconds to wait for open SSE streams to finish after `SIGTERM` (`REL-1`). |
 | `price_sync_catalog_url` | Object `{enabled: bool, url: https}` | `{"enabled":false,"url":"https://models.dev/api.json"}` | Opt-in external price-book synchronization configuration (`PRIV-1`, `USG-3`). |
 | `unpriced_fallback_rates` | Object `{input, output, cache_read, cache_write}` | `{"input":3000000,"output":15000000,"cache_read":300000,"cache_write":3750000}` | Fallback micro-USD per MTok rates charged whenever no `prices` row matches (`USG-3`). |
-| `traceability_config` | Object `{enabled, match, retention_days 1..=90, auto_disable_at}` | `{"enabled":false,"match":{"user_ids":[],"client_key_ids":[],"models":[]},"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
+| `traceability_config` | Object `{enabled, match_filters, retention_days 1..=90, auto_disable_at}` | `{"enabled":false,"match_filters":{"user_ids":[],"client_key_ids":[],"models":[]},"retention_days":14,"auto_disable_at":null}` | Admin opt-in content traceability mode configuration (`TRC-1`, `TRC-7`). |
 
 ### 9.4 Service accounts, control-plane logs, and cost-breakdown query patterns
 
@@ -3176,7 +3177,7 @@ llmroller/
                               #   header pipelines, inline SseUsageTap, bounded TraceTap,
                               #   ProviderAdapter trait, 5-class error classifier, /models & /usage parsers
     store/                    # SQLite persistence, sealer pool, and cryptography:
-                              #   connect_options(role), 31-table migrations & triggers, dual-queue
+                              #   connect_options(role), 33-table migrations & triggers, dual-queue
                               #   batching writer (Control + durable_state, rollups, raw_events),
                               #   2-thread zstd::bulk::Compressor sealer pool, canonical AAD sealer,
                               #   resumable rotate-master-key, Argon2id, HMAC audit_log chain
@@ -3412,7 +3413,7 @@ The table below defines the scope, deliverables, and exit criteria for each mile
 
 | Milestone (Big-Bang Epic) | Scope and deliverables | Exit criteria (must pass in `cargo xtask traceability --milestone <M>` before starting next milestone) |
 | --- | --- | --- |
-| `M0`: Foundation, Dual-Queue Writer, Reloader, RBAC, and Auth (`Epic 1`: `1.1`..`1.6`) | Six-crate + `xtask` workspace, foundational Docker scaffolding (`Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`), `POR-1` multi-arch CI matrix, `connect_options(role)` + 31-table SQLite WAL migrations (`auto_vacuum = INCREMENTAL`), `instance_meta` & `instance_secrets`, canonical AAD `XChaCha20-Poly1305` sealer, offline resumable 500-row `rotate-master-key`, `ActorScope::{User, System}`, `Argon2id` + TOTP + `setup-token` file (`0600`) + `reset-admin` CLI + 3-tier login limiter, HMAC `audit_log` with `audit_anchor`, dual-queue writer (`Control` + `Data` `4 MiB` cap), closed 14-key settings registry (including `default_routing_strategy`), and single `Reloader` task (`config_version` + `RuntimeState`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `MNT-3`, `POR-1` (build matrix + base container build), `REL-4`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
+| `M0`: Foundation, Dual-Queue Writer, Reloader, RBAC, and Auth (`Epic 1`: `1.1`..`1.6`) | Six-crate + `xtask` workspace, foundational Docker scaffolding (`Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`), `POR-1` multi-arch CI matrix, `connect_options(role)` + 33-table SQLite WAL migrations (`auto_vacuum = INCREMENTAL`), `instance_meta` & `instance_secrets`, canonical AAD `XChaCha20-Poly1305` sealer, offline resumable 500-row `rotate-master-key`, `ActorScope::{User, System}`, `Argon2id` + TOTP + `setup-token` file (`0600`) + `reset-admin` CLI + 3-tier login limiter, HMAC `audit_log` with `audit_anchor`, dual-queue writer (`Control` + `Data` `4 MiB` cap), closed 14-key settings registry (including `default_routing_strategy`), and single `Reloader` task (`config_version` + `RuntimeState`). | `AUTH-1`..`AUTH-9`, `USR-1`, `AUD-1`, `MNT-1`, `MNT-2`, `MNT-3`, `POR-1` (build matrix + base container build), `REL-4`, `SEC-1`, `SEC-2`, `SEC-4`, `SEC-10`, `SEC-13`, `SEC-14`, `SEC-17` tests pass; zero surviving mutants in `crates/store`. |
 | `M1`: Transparent Pass-Through Proxy & Orchestrator v1 (`Epic 2`: `2.0`..`2.7`) | Minimal control-plane JSON CRUD (`2.0`), `GuardedConnector` socket-level SSRF filter (`2.1`), client key issuance and `prev_key_hash` grace rotation + gates `G1`..`G6` + `auth_failure_counters` + `/healthz`, `/readyz`, `/metrics` with closed label allow-list (`2.2`), request & response header pipelines (`R1`..`R5`) (`2.3`), duplicate-rejecting surgical JSON span editor (`2.4`), 64 KiB pre-first-frame holding buffer + 64 KiB usage-chunk filter + `RequestLifecycle` drop guard (`2.5`), `ProviderAdapter` presets (`2.6`), and `/v1/*` orchestrator v1 + `LLMROLLER_PREFLIGHT_BODY_BUDGET_MB` admission queue + 8-step `SIGTERM` drain + parser fuzz targets + initial TTFF load benchmark (`2.7`). | `PRV-1`..`PRV-5`, `PRV-7`, `CLK-1`, `CLK-4`, `API-2`..`API-4`, `API-6`, `API-7`, `TRN-0`..`TRN-3`, `PERF-1`, `PERF-2`, `REL-1`, `OBS-1`, `SEC-3`, `SEC-6`..`SEC-9`, `SEC-12`, `SEC-15` tests pass. |
 | `M2`: Pure Pricing/Windows Core, Catalog, Consented Sharing, Pluggable Routing Engine, and Pinning (`Epic 3`: `3.0a`..`3.7`) | Pure `crates/core::pricing` + binary-aware estimator (`3.0a`), pure `WindowState` (360-bucket rings, day-clamped calendar months, decaying `UpstreamObservation`, cache-aware `try_reserve`) (`3.0b`), pure UTC monthly accumulators + gate `G7` (`3.0c`), `/models` discovery + digit-preserving normalization + surrogate `model_pk` merge/split (`3.1`), consented `provider_shares` (`effective_share`, `share_config_fingerprint`, `custom` approval) (`3.2`), 8-step session resolver + 21-slot detector + `Shared`/`Global` carrier stripping (`3.3`), `C1`..`C8` + 3-tier pool selector (`3.4`), pluggable `RouteSelector` engine (`smooth_weighted_rr`, `naive_rr`, `weighted_rr`, `uniform_random`, `weighted_random`, `power_of_two_choices`) (`3.5`), pure health/5-class classifier/`OriginBreaker` (`3.6a`), `PinStore` mutex state machine + durable `response_links` inheritance + failover (`3.6b`), and orchestrator v2 (`3.7`). | `USR-2`..`USR-5`, `PRV-8`, `SHR-1`..`SHR-5`, `CLK-2`, `CLK-3`, `CLK-5`, `MDL-1`..`MDL-7`, `RTE-1`..`RTE-14`, `API-8`, `LIM-1`, `REL-5`, `SEC-16` tests pass; zero surviving mutants in `crates/core`. |
 | `M3`: Usage Pipeline, 5-Min & Hourly Rollups, Orchestrator v3, and Retention (`Epic 4`: `4.1`..`4.3`, `4.6`, `4.7`) | Inline `SseUsageTap` and `JsonUsageExtractor` with unified `cache_read` and `cache_write` subtraction (`4.1`), `models.dev` price sync and body-based price APIs (`4.2`), three-queue writer (`durable_state`, `rollups`, `raw_events` `VecDeque` dropping oldest) + `usage_events` + `usage_attempts` + `usage_rollups_5min` + `usage_rollups_hourly` + `SIGKILL` recovery (`4.3`), orchestrator v3 wiring live usage and reservations (`4.6`), and general retention sweeper + 30 s/256 MiB WAL checkpointer + `SQLITE_FULL` handling (`4.7`). | `SHR-6`, `API-5`, `USG-1`..`USG-3`, `REL-2`, `REL-3`, `PRIV-1` tests and all golden SSE fixtures in `fixtures/sse/` pass. |
@@ -4014,6 +4015,7 @@ services:
         condition: service_completed_successfully
     environment:
       LLMROLLER_MASTER_KEY_FILE: /run/secrets/llmroller_master_key
+      # The deployment chooses the key id; the binary has no default (exit 3 if unset).
       LLMROLLER_MASTER_KEY_ID: ${LLMROLLER_MASTER_KEY_ID:-mk_2026_10}
       LLMROLLER_DATA_DIR: /var/lib/llmroller
       LLMROLLER_LISTEN: 0.0.0.0:8080
@@ -4144,6 +4146,10 @@ services:
         condition: service_completed_successfully
     environment:
       LLMROLLER_MASTER_KEY: ${LLMROLLER_DEV_MASTER_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      # Deliberately a different id from the prod profile: the two profiles use different
+      # databases, so a shared id would only invite copying one file's key id onto the other's
+      # rows, which the `active_master_key_id` check rejects with exit 3. Distinct values make a
+      # profile mix-up fail loudly instead of silently reusing an identifier.
       LLMROLLER_MASTER_KEY_ID: mk_dev
       LLMROLLER_DATA_DIR: /var/lib/llmroller
       LLMROLLER_LISTEN: 0.0.0.0:8080
@@ -4234,11 +4240,18 @@ LLMRoller validates all environment variables at startup before opening network 
 
 The table below lists all supported environment variables, their defaults, and their validation rules.
 
+> **`LLMROLLER_MASTER_KEY_ID` is required and has no binary default.** It must equal the
+> `instance_meta.active_master_key_id` recorded when the instance was initialised. Omitting it, or
+> supplying an arbitrary value, exits `3` — the same code as a corrupt `instance_secrets` row, which
+> is why the failure is easy to misdiagnose as database corruption rather than a missing variable. The
+> Compose profiles below supply `mk_2026_10` (prod) and `mk_dev` (dev): those are *the deployment
+> choosing a value*, which is legitimate and is not a binary default.
+
 | Variable name | Type | Default | Mandatory / optional | Description and validation rule |
 | --- | --- | --- | --- | --- |
 | `LLMROLLER_MASTER_KEY_FILE` | Path | `None` | Mandatory (unless `LLMROLLER_MASTER_KEY` is set) | Path to a `0400`/`0600` file containing the base64-encoded 32-byte master key (`/run/secrets/llmroller_master_key` in Docker). Group or world permission bits cause exit `3` (`SEC-2`). |
 | `LLMROLLER_MASTER_KEY` | Base64 string | `None` | Optional fallback | Raw base64 master key; must decode to **exactly** 32 bytes (exit `3` otherwise). Logs a one-time `/proc/<pid>/environ` warning at startup (`SEC-2`). |
-| `LLMROLLER_MASTER_KEY_ID` | ASCII string | `"mk_default"` | Optional | Key identifier `^[A-Za-z0-9_.-]{1,64}$` verified against `instance_meta.active_master_key_id` at startup (exit `3` on mismatch, `SEC-1`). |
+| `LLMROLLER_MASTER_KEY_ID` | ASCII string | `None` | **Mandatory** | Key identifier bound into the AEAD `AAD` of newly sealed rows and verified against `instance_meta.active_master_key_id` at startup (**exit `3` if absent, empty, or mismatched**, `SEC-1`, `SEC-2`). It must equal the `active_master_key_id` recorded when the instance was initialised; an arbitrary id is not a default, it is a startup failure. |
 | `LLMROLLER_DATA_DIR` | Path | `"/var/lib/llmroller"` | Optional | Writable directory holding `llmroller.db`, `-wal`, `-shm`, `llmroller.lock`, and `setup-token`. |
 | `LLMROLLER_LISTEN` | SocketAddr | `"0.0.0.0:8080"` | Optional | Data-plane bind address serving `/v1/*`, `/healthz`, and `/readyz` (exit `5` on bind error). |
 | `LLMROLLER_ADMIN_LISTEN` | SocketAddr | `"127.0.0.1:8081"` | Optional | Control-plane bind address serving `/admin/*`, `/app/*`, `/api/*`, `/setup`, and `/login`. Non-loopback without TLS or `LLMROLLER_TRUSTED_PROXIES` exits with code `2` (`SEC-5`). |
