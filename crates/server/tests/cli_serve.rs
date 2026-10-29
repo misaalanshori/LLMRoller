@@ -513,3 +513,246 @@ async fn serve_starts_normally_without_tls_vars() {
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// ISSUE-0186 / ISSUE-0187 — the two spec-required timers, on a live process
+// ---------------------------------------------------------------------------
+
+/// Spawn `serve` with extra env, wait `observe_for`, then stop it and return everything it logged.
+///
+/// # Why an env knob and not a shorter timeout
+///
+/// The real periods are ten minutes and one hour. A test that used them would either not run or not
+/// be run; `LLMROLLER_TEST_PERIODIC_INTERVAL_SECS` collapses both so this exercises the *shipped
+/// path* — real binary, real `serve`, real tasks — in a few seconds. The defaults are asserted
+/// separately (`periodic_interval_defaults_match_the_specs`) so the knob cannot become the only
+/// behaviour under test.
+///
+/// stdout carries the JSON log lines (`SEC-13` says the anchor goes to `stdout`), so stdout is the
+/// stream captured here. The child is always stopped: [`tokio::time::timeout`] bounds the wait, and
+/// `kill_on_drop` reaps it, so "the server keeps running" is the expected case rather than a hang.
+async fn serve_and_collect_logs(
+    extra: &[(&str, &str)],
+    observe_for: std::time::Duration,
+    listen_address: Option<&str>,
+) -> String {
+    let dir = tempdir().expect("temp dir");
+    serve_and_collect_logs_in(dir.path(), extra, observe_for, listen_address).await
+}
+
+/// Same as [`serve_and_collect_logs`] but against a caller-owned data directory, so a test can
+/// modify the database between two runs.
+async fn serve_and_collect_logs_in(
+    data_dir: &std::path::Path,
+    extra: &[(&str, &str)],
+    observe_for: std::time::Duration,
+    listen_address: Option<&str>,
+) -> String {
+    let stdout_path = data_dir.join("serve.stdout");
+    let stdout_file = std::fs::File::create(&stdout_path).expect("stdout file");
+    let mut command = tokio::process::Command::new(llmroller_binary());
+    command
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--listen")
+        .arg(listen_address.map_or_else(
+            || format!("127.0.0.1:{}", get_available_port()),
+            ToString::to_string,
+        ))
+        .arg("--admin-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .arg("--metrics-listen")
+        .arg(format!("127.0.0.1:{}", get_available_port()))
+        .env("LLMROLLER_MASTER_KEY", BASE64.encode([0x51; 32]))
+        .env("LLMROLLER_MASTER_KEY_ID", "key-periodic-test")
+        .kill_on_drop(true)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::null());
+    for (name, value) in extra {
+        command.env(name, value);
+    }
+
+    let mut child = command.spawn().expect("spawn serve");
+
+    // Always bounded: the server does not exit on its own, so this is the only way to sample it.
+    tokio::time::sleep(observe_for).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    std::fs::read_to_string(&stdout_path).unwrap_or_default()
+}
+
+/// `SEC-9`: a non-loopback plaintext bind must repeat the error, not warn once and go quiet.
+///
+/// Pre-fix the process logs one `WARN` at startup and nothing ever again, so an operator tailing the
+/// log cannot distinguish "still plaintext after an hour" from "fixed an hour ago". This asserts the
+/// repeat on the real binary: one startup warning, then at least one `ERROR` from the repeater.
+#[doc = "Spec: SEC-9, Spec: SEC-10 — ISSUE-0187"]
+#[tokio::test]
+async fn serve_repeats_the_plaintext_error_on_a_live_process() {
+    let port = get_available_port();
+    let listen = format!("0.0.0.0:{port}");
+    let logs = serve_and_collect_logs(
+        &[("LLMROLLER_TEST_PERIODIC_INTERVAL_SECS", "1")],
+        std::time::Duration::from_secs(5),
+        Some(&listen),
+    )
+    .await;
+
+    let startup_warnings = logs
+        .lines()
+        .filter(|line| line.contains("Binding plaintext data-plane on non-loopback"))
+        .count();
+    assert_eq!(
+        startup_warnings, 1,
+        "exactly one startup warning is expected; the repeater must not duplicate it. logs:\n{logs}"
+    );
+
+    let repeats = logs
+        .lines()
+        .filter(|line| line.contains("still serving plaintext"))
+        .count();
+    assert!(
+        repeats >= 1,
+        "SEC-9 requires the plaintext error to repeat (found {repeats}); logs:\n{logs}"
+    );
+
+    let error_lines = logs
+        .lines()
+        .filter(|line| line.contains("still serving plaintext") && line.contains("\"ERROR\""))
+        .count();
+    assert!(
+        error_lines >= 1,
+        "the repeat must be an ERROR, not a warning (SEC-9); logs:\n{logs}"
+    );
+
+    assert!(
+        logs.contains(&listen),
+        "the repeated error must name the address it is about ({listen}); logs:\n{logs}"
+    );
+}
+
+/// A loopback bind must log no repeater line at all — the task is not spawned (`§2`, `ISSUE-0187`).
+#[doc = "Spec: SEC-9 — ISSUE-0187"]
+#[tokio::test]
+async fn serve_logs_no_plaintext_error_on_a_loopback_bind() {
+    let logs = serve_and_collect_logs(
+        &[("LLMROLLER_TEST_PERIODIC_INTERVAL_SECS", "1")],
+        std::time::Duration::from_secs(4),
+        None,
+    )
+    .await;
+
+    assert!(
+        !logs.contains("still serving plaintext"),
+        "a loopback bind must spawn no repeater; logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains("Binding plaintext data-plane on non-loopback"),
+        "a loopback bind must not warn about plaintext; logs:\n{logs}"
+    );
+}
+
+/// `SEC-13`/`AUD-1`: a live instance must emit an `audit_anchor` on a clock even when the row
+/// counter is silent.
+///
+/// Two runs against one data directory, because the precondition cannot be created any other way:
+///
+/// 1. Start `serve` long enough to migrate and initialize the instance (which unseals
+///    `audit_hmac_key`), then stop it.
+/// 2. Append **one** audit row through the real `audit::append` path. One row, so the 100-row
+///    counter cannot fire — the timer must be the only possible source of an anchor, which is
+///    precisely the idle-instance state the "at least hourly" clause exists for.
+/// 3. Start `serve` again and assert the timer attested that tip.
+///
+/// Deliberately **not** asserting anything about an empty log: emitting nothing there is correct
+/// (`ISSUE-0186` §3), and a fresh database is covered by
+/// `hourly_anchor_emits_nothing_on_an_empty_audit_log`.
+#[doc = "Spec: AUD-1, Spec: SEC-13 — ISSUE-0186"]
+#[tokio::test]
+async fn serve_emits_an_audit_anchor_from_the_timer() {
+    let dir = tempdir().expect("temp dir");
+    let master_key_b64 = BASE64.encode([0x51; 32]);
+
+    // (1) Initialize the instance.
+    let _ = serve_and_collect_logs_in(
+        dir.path(),
+        &[("LLMROLLER_TEST_PERIODIC_INTERVAL_SECS", "1")],
+        std::time::Duration::from_secs(3),
+        None,
+    )
+    .await;
+
+    // (2) Append exactly one audit row through the production path.
+    let pool = llmroller_store::pool::open_pool(
+        &dir.path().join("llmroller.db"),
+        llmroller_store::pool::Role::Writer,
+    )
+    .await
+    .expect("open pool");
+    let master_key = llmroller_store::crypto::MasterKey::from_base64(&master_key_b64)
+        .expect("decode master key");
+    let instance_state = llmroller_store::instance::load_or_initialize(
+        &pool,
+        "key-periodic-test",
+        &master_key,
+        std::sync::Arc::new(llmroller_core::seams::OsEntropy::new()),
+        1_700_000_000_000,
+    )
+    .await
+    .expect("load instance state");
+    {
+        use llmroller_core::seams::ExposeSecret as _;
+        use sqlx::Connection as _;
+        let mut connection = pool.acquire().await.expect("acquire");
+        let mut transaction = connection.begin().await.expect("begin");
+        llmroller_store::audit::append(
+            &mut transaction,
+            instance_state.audit_hmac_key.expose_secret(),
+            llmroller_store::audit::AuditEntry {
+                id: "periodic-anchor-seed",
+                ts: 1_700_000_000_000,
+                actor_user_id: None,
+                ip_addr: None,
+                action: "periodic.anchor.seed",
+                target_type: "instance",
+                target_id: None,
+                detail_json: None,
+            },
+        )
+        .await
+        .expect("append the single seed audit row");
+        transaction.commit().await.expect("commit");
+    }
+    pool.close().await;
+
+    // (3) The timer must attest that tip.
+    let logs = serve_and_collect_logs_in(
+        dir.path(),
+        &[("LLMROLLER_TEST_PERIODIC_INTERVAL_SECS", "1")],
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .await;
+
+    let anchor_lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("audit_anchor") && line.contains("\"seq\""))
+        .collect();
+    assert!(
+        !anchor_lines.is_empty(),
+        "the hourly timer must anchor a one-row chain that the 100-row counter never reaches; \
+         logs:\n{logs}"
+    );
+    for line in &anchor_lines {
+        assert!(
+            line.contains("\"seq\":1"),
+            "the anchor must attest the real chain tip (seq 1), not seq 0; line: {line}"
+        );
+        assert!(
+            !line.contains("\"seq\":0"),
+            "an anchor must never be fabricated for an empty chain; line: {line}"
+        );
+    }
+}
