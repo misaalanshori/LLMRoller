@@ -542,15 +542,16 @@ pub(crate) async fn get_admin_usage_event_breakdown_handler(
     get_usage_event_breakdown_internal(&state, None, &id).await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn get_usage_event_breakdown_internal(
     state: &ApiAppState,
     owner_user_id: Option<String>,
     event_id_or_request_id: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use llmroller_core::pricing::{ContextTier, Rates, Schedule, TokenUsage, div_ceil_i128};
+    use llmroller_core::pricing::{ContextTier, Rates, TokenUsage, div_ceil_i128};
 
     let sql = if owner_user_id.is_some() {
-        "SELECT id, ts, request_id, canonical_id, upstream_key_id,
+        "SELECT id, ts, request_id, canonical_id, upstream_key_id, upstream_model_id, provider_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
@@ -558,7 +559,7 @@ pub(crate) async fn get_usage_event_breakdown_internal(
          WHERE (id = ? OR request_id = ?) AND owner_user_id = ?
          LIMIT 1"
     } else {
-        "SELECT id, ts, request_id, canonical_id, upstream_key_id,
+        "SELECT id, ts, request_id, canonical_id, upstream_key_id, upstream_model_id, provider_id,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 reasoning_tokens,
                 cost_micro_usd, list_cost_micro_usd, plan_multiplier_bps, billing_coverage_mode
@@ -587,9 +588,11 @@ pub(crate) async fn get_usage_event_breakdown_internal(
     let ts: i64 = row.try_get("ts").unwrap_or(0);
     let canonical_id: String = row
         .try_get::<Option<String>, _>("canonical_id")
-        .unwrap_or(None)
+        .unwrap_or_default()
         .unwrap_or_default();
-    let upstream_key_id: Option<String> = row.try_get("upstream_key_id").unwrap_or(None);
+    let upstream_key_id: Option<String> = row
+        .try_get::<Option<String>, _>("upstream_key_id")
+        .unwrap_or_default();
     let in_uncached = row
         .try_get::<Option<i64>, _>("input_uncached_tokens")
         .unwrap_or(None)
@@ -613,66 +616,43 @@ pub(crate) async fn get_usage_event_breakdown_internal(
         .try_get("billing_coverage_mode")
         .unwrap_or_else(|_| "pay_as_you_go".to_string());
 
-    // Look up price entry (base rates + tiers_json + schedule_json) for this event (F-070)
-    let mut base_rates = Rates::default();
-    let mut tiers: Vec<ContextTier> = Vec::new();
-    let mut schedules: Vec<Schedule> = Vec::new();
-    let price_row = if let Some(ref uk_id) = upstream_key_id {
-        sqlx::query(
-            "SELECT pr.input_per_mtok_micro_usd, pr.output_per_mtok_micro_usd,
-                    pr.cache_read_per_mtok_micro_usd, pr.cache_write_per_mtok_micro_usd,
-                    pr.tiers_json, pr.schedule_json
-             FROM prices pr
-             LEFT JOIN upstream_keys k ON k.id = ?
-             WHERE pr.upstream_model_id = ?
-             ORDER BY CASE WHEN pr.provider_id = k.provider_id THEN 0
-                           WHEN pr.provider_id = '' THEN 1
-                           ELSE 2 END
-             LIMIT 1",
-        )
-        .bind(uk_id)
-        .bind(&canonical_id)
-        .fetch_optional(&state.auth.reader_pool)
-        .await
-        .ok()
-        .flatten()
-    } else {
-        sqlx::query(
-            "SELECT input_per_mtok_micro_usd, output_per_mtok_micro_usd,
-                    cache_read_per_mtok_micro_usd, cache_write_per_mtok_micro_usd,
-                    tiers_json, schedule_json
-             FROM prices
-             WHERE upstream_model_id = ?
-             ORDER BY CASE WHEN provider_id = '' THEN 0 ELSE 1 END
-             LIMIT 1",
-        )
-        .bind(&canonical_id)
-        .fetch_optional(&state.auth.reader_pool)
-        .await
-        .ok()
-        .flatten()
+    // The identifiers the price lookup needs (`ISSUE-0164`). `upstream_model_id` is what the price
+    // book is keyed by, and it is *not* the canonical id for most providers.
+    let upstream_model_id: Option<String> = row.try_get("upstream_model_id").ok().flatten();
+    let event_provider_id: Option<String> = row.try_get("provider_id").ok().flatten();
+    // Fall back to the key's provider when the event row left `provider_id` null: same provider,
+    // same lookup. Above it in precedence is the event's own column.
+    let lookup_provider_id: Option<String> = match event_provider_id {
+        Some(pid) => Some(pid),
+        None => match upstream_key_id.as_ref() {
+            Some(uk_id) => sqlx::query_scalar("SELECT provider_id FROM upstream_keys WHERE id = ?")
+                .bind(uk_id)
+                .fetch_optional(&state.auth.reader_pool)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
     };
 
-    if let Some(pr) = price_row {
-        base_rates = Rates {
-            input_per_mtok_micro_usd: pr.try_get("input_per_mtok_micro_usd").unwrap_or(3_000_000),
-            output_per_mtok_micro_usd: pr
-                .try_get("output_per_mtok_micro_usd")
-                .unwrap_or(15_000_000),
-            cache_read_per_mtok_micro_usd: pr
-                .try_get("cache_read_per_mtok_micro_usd")
-                .unwrap_or(300_000),
-            cache_write_per_mtok_micro_usd: pr
-                .try_get("cache_write_per_mtok_micro_usd")
-                .unwrap_or(3_750_000),
-        };
-        if let Ok(Some(tj)) = pr.try_get::<Option<String>, _>("tiers_json") {
-            tiers = serde_json::from_str(&tj).unwrap_or_default();
+    let price = crate::api::price_resolution::resolve_price(
+        state,
+        lookup_provider_id.as_deref(),
+        upstream_model_id.as_deref(),
+        &canonical_id,
+    )
+    .await?;
+    let (base_rates, tiers, schedules, priced_by) = match price {
+        crate::api::price_resolution::PriceResolution::Priced {
+            base_rates,
+            tiers,
+            schedules,
+            priced_by,
+        } => (Some(base_rates), tiers, schedules, Some(priced_by)),
+        crate::api::price_resolution::PriceResolution::Unavailable => {
+            (None, Vec::new(), Vec::new(), None)
         }
-        if let Ok(Some(sj)) = pr.try_get::<Option<String>, _>("schedule_json") {
-            schedules = serde_json::from_str(&sj).unwrap_or_default();
-        }
-    }
+    };
 
     // `reasoning` is a diagnostic subset of `output`, so it is carried for display but is not
     // part of `total_input()` or any priced line item: `calculate_cost_micro_usd` prices exactly
@@ -691,7 +671,8 @@ pub(crate) async fn get_usage_event_breakdown_internal(
     };
     let total_input = tokens.total_input();
     let active_tier = tiers.iter().find(|t| t.matches(total_input));
-    let effective_rates = active_tier.map_or(base_rates, ContextTier::rates);
+    // `None` when no price row was found, so nothing downstream can accidentally price the event.
+    let effective_rates = base_rates.map(|base| active_tier.map_or(base, ContextTier::rates));
     let active_schedule = schedules.iter().find(|s| s.matches(ts));
     let (mult_num, mult_den) = active_schedule.map_or((1_i64, 1_i64), |s| {
         (s.multiplier_num.max(1), s.multiplier_den.max(1))
@@ -702,43 +683,68 @@ pub(crate) async fn get_usage_event_breakdown_internal(
         let den = 1_000_000_i128 * (mult_den as i128);
         div_ceil_i128(num, den) as i64
     };
-    let input_cost = line_cost(in_uncached, effective_rates.input_per_mtok_micro_usd);
-    let cache_read_cost = line_cost(cache_read, effective_rates.cache_read_per_mtok_micro_usd);
-    let cache_write_cost = line_cost(cache_write, effective_rates.cache_write_per_mtok_micro_usd);
-    let output_cost = line_cost(output, effective_rates.output_per_mtok_micro_usd);
+
+    // `line_items` always carries the four token classes, because the token counts are metered
+    // facts independent of whether a price row exists — the Logs Explorer, the Usage Ledger and
+    // this popover must agree on the canonical total (`input_uncached + cache_read + cache_write +
+    // output`) even for an event nobody can price.
+    //
+    // What is `null` when no price row was found is the **money**: `rate_per_mtok_micro_usd` and
+    // `subtotal_micro_usd` are absent rather than computed from invented rates. A number here says
+    // "this cost that", which would be false and confident; `null` says "we could not price it",
+    // and `pricing` says why.
+    let priced = |tokens: i64, rate: Option<i64>| -> serde_json::Value {
+        match rate {
+            Some(rate) => serde_json::json!({
+                "tokens": tokens,
+                "rate_per_mtok_micro_usd": rate,
+                "subtotal_micro_usd": line_cost(tokens, rate),
+            }),
+            None => serde_json::json!({ "tokens": tokens }),
+        }
+    };
+    let rate_of =
+        |pick: fn(&Rates) -> i64| -> Option<i64> { effective_rates.map(|rates| pick(&rates)) };
+    let line_items_json = serde_json::json!({
+        "input_uncached": priced(in_uncached, rate_of(|r| r.input_per_mtok_micro_usd)),
+        "cache_read": priced(cache_read, rate_of(|r| r.cache_read_per_mtok_micro_usd)),
+        "cache_write": priced(cache_write, rate_of(|r| r.cache_write_per_mtok_micro_usd)),
+        "output": priced(output, rate_of(|r| r.output_per_mtok_micro_usd)),
+    });
+    let rates_json = match effective_rates {
+        Some(rates) => serde_json::json!(rates),
+        None => serde_json::Value::Null,
+    };
+    let tier_applied = effective_rates.is_some() && active_tier.is_some();
 
     Ok(Json(serde_json::json!({
         "id": row.try_get::<String, _>("id").unwrap_or_default(),
         "request_id": row.try_get::<String, _>("request_id").unwrap_or_default(),
         "ts": ts,
         "canonical_id": canonical_id,
-        "rates": effective_rates,
-        "tier_applied": active_tier.is_some(),
+        // `price_book` when a row was found, `unavailable` when it was not. Never a silent number.
+        "pricing": if priced_by.is_some() { "price_book" } else { "unavailable" },
+        // Which identifier the row was matched on: `upstream_model_id`, `canonical_id`, or `None`.
+        // Exposed because "priced by the canonical id as a last resort" is materially different
+        // from "priced by this provider's own upstream id", and an operator debugging a surprising
+        // cost needs to know which happened.
+        "priced_by": priced_by.map_or(serde_json::Value::Null, |p| serde_json::json!(p.as_str())),
+        "rates": rates_json,
+        "tier_applied": tier_applied,
         "schedule_multiplier": {
             "numerator": mult_num,
             "denominator": mult_den,
         },
-        "line_items": {
-            "input_uncached": {
-                "tokens": in_uncached,
-                "rate_per_mtok_micro_usd": effective_rates.input_per_mtok_micro_usd,
-                "subtotal_micro_usd": input_cost,
-            },
-            "cache_read": {
-                "tokens": cache_read,
-                "rate_per_mtok_micro_usd": effective_rates.cache_read_per_mtok_micro_usd,
-                "subtotal_micro_usd": cache_read_cost,
-            },
-            "cache_write": {
-                "tokens": cache_write,
-                "rate_per_mtok_micro_usd": effective_rates.cache_write_per_mtok_micro_usd,
-                "subtotal_micro_usd": cache_write_cost,
-            },
-            "output": {
-                "tokens": output,
-                "rate_per_mtok_micro_usd": effective_rates.output_per_mtok_micro_usd,
-                "subtotal_micro_usd": output_cost,
-            },
+        "line_items": line_items_json,
+        // Tokens are metered facts, independent of whether a price row exists, so they are always
+        // reported — including for an unpriced event.
+        "tokens_observed": {
+            "input_uncached": in_uncached,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
+            "output": output,
+            "reasoning": tokens.reasoning,
+            "total_input": total_input,
         },
         // Diagnostic only, deliberately *not* a `line_items` entry: reasoning is a subset of
         // `output`, so a fifth priced line would imply a charge that does not exist.

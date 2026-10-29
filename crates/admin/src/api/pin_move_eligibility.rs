@@ -153,16 +153,20 @@ async fn owned_pin_models(
     pool: &sqlx::SqlitePool,
     owner_user_id: String,
     session_hash: &str,
+    canonical_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>, (StatusCode, Json<serde_json::Value>)> {
     sqlx::query_as(
         "SELECT p.model_pk, m.canonical_id
          FROM pins p
          JOIN models m ON m.model_pk = p.model_pk
          WHERE p.session_hash = ?
-           AND p.client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)",
+           AND p.client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)
+           AND (? IS NULL OR m.canonical_id = ?)",
     )
     .bind(session_hash)
     .bind(owner_user_id)
+    .bind(canonical_filter)
+    .bind(canonical_filter)
     .fetch_all(pool)
     .await
     .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))
@@ -175,15 +179,25 @@ async fn owned_pin_models(
 /// handler answers `404` — which is the pre-existing, correct behaviour (`USR-3`), not an
 /// eligibility failure. Returning `Ok(())` here lets that path keep producing `404` rather than
 /// turning it into a `422` about a key the caller is allowed to name.
+/// `canonical_filter` mirrors the `UPDATE`'s own `(? IS NULL OR model_pk IN (…))` predicate, so the
+/// set verified is exactly the set moved (`ISSUE-0235`). Verifying every model the caller owns in
+/// the session — which is what this did before — rejected a move onto a key that serves the model
+/// the caller actually named.
 pub(crate) async fn verify_move_target_for_owned_pins(
     state: &ApiAppState,
     owner_user_id: UserId,
     session_hash: &str,
+    canonical_filter: Option<&str>,
     target_key: UpstreamKeyId,
     now_ms: i64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let models =
-        owned_pin_models(&state.auth.pool, owner_user_id.to_string(), session_hash).await?;
+    let models = owned_pin_models(
+        &state.auth.pool,
+        owner_user_id.to_string(),
+        session_hash,
+        canonical_filter,
+    )
+    .await?;
     for (model_pk, canonical_id) in models {
         verify_target_serves_model_pk(
             &state.auth.pool,

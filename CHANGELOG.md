@@ -8,6 +8,56 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **The per-event cost breakdown priced by the wrong key and invented rates when it missed
+  (ISSUE-0164).** `get_usage_event_breakdown_internal` bound `canonical_id` into a column literally
+  named `upstream_model_id`. For any provider whose upstream id differs from the canonical id — most
+  of them, e.g. `openai/gpt-4o-2024-11-20` vs `gpt-4o` — the lookup missed, and the miss fell back
+  to `Rates::default()`: `$3 / $15 / $0.30 / $3.75 per MTok`. So the popover showed a **confident
+  cost computed from rates that were never in the price book**, with nothing saying so. Money is
+  where a plausible default does the most damage — wrong, confident and consequential.
+
+  The lookup now selects `usage_events.upstream_model_id` and resolves in a documented precedence:
+  `(provider_id, upstream_model_id)`, then the provider-agnostic `('', upstream_model_id)`, then the
+  same two steps with `canonical_id` as a deliberate last resort — canonically-priced rows genuinely
+  exist, and the original bug was using that path *first and only*, not using it at all. This
+  mirrors `ConfigSnapshot::price_for`, which cannot be called from this crate because it needs the
+  in-memory snapshot and `ApiAppState` carries none.
+
+  **No price row is now a reported state, not a fabricated number.** The response carries
+  `"pricing": "price_book" | "unavailable"` and `"priced_by": "upstream_model_id" | "canonical_id" |
+  null`, so which identifier matched is visible after the fact. When pricing is unavailable, `rates`
+  is `null` and each `line_items` entry carries only `tokens` — no `rate_per_mtok_micro_usd`, no
+  `subtotal_micro_usd`. The four token classes are still reported in full, because token counts are
+  metered facts and the Logs Explorer, the Usage Ledger and this popover must agree on the canonical
+  total even for an event nobody can price.
+
+  **"Row absent" and "column missing within a found row" are handled differently on purpose.** A
+  found row whose rate column cannot be read is a schema surprise and returns `500`; an absent row
+  is a reportable state and returns `pricing: "unavailable"`. The old `unwrap_or(3_000_000)` treated
+  them identically, which is exactly how the invented value became a displayed cost.
+
+  The lookup moved into `crates/admin/src/api/price_resolution.rs` as one named function with its
+  own doc comment, because the precedence and the absence policy are policy rather than an inline
+  block inside a 400-line handler — and because a third copy of the chain is how the drift happened.
+
+  The `reasoning_tokens` half of the issue was already correct (read from the row, returned as a
+  diagnostic field, deliberately not a priced line item) and is untouched; a test pins it.
+
+- **A user pin move naming `canonical_id` moved every pin in the session (ISSUE-0235).** The admin
+  handler got a `canonical_id` filter in cycle 36; the user handler did not, so
+  `POST /api/user/pins/move` with one model named silently repointed every model's pin in that
+  session onto the target key. Cycle 44 then added `verify_move_target_for_owned_pins`, which
+  validated the target against **every** model the caller had pinned there, so the same request was
+  also falsely rejected whenever some other model's pin was unservable. Over-broad write and false
+  rejection at once.
+
+  The `UPDATE` now carries the admin handler's single-statement form —
+  `AND (? IS NULL OR model_pk IN (SELECT model_pk FROM models WHERE canonical_id = ?))` — rather
+  than two string-built branches differing only in a `WHERE` clause, which is how the original
+  drifted. `verify_move_target_for_owned_pins` takes the same `canonical_filter`, so the set
+  validated is exactly the set moved: a move naming a model is validated against that model alone,
+  and a session-wide move still validates all of them.
+
 - **A trace record was returned with its block references unresolved (ISSUE-0165).**
   `get_trace_record_internal` decrypted `trace_records.payload_enc` and returned the skeleton
   verbatim, `{"$blk": "<sha256>"}` placeholders and all, without ever reading `trace_blocks`. So

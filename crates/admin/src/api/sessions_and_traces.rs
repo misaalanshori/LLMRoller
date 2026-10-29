@@ -992,7 +992,19 @@ pub(crate) async fn post_user_move_pin_body_handler(
     // predicate is the same one the `UPDATE` below uses, so the models verified are exactly the
     // models moved. A rejection here happens before `execute_atomic_mutation`, so nothing is
     // written and nothing needs rolling back.
-    verify_move_target_for_owned_pins(&state, user_id, &session_hash, target_key, now_ms).await?;
+    // `ISSUE-0235`: validate only the models this move will actually touch. A session-wide move
+    // (`canonical_id` absent) still touches every model the caller owns there; a move that names a
+    // model must be validated against that model alone, or a target that serves it would still be
+    // rejected for failing some *other* model's pin that this move never touches.
+    verify_move_target_for_owned_pins(
+        &state,
+        user_id,
+        &session_hash,
+        payload.canonical_id.as_deref(),
+        target_key,
+        now_ms,
+    )
+    .await?;
 
     let target_tier_int: i64 = if key_record.owner_user_id == Some(user_id) {
         0
@@ -1009,6 +1021,7 @@ pub(crate) async fn post_user_move_pin_body_handler(
 
     let user_id_str = user_id.to_string();
     let session_for_tx = session_hash.clone();
+    let canonical_filter = payload.canonical_id.clone();
     // `RETURNING` gives the rows this statement actually changed, so the store is driven by the
     // write's own result rather than by a second query that could disagree with it.
     let moved: Vec<(String, String)> = execute_atomic_mutation(&state, Vec::new(), move |tx| {
@@ -1024,6 +1037,9 @@ pub(crate) async fn post_user_move_pin_body_handler(
                        AND client_key_id IN (
                            SELECT id FROM client_keys WHERE owner_user_id = ?
                        )
+                       AND (? IS NULL OR model_pk IN (
+                           SELECT model_pk FROM models WHERE canonical_id = ?
+                       ))
                      RETURNING client_key_id, model_pk",
             )
             .bind(target_key.to_string())
@@ -1031,6 +1047,8 @@ pub(crate) async fn post_user_move_pin_body_handler(
             .bind(now_ms)
             .bind(&session_for_tx)
             .bind(&user_id_str)
+            .bind(&canonical_filter)
+            .bind(&canonical_filter)
             .fetch_all(&mut **tx)
             .await
             .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;

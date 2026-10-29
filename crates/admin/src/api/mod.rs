@@ -72,6 +72,7 @@ pub(crate) mod logs_and_audit;
 pub(crate) mod models;
 pub(crate) mod partials;
 pub(crate) mod pin_move_eligibility;
+pub(crate) mod price_resolution;
 pub(crate) mod providers;
 pub(crate) mod router;
 pub(crate) mod service_accounts;
