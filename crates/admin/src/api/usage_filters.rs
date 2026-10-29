@@ -367,8 +367,11 @@ pub(crate) use tenant_audit_visibility;
 /// "datatype mismatch" that names no column. That is exactly what happened while writing this:
 /// the fragment has 12 placeholders (actor, user target, 2× share, client_key, upstream_key,
 /// provider, service_account, web_session, 2× trace, session) and the first binder copied 11.
-/// `tenant_audit_visibility_placeholder_count_matches_binder` in this module's tests now pins the
-/// two together so the next edit cannot repeat it.
+/// `tenant_audit_visibility_placeholder_count_matches_binder` (this module's tests) pins the two
+/// together: equality catches a miscount, and an exact-count assertion catches a clause removed
+/// *with* its bind, which equality alone cannot see. That second check is the one that matters
+/// here, because these clauses are a security decision and a silent removal hides a target type
+/// from the owner it belongs to.
 macro_rules! bind_tenant_audit_visibility {
     ($query:expr, $user_id:expr) => {
         $query
@@ -497,20 +500,47 @@ mod tests {
             count_binds!(bind_audit_log_filters, &f),
             "audit clause vs bind_audit_log_filters!:\n{audit}"
         );
+    }
 
-        // The tenant-visibility predicate binds the caller's id once per placeholder, so its
-        // binder takes a plain string rather than a filter struct.
-        let tenant = tenant_audit_visibility!();
-        assert_eq!(
-            placeholders(tenant),
-            count_binds!(bind_tenant_audit_visibility, "user-id"),
-            "tenant visibility clause vs bind_tenant_audit_visibility!:\n{tenant}"
+    /// `ISSUE-0172`: the tenant-visibility predicate and its binder must agree on placeholder
+    /// count.
+    ///
+    /// This name is cited by [`bind_tenant_audit_visibility`]'s doc comment, so it must resolve —
+    /// a doc comment claiming a guard that does not exist is worse than an admitted gap, because
+    /// the next reader stops looking.
+    ///
+    /// Separate from [`every_clause_declares_the_number_of_binds_its_binder_supplies`] rather than
+    /// folded into it because this predicate's clauses are a **security decision**: each one grants
+    /// a tenant visibility of a target type, so a silent *removal* is the failure mode, not just a
+    /// miscount. The exact-count assertion below is what notices that; an equality-only test would
+    /// pass if a clause and its bind were deleted together.
+    ///
+    /// Both sides are read from the **shipped** macros — `tenant_audit_visibility!()` and
+    /// `bind_tenant_audit_visibility!` are the same expansions the two handlers splice into their
+    /// queries, so this counts the strings that actually run. A duplicated literal here would
+    /// guard nothing.
+    #[test]
+    fn tenant_audit_visibility_placeholder_count_matches_binder() {
+        let fragment = tenant_audit_visibility!();
+        let declared = placeholders(fragment);
+        let bound = count_binds!(bind_tenant_audit_visibility, "user-id");
+
+        assert_ne!(
+            declared, 0,
+            "an empty fragment would make 0 == 0 pass and guard nothing:\n{fragment}"
         );
         assert_eq!(
-            placeholders(tenant),
-            12,
-            "the tenant predicate has 12 placeholders; if this number changed, the binder must \
-             change with it and the visibility test must still cover every target type:\n{tenant}"
+            declared, bound,
+            "tenant visibility clause vs bind_tenant_audit_visibility!: {declared} placeholders, \
+             {bound} binds -- a mis-splice shifts every later bind by one and returns a plausible \
+             wrong set rather than failing:\n{fragment}"
+        );
+        assert_eq!(
+            declared, 12,
+            "the tenant predicate has 12 placeholders (actor, user target, 2x share, client_key, \
+             upstream_key, provider, service_account, web_session, 2x trace, session). If this \
+             changed, a clause was added or removed -- check that \
+             `audit_visibility_tests` still covers every target type:\n{fragment}"
         );
     }
 

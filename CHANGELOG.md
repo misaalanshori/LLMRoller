@@ -33,7 +33,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   synthetic clicks to confirm the dispatcher still routes. It passes identically against the
   pre-split file, which is the evidence that behaviour did not change.
 
-### Security
+### Tests
+
+- **A doc comment cited a guard test by a name that did not resolve (ISSUE-0172, follow-up).**
+  `bind_tenant_audit_visibility`'s doc said
+  `tenant_audit_visibility_placeholder_count_matches_binder` "in this module's tests now pins the
+  two together". The *assertions* existed — inside
+  `every_clause_declares_the_number_of_binds_its_binder_supplies` — but the cited name did not, so
+  the comment and the commit message both pointed at something a reader could not find. That is the
+  same class as an untested redactor: a safety property that reads as guarded while the reader's
+  search comes back empty.
+
+  The assertions now live in the cited name, so the reference resolves. Nothing was duplicated: the
+  tenant block moved out of the combined test rather than being repeated in a second one.
+
+  Two checks, and the second is the one that earns its keep. Equality alone catches a *miscount*,
+  but a clause deleted **together with its bind** keeps the two sides equal at 11 — and this
+  predicate's clauses are a security decision, so a silent removal hides a target type from its
+  owner. An exact-count assertion (`12`) notices that. Both were demonstrated red: an extra `?`
+  with no bind gives `13 placeholders, 12 binds`; dropping the `session` clause and its bind
+  together gives `left: 11, right: 12`. A count assertion nobody has seen fail is another
+  assertion nobody has seen work.
 
 - **A tenant's audit log omitted every admin action on their own resources (ISSUE-0172).**
   `/api/user/audit-log` and `/app/partials/audit-log` decide what a tenant may see in an
