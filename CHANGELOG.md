@@ -8,6 +8,45 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **A session-pin move accepted any target key, with no route behind it (ISSUE-0167).** Both move
+  handlers verified only that the caller **owns** the target, then wrote SQLite and `PinStore` and
+  answered `{"moved": true}`. So a move onto a disabled key, a quarantined key, or a key with no
+  `model_routes` row for the pinned model succeeded — and the session's next request had no eligible
+  route. The pin the operator created was worse than the one it replaced. This is the same family as
+  `ISSUE-0232`: a successful write that produces a broken pin.
+
+  `14.t.4` already specified the fix: the handler "verifies that `target_upstream_key_id` passes
+  candidate checks `C1` through `C8` for `(caller, canonical_id)` (returning HTTP `422
+  target_route_ineligible` otherwise)". The response is now exactly that code, with a message naming
+  the failed condition (`no route for the pinned model`, `disabled`, `quarantined (health:
+  invalid)`, `exhausted for its current quota window`, `cooling down after failures`, `route … is
+  disabled`, `route … is not active`).
+
+  **The check is a documented partial C1–C8, not a SQL imitation of the real thing.** The data
+  plane's predicate is `evaluate_candidate`, fed by `eligibility_route`, which needs
+  `&ConfigSnapshot` and `&RuntimeState`. `ApiAppState` exposes neither — it carries `auth.pool`,
+  `writer`, `reloader_tx`, `published_version`, `pin_store`, `token_manager`, and no runtime state.
+  So what is verified is what is a function of rows: route existence for the exact `model_pk`,
+  `upstream_keys.enabled`, `upstream_keys.health` (honouring `health_until`, mirroring
+  `KeyHealthEntry::is_routable`), `model_routes.enabled`, and `model_routes.status = 'active'`.
+  **Not** verifiable here, and listed in `pin_move_eligibility::NOT_CHECKABLE_HERE`: C7 origin
+  breaker, C8 budget admission, the memory half of C6, C2 share authorization, C4 exposure and
+  merge-review rules, and C5 protocol narrowing (a pin move does not know the next request's
+  protocol). SQLite health is a faithful **projection** of memory — `project_health` writes it
+  through the durable queue and encodes the same rule as `is_routable` — which is why checking it is
+  a real check rather than a stale claim.
+
+  The models verified are exactly the models the `UPDATE` would move: the user handler resolves them
+  through the same `client_key_id IN (SELECT id FROM client_keys WHERE owner_user_id = ?)` predicate
+  the write uses, the admin handler through its own `session_hash`/`canonical_id` filter. A
+  rejection happens **before** `execute_atomic_mutation`, so nothing is written and nothing needs
+  rolling back. An unknown or foreign key still answers `404`, not `422`, so a caller cannot probe
+  another tenant's key space by distinguishing "not yours" from "yours but ineligible" (`USR-3`).
+
+  The `canonical_id` filter the issue also complained about was already correct for the **admin**
+  handler (cycle 36, `375c17a`); the **user** handler never filtered by it at all, and that is
+  reported in the cycle report rather than changed here.
+
 
 - **The active-pins view read only durable state, so a pin was invisible until the writer flushed
   it (ISSUE-0168).** `GET /api/user/pins`, `GET /admin/api/pins` and `GET /app/partials/pins`

@@ -945,6 +945,18 @@ pub(crate) async fn post_user_move_pin_body_handler(
     }
 
     let now_ms = state.auth.clock.now_ms();
+
+    // `14.t.4`: the target must be able to serve the pinned model before the pin is moved onto
+    // it. Without this the handler happily wrote a pin to a disabled, quarantined, or unrouted
+    // key and answered `{"moved": true}`, leaving the session with no eligible route on its next
+    // request — a successful write that produces a broken pin (`ISSUE-0167`).
+    //
+    // The pinned model is the one(s) the caller owns pins for in this session; the ownership
+    // predicate is the same one the `UPDATE` below uses, so the models verified are exactly the
+    // models moved. A rejection here happens before `execute_atomic_mutation`, so nothing is
+    // written and nothing needs rolling back.
+    verify_move_target_for_owned_pins(&state, user_id, &session_hash, target_key, now_ms).await?;
+
     let target_tier_int: i64 = if key_record.owner_user_id == Some(user_id) {
         0
     } else if key_record.owner_user_id.is_some() {
@@ -1131,6 +1143,18 @@ pub(crate) async fn post_admin_move_session_pin_handler(
             "upstream key not found",
         ));
     };
+
+    // `14.t.4`: same guard as the user handler. The admin handler is the same operation with a
+    // different ownership predicate, and leaving one unguarded is how this defect family
+    // survives (`ISSUE-0167`).
+    verify_move_target_for_admin(
+        &state,
+        &session_hash,
+        payload.canonical_id.as_deref(),
+        target_key,
+        now_ms,
+    )
+    .await?;
 
     let canonical_filter = payload.canonical_id.clone();
     let session_for_tx = session_hash.clone();

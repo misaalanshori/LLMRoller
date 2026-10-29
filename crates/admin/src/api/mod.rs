@@ -71,6 +71,7 @@ pub(crate) mod log_detail_drawer;
 pub(crate) mod logs_and_audit;
 pub(crate) mod models;
 pub(crate) mod partials;
+pub(crate) mod pin_move_eligibility;
 pub(crate) mod providers;
 pub(crate) mod router;
 pub(crate) mod service_accounts;
@@ -90,6 +91,9 @@ pub(crate) use log_detail_drawer::*;
 pub(crate) use logs_and_audit::*;
 pub(crate) use models::*;
 pub(crate) use partials::*;
+pub(crate) use pin_move_eligibility::{
+    verify_move_target_for_admin, verify_move_target_for_owned_pins,
+};
 pub(crate) use providers::*;
 pub use router::*;
 pub(crate) use service_accounts::*;
