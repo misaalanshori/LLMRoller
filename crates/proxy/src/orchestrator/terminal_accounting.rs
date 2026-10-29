@@ -38,6 +38,8 @@ pub(crate) struct TerminalUsageFacts<'a> {
     pub(crate) billing_coverage_mode: String,
     pub(crate) plan_multiplier_bps: i64,
     pub(crate) request_headers_json: Option<String>,
+    /// Admission-decided geo attribution carrier (`#158`).
+    pub(crate) metadata_json: Option<String>,
     /// HTTP status recorded on the event.
     pub(crate) status: StatusCode,
     pub(crate) is_streaming: bool,
@@ -85,6 +87,7 @@ pub(crate) fn enqueue_terminal_usage(
             .as_ref()
             .map(ToString::to_string),
         request_headers_json: facts.request_headers_json,
+        metadata_json: facts.metadata_json,
     };
     let event = usage.event(
         facts.now,

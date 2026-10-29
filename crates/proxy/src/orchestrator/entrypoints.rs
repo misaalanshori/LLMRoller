@@ -5,6 +5,7 @@ pub async fn post_chat_completions(
     State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     client_key: Option<Extension<ClientKeyRecord>>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
     handle_inference_request(
@@ -13,6 +14,7 @@ pub async fn post_chat_completions(
         headers,
         body,
         client_key.map(|e| e.0),
+        connect_info.map(|Extension(ci)| ci.0),
     )
     .await
 }
@@ -22,6 +24,7 @@ pub async fn post_responses(
     State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     client_key: Option<Extension<ClientKeyRecord>>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
     handle_inference_request(
@@ -30,6 +33,7 @@ pub async fn post_responses(
         headers,
         body,
         client_key.map(|e| e.0),
+        connect_info.map(|Extension(ci)| ci.0),
     )
     .await
 }
@@ -39,6 +43,7 @@ pub async fn post_messages(
     State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     client_key: Option<Extension<ClientKeyRecord>>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
     handle_inference_request(
@@ -47,6 +52,7 @@ pub async fn post_messages(
         headers,
         body,
         client_key.map(|e| e.0),
+        connect_info.map(|Extension(ci)| ci.0),
     )
     .await
 }
@@ -56,6 +62,7 @@ pub async fn post_embeddings(
     State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     client_key: Option<Extension<ClientKeyRecord>>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
     handle_inference_request(
@@ -64,6 +71,7 @@ pub async fn post_embeddings(
         headers,
         body,
         client_key.map(|e| e.0),
+        connect_info.map(|Extension(ci)| ci.0),
     )
     .await
 }

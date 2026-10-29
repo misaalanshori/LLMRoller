@@ -586,18 +586,18 @@ async fn insert_usage_event(
                 )
             },
         );
+    // `#158`: `client_location` comes only from the admission-decided `metadata_json`
+    // carrier, never from `request_headers_json`. The latter holds the inbound client's own
+    // headers, so a `cf-ipcountry` there is a claim the caller made about itself — extracting
+    // it wrote an attacker-chosen value into the very field audit and abuse review read. This
+    // actor cannot see the peer address, so it cannot re-derive trust; admission decides while
+    // the connection is known and stamps the answer into `metadata_json`
+    // (`llmroller_proto::geo::client_location_metadata`).
     let client_location = extract_json_string_field(
         e.metadata_json.as_deref(),
         &["client_location", "location"],
         128,
-    )
-    .or_else(|| {
-        extract_json_string_field(
-            e.request_headers_json.as_deref(),
-            &["cf-ipcountry", "x-client-location"],
-            128,
-        )
-    });
+    );
 
     sqlx::query(
         r#"INSERT INTO usage_events (

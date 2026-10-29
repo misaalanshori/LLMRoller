@@ -38,6 +38,7 @@ pub(crate) async fn handle_streaming_attempt(
         store_flag,
         pin_ttl_ms,
         request_headers_json,
+        metadata_json,
         origin,
         secret,
         input_tokens_est,
@@ -170,6 +171,7 @@ pub(crate) async fn handle_streaming_attempt(
                                 billing_coverage_mode,
                                 plan_multiplier_bps,
                                 request_headers_json: request_headers_json.clone(),
+                                metadata_json: metadata_json.clone(),
                                 status: rej_status,
                                 is_streaming: true,
                                 termination: Termination::Completed.as_str(),
@@ -531,6 +533,7 @@ pub(crate) async fn handle_streaming_attempt(
             plan_multiplier_bps,
             service_account_id: caller.service_account_id.clone().map(|sa| sa.to_string()),
             request_headers_json: request_headers_json.clone(),
+            metadata_json: metadata_json.clone(),
         };
         let trace = trace_request.map(|request_body| {
             TraceCapture::new(

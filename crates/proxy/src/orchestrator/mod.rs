@@ -7,6 +7,7 @@
 //! Phase: ./docs/bigbang/big-bang-phases-2.md#27-sub-phase-27-v1-orchestrator-v1-pre-flight-body-memory-budget-graceful-sigterm-drain-and-early-load-harness
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -114,6 +115,8 @@ pub use entrypoints::*;
 pub use errors::*;
 pub use pipeline::*;
 pub use preflight::*;
+#[doc(hidden)]
+pub use routes::client_location_metadata_from as client_location_metadata_from_for_test;
 pub(crate) use routes::*;
 pub(crate) use session::*;
 #[doc(hidden)]

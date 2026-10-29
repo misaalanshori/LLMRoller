@@ -33,6 +33,8 @@ pub(crate) struct AttemptExecutionContext<'a> {
     pub(crate) store_flag: bool,
     pub(crate) pin_ttl_ms: i64,
     pub(crate) request_headers_json: Option<String>,
+    /// Admission-decided geo attribution carrier (`#158`).
+    pub(crate) metadata_json: Option<String>,
     pub(crate) origin: &'a OriginKey,
     pub(crate) secret: &'a str,
     pub(crate) input_tokens_est: i64,

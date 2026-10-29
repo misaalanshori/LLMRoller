@@ -6,11 +6,13 @@ pub async fn handle_inference_request(
     headers: HeaderMap,
     body: Bytes,
     client_key: Option<ClientKeyRecord>,
+    peer_addr: Option<SocketAddr>,
 ) -> Response {
-    let admitted = match admit_inbound_request(state, endpoint, headers, body, client_key).await {
-        Ok(admitted) => admitted,
-        Err(err_response) => return err_response,
-    };
+    let admitted =
+        match admit_inbound_request(state, endpoint, headers, body, client_key, peer_addr).await {
+            Ok(admitted) => admitted,
+            Err(err_response) => return err_response,
+        };
     run_inference_attempt_loop(admitted).await
 }
 
@@ -25,6 +27,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
         request_id,
         request_id_str,
         request_headers_json,
+        metadata_json,
         headers,
         body,
         permit,
@@ -467,6 +470,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                             billing_coverage_mode,
                             plan_multiplier_bps,
                             request_headers_json: request_headers_json.clone(),
+                            metadata_json: metadata_json.clone(),
                             status: StatusCode::GATEWAY_TIMEOUT,
                             is_streaming,
                             termination: Termination::IdleTimeout.as_str(),
@@ -764,6 +768,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                             plan_multiplier_bps,
                             service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
                             request_headers_json: request_headers_json.clone(),
+                            metadata_json: metadata_json.clone(),
                         };
                         let event = usage.event(
                             now,
@@ -1053,6 +1058,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                             plan_multiplier_bps,
                             service_account_id: caller.service_account_id.map(|sa| sa.to_string()),
                             request_headers_json: request_headers_json.clone(),
+                            metadata_json: metadata_json.clone(),
                         };
                         let event = usage.event(
                             now,
@@ -1142,6 +1148,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             store_flag,
             pin_ttl_ms,
             request_headers_json: request_headers_json.clone(),
+            metadata_json: metadata_json.clone(),
             origin: &origin,
             secret: &secret,
             input_tokens_est,
@@ -1212,6 +1219,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
                 billing_coverage_mode: "pay_as_you_go".to_string(),
                 plan_multiplier_bps: 10_000,
                 request_headers_json: request_headers_json.clone(),
+                metadata_json: metadata_json.clone(),
                 // Every `GateG7Error` renders as 429 (`gate_error_response`).
                 status: StatusCode::TOO_MANY_REQUESTS,
                 is_streaming,
@@ -1265,6 +1273,7 @@ pub(crate) async fn run_inference_attempt_loop(admitted: AdmittedRequest) -> Res
             billing_coverage_mode: "pay_as_you_go".to_string(),
             plan_multiplier_bps: 10_000,
             request_headers_json: request_headers_json.clone(),
+            metadata_json: metadata_json.clone(),
             status: terminal_status,
             is_streaming,
             termination: Termination::UpstreamTruncated.as_str(),

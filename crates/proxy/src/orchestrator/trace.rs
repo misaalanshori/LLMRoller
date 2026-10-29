@@ -163,6 +163,8 @@ pub(crate) struct UsageContext {
     pub(crate) plan_multiplier_bps: i64,
     pub(crate) service_account_id: Option<String>,
     pub(crate) request_headers_json: Option<String>,
+    /// Admission-decided geo attribution carrier (`#158`).
+    pub(crate) metadata_json: Option<String>,
 }
 
 impl UsageContext {
@@ -229,7 +231,7 @@ impl UsageContext {
             service_account_id: self.service_account_id.clone(),
             stop_reason,
             request_headers_json: self.request_headers_json.clone(),
-            metadata_json: None,
+            metadata_json: self.metadata_json.clone(),
         }
     }
 }

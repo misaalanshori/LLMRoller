@@ -289,17 +289,15 @@ pub fn peer_addr_from(extensions: &axum::http::Extensions) -> SocketAddr {
 
 /// Whether `peer_ip` is inside `trusted_proxies` (`SEC-12`).
 ///
-/// One matcher for both forwarded-header readers — [`extract_client_ip`] for
-/// `X-Forwarded-For` and [`cookie_policy_for`] for `X-Forwarded-Proto` — so the two can never
-/// disagree about who is trusted.
+/// The implementation now lives in [`llmroller_core::trust::peer_is_trusted_proxy`] (`#158`),
+/// because the data plane needs the same answer and `llmroller_proxy` cannot depend on
+/// `llmroller_admin` — `admin` already depends on `proxy`, so importing this direction would be
+/// a cycle. Rather than keep two copies that can drift, this delegates. The three callers that
+/// must agree are [`extract_client_ip`] (`X-Forwarded-For`), [`cookie_policy_for`]
+/// (`X-Forwarded-Proto`) and the proxy's `client_location` gate.
+#[must_use]
 fn peer_is_trusted_proxy(peer_ip: IpAddr, trusted_proxies: &[String]) -> bool {
-    if trusted_proxies.is_empty() {
-        return false;
-    }
-    let peer_str = peer_ip.to_string();
-    trusted_proxies
-        .iter()
-        .any(|p| p.trim() == peer_str || cidr_contains(p.trim(), peer_ip))
+    llmroller_core::trust::peer_is_trusted_proxy(peer_ip, trusted_proxies)
 }
 
 /// Extract the effective client IP honoring trusted proxies per `SEC-12`.
@@ -324,52 +322,13 @@ pub fn extract_client_ip(
         let Ok(ip) = entry.parse::<IpAddr>() else {
             break;
         };
-        let is_proxy = trusted_proxies
-            .iter()
-            .any(|p| p.trim() == entry || cidr_contains(p.trim(), ip));
+        let is_proxy = llmroller_core::trust::peer_is_trusted_proxy(ip, trusted_proxies);
         if !is_proxy {
             return ip;
         }
     }
 
     peer_ip
-}
-
-fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
-    let mut parts = cidr.split('/');
-    let Some(network_str) = parts.next() else {
-        return false;
-    };
-    let Some(prefix_len_str) = parts.next() else {
-        return network_str.parse::<IpAddr>() == Ok(ip);
-    };
-    let Ok(prefix_len) = prefix_len_str.parse::<u8>() else {
-        return false;
-    };
-
-    match (network_str.parse::<IpAddr>(), ip) {
-        (Ok(IpAddr::V4(net_v4)), IpAddr::V4(ip_v4)) if prefix_len <= 32 => {
-            let net_u32 = u32::from(net_v4);
-            let ip_u32 = u32::from(ip_v4);
-            let mask = if prefix_len == 0 {
-                0
-            } else {
-                !((1_u32 << (32 - prefix_len)) - 1)
-            };
-            (net_u32 & mask) == (ip_u32 & mask)
-        }
-        (Ok(IpAddr::V6(net_v6)), IpAddr::V6(ip_v6)) if prefix_len <= 128 => {
-            let net_u128 = u128::from(net_v6);
-            let ip_u128 = u128::from(ip_v6);
-            let mask = if prefix_len == 0 {
-                0
-            } else {
-                !((1_u128 << (128 - prefix_len)) - 1)
-            };
-            (net_u128 & mask) == (ip_u128 & mask)
-        }
-        _ => false,
-    }
 }
 
 /// Shared state for authentication handlers and middleware.

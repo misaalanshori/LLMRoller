@@ -8,6 +8,45 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **Any client could write its own `client_location` into its audit record (#158).** The writer
+  extracted `usage_events.client_location` from `cf-ipcountry` / `x-client-location` in
+  `request_headers_json`, which is the **inbound client's own headers**. A caller sending
+  `cf-ipcountry: ZZ` recorded `ZZ` as its location, in the field audit and abuse review read.
+
+  The trust predicate already existed but under another name —
+  `peer_is_trusted_proxy`, governing only the cookie `Secure` decision — so the two questions
+  "may I trust your forwarded headers?" and "may I trust your claimed location?" had different
+  answers. They now have the same one. The predicate moved to
+  `llmroller_core::trust::peer_is_trusted_proxy` because `llmroller_proxy` cannot depend on
+  `llmroller_admin` (`admin` depends on `proxy`), and `admin`'s copy now delegates to it. That
+  also collapsed a third duplicate of the same CIDR arithmetic inside `extract_client_ip`.
+
+  **The gate is at admission, not in the writer.** The write-behind actor consumes queued events
+  and cannot see the peer address, so a check there would always pass or always fail — theatre.
+  `client_location` is now resolved in the proxy while the connection is known, carried to the
+  writer in `metadata_json`, and the writer no longer reads `request_headers_json` for location
+  at all. A gate-only fix would have been undone by the next person who widened that header
+  list, which `#158` was itself asking for.
+
+  `x-geo-country` / `x-geo-city` are honoured from a trusted edge, formatted per `11.3` as
+  `"{city}, {country}"` and `"{country}"`. A city without a country renders alone rather than
+  with a trailing separator, and a value that fails validation is **dropped, never truncated**
+  — a truncated city is a different city. Absent stays NULL, so the drawer renders a dash
+  instead of an invented value.
+
+  `cf-ipcountry`, `x-geo-country`, `x-geo-city` and `x-client-location` are now stripped from
+  **outbound** requests unconditionally. A client-supplied privacy header has no legitimate
+  upstream purpose: it tells the provider something about the caller that the caller chose to
+  assert, and the provider may treat that assertion as trustworthy. The `cf-` prefix rule
+  already caught `cf-ipcountry`; the three others needed their own entries.
+
+  One existing fixture asserted `Some("US")` for a `cf-ipcountry` arriving in the client's
+  headers. That expectation *was* the vulnerability and is now the regression test. Production
+  behaviour did not change for anyone: `request_headers_json` is built from a closed nine-name
+  allow-list that contains no geo header, so `client_location` was already always NULL in
+  practice. The bug was latent — armed the moment that list was widened — and the exposure is
+  why it still needed a fix rather than a note.
+
 - **The admin price API could not round-trip the tiers and schedules the resolver prices with, and a
   PUT that omitted them erased them (ISSUE-0163).** `GET /admin/api/prices` projected only the four flat
   per-MTok columns while `prices.tiers_json` and `prices.schedule_json` existed and were honoured by

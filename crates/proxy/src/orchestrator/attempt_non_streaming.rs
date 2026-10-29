@@ -36,6 +36,7 @@ pub(crate) async fn handle_non_streaming_attempt(
         store_flag,
         pin_ttl_ms,
         request_headers_json,
+        metadata_json,
         origin,
         secret,
         input_tokens_est,
@@ -154,6 +155,7 @@ pub(crate) async fn handle_non_streaming_attempt(
                             .clone()
                             .map(|sa| sa.to_string()),
                         request_headers_json: request_headers_json.clone(),
+                        metadata_json: metadata_json.clone(),
                     };
                     let est_usage = llmroller_proto::json_usage::ExtractedUsage {
                         input_uncached_tokens: input_tokens_est,
@@ -309,6 +311,7 @@ pub(crate) async fn handle_non_streaming_attempt(
                         billing_coverage_mode,
                         plan_multiplier_bps,
                         request_headers_json: request_headers_json.clone(),
+                        metadata_json: metadata_json.clone(),
                         status: StatusCode::BAD_REQUEST,
                         is_streaming: false,
                         termination: Termination::Completed.as_str(),
@@ -641,6 +644,7 @@ pub(crate) async fn handle_non_streaming_attempt(
             plan_multiplier_bps,
             service_account_id: caller.service_account_id.clone().map(|sa| sa.to_string()),
             request_headers_json: request_headers_json.clone(),
+            metadata_json: metadata_json.clone(),
         };
         let mut event = usage.event(
             now,

@@ -43,6 +43,8 @@ pub(crate) mod common;
 mod failover_and_errors;
 #[path = "e2e_wire_orchestrator/forwarding.rs"]
 mod forwarding;
+#[path = "e2e_wire_orchestrator/geo_attribution.rs"]
+mod geo_attribution;
 #[path = "e2e_wire_orchestrator/limits_and_quotas.rs"]
 mod limits_and_quotas;
 #[path = "e2e_wire_orchestrator/protocols_and_headers.rs"]

@@ -356,13 +356,18 @@ pub async fn client_key_auth_middleware(
 ) -> Response {
     let now_ms = state.clock.now_ms();
 
-    let peer_addr = request
+    // The raw peer address, or `None` when the router was built without `ConnectInfo`
+    // (in-process tests, unusual embeddings). Kept as an `Option` because the two readers below
+    // want different things from its absence: rate limiting needs *an* address and defaults to
+    // loopback, while geo attribution must default to **untrusted** (`#158`) — an unknown peer
+    // is not an edge we configured, and assuming loopback would let any in-process caller be
+    // attributed as if Caddy had spoken.
+    let connect_info_peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map_or_else(
-            || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            |ci| ci.0,
-        );
+        .map(|ci| ci.0);
+    let peer_addr =
+        connect_info_peer.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080));
 
     let client_ip = extract_client_ip(peer_addr, &headers, &state.trusted_proxies);
     let path = request.uri().path().to_string();
@@ -418,6 +423,14 @@ pub async fn client_key_auth_middleware(
     let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
         &headers,
     ));
+    // `#158`: geo attribution is decided here, where both the peer address and the headers are
+    // available, and carried to the writer in `metadata_json`. Gate rejections happen before
+    // `admit_inbound_request`, so this path needs its own copy of the same decision.
+    let metadata_json = crate::orchestrator::client_location_metadata_from(
+        &headers,
+        connect_info_peer,
+        &state.trusted_proxies,
+    );
     let is_inference = path.starts_with("/v1/chat/completions")
         || is_messages_path
         || path.starts_with("/v1/responses");
@@ -499,7 +512,7 @@ pub async fn client_key_auth_middleware(
                                 .map(|sa| sa.to_string()),
                             stop_reason: None,
                             request_headers_json: request_headers_json.clone(),
-                            metadata_json: None,
+                            metadata_json: metadata_json.clone(),
                         },
                         Vec::new(),
                     );

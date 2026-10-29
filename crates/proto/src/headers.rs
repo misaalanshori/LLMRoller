@@ -46,7 +46,14 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
 ];
 
 /// Internal and forwarding headers stripped from outbound requests (SEC-15, F011, F023).
-const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 20] = [
+///
+/// `cf-ipcountry`, `x-geo-country`, `x-geo-city` and `x-client-location` are here rather than
+/// behind a per-provider switch (`#158`). A client-supplied **privacy** header has no
+/// legitimate upstream purpose: it tells the provider something about the caller that the
+/// caller chose to assert, and the provider may then treat that assertion as trustworthy.
+/// These are our metadata, so they are stripped unconditionally, and the `cf-` prefix rule
+/// below would catch `cf-ipcountry` even if it were removed from this list.
+const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 23] = [
     "host",
     "content-length",
     "cookie",
@@ -67,6 +74,9 @@ const INTERNAL_STRIP_REQUEST_HEADERS: [&str; 20] = [
     "cf-connecting-ip",
     "cf-ipcountry",
     "true-client-ip",
+    "x-geo-country",
+    "x-geo-city",
+    "x-client-location",
 ];
 
 /// Base allowlisted headers preserved in response pipeline R3.

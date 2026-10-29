@@ -832,6 +832,9 @@ pub(crate) async fn forward_state_bound_response_op(
                     billing_coverage_mode,
                     plan_multiplier_bps,
                     request_headers_json: None,
+                    // A state-bound pass-through carries no inbound `HeaderMap` at this depth,
+                    // so it has no admission-decided location to report (`#158`).
+                    metadata_json: None,
                     // The client sees 502, and the row records what the client saw.
                     status: StatusCode::BAD_GATEWAY,
                     is_streaming: false,
@@ -1277,6 +1280,7 @@ pub async fn post_responses_compact(
     State(state): State<ProxyAuthState>,
     headers: HeaderMap,
     client_key: Option<Extension<ClientKeyRecord>>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response {
     handle_inference_request(
@@ -1285,6 +1289,7 @@ pub async fn post_responses_compact(
         headers,
         body,
         client_key.map(|e| e.0),
+        connect_info.map(|Extension(ci)| ci.0),
     )
     .await
 }

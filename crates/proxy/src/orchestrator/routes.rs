@@ -1,4 +1,5 @@
 use super::*;
+use std::net::SocketAddr;
 
 /// Compute the Unix wall-clock time in milliseconds.
 pub(crate) fn now_ms() -> i64 {
@@ -106,6 +107,30 @@ pub(crate) fn resolve_caller_scope(
     } else {
         parse_scope(&caller.routing_scope)
     }
+}
+
+/// Admission-time `metadata_json` carrier for the trusted-edge `client_location` (`#158`).
+///
+/// This is the whole trust boundary for geo attribution, and it is deliberately one function so
+/// every event path makes the same decision. The peer address is available only here, while the
+/// request is being admitted; the write-behind actor that persists the row cannot see the
+/// connection, so it must not be asked to judge a header the client controls.
+///
+/// Returns `None` unless the connecting peer is in `LLMROLLER_TRUSTED_PROXIES`, so an untrusted
+/// caller cannot influence the stored value by any header. Also `None` when the trusted edge
+/// sent no usable geo header, because `client_location` must never be invented.
+pub fn client_location_metadata_from(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    trusted_proxies: &[String],
+) -> Option<String> {
+    // A request with no `ConnectInfo` is not a real connection; default to untrusted rather
+    // than to loopback, so the in-process default can only ever deny (`#158`).
+    let peer_trusted = peer_addr.is_some_and(|addr| {
+        llmroller_core::trust::peer_is_trusted_proxy(addr.ip(), trusted_proxies)
+    });
+    let location = llmroller_proto::geo::derive_client_location(headers, peer_trusted);
+    llmroller_proto::geo::client_location_metadata(location.as_deref())
 }
 
 /// Whether a discovered route is currently routable by health state.

@@ -11,6 +11,9 @@ pub(crate) struct AdmittedRequest {
     pub(crate) request_id: RequestId,
     pub(crate) request_id_str: String,
     pub(crate) request_headers_json: Option<String>,
+    /// Admission-decided geo attribution carrier (`#158`); `None` unless a trusted edge
+    /// supplied geo headers. Travels with the event because the writer cannot see the peer.
+    pub(crate) metadata_json: Option<String>,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Bytes,
     pub(crate) permit: OwnedSemaphorePermit,
@@ -444,6 +447,7 @@ pub(crate) async fn admit_inbound_request(
     headers: HeaderMap,
     body: Bytes,
     client_key: Option<ClientKeyRecord>,
+    peer_addr: Option<SocketAddr>,
 ) -> Result<AdmittedRequest, Response> {
     let endpoint_str = match endpoint {
         EndpointKind::Chat => "chat",
@@ -470,6 +474,10 @@ pub(crate) async fn admit_inbound_request(
     let request_headers_json = Some(llmroller_proto::headers::extract_safe_diagnostic_headers(
         &headers,
     ));
+    // `#158`: decide geo attribution here, where the peer address is still known, and carry
+    // the answer to the writer in `metadata_json`. The writer cannot see the connection, so a
+    // check it performed itself would be theatre.
+    let metadata_json = client_location_metadata_from(&headers, peer_addr, &state.trusted_proxies);
 
     // 1-4. Shared pre-candidate gates: preflight memory admission, decompression,
     // envelope scan, model resolution, G6 allow-list, client-key TPM and scope
@@ -814,6 +822,7 @@ pub(crate) async fn admit_inbound_request(
                     billing_coverage_mode: "pay_as_you_go".to_string(),
                     plan_multiplier_bps: 10_000,
                     request_headers_json: request_headers_json.clone(),
+                metadata_json: metadata_json.clone(),
                     status: StatusCode::TOO_MANY_REQUESTS,
                     is_streaming: scan.stream.as_ref().is_some_and(|(s, _)| *s),
                     termination: Termination::Completed.as_str(),
@@ -942,6 +951,7 @@ pub(crate) async fn admit_inbound_request(
         request_id,
         request_id_str,
         request_headers_json,
+        metadata_json,
         headers,
         body,
         permit,
