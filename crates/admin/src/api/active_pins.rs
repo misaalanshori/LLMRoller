@@ -58,7 +58,9 @@ pub(crate) fn mask_key_label(
 }
 
 /// Build a `(?, ?, ?)` placeholder list of `count` items for a dynamic `IN` clause.
-fn placeholders(count: usize) -> String {
+///
+/// Shared with the trace block rehydration query, which has the same problem (`trace_rehydration`).
+pub(crate) fn placeholders(count: usize) -> String {
     let mut out = String::with_capacity(count * 2);
     for index in 0..count {
         if index > 0 {

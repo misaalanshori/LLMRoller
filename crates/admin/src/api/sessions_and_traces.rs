@@ -667,7 +667,44 @@ pub(crate) async fn get_trace_record_internal(
         )
     })?;
 
-    Ok(Json(serde_json::to_value(turn_trace).unwrap_or_default()))
+    // `TRC-2`/`TRC-4`: prompt-bearing fields carry `{"$blk": …}` markers where their content used
+    // to be (`prepare_request_blocks`), so the trace is rehydrated before it is returned. Without
+    // this the endpoint answered with a list of hashes (`ISSUE-0165`).
+    //
+    // The whole payload is walked rather than `request_skeleton` alone: a marker is a marker, and
+    // narrowing the walk to one field would need a reason to exclude the others. `block_refs` is
+    // unaffected either way — it is the ordered list of **hash strings**, not `$blk` objects — so
+    // the walk leaves it intact, which is what `resolving_blocks_does_not_change_the_rest_of_the_
+    // payload` asserts.
+    let mut payload = serde_json::to_value(turn_trace).unwrap_or_default();
+    match crate::api::trace_rehydration::resolve_block_references(
+        state,
+        &row_owner,
+        &mut payload,
+        &sealer,
+    )
+    .await
+    {
+        Ok(fetched) => {
+            tracing::debug!(
+                request_id,
+                blocks = fetched,
+                "rehydrated trace block references"
+            );
+        }
+        // A store failure while resolving blocks must not hide the trace itself: the record is
+        // what an operator consults during an incident, and a payload with the markers intact is
+        // still a usable answer. Logged rather than swallowed.
+        Err(_) => {
+            tracing::warn!(
+                request_id,
+                "could not rehydrate trace block references; returning the payload with \
+                 unresolved markers"
+            );
+        }
+    }
+
+    Ok(Json(payload))
 }
 
 pub(crate) async fn delete_admin_session_trace_handler(

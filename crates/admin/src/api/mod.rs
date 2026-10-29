@@ -78,6 +78,7 @@ pub(crate) mod service_accounts;
 pub(crate) mod sessions_and_traces;
 pub(crate) mod settings;
 pub(crate) mod shares;
+pub(crate) mod trace_rehydration;
 pub(crate) mod usage;
 pub(crate) mod usage_filters;
 pub(crate) mod users_and_auth;

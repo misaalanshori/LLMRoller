@@ -8,6 +8,48 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **A trace record was returned with its block references unresolved (ISSUE-0165).**
+  `get_trace_record_internal` decrypted `trace_records.payload_enc` and returned the skeleton
+  verbatim, `{"$blk": "<sha256>"}` placeholders and all, without ever reading `trace_blocks`. So
+  `GET /api/user/traces/{request_id}` answered with a list of hashes where the prompt content should
+  have been — while `get_session_preview_internal`, in the same file, resolved the same blocks
+  correctly. Two read paths, two dialects.
+
+  The fix walks the JSON tree depth-first and collects every distinct `$blk` hash, then fetches them
+  in one `IN (…)` query chunked at 500 hashes (one batch is always enough in practice: `trace_tap`
+  caps unique block bytes at 4 MiB per turn, and the chunk keeps each statement inside even the
+  older 999-variable SQLite limit). A tree walk rather than a field list because the markers live
+  wherever `prepare_request_blocks` put them; a list of `system`/`tools`/`messages` would silently
+  leave a marker behind in any field added later, and a test puts one in a field the issue never
+  names to make that failure visible.
+
+  **Three absences that stay distinct.** A block that is *missing* (swept by retention, or a partial
+  write) keeps its hash and gains `"$unresolved": "missing_block"`; it is never dropped and never
+  `null`, because `null` reads as *empty content*, which is an invented value. A block that *fails
+  to decrypt* is `"$unresolved": "decrypt_failed"` — a different rendering on purpose, since
+  collapsing the two hides a key-rotation fault behind a retention story. A block *owned by another
+  tenant* renders exactly like a missing one.
+
+  That last case is the security boundary, and it is the `AND owner_user_id = ?` on the fetch query
+  that holds it — a block hash is not a secret, since it appears in `$blk` markers throughout every
+  trace. The mutation that removes the predicate is **not** caught by asserting absence of
+  plaintext: a block's AAD binds its owner (`master_key_id || owner_user_id || block_hash`), so a
+  foreign row fails to open and no plaintext can leak either way. What it leaks is *existence and
+  key material* — the row is found, so the renderer says `decrypt_failed` instead of
+  `missing_block`, disclosing that such a block exists under another owner and under a different
+  master key id. The test therefore asserts the *rendering*, and kills the mutant.
+
+  A single unresolvable block does not fail the read: the trace is what an operator consults during
+  an incident, so a partial answer with the gaps marked beats an error page.
+
+  The block-reading site is deliberately separate from `get_session_preview_internal`'s rather than
+  shared: the preview resolves `block_refs[lcp..]` positionally into a flat message array, renders a
+  missing row as `{"content": "content expired", "expired": true}`, and treats a decrypt failure as
+  a hard `500`. A helper general enough for both would carry the renderings, the failure policy and
+  the traversal shape as parameters — more surface than the two call sites — and the preview's
+  output must not change. The one thing they genuinely share, the `trace_block` AAD triple, is
+  documented in both places.
+
 - **A session-pin move accepted any target key, with no route behind it (ISSUE-0167).** Both move
   handlers verified only that the caller **owns** the target, then wrote SQLite and `PinStore` and
   answered `{"moved": true}`. So a move onto a disabled key, a quarantined key, or a key with no
