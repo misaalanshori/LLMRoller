@@ -60,11 +60,8 @@ async fn create_live_database(data_dir: &Path) {
         listener_ports.push(listener.local_addr().expect("local addr").port());
         drop(listener);
     }
-    let [data_port, admin_port, metrics_port] = [
-        listener_ports[0],
-        listener_ports[1],
-        listener_ports[2],
-    ];
+    let [data_port, admin_port, metrics_port] =
+        [listener_ports[0], listener_ports[1], listener_ports[2]];
 
     let mut child = tokio::process::Command::new(llmroller_binary())
         .arg("serve")

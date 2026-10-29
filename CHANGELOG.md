@@ -33,7 +33,69 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   synthetic clicks to confirm the dispatcher still routes. It passes identically against the
   pre-split file, which is the evidence that behaviour did not change.
 
-### Fixed
+### Security
+
+- **The diagnostics export leaked nested provider credentials (ISSUE-0184).** `export-diagnostics`
+  exists to be handable to a support engineer, and its redactor walked exactly two hardcoded paths
+  (`add_headers`, `header_edits`). Everything else passed through verbatim, so a provider config
+  with `{"oauth": {"refresh_token": …}}` was exported in full. Measured on the shipped binary: a
+  config carrying one marker at five placements printed the marker **five times** before the fix
+  and **zero** times after.
+
+  Provider `config_json` is operator- and plugin-shaped, so there is no enumerable set of paths a
+  secret can occupy — the two-path approach could never be complete. The walker is now depth-first
+  over **objects and arrays** alike, so a secret at any depth, in an array element, or in an array
+  inside an object is found. Depth is the thing most likely to be weakened later, so
+  `redaction_reaches_a_secret_at_arbitrary_depth` exists specifically to fail if the walk stops
+  early, and the mutation that limits it to one level kills it.
+
+  Two mechanisms turned out to be needed beyond "recurse and match the key name", both found by
+  the end-to-end test rather than by reasoning:
+
+  - **Header names use hyphens.** `x-api-key` is a real credential header, and an `api_key`
+    substring never matched it. Names are now normalized (`-`, `.` → `_`) before matching, so one
+    vocabulary serves header names, config keys and edit paths.
+  - **Some objects name their secret in a *sibling* field.** `header_edits` is
+    `[{op, name, value}]` and `body_edits` is `[{op, path, value, from}]` — the credential is in
+    `value`, and what makes it a credential is the neighbouring `name`/`path`. No key-name test on
+    `value` can find it, which is why the original code needed a bespoke `header_edits` branch and
+    why a naive "just recurse" rewrite silently drops the protection. A structural rule now
+    handles any object of that shape, so `body_edits` is covered too — it never was.
+
+  **The matcher is now an explicit vocabulary** rather than three broad substrings. Added
+  `password`, `passphrase`, `credential`, `bearer`, `signature`, `private` — all genuinely
+  under-matched before. **Dropped the bare `key` substring**, which used to redact `key_id`,
+  `public_key`, `keys_per_second` and `monkey`. Dropping it is the point: over-redaction is a
+  regression, not a safe default, because redacting `key_id` removes the correlation handle that
+  makes the export useful for its main job. `api_key` and `private_key` have their own entries, so
+  nothing secret is lost. Non-secret `*_id`, `public_key`, `keyboard*` and `max_tokens` are
+  allow-listed ahead of the substring scan — `max_tokens` because it is the model's **output
+  budget**, which the bare `token` substring used to redact and so silently corrupt.
+
+  **A parse failure is now visible.** An unparseable `config_json` used to become `{}`, which reads
+  as "this provider has no configuration" — a different and false statement about an *unreadable*
+  one. It is now `{"error": "…"}` naming the cause.
+
+- **`export-diagnostics` dropped four of the five sections it should carry (ISSUE-0184).** It
+  exported only `providers`. `settings`, `models`, `upstream_keys` and `budget_windows` are now
+  included, each column-named rather than `SELECT *` so a future schema addition cannot silently
+  widen the export.
+
+  `upstream_keys` is the one section with a real leak risk: `secret_enc` is **omitted** (a sealed
+  credential plus a leaked master key is a full compromise, and the export is meant to be
+  emailable), while `secret_last4`, `health*`, `last_error`, `master_key_id` and the routing
+  columns are included because they are how an operator identifies a key and its health without
+  ever seeing it. Every included and omitted column is listed with its reason in the report.
+
+  `settings.value_json` is parsed rather than emitted as an escaped string, so the export is
+  shaped like the config it describes instead of forcing a double-decode.
+
+- **`doctor` on a corrupted audit chain had no test (ISSUE-0210).** The behaviour was already
+  correct — `run_doctor_cmd` verified the chain and returned `8` — so this is coverage rather than
+  a fix, and the report says so. It is the case where `doctor`'s value is highest: a healthy-chain
+  test proves almost nothing, while a tampered row producing `8` is the whole reason the command
+  verifies the chain. The test also asserts an intact chain exits `0` first, or the tamper would
+  prove nothing.
 
 - **The two spec-required periodic tasks were never spawned, so a quiet instance stopped
   attesting its audit chain and a plaintext deployment stopped saying so (ISSUE-0186,

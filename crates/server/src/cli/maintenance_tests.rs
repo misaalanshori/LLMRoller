@@ -70,7 +70,10 @@ fn redaction_reaches_a_secret_at_arbitrary_depth() {
         r#"{{"a":{{"b":{{"c":{{"api_key":"{MARKER}"}}}}}},"arr":[[{{"nested_in_array_of_array":{{"password":"{MARKER}"}}}}]]}}"#
     );
     let redacted = redact_provider_config_json(&raw);
-    assert_no_marker(&redacted, "secret three levels deep, and in an array of arrays");
+    assert_no_marker(
+        &redacted,
+        "secret three levels deep, and in an array of arrays",
+    );
 
     // And the walk must not have flattened or dropped the structure on its way down: a walker
     // that "redacts" by replacing the whole subtree would pass the assertion above while making
@@ -93,6 +96,14 @@ fn redaction_reaches_a_secret_at_arbitrary_depth() {
 fn redaction_keeps_non_secret_identifiers() {
     let raw = serde_json::json!({
         "key_id": "key_abc123",
+        // The `*_id` rule is load-bearing for these three and nothing else in this test: their
+        // names contain a sensitive substring (`token`, `api_key`, `auth`) *and* end in `_id`.
+        // Without the `_id` allowlist they are redacted, which is the over-inclusion regression
+        // this test exists to prevent — mutation M3 (delete the `_id` rule) survived until these
+        // cases were added.
+        "token_id": "tok_abc123",
+        "api_key_id": "ak_abc123",
+        "auth_id": "auth_abc123",
         "public_key": "ssh-ed25519 AAAA",
         "keyboard_shortcut": "ctrl+k",
         "models_per_minute": 60,
@@ -110,6 +121,9 @@ fn redaction_keeps_non_secret_identifiers() {
 
     for kept in [
         "key_id",
+        "token_id",
+        "api_key_id",
+        "auth_id",
         "public_key",
         "keyboard_shortcut",
         "models_per_minute",
@@ -160,6 +174,74 @@ fn redaction_reports_an_unparseable_config() {
 fn redaction_replaces_rather_than_truncates() {
     let raw = format!(r#"{{"api_key":"{MARKER}"}}"#);
     let rendered = serde_json::to_string(&redact_provider_config_json(&raw)).expect("serialize");
-    assert!(!rendered.contains("LEAK"), "no prefix of the secret may survive");
+    assert!(
+        !rendered.contains("LEAK"),
+        "no prefix of the secret may survive"
+    );
     assert!(rendered.contains(REDACTED));
+}
+
+/// A header-style key must match even though it uses hyphens, not underscores (`ISSUE-0184`).
+///
+/// `x-api-key` is a real credential header and every provider config carries it under that
+/// spelling. The first version of the rewritten matcher normalized nothing, so `api_key` never
+/// matched `x-api-key` — the export leaked it while the recursive walk was working perfectly.
+/// Found by the end-to-end test, not by reasoning, which is the argument for having one.
+#[test]
+#[doc = "Spec: SEC-6, F-086 — ISSUE-0184"]
+fn redaction_matches_hyphenated_header_names() {
+    for name in [
+        "x-api-key",
+        "X-Api-Key",
+        "proxy-authorization",
+        "set-cookie",
+    ] {
+        let raw = serde_json::json!({ "add_headers": { name: MARKER } }).to_string();
+        let redacted = redact_provider_config_json(&raw);
+        assert_no_marker(&redacted, &format!("hyphenated header `{name}`"));
+    }
+}
+
+/// A `{name|path, value}` edit must have its `value` redacted even though `value` is not a
+/// sensitive *name* (`ISSUE-0184`).
+///
+/// This is the structural half of the redactor. `header_edits` and `body_edits` name their
+/// target in one field and carry the credential in another, so a key-name-only walker cannot
+/// find it — which is why the original implementation needed a bespoke `header_edits` branch,
+/// and why a naive "just recurse" rewrite silently drops that protection. The e2e test caught
+/// this too.
+#[test]
+#[doc = "Spec: SEC-6, F-086 — ISSUE-0184"]
+fn redaction_reaches_a_value_named_by_a_sibling_field() {
+    // `header_edits` shape.
+    let raw = serde_json::json!({
+        "header_edits": [{ "op": "set", "name": "authorization", "value": MARKER }]
+    })
+    .to_string();
+    assert_no_marker(
+        &redact_provider_config_json(&raw),
+        "header_edits[].value named by a sibling `name`",
+    );
+
+    // `body_edits` shape: the same hazard with `path`, which no bespoke branch ever handled.
+    let raw = serde_json::json!({
+        "body_edits": [{ "op": "set", "path": "$.api_key", "value": MARKER }]
+    })
+    .to_string();
+    assert_no_marker(
+        &redact_provider_config_json(&raw),
+        "body_edits[].value named by a sibling `path`",
+    );
+
+    // And a non-sensitive sibling must NOT cause redaction, or the structural rule would
+    // destroy every ordinary header edit in the export.
+    let raw = serde_json::json!({
+        "header_edits": [{ "op": "set", "name": "user-agent", "value": "llmroller/1" }]
+    })
+    .to_string();
+    let redacted = redact_provider_config_json(&raw);
+    assert_eq!(
+        redacted["header_edits"][0]["value"], "llmroller/1",
+        "a non-sensitive sibling must leave the value alone: {redacted}"
+    );
 }

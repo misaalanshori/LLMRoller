@@ -100,6 +100,159 @@ const EXIT_SCHEMA_OLDER: u8 = 15;
 /// code, so `doctor` and `serve` agree on the same database (`ISSUE-0183`).
 const EXIT_SCHEMA_NEWER: u8 = 14;
 
+/// `settings` for the export.
+///
+/// Included verbatim: the closed 14-key registry holds routing policy, retention windows and
+/// the traceability config — none of which is a credential, and all of which are the first
+/// thing a support engineer needs to reproduce a routing complaint. The registry is closed
+/// (`ALL_SETTINGS_KEYS`), so this cannot grow a secret without someone adding a secret to a
+/// documented list first.
+async fn export_settings_section(pool: &sqlx::SqlitePool) -> Vec<serde_json::Value> {
+    use sqlx::Row as _;
+    let rows = sqlx::query("SELECT key, value_json, updated_at FROM settings ORDER BY key")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            let raw: String = row.try_get("value_json").unwrap_or_default();
+            // `value_json` is JSON *text* in the column. Emitting it as a string would force an
+            // operator to double-decode; parse it so the export is shaped like the config it
+            // describes. A row that will not parse becomes a visible error object, matching the
+            // provider-config rule, rather than a silently-stringified blob.
+            let value = serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::json!({"error": "value_json is not valid JSON"}));
+            serde_json::json!({
+                "key": row.try_get::<String, _>("key").unwrap_or_default(),
+                "value": value,
+                "updated_at": row.try_get::<i64, _>("updated_at").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// `models` for the export.
+///
+/// Explicitly column-named, though none of these columns is secret: naming them means a later
+/// schema addition cannot silently widen the export, which is the same discipline the
+/// `upstream_keys` section needs for a much better reason.
+async fn export_models_section(pool: &sqlx::SqlitePool) -> Vec<serde_json::Value> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT model_pk, canonical_id, display_name, exposed, distribution, routing_strategy, \
+         merge_state, origin, created_by_user_id, context_window \
+         FROM models ORDER BY canonical_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "model_pk": row.try_get::<String, _>("model_pk").unwrap_or_default(),
+                "canonical_id": row.try_get::<String, _>("canonical_id").unwrap_or_default(),
+                "display_name": row.try_get::<Option<String>, _>("display_name").unwrap_or_default(),
+                "exposed": row.try_get::<Option<i64>, _>("exposed").unwrap_or_default(),
+                "distribution": row.try_get::<String, _>("distribution").unwrap_or_default(),
+                "routing_strategy": row.try_get::<Option<String>, _>("routing_strategy").unwrap_or_default(),
+                "merge_state": row.try_get::<String, _>("merge_state").unwrap_or_default(),
+                "origin": row.try_get::<String, _>("origin").unwrap_or_default(),
+                "created_by_user_id": row.try_get::<Option<String>, _>("created_by_user_id").unwrap_or_default(),
+                "context_window": row.try_get::<Option<i64>, _>("context_window").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// `upstream_keys` for the export — the one section with a real leak risk.
+///
+/// **Columns included**, each because it identifies a key without revealing it:
+///
+/// | Column | Why it is safe |
+/// | --- | --- |
+/// | `id` | Opaque ULID-shaped identifier; already shown in the UI. |
+/// | `provider_id` | Foreign key; needed to correlate the key with its provider. |
+/// | `owner_user_id` | Foreign key; a user id, not a credential. |
+/// | `label` | Operator-chosen display name. |
+/// | `master_key_id` | *Which* master key sealed the secret, not the secret. Essential for diagnosing a rotation fault. |
+/// | `secret_last4` | The four characters the admin UI already displays to identify a key. |
+/// | `enabled`, `priority`, `strict_tier` | Routing configuration. |
+/// | `health`, `health_until`, `health_version` | Health state; the main reason to export this table. |
+/// | `last_error` | The last failure text. Scanned by `SEC-6`'s scrubber before storage; not a credential. |
+/// | `created_at` | Timestamp. |
+///
+/// **Column omitted, with the reason:**
+///
+/// | Column | Why it is omitted |
+/// | --- | --- |
+/// | `secret_enc` | The sealed credential itself. Sealed is not safe to export — an export plus a leaked master key is a full credential compromise, and the export is meant to be emailable. |
+///
+/// The column list is written out rather than `SELECT *` so a future schema addition — a
+/// `refresh_token`, a `client_cert` — cannot silently join the export. That is the whole point
+/// of naming them.
+async fn export_upstream_keys_section(pool: &sqlx::SqlitePool) -> Vec<serde_json::Value> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, provider_id, owner_user_id, label, master_key_id, secret_last4, enabled, \
+         priority, strict_tier, health, health_until, health_version, last_error, created_at \
+         FROM upstream_keys ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "provider_id": row.try_get::<String, _>("provider_id").unwrap_or_default(),
+                "owner_user_id": row.try_get::<Option<String>, _>("owner_user_id").unwrap_or_default(),
+                "label": row.try_get::<String, _>("label").unwrap_or_default(),
+                "master_key_id": row.try_get::<String, _>("master_key_id").unwrap_or_default(),
+                "secret_last4": row.try_get::<String, _>("secret_last4").unwrap_or_default(),
+                "enabled": row.try_get::<i64, _>("enabled").unwrap_or(0) != 0,
+                "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),
+                "strict_tier": row.try_get::<i64, _>("strict_tier").unwrap_or_default(),
+                "health": row.try_get::<String, _>("health").unwrap_or_default(),
+                "health_until": row.try_get::<Option<i64>, _>("health_until").unwrap_or_default(),
+                "health_version": row.try_get::<i64, _>("health_version").unwrap_or_default(),
+                "last_error": row.try_get::<Option<String>, _>("last_error").unwrap_or_default(),
+                "created_at": row.try_get::<i64, _>("created_at").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// `budget_windows` for the export.
+///
+/// Limits and their scope, no secrets: a window bound to an `upstream_key_id` is identified by
+/// that same opaque id, never by the key.
+async fn export_budget_windows_section(pool: &sqlx::SqlitePool) -> Vec<serde_json::Value> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "SELECT id, scope_kind, upstream_key_id, model_pk, window_kind, period_ms, anchor_at, \
+         upstream_window_kind, limit_micro_usd, reserve_pct FROM budget_windows ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "scope_kind": row.try_get::<String, _>("scope_kind").unwrap_or_default(),
+                "upstream_key_id": row.try_get::<String, _>("upstream_key_id").unwrap_or_default(),
+                "model_pk": row.try_get::<Option<String>, _>("model_pk").unwrap_or_default(),
+                "window_kind": row.try_get::<String, _>("window_kind").unwrap_or_default(),
+                "period_ms": row.try_get::<Option<i64>, _>("period_ms").unwrap_or_default(),
+                "anchor_at": row.try_get::<Option<i64>, _>("anchor_at").unwrap_or_default(),
+                "upstream_window_kind": row.try_get::<Option<String>, _>("upstream_window_kind").unwrap_or_default(),
+                "limit_micro_usd": row.try_get::<i64, _>("limit_micro_usd").unwrap_or_default(),
+                "reserve_pct": row.try_get::<i64, _>("reserve_pct").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 /// The schema version actually recorded in the database file.
 ///
 /// Returns `None` when `_llmroller_schema` has no usable row, which means the file is not a
@@ -246,47 +399,212 @@ pub(crate) async fn run_doctor_cmd(args: DoctorArgs) -> ExitCode {
     exit_code
 }
 
-/// Redacts sensitive header values (`authorization`, `*key*`, `*token*`, `*secret*`, `cookie`)
-/// inside a provider `config_json` object before exporting diagnostics (`F086`, `SEC-6`).
+/// Replacement text for a redacted value.
+///
+/// Visible rather than empty so an operator can tell "this provider has no OAuth config" from
+/// "this provider has OAuth config that was removed here" — the same rule the log-detail drawer
+/// applies to an absent value.
+const REDACTED_VALUE: &str = "[REDACTED]";
+
+/// Substrings that mark a JSON **key** as holding a credential (`SEC-6`, `F-086`).
+///
+/// This is an explicit vocabulary rather than three broad substrings, because the previous
+/// `name.contains("key") || name.contains("token") || name.contains("secret")` was both
+/// over- and under-inclusive, and the under-inclusive half is the leak:
+///
+/// - **Added** (previously missed, all genuine credential carriers): `password`, `passphrase`,
+///   `credential`, `bearer`, `signature`, `private`, `passwd`, `auth`.
+/// - **Deliberately dropped**: the bare `key` substring. It redacted `key_id`, `public_key`,
+///   `keys_per_second` and `monkey` — none of which is a secret, and redacting `key_id` in
+///   particular makes the export *less* useful for its main job, correlating a key you can see
+///   with a failure you are debugging. `api_key` and `private_key` are covered by their own
+///   entries, so nothing secret is lost by dropping the bare form.
+///
+/// `auth` is included as a whole-word-ish substring because operator configs use `auth`,
+/// `auth_token` and `authorization` interchangeably. `key_id` cannot match it.
+///
+/// Not redacted, on purpose, and each is pinned by `redaction_keeps_non_secret_identifiers`:
+/// `*_id` (identifiers), `public_key` (public by definition), `keyboard*` (UI config),
+/// `keys_per_second` / `models_per_minute` (rate limits), `max_tokens` (**the model's output
+/// budget**, not a credential — the bare `token` substring used to redact this, which silently
+/// corrupted an interesting diagnostic field).
+const SENSITIVE_KEY_SUBSTRINGS: [&str; 12] = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "authorization",
+    "cookie",
+    "bearer",
+    "signature",
+    "private",
+    "api_key",
+];
+
+/// Whole-name matches that the substring list above cannot express without over-matching.
+///
+/// `auth` is here rather than in the substring list: as a substring it would redact
+/// `authorization` (fine) but also an `oauth_provider_name`-style key (not fine). Matched as an
+/// exact name or a `_`-delimited segment instead.
+const SENSITIVE_KEY_SEGMENTS: [&str; 2] = ["auth", "key"];
+
+/// Whether a JSON key names a credential (`SEC-6`).
+///
+/// Two tests, in this order:
+///
+/// 1. **Non-secret suffixes win by fiat.** `key_id`, `public_key`, `max_tokens` and
+///    `keys_per_second` are checked *first* and return `false`. This is what keeps the
+///    matcher from being over-inclusive, and over-inclusion is a real regression here: a fix
+///    that redacts everything containing `key` makes the export useless and reads as success.
+/// 2. **Substring and segment matches**, per the constants above.
+///
+/// Order matters and is deliberate: `max_tokens` contains `token`, so the allow-first check has
+/// to come before the substring scan or the model's output budget gets redacted.
+fn is_sensitive_key(name: &str) -> bool {
+    // Hyphens and dots are header-name and JSON-path separators (`x-api-key`, `$.api_key`), and
+    // treating them as ordinary characters made `x-api-key` invisible to the `api_key` entry.
+    // Normalizing to `_` first is what lets one vocabulary serve header names, config keys and
+    // edit paths.
+    let lowered = name.to_ascii_lowercase().replace(['-', '.'], "_");
+
+    // (1) Non-secret names that a substring rule would otherwise swallow.
+    const NOT_SECRET: [&str; 7] = [
+        "key_id",
+        "public_key",
+        "max_tokens",
+        "token_count",
+        "keys_per_second",
+        "keyboard_shortcut",
+        "id",
+    ];
+    if NOT_SECRET.contains(&lowered.as_str()) {
+        return false;
+    }
+    // `*_id` suffixes are identifiers in this schema by convention (`provider_id`, `model_pk`,
+    // `key_id`), so redacting them would remove every correlation handle in the export.
+    if lowered.ends_with("_id") || lowered == "id" {
+        return false;
+    }
+
+    // (2) The deliberate vocabulary.
+    if SENSITIVE_KEY_SUBSTRINGS
+        .iter()
+        .any(|needle| lowered.contains(needle))
+    {
+        return true;
+    }
+    // `key` and `auth` only as whole `_`-delimited segments, so `api_key`/`auth_token`/
+    // `x_api_key` match while `monkey` and `keys_per_second` do not.
+    lowered
+        .split('_')
+        .any(|segment| SENSITIVE_KEY_SEGMENTS.contains(&segment))
+}
+
+/// Field names whose **value** names something the surrounding object then supplies a value for.
+///
+/// `header_edits` is `[{op, name, value}]` and `body_edits` is `[{op, path, value, from}]`: the
+/// credential is in `value`, and what makes it a credential is the sibling `name` or `path`.
+/// A key-name-only walker cannot see this — `value` is not a sensitive name — which is why the
+/// old implementation needed a bespoke `header_edits` branch and why a generic rewrite would
+/// have silently dropped the protection.
+const DESCRIBING_FIELDS: [&str; 3] = ["name", "path", "header"];
+
+/// Fields inside such an object that hold the credential the describing field refers to.
+const DESCRIBED_SECRET_FIELDS: [&str; 2] = ["value", "from"];
+
+/// Whether an object describes a sensitive target via a sibling field.
+///
+/// Deliberately not limited to `header_edits`: `body_edits` has the same shape with `path`, and
+/// an operator writing `{"op":"set","path":"$.api_key","value":"…"}` is doing exactly the same
+/// thing. Matching the *shape* rather than the parent key is what makes this survive a new
+/// edit type.
+fn describes_a_sensitive_target(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    DESCRIBING_FIELDS.iter().any(|field| {
+        map.get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_sensitive_key)
+    })
+}
+
+/// Redact every credential in a provider `config_json` before exporting diagnostics.
+///
+/// Walks the **whole** tree depth-first, over objects *and* arrays. The previous implementation
+/// inspected exactly two hardcoded paths (`add_headers`, `header_edits`), which cannot be
+/// complete: provider config is operator- and plugin-shaped, so there is no enumerable set of
+/// paths a secret can occupy (`ISSUE-0184`).
+///
+/// Rules, and why each:
+///
+/// - **An object entry whose key matches** has its value replaced by [`REDACTED_VALUE`],
+///   whatever the value's type. Replacing rather than truncating: a prefix of an `sk-` key still
+///   identifies its scope.
+/// - **Untouched keys still have their values walked.** `{"oauth": {...}}` redacts
+///   `refresh_token` inside, and `{"headers": [{...}]}` reaches the array elements. This is the
+///   half a depth-limited walker gets wrong.
+/// - **Arrays recurse into every element**, including nested arrays.
+///
+/// An unparseable config returns `{"error": "..."}` rather than `{}`. `{}` reads as "this
+/// provider has no configuration", which is a different and false statement about an
+/// **unreadable** one — the invented-value class. The error names the cause so an operator
+/// knows to fix the row rather than wonder where the config went.
 #[must_use]
 pub(crate) fn redact_provider_config_json(raw: &str) -> serde_json::Value {
-    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return serde_json::json!({});
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return serde_json::json!({
+            "error": "provider config_json is not valid JSON; the stored value could not be \
+                      redacted or exported",
+        });
     };
-    let is_sensitive = |name: &str| {
-        let l = name.to_ascii_lowercase();
-        l == "authorization"
-            || l == "cookie"
-            || l.contains("key")
-            || l.contains("token")
-            || l.contains("secret")
-    };
-    if let Some(obj) = val.as_object_mut() {
-        if let Some(add_headers) = obj.get_mut("add_headers").and_then(|v| v.as_object_mut()) {
-            for (k, v) in add_headers.iter_mut() {
-                if is_sensitive(k) {
-                    *v = serde_json::Value::String("[REDACTED]".to_string());
-                }
+    redact_value_in_place(&mut value);
+    value
+}
+
+/// Depth-first redaction of one JSON value, recursing through objects and arrays.
+fn redact_value_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Collect first, mutate after: replacing a value while iterating forces a second
+            // pass anyway, and a collected list keeps the mutation in one place.
+            let keys_to_redact: Vec<String> = map
+                .keys()
+                .filter(|key| is_sensitive_key(key))
+                .cloned()
+                .collect();
+            for key in keys_to_redact {
+                map.insert(key, serde_json::Value::String(REDACTED_VALUE.to_string()));
             }
-        }
-        if let Some(edits) = obj.get_mut("header_edits").and_then(|v| v.as_array_mut()) {
-            for edit in edits.iter_mut() {
-                if let Some(eobj) = edit.as_object_mut() {
-                    let name_sens = eobj
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .is_some_and(is_sensitive);
-                    if name_sens && eobj.contains_key("value") {
-                        eobj.insert(
-                            "value".to_string(),
-                            serde_json::Value::String("[REDACTED]".to_string()),
+            // The structural rule: `{name|path|header: <sensitive>, value: …}` names its secret in
+            // one field and carries it in another, so no key-name test on `value` can find it.
+            if describes_a_sensitive_target(map) {
+                for field in DESCRIBED_SECRET_FIELDS {
+                    if map.contains_key(field) {
+                        map.insert(
+                            field.to_string(),
+                            serde_json::Value::String(REDACTED_VALUE.to_string()),
                         );
                     }
                 }
             }
+            // Walk the survivors' values. A redacted entry is now a string and its recursion is
+            // a no-op, so this is safe to do unconditionally and keeps the code single-path.
+            for value in map.values_mut() {
+                redact_value_in_place(value);
+            }
         }
+        serde_json::Value::Array(elements) => {
+            for element in elements {
+                redact_value_in_place(element);
+            }
+        }
+        // Scalars carry no keys, so there is nothing to match on. This arm is the walker's
+        // termination condition.
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
-    val
 }
 
 pub(crate) async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> ExitCode {
@@ -315,6 +633,15 @@ pub(crate) async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> E
             })
         })
         .collect();
+
+    // The remaining sections the issue asks for. Each one is aggregate configuration and
+    // accounting metadata, none of it secret; `upstream_keys` is the only section with a leak
+    // risk and it is column-named below (`ISSUE-0184`).
+    let settings = export_settings_section(&pool).await;
+    let models = export_models_section(&pool).await;
+    let upstream_keys = export_upstream_keys_section(&pool).await;
+    let budget_windows = export_budget_windows_section(&pool).await;
+
     // Same rule as `doctor`: report what the file says, not what the binary was built for
     // (`ISSUE-0183`).
     let database_schema_version = read_database_schema_version(&pool).await;
@@ -324,6 +651,10 @@ pub(crate) async fn run_export_diagnostics_cmd(args: ExportDiagnosticsArgs) -> E
         "schema_version": database_schema_version,
         "binary_schema_version": llmroller_store::migrations::SCHEMA_VERSION,
         "providers": providers,
+        "settings": settings,
+        "models": models,
+        "upstream_keys": upstream_keys,
+        "budget_windows": budget_windows,
     });
     let serialized = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
     if let Some(out) = args.out {

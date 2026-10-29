@@ -582,6 +582,7 @@ tests = [
     "crates/store/src/audit/tests.rs",
     "crates/server/src/cli/phase7_tests/periodic_tasks.rs",
     "crates/server/tests/cli_serve.rs",
+    "crates/server/tests/cli_export_diagnostics.rs",
 ]
 
 [requirements.UI-5]
@@ -679,7 +680,11 @@ tests = ["crates/core/src/health/tests.rs"]
 priority = "P1"
 milestone = "M6"
 delivering_subphase = "7.3"
-tests = ["crates/server/tests/e2e_kill9_recovery.rs"]
+tests = [
+    "crates/server/tests/e2e_kill9_recovery.rs",
+    "crates/server/tests/cli_doctor_schema_version.rs",
+    "crates/server/tests/cli_export_diagnostics.rs",
+]
 
 [requirements.TRN-0]
 priority = "P0"
@@ -789,7 +794,11 @@ priority = "P0"
 milestone = "M1"
 delivering_subphase = "2.3"
 partial_subphases = ["6.4", "7.1"]
-tests = ["crates/server/tests/security_canary_and_ssrf.rs"]
+tests = [
+    "crates/server/tests/security_canary_and_ssrf.rs",
+    "crates/server/src/cli/maintenance_tests.rs",
+    "crates/server/tests/cli_export_diagnostics.rs",
+]
 
 [requirements.SEC-7]
 priority = "P0"
@@ -844,6 +853,7 @@ tests = [
     "crates/store/src/audit/tests.rs",
     "crates/server/src/cli/phase7_tests/periodic_tasks.rs",
     "crates/server/tests/cli_serve.rs",
+    "crates/server/tests/cli_export_diagnostics.rs",
 ]
 
 [requirements.SEC-14]
