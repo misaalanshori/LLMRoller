@@ -7,6 +7,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **The active-pins view read only durable state, so a pin was invisible until the writer flushed
+  it (ISSUE-0168).** `GET /api/user/pins`, `GET /admin/api/pins` and `GET /app/partials/pins`
+  queried the `pins` table alone. Pins reach that table through the async `durable_state` queue on
+  a `BATCH_MAX_AGE` (250 ms) tick, so for up to a tick after a session acquired a pin the user's
+  own pins view did not show it.
+
+  The reading is settled by the specification rather than by preference: `Section 14` states that
+  `GET /api/user/pins` returns "live `PinStore` pins", and `Section 14.t.1` that the Active Sessions
+  screen renders "confirmed session pins in `PinStore`". So the fix merges confirmed, unexpired live
+  entries into the durable rows instead of documenting the staleness as intended.
+
+  **A live `PinEntry` carries no owner**, only `upstream_key_id` and `pool_tier` — so the SQL
+  predicate that scopes durable rows has nothing to apply to it. Ownership is therefore resolved in
+  one scoped query against `client_keys`, and an entry whose owner cannot be proved is **dropped**,
+  never shown (`USR-3`, `SEC-17`). Merging naively would either silently drop every live entry or
+  show one tenant another tenant's session, which is why a test that passes before the fix
+  (`a_live_pin_from_another_tenant_is_never_shown`) exists to stop the *new* code from leaking.
+
+  A durable row and its live entry are two versions of one thing, not two rows: the merge is keyed
+  by `(client_key_id, session_hash, canonical_id)`. `created_at` comes from **SQLite** (the record
+  of when the pin was made, whereas a live entry's `created_ms` is only when this process first saw
+  it and resets on restart), `last_used_at` from **the later of the two** (the store advances it
+  every turn while SQLite lags), and the route fields from the **live entry** (a repin changes them
+  before the flush lands). Provisional entries are excluded — the screen lists confirmed pins, and a
+  provisional one is mid-handshake, may be discarded, and may still change keys.
+
+  The 50-row cap, `ORDER BY last_used_at DESC`, and both SQL predicates are unchanged; the cap is
+  applied *after* the merge, so appending cannot exceed the limit the SQL `LIMIT` was enforcing.
+
+  The loader lives in a new `crates/admin/src/api/active_pins.rs`, shared by the JSON handler and
+  the HTML partial so the two views cannot drift apart about which rows exist.
+
 ### Changed
 
 - **`app.js` split into twelve domain modules, and the MNT-3 ceiling now gates static assets

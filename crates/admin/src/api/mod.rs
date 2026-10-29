@@ -63,6 +63,7 @@ tokio::task_local! {
     static MUTATION_HANDLED: std::sync::atomic::AtomicBool;
 }
 
+pub(crate) mod active_pins;
 pub(crate) mod budgets;
 pub(crate) mod client_keys;
 pub(crate) mod common;
@@ -80,6 +81,7 @@ pub(crate) mod usage;
 pub(crate) mod usage_filters;
 pub(crate) mod users_and_auth;
 
+pub(crate) use active_pins::*;
 pub(crate) use budgets::*;
 pub(crate) use client_keys::*;
 pub use common::ApiAppState;

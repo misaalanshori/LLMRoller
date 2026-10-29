@@ -10,36 +10,9 @@ pub(crate) async fn get_partial_pins_handler(
     let uid = actor.user_id().map(|u| u.to_string()).unwrap_or_default();
     let now_ms = state.auth.clock.now_ms();
 
-    let query_str = if is_admin {
-        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
-         FROM pins p
-         LEFT JOIN models m ON p.model_pk = m.model_pk
-         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
-         WHERE p.expires_at > ?
-         ORDER BY p.last_used_at DESC LIMIT 50"
-    } else {
-        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
-         FROM pins p
-         JOIN client_keys ck ON p.client_key_id = ck.id
-         LEFT JOIN models m ON p.model_pk = m.model_pk
-         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
-         WHERE ck.owner_user_id = ? AND p.expires_at > ?
-         ORDER BY p.last_used_at DESC LIMIT 50"
-    };
-
-    let rows = if is_admin {
-        sqlx::query(query_str)
-            .bind(now_ms)
-            .fetch_all(&state.auth.pool)
-            .await
-    } else {
-        sqlx::query(query_str)
-            .bind(&uid)
-            .bind(now_ms)
-            .fetch_all(&state.auth.pool)
-            .await
-    }
-    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Same loader as the JSON view, so the table and `/api/user/pins` can never disagree about
+    // which rows exist (`Section 14.t.1`; live `PinStore` entries merged with durable rows).
+    let rows = load_active_pins(&state, &actor, now_ms).await?;
 
     if rows.is_empty() {
         return Ok(Html(
@@ -49,32 +22,25 @@ pub(crate) async fn get_partial_pins_handler(
 
     let mut html = String::new();
     for r in rows {
-        let hash: String = r.try_get("session_hash").unwrap_or_default();
+        let hash = r.session_hash;
         let short_hash = if hash.len() > 12 { &hash[..12] } else { &hash };
         let short_hash = escape_html(short_hash);
-        let clk: String = r.try_get("client_key_id").unwrap_or_default();
+        let clk = r.client_key_id;
         let short_clk = if clk.len() > 10 { &clk[..10] } else { &clk };
         let short_clk = escape_html(short_clk);
-        let model: String = r
-            .try_get::<Option<String>, _>("canonical_id")
-            .unwrap_or_default()
-            .unwrap_or_else(|| "unresolved".to_string());
+        let model: String = r.canonical_id.unwrap_or_else(|| "unresolved".to_string());
         let model = escape_html(&model);
-        let pool_tier: i64 = r.try_get("pool_tier").unwrap_or(1);
-        let key_owner: Option<String> = r.try_get("key_owner").ok().flatten();
-        let raw_label: Option<String> = r.try_get("key_label").ok().flatten();
-        let display_label = if is_admin {
-            raw_label.unwrap_or_else(|| "key".to_string())
-        } else if pool_tier == 2 {
-            "shared pool".to_string()
-        } else if pool_tier == 3 || key_owner.as_deref() != Some(uid.as_str()) {
-            "global pool".to_string()
-        } else {
-            raw_label.unwrap_or_else(|| "key".to_string())
-        };
+        let pool_tier: i64 = r.pool_tier;
+        let display_label = mask_key_label(
+            is_admin,
+            pool_tier,
+            r.key_owner.as_deref(),
+            Some(uid.as_str()),
+            r.key_label,
+        )
+        .unwrap_or_else(|| "key".to_string());
         let key_label = escape_html(&display_label);
-        let pool_tier: i64 = r.try_get("pool_tier").unwrap_or(1);
-        let last_used: i64 = r.try_get("last_used_at").unwrap_or(0);
+        let last_used: i64 = r.last_used_at;
         let time_str = format!(
             "{}s ago",
             (state.auth.clock.now_ms() - last_used).max(0) / 1000

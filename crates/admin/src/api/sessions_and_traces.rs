@@ -828,64 +828,31 @@ pub(crate) async fn get_active_pins_handler(
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<serde_json::Value>)> {
     let actor = authenticate_actor(&state, &headers, false).await?;
     let now_ms = state.auth.clock.now_ms();
-    let uid_opt = actor.user_id().map(|u| u.to_string());
 
-    let query_str = if actor.is_admin() {
-        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
-         FROM pins p
-         LEFT JOIN models m ON p.model_pk = m.model_pk
-         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
-         WHERE p.expires_at > ?
-         ORDER BY p.last_used_at DESC LIMIT 50"
-    } else {
-        "SELECT p.session_hash, p.client_key_id, p.model_pk, p.upstream_key_id, p.pool_tier, p.created_at, p.last_used_at, m.canonical_id, k.label as key_label, k.owner_user_id as key_owner
-         FROM pins p
-         JOIN client_keys ck ON p.client_key_id = ck.id
-         LEFT JOIN models m ON p.model_pk = m.model_pk
-         LEFT JOIN upstream_keys k ON p.upstream_key_id = k.id
-         WHERE ck.owner_user_id = ? AND p.expires_at > ?
-         ORDER BY p.last_used_at DESC LIMIT 50"
-    };
-
-    let rows = if actor.is_admin() {
-        sqlx::query(query_str)
-            .bind(now_ms)
-            .fetch_all(&state.auth.pool)
-            .await
-    } else {
-        let uid = uid_opt.clone().unwrap_or_default();
-        sqlx::query(query_str)
-            .bind(uid)
-            .bind(now_ms)
-            .fetch_all(&state.auth.pool)
-            .await
-    }
-    .map_err(|e| map_price_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let mut list = Vec::new();
-    for r in rows {
-        let pool_tier: i64 = r.try_get("pool_tier").unwrap_or(1);
-        let key_owner: Option<String> = r.try_get("key_owner").ok().flatten();
-        let raw_label: Option<String> = r.try_get("key_label").ok().flatten();
-        let key_label = if actor.is_admin() {
-            raw_label
-        } else if pool_tier == 2 {
-            Some("shared pool".to_string())
-        } else if pool_tier == 3 || key_owner.as_deref() != uid_opt.as_deref() {
-            Some("global pool".to_string())
-        } else {
-            raw_label
-        };
-        list.push(serde_json::json!({
-            "session_hash": r.try_get::<String, _>("session_hash").unwrap_or_default(),
-            "client_key_id": r.try_get::<String, _>("client_key_id").unwrap_or_default(),
-            "canonical_id": r.try_get::<Option<String>, _>("canonical_id").unwrap_or_default(),
-            "key_label": key_label.unwrap_or_default(),
-            "pool_tier": pool_tier,
-            "created_at": r.try_get::<i64, _>("created_at").unwrap_or(0),
-            "last_used_at": r.try_get::<i64, _>("last_used_at").unwrap_or(0),
-        }));
-    }
+    // The loader is shared with `/app/partials/pins` so the two views cannot disagree about
+    // which rows exist (`Section 14.t.1`; live `PinStore` entries merged with durable rows).
+    let list = load_active_pins(&state, &actor, now_ms)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let key_label = mask_key_label(
+                actor.is_admin(),
+                row.pool_tier,
+                row.key_owner.as_deref(),
+                actor.user_id().map(|u| u.to_string()).as_deref(),
+                row.key_label,
+            );
+            serde_json::json!({
+                "session_hash": row.session_hash,
+                "client_key_id": row.client_key_id,
+                "canonical_id": row.canonical_id,
+                "key_label": key_label.unwrap_or_default(),
+                "pool_tier": row.pool_tier,
+                "created_at": row.created_at,
+                "last_used_at": row.last_used_at,
+            })
+        })
+        .collect();
 
     Ok(Json(list))
 }
