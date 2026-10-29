@@ -164,8 +164,8 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
             provider_kind: "openrouter".to_string(),
             upstream_model_id: "deepseek/deepseek-v4.1-flash".to_string(),
             rates: global_rates,
-            tiers: vec![],
-            schedules: vec![],
+            tiers: Some(vec![]),
+            schedules: Some(vec![]),
             source: "admin".to_string(),
             now_ms: 1000,
         },
@@ -187,8 +187,8 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
             provider_kind: "openrouter".to_string(),
             upstream_model_id: "deepseek/deepseek-v4.1-flash".to_string(),
             rates: override_rates,
-            tiers: vec![],
-            schedules: vec![],
+            tiers: Some(vec![]),
+            schedules: Some(vec![]),
             source: "user".to_string(),
             now_ms: 1000,
         },
@@ -229,7 +229,7 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
             provider_kind: "openrouter".to_string(),
             upstream_model_id: "deepseek/deepseek-v4.1-flash".to_string(),
             rates: global_rates,
-            tiers: vec![
+            tiers: Some(vec![
                 ContextTier {
                     min_total_input_tokens: 0,
                     max_total_input_tokens: Some(100_000),
@@ -246,8 +246,8 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
                     cache_read_per_mtok_micro_usd: 150_000,
                     cache_write_per_mtok_micro_usd: 1_875_000,
                 },
-            ],
-            schedules: vec![],
+            ]),
+            schedules: Some(vec![]),
             source: "admin".to_string(),
             now_ms: 1000,
         },
@@ -269,8 +269,8 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
             provider_kind: "openrouter".to_string(),
             upstream_model_id: "deepseek/deepseek-v4.1-flash".to_string(),
             rates: global_rates,
-            tiers: vec![],
-            schedules: vec![
+            tiers: Some(vec![]),
+            schedules: Some(vec![
                 Schedule {
                     name: "peak1".to_string(),
                     iso_weekdays: vec![1, 2, 3],
@@ -285,7 +285,7 @@ async fn test_price_book_endpoints_and_resolution_hierarchy() {
                     multiplier_num: 3,
                     multiplier_den: 1,
                 },
-            ],
+            ]),
             source: "admin".to_string(),
             now_ms: 1000,
         },

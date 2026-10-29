@@ -218,10 +218,13 @@ pub(crate) struct UpsertPricePayload {
     pub output_per_mtok_micro_usd: i64,
     pub cache_read_per_mtok_micro_usd: Option<i64>,
     pub cache_write_per_mtok_micro_usd: Option<i64>,
+    /// `None` (field absent) leaves the stored tiers alone; `[]` clears them. See
+    /// `UpsertPriceParams::tiers` for why the distinction is load-bearing.
     #[serde(default)]
-    pub tiers: Vec<llmroller_core::pricing::ContextTier>,
+    pub tiers: Option<Vec<llmroller_core::pricing::ContextTier>>,
+    /// `None` (field absent) leaves the stored schedules alone; `[]` clears them.
     #[serde(default)]
-    pub schedules: Vec<llmroller_core::pricing::Schedule>,
+    pub schedules: Option<Vec<llmroller_core::pricing::Schedule>>,
 }
 
 pub(crate) async fn get_admin_prices_handler(
@@ -232,7 +235,7 @@ pub(crate) async fn get_admin_prices_handler(
     let rows = sqlx::query(
         "SELECT provider_id, provider_kind, upstream_model_id, input_per_mtok_micro_usd,
                 output_per_mtok_micro_usd, cache_read_per_mtok_micro_usd,
-                cache_write_per_mtok_micro_usd, source
+                cache_write_per_mtok_micro_usd, tiers_json, schedule_json, source
          FROM prices ORDER BY upstream_model_id ASC, provider_id ASC",
     )
     .fetch_all(&state.auth.reader_pool)
@@ -241,6 +244,15 @@ pub(crate) async fn get_admin_prices_handler(
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
+        // `tiers_json`/`schedule_json` are what the cost resolver reads (`ISSUE-0163`). Reporting
+        // them is not decoration: without them an admin sees a cost produced by a context tier and
+        // cannot inspect the tier that produced it.
+        //
+        // A NULL column means "no tiers configured", which is `[]`. A *populated* column that will
+        // not parse is a different thing — a stored value the resolver would also choke on — and
+        // it is reported as `null` rather than silently flattened to `[]`. Flattening would claim
+        // "this model has no tiers" about a row that has unreadable ones, which is exactly the
+        // invented-fact failure cycle 46 removed from the breakdown.
         out.push(serde_json::json!({
             "provider_id": r.try_get::<String, _>("provider_id").unwrap_or_default(),
             "provider_kind": r.try_get::<String, _>("provider_kind").unwrap_or_default(),
@@ -249,10 +261,33 @@ pub(crate) async fn get_admin_prices_handler(
             "output_per_mtok_micro_usd": r.try_get::<i64, _>("output_per_mtok_micro_usd").unwrap_or(0),
             "cache_read_per_mtok_micro_usd": r.try_get::<Option<i64>, _>("cache_read_per_mtok_micro_usd").unwrap_or_default().unwrap_or(0),
             "cache_write_per_mtok_micro_usd": r.try_get::<Option<i64>, _>("cache_write_per_mtok_micro_usd").unwrap_or_default().unwrap_or(0),
+            "tiers": decode_price_json::<llmroller_core::pricing::ContextTier>(
+                r.try_get::<Option<String>, _>("tiers_json").ok().flatten().as_deref(),
+            ),
+            "schedules": decode_price_json::<llmroller_core::pricing::Schedule>(
+                r.try_get::<Option<String>, _>("schedule_json").ok().flatten().as_deref(),
+            ),
             "source": r.try_get::<String, _>("source").unwrap_or_default(),
         }));
     }
     Ok(Json(out))
+}
+
+/// Project a stored `*_json` price column into the admin API's array shape.
+///
+/// `None` (a NULL column) becomes `[]`, because "no tiers" is a real configuration. A column that
+/// is present but unparseable becomes `null`, so the admin API never claims a row has no tiers when
+/// in fact it has unreadable ones (`ISSUE-0163`, and the cycle-46 rule that a missing financial fact
+/// is reported rather than defaulted).
+fn decode_price_json<T: serde::de::DeserializeOwned + serde::Serialize>(
+    raw: Option<&str>,
+) -> serde_json::Value {
+    match raw {
+        None => serde_json::json!([]),
+        Some(text) => serde_json::from_str::<Vec<T>>(text)
+            .map(|items| serde_json::to_value(items).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null),
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -465,8 +500,8 @@ pub(crate) fn parse_catalog_prices(
                         provider_kind: String::new(),
                         upstream_model_id: model_id.clone(),
                         rates: llmroller_core::pricing::Rates::default(),
-                        tiers: Vec::new(),
-                        schedules: Vec::new(),
+                        tiers: Some(Vec::new()),
+                        schedules: Some(Vec::new()),
                         source: "synced".to_string(),
                         now_ms: 0,
                     }
@@ -488,7 +523,7 @@ pub(crate) fn parse_catalog_prices(
                     cache_write_per_mtok_micro_usd: micro(cw_rate),
                 };
                 entry.rates = rates;
-                entry.tiers = tiers.clone();
+                entry.tiers = Some(tiers.clone());
                 if let Ok(norm_id) = llmroller_core::catalog::normalize_model_id(model_id)
                     && &norm_id != model_id
                 {
@@ -498,8 +533,8 @@ pub(crate) fn parse_catalog_prices(
                             provider_kind: String::new(),
                             upstream_model_id: norm_id,
                             rates,
-                            tiers,
-                            schedules: Vec::new(),
+                            tiers: Some(tiers),
+                            schedules: Some(Vec::new()),
                             source: "synced".to_string(),
                             now_ms: 0,
                         }
@@ -570,8 +605,8 @@ pub(crate) fn parse_catalog_prices(
                         provider_kind: String::new(),
                         upstream_model_id: key_id,
                         rates,
-                        tiers: Vec::new(),
-                        schedules: Vec::new(),
+                        tiers: Some(Vec::new()),
+                        schedules: Some(Vec::new()),
                         source: "synced".to_string(),
                         now_ms: 0,
                     },

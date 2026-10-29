@@ -19,8 +19,15 @@ pub struct UpsertPriceParams {
     pub provider_kind: String,
     pub upstream_model_id: String,
     pub rates: Rates,
-    pub tiers: Vec<ContextTier>,
-    pub schedules: Vec<Schedule>,
+    /// `None` preserves the stored value; `Some(vec![])` explicitly clears it.
+    ///
+    /// The distinction is load-bearing (`ISSUE-0163`): a UI that edits only the flat rates sends
+    /// no `tiers` at all, and treating that as "no tiers" wiped an operator's configuration while
+    /// reporting success. This is the same rule `patch_admin_model_handler` documents
+    /// (`models.rs:100-104`) — omission means unchanged, and clearing must be asked for.
+    pub tiers: Option<Vec<ContextTier>>,
+    /// `None` preserves the stored value; `Some(vec![])` explicitly clears it.
+    pub schedules: Option<Vec<Schedule>>,
     pub source: String,
     pub now_ms: i64,
 }
@@ -29,20 +36,25 @@ pub async fn upsert_price_tx(
     tx: &mut Transaction<'_, Sqlite>,
     params: UpsertPriceParams,
 ) -> Result<(), PriceError> {
-    validate_tiers(&params.tiers).map_err(PriceError::Validation)?;
-    validate_schedules(&params.schedules).map_err(PriceError::Validation)?;
+    // Validate only what the caller is setting. An omitted collection is not "empty input" — it
+    // is "unchanged", so validating it would be validating a value nobody asked to write.
+    if let Some(tiers) = &params.tiers {
+        validate_tiers(tiers).map_err(PriceError::Validation)?;
+    }
+    if let Some(schedules) = &params.schedules {
+        validate_schedules(schedules).map_err(PriceError::Validation)?;
+    }
 
-    let tiers_json = if params.tiers.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&params.tiers).unwrap_or_else(|_| "[]".to_string()))
-    };
-
-    let schedule_json = if params.schedules.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&params.schedules).unwrap_or_else(|_| "[]".to_string()))
-    };
+    // `None` binds as SQL NULL, which `COALESCE` turns into the stored value. `Some(vec![])`
+    // serialises to `[]` and therefore clears, so "clear" stays expressible and explicit.
+    let tiers_json = params
+        .tiers
+        .as_ref()
+        .map(|tiers| serde_json::to_string(tiers).unwrap_or_else(|_| "[]".to_string()));
+    let schedule_json = params
+        .schedules
+        .as_ref()
+        .map(|schedules| serde_json::to_string(schedules).unwrap_or_else(|_| "[]".to_string()));
 
     sqlx::query(
         r#"INSERT INTO prices (
@@ -57,8 +69,8 @@ pub async fn upsert_price_tx(
                output_per_mtok_micro_usd = excluded.output_per_mtok_micro_usd,
                cache_read_per_mtok_micro_usd = excluded.cache_read_per_mtok_micro_usd,
                cache_write_per_mtok_micro_usd = excluded.cache_write_per_mtok_micro_usd,
-               tiers_json = excluded.tiers_json,
-               schedule_json = excluded.schedule_json,
+               tiers_json = COALESCE(excluded.tiers_json, prices.tiers_json),
+               schedule_json = COALESCE(excluded.schedule_json, prices.schedule_json),
                source = excluded.source,
                updated_at = excluded.updated_at"#,
     )

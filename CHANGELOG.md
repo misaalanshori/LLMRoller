@@ -8,6 +8,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **The admin price API could not round-trip the tiers and schedules the resolver prices with, and a
+  PUT that omitted them erased them (ISSUE-0163).** `GET /admin/api/prices` projected only the four flat
+  per-MTok columns while `prices.tiers_json` and `prices.schedule_json` existed and were honoured by
+  `compute_request_cost` — cycle 46 had just made the *usage breakdown* read them. So an admin could see
+  a cost produced by a context tier and had no way to inspect the tier, nor to configure one.
+
+  `GET` now returns `tiers` and `schedules` per row. A NULL column is `[]`, because "none configured" is
+  a real state; a column that is **present but unparseable** is `null` rather than `[]`, because
+  reporting "this model has no tiers" about a row that has unreadable ones is the invented-fact failure
+  cycle 46 removed from the breakdown.
+
+  **`UpsertPriceParams::tiers`/`schedules` are now `Option<Vec<_>>`, where `None` means "unchanged" and
+  `Some(vec![])` means "clear".** The two `SET` clauses use `COALESCE(excluded, prices)` — the rule
+  `patch_admin_model_handler` already documents (`models.rs:100-104`). Before this, a UI editing only
+  the flat rates sent no `tiers` at all, and `upsert_price_tx` treated that as "no tiers" and wiped the
+  operator's configuration while returning `200 OK`. The `[]`-means-clear form is kept and tested, so
+  removal stays expressible.
+
+  Validation still runs before the write and is now applied only to the collections the caller actually
+  supplied, so a malformed payload is a `422` with the row untouched — never a `500` and never a stored
+  invalid row that only fails later inside the resolver.
+
+  The issue also asked for `reasoning_per_mtok_micro_usd` to be plumbed through. **That field exists
+  nowhere** — not a column on `prices`, no `rates_json` to hold it, and `Rates` has exactly four fields;
+  adding it would be a schema change. It is also unnecessary: `TokenUsage::reasoning` is documented as a
+  diagnostic **subset of `output`**, and `calculate_cost_micro_usd` prices `output`, so reasoning tokens
+  are already charged at the output rate. A test now pins that, so a later cycle cannot add a
+  `reasoning_per_mtok` column that would double-charge the same tokens.
+
+
 - **Four documentation contradictions, and two exit-code gaps the audit found along the way
   (ISSUE-0034, ISSUE-0036, ISSUE-0037, ISSUE-0055).** No production behaviour changed; the
   documents now agree with the code, and the code is the authority in every case.

@@ -26,8 +26,10 @@ fn parses_context_tiers_and_aliases_from_the_catalogue() {
     let price = prices.get("vendor/model-a").expect("price template");
     assert_eq!(price.rates.input_per_mtok_micro_usd, 3_000_000);
     assert_eq!(price.rates.output_per_mtok_micro_usd, 15_000_000);
-    assert_eq!(price.tiers.len(), 1);
-    let tier = &price.tiers[0];
+    // The sync template always carries the catalogue's complete tier set, so it is `Some(..)`.
+    let tiers = price.tiers.as_ref().expect("tiers must be set by the sync");
+    assert_eq!(tiers.len(), 1);
+    let tier = &tiers[0];
     assert_eq!(tier.min_total_input_tokens, 200_000);
     assert_eq!(tier.input_per_mtok_micro_usd, 6_000_000);
     assert_eq!(tier.output_per_mtok_micro_usd, 22_500_000);
