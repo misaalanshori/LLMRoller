@@ -633,3 +633,7 @@ async fn verify_audit_log_command(args: VerifyAuditLogArgs) -> Result<(), CliFai
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "maintenance_tests.rs"]
+mod maintenance_tests;
