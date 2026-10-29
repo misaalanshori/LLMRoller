@@ -713,3 +713,301 @@ fn test_admin_move_with_tier_updates_pool_tier_and_generation() {
     assert_eq!(ticket.pool_tier, CandidatePoolTier::Own);
     assert_eq!(ticket.outcome, PinOutcome::Followed);
 }
+
+// ---------------------------------------------------------------------------
+// ISSUE-0169 — capacity pressure must reclaim expired entries instead of refusing
+// ---------------------------------------------------------------------------
+
+/// Build a `PinKey` for the capacity tests.
+fn capacity_key(session: &str) -> PinKey {
+    PinKey {
+        client_key_id: ClientKeyId::generate(),
+        canonical_id: "capacity-model".to_string(),
+        session_hash: session.to_string(),
+    }
+}
+
+/// Acquire one pin, expecting a ticket.
+fn acquire_one(store: &PinStore, key: &PinKey, clock: &FakeClock, k: UpstreamKeyId) -> PinTicket {
+    store
+        .acquire(
+            key,
+            clock,
+            86_400_000,
+            false,
+            300,
+            RoutingScope::PersonalFirst,
+            Some(CandidatePoolTier::Own),
+            |_| true,
+            |_| Some((k, CandidatePoolTier::Own)),
+        )
+        .expect("selection must succeed")
+}
+
+/// Fill `store` with `count` confirmed entries that are **already expired** at `now_ms`.
+///
+/// Written through `upsert_confirmed` with a TTL that puts `expires_ms` in the past relative to the
+/// clock afterwards, which is the state a real store reaches whenever writes outpace the 30 s
+/// background sweep.
+fn fill_with_expired(store: &PinStore, count: usize, now_ms: i64, k: UpstreamKeyId) {
+    for index in 0..count {
+        store.upsert_confirmed(
+            capacity_key(&format!("stale-{index}")),
+            k,
+            CandidatePoolTier::Own,
+            now_ms.saturating_sub(1_000),
+            // expires 1 000 ms after created_ms, i.e. before `now_ms`.
+            1_000,
+        );
+    }
+}
+
+/// A full store whose entries have all expired must reclaim one and insert the new pin
+/// (`ISSUE-0169`).
+///
+/// **This is the measured defect.** A store at capacity with `active_len(now_ms) == 0` — not one
+/// live pin in it — still returns `UnpinnedCapacity` and refuses the new session. The capacity
+/// branch consults only `entries.len()`, which counts expired entries that the 30 s background
+/// sweep has not collected yet.
+///
+/// The window is bounded by the sweep interval rather than permanent (the issue claims permanent;
+/// see the cycle-42 report), but inside it a burst of new sessions all lose affinity even though
+/// the store is empty of anything live.
+#[doc = "Spec: RTE-10, F039 — ISSUE-0169"]
+#[test]
+fn an_expired_pin_is_reclaimed_when_the_store_is_full() {
+    let store = PinStore::new(2);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let k = UpstreamKeyId::generate();
+
+    fill_with_expired(&store, 2, clock.now_ms(), k);
+    assert_eq!(store.len(), 2, "precondition: the map is full");
+    assert_eq!(
+        store.active_len(clock.now_ms()),
+        0,
+        "precondition: nothing in the store is live"
+    );
+
+    let fresh = capacity_key("fresh-session");
+    let ticket = acquire_one(&store, &fresh, &clock, k);
+
+    assert_ne!(
+        ticket.outcome,
+        PinOutcome::UnpinnedCapacity,
+        "a store full of expired pins must make room, not refuse"
+    );
+    assert_eq!(ticket.outcome, PinOutcome::NewPin);
+    assert!(
+        store.len() <= 2,
+        "an expired entry must have been reclaimed to stay within the cap, len={}",
+        store.len()
+    );
+    assert!(
+        store.entries.contains_key(&fresh),
+        "the new pin must actually be inserted"
+    );
+}
+
+/// The acceptance test for the degradation (`ISSUE-0169`).
+///
+/// A store that is already full of expired pins must keep serving new sessions indefinitely, as
+/// long as each session's own pin expires between rounds. That second clause is what makes this a
+/// realistic test rather than a tautology: a pin that is confirmed and kept live genuinely occupies
+/// capacity, and `RTE-10`'s refusal is then *correct*. The defect is refusing while holding nothing
+/// live.
+///
+/// So each round: acquire (the capacity branch must reclaim the round-before-last's expired
+/// provisional), then advance past the 50 s provisional expiry. Without the reclaim the very first
+/// round is refused, and every later one too — measured pre-fix at 92 of 100 refused even with
+/// reclaiming, because a confirmed pin never expires.
+#[doc = "Spec: RTE-10, F039 — ISSUE-0169"]
+#[test]
+fn a_store_that_is_full_of_stale_pins_never_degrades() {
+    let cap = 8;
+    let store = PinStore::new(cap);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let k = UpstreamKeyId::generate();
+
+    fill_with_expired(&store, cap, clock.now_ms(), k);
+
+    let mut degraded = 0_usize;
+    for index in 0..100 {
+        let key = capacity_key(&format!("run-{index}"));
+        let ticket = acquire_one(&store, &key, &clock, k);
+        if ticket.outcome == PinOutcome::UnpinnedCapacity {
+            degraded += 1;
+        }
+        // Let this round's provisional pin expire, exactly as a session that goes quiet does.
+        // Pins are left unconfirmed on purpose: a confirmed pin is supposed to hold capacity, and
+        // a test that kept confirming would be asserting that the cap is unreachable.
+        clock.advance_ms(60_000);
+        assert!(
+            store.len() <= cap,
+            "the cap must still be respected at iteration {index}, len={}",
+            store.len()
+        );
+    }
+
+    assert_eq!(
+        degraded, 0,
+        "no acquisition in a 100-session run of expiring sessions may be refused; {degraded} were"
+    );
+}
+
+/// `UnpinnedCapacity` must stay reachable when nothing can be freed (`RTE-10`).
+///
+/// This is the safety valve, and it is what makes the fix a repair of a window rather than a
+/// removal of the limit. A full store of **live** confirmed pins with a genuine cap must still
+/// refuse — the alternative would be evicting a live, confirmed pin, which `15. SRDD` rejects by
+/// name for exactly this structure ("TinyLFU eviction would silently drop confirmed pins").
+#[doc = "Spec: RTE-10 — ISSUE-0169"]
+#[test]
+fn capacity_is_still_reported_when_nothing_can_be_freed() {
+    let store = PinStore::new(2);
+    let clock = FakeClock::new(1_000_000_000_000);
+    let k = UpstreamKeyId::generate();
+
+    for index in 0..2 {
+        let key = capacity_key(&format!("live-{index}"));
+        let ticket = acquire_one(&store, &key, &clock, k);
+        store.first_valid_frame(&key, &ticket, clock.now_ms(), 86_400_000);
+    }
+    assert_eq!(store.len(), 2);
+    assert_eq!(
+        store.active_len(clock.now_ms()),
+        2,
+        "precondition: both entries are live confirmed pins"
+    );
+
+    let overflow = acquire_one(&store, &capacity_key("overflow"), &clock, k);
+    assert_eq!(
+        overflow.outcome,
+        PinOutcome::UnpinnedCapacity,
+        "with nothing expired there is nothing to reclaim, so RTE-10's fallback must fire"
+    );
+    assert_eq!(store.len(), 2, "no live entry may be evicted");
+}
+
+/// The capacity branch must not disturb live pins while reclaiming expired ones (`ISSUE-0169`).
+///
+/// Mixed store: some live, some expired, at capacity. Reclaiming must free *only* the expired ones
+/// and leave every live pin in place — including its `upstream_key_id` and `generation`, so an
+/// in-flight stream holding a ticket is not invalidated by an unrelated capacity event.
+#[doc = "Spec: RTE-10, RTE-2 — ISSUE-0169"]
+#[test]
+fn reclaiming_expired_entries_leaves_live_pins_untouched() {
+    let now = 1_000_000_000_000;
+    let clock = FakeClock::new(now);
+    let k = UpstreamKeyId::generate();
+    let store = PinStore::new(3);
+
+    // One live confirmed pin.
+    let live_key = capacity_key("live");
+    let live_ticket = acquire_one(&store, &live_key, &clock, k);
+    store.first_valid_frame(&live_key, &live_ticket, now, 86_400_000);
+    // Two expired pins.
+    fill_with_expired(&store, 2, now, k);
+    assert_eq!(store.len(), 3);
+
+    let fresh = capacity_key("fresh");
+    let ticket = acquire_one(&store, &fresh, &clock, k);
+    assert_ne!(ticket.outcome, PinOutcome::UnpinnedCapacity);
+
+    let live = store
+        .entries
+        .get(&live_key)
+        .expect("the live pin must survive")
+        .lock()
+        .clone();
+    assert_eq!(
+        live.upstream_key_id, k,
+        "the live pin's target must be unchanged"
+    );
+    assert_eq!(
+        live.generation, live_ticket.generation,
+        "the live pin's generation must not be bumped by a capacity event"
+    );
+    assert!(
+        live.expires_ms > now,
+        "the live pin must still be unexpired"
+    );
+}
+
+/// Concurrent acquisition at capacity must not deadlock and must not lose the cap
+/// (`ISSUE-0169`).
+///
+/// The capacity branch mutates the same `DashMap` that `acquire` reads, and `DashMap` iteration
+/// holds shard locks — so this is the test most likely to hang rather than fail. It is bounded by
+/// a watchdog thread: a deadlock is reported as a failure, not as a hung suite (cycle 38's lesson:
+/// an unbounded wait on something that never terminates is a lost cycle, and the bound *is* the
+/// measurement).
+#[doc = "Spec: RTE-10, REL-1 — ISSUE-0169"]
+#[test]
+fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    let cap = 8;
+    let store = Arc::new(PinStore::new(cap));
+    let k = UpstreamKeyId::generate();
+    let clock = Arc::new(FakeClock::new(1_000_000_000_000));
+
+    // Start full of already-expired entries, so every worker hits the capacity branch.
+    fill_with_expired(&store, cap, clock.now_ms(), k);
+
+    let (done_tx, done_rx) = mpsc::channel::<usize>();
+    let mut handles = Vec::new();
+    for worker in 0..6 {
+        let store = Arc::clone(&store);
+        let clock = Arc::clone(&clock);
+        let done_tx = done_tx.clone();
+        handles.push(thread::spawn(move || {
+            let mut refused = 0;
+            for index in 0..30 {
+                let key = capacity_key(&format!("worker-{worker}-{index}"));
+                let ticket = store
+                    .acquire(
+                        &key,
+                        &*clock,
+                        86_400_000,
+                        false,
+                        300,
+                        RoutingScope::PersonalFirst,
+                        Some(CandidatePoolTier::Own),
+                        |_| true,
+                        |_| Some((k, CandidatePoolTier::Own)),
+                    )
+                    .expect("selection");
+                if ticket.outcome == PinOutcome::UnpinnedCapacity {
+                    refused += 1;
+                }
+            }
+            let _ = done_tx.send(refused);
+        }));
+    }
+    drop(done_tx);
+
+    // Watchdog: if the shard locks deadlock, this returns Err instead of hanging the suite.
+    let (watch_tx, watch_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let total: usize = done_rx.iter().sum();
+        let _ = watch_tx.send(total);
+    });
+    let total_refused = watch_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("capacity branch deadlocked: no worker finished within 30 s");
+
+    for handle in handles {
+        handle.join().expect("worker thread must not panic");
+    }
+
+    assert!(
+        store.len() <= cap,
+        "the cap must hold under concurrency, len={}",
+        store.len()
+    );
+    assert!(
+        store.active_len(clock.now_ms()) > 0,
+        "concurrent acquire must have inserted at least one live pin; refused={total_refused}"
+    );
+}
