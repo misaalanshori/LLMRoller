@@ -12,6 +12,24 @@ pub(crate) enum MockMode {
     StreamOverloaded,
     StreamModelNotFound,
     StreamStall,
+    /// Emit the first SSE frame after `first_frame_ms`, then stay open `hold_ms` longer and
+    /// complete normally (`ISSUE-0161`).
+    ///
+    /// Two separate delays are needed to tell three behaviours apart on one successful attempt:
+    ///
+    /// | Code under test | EWMA (weight 0.2, first observation) |
+    /// | --- | --- |
+    /// | records TTFB (correct) | `0.2 * first_frame_ms` |
+    /// | records at stream end | `0.2 * (first_frame_ms + hold_ms)` |
+    /// | records nothing (`None`) | `0` |
+    ///
+    /// A single "hold after an immediate first frame" cannot distinguish the first from the third,
+    /// because both land at or near zero. `StreamStall` is unusable here: it never completes, so
+    /// the attempt would be scored as a timeout instead of a success.
+    StreamFirstFrameAfterThenHold {
+        first_frame_ms: u64,
+        hold_ms: u64,
+    },
     ChatJson,
     /// Non-streaming JSON completion after a fixed delay, so latency measurements
     /// have a real elapsed time to observe (`ISSUE-0148`).
@@ -73,6 +91,28 @@ async fn mock_chat(State(state): State<MockUpstreamState>) -> Response {
                 .chain(stream::pending()),
             ))
             .expect("stall response"),
+        MockMode::StreamFirstFrameAfterThenHold {
+            first_frame_ms,
+            hold_ms,
+        } => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(
+                stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(first_frame_ms)).await;
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        SSE_STALL_AFTER_FIRST_FRAME.as_bytes(),
+                    ))
+                })
+                // ...then the rest of the body arrives only after `hold_ms`, and the stream ends.
+                // So total duration ~= hold_ms while TTFB ~= 0, which is the discrimination the
+                // test needs.
+                .chain(stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(SSE_OK.as_bytes()))
+                })),
+            ))
+            .expect("hold response"),
         MockMode::ChatJson => (
             StatusCode::OK,
             [("content-type", "application/json")],

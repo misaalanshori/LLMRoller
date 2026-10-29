@@ -1379,3 +1379,110 @@ pub(crate) async fn metrics_serial() -> tokio::sync::MutexGuard<'static, ()> {
 
 #[path = "integration_streaming_accounting/metrics_token_classes.rs"]
 mod metrics_token_classes;
+
+// ---------------------------------------------------------------------------
+// A streaming attempt must teach the P2C tracker *time to first frame*, not
+// total stream duration (`RTE-3`, `ISSUE-0161`)
+// ---------------------------------------------------------------------------
+
+/// The route's `ewma_ttfb_ms` must reflect the first frame, not the end of the stream.
+///
+/// `ISSUE-0161` reported that `attempt_streaming.rs` recorded latency only when the whole stream
+/// finished (`StreamLifecycleGuard::drop`), mixing multi-minute generation duration into
+/// `ewma_ttfb_ms`. The code is already correct: `ttfb_ms` is computed at `:439`, at the point the
+/// first valid frame is accepted, and passed as `Some(ttfb_ms)` to `record_upstream_success`. What
+/// was missing is any test saying so.
+///
+/// # Three-way discrimination, and the numbers
+///
+/// The mock delays its **first frame by 300 ms**, then holds the stream open a further
+/// **2000 ms** before finishing. The tracker weights a first observation at `0.2`, so:
+///
+/// | Code under test | Recorded | EWMA |
+/// | --- | --- | --- |
+/// | records TTFB (correct) | ~300 | **~60** |
+/// | records at stream end | ~2300 | **~460** |
+/// | records nothing (`None`) | — | **0** |
+///
+/// The assertion is `40 <= ewma <= 200`. That is:
+///
+/// - comfortably **above** zero, so the "records nothing" mutant fails. (My first cut asserted only
+///   `ewma < ceiling`, and reverting `Some(ttfb_ms)` to `None` passed it — a test with no teeth
+///   against the very mutation it was written for.)
+/// - comfortably **below** `0.2 * (300 + 2000) = 460`, so record-at-stream-end fails by more than
+///   a factor of two.
+/// - a **~3x window** either side of the expected 60, so a loaded CI box would have to distort a
+///   deliberate 300 ms sleep by 3x in one direction and 7x in the other.
+///
+/// The lower bound is a *floor with margin*, not an equality: an EWMA is a weighted average, so
+/// pinning it exactly would assert the scheduler rather than the code.
+#[doc = "Spec: RTE-3 — ISSUE-0161 streaming records TTFB, not stream duration"]
+#[tokio::test]
+async fn a_streaming_attempt_records_ttfb_not_the_full_stream_duration() {
+    /// Delay before the mock's first SSE frame.
+    const FIRST_FRAME_MS: u64 = 300;
+    /// Additional time the stream is held open after that.
+    const HOLD_MS: u64 = 2_000;
+    /// `0.2 * 300 = 60`; a 3x window either side.
+    const EWMA_FLOOR_MS: u64 = 40;
+    const EWMA_CEILING_MS: u64 = 200;
+
+    let harness = harness().await;
+    let user = insert_user(&harness.pool, "ttfb-stream-user").await;
+    let (mock_addr, mock_state) = spawn_mock(MockMode::StreamFirstFrameAfterThenHold {
+        first_frame_ms: FIRST_FRAME_MS,
+        hold_ms: HOLD_MS,
+    })
+    .await;
+    let (_provider, key_id, model_pk) =
+        single_key_route(&harness, mock_addr, "ttfb-stream", 100).await;
+    seed_price(&harness).await;
+    let token = create_client_key(&harness, user, "ttfb-stream-key").await;
+    let (app, runtime) = build_app_with_runtime(&harness).await;
+
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(stream_request(&token, None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    // Draining the body is required for the attempt to *succeed*: `StreamStall` never finishes, so
+    // it would exercise the timeout path rather than the success path this test is about.
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect stream");
+    let elapsed = started.elapsed();
+
+    // The premise: the stream really did run for about `FIRST_FRAME_MS + HOLD_MS`. Without this the
+    // windowed assertion below could pass because the mock answered instantly, proving nothing.
+    let minimum_duration = u128::from(FIRST_FRAME_MS + HOLD_MS);
+    assert!(
+        elapsed.as_millis() >= minimum_duration,
+        "the mock must actually hold the stream for {minimum_duration} ms, else this test cannot \
+         distinguish TTFB from stream duration; it took {elapsed:?}"
+    );
+    assert_eq!(
+        mock_state.calls.load(Ordering::SeqCst),
+        1,
+        "exactly one upstream call, so the recorded latency belongs to this attempt"
+    );
+
+    let route = llmroller_core::strategy::RouteId {
+        upstream_key_id: key_id,
+        model_pk,
+    };
+    let recorded = runtime.load_tracker.ewma_ttfb_ms(&route);
+    assert!(
+        recorded >= EWMA_FLOOR_MS,
+        "the streaming attempt recorded {recorded} ms, which is below the {EWMA_FLOOR_MS} ms \
+         floor: a route that never teaches the tracker its latency is indistinguishable from a \
+         perfectly fast one, and P2C would treat it as free"
+    );
+    assert!(
+        recorded <= EWMA_CEILING_MS,
+        "the streaming attempt recorded {recorded} ms, above the {EWMA_CEILING_MS} ms ceiling: \
+         the {HOLD_MS} ms the stream was held open after its first frame has leaked into the \
+         latency estimate (record-at-stream-end would report ~{})",
+        ((FIRST_FRAME_MS + HOLD_MS) as f64 * 0.2) as u64
+    );
+}
