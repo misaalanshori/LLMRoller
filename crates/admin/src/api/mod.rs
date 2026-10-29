@@ -97,16 +97,17 @@ pub(crate) use shares::*;
 pub(crate) use usage::*;
 pub(crate) use usage_filters::{
     api_logs_export_query, audit_log_query, bind_api_logs_export_filters, bind_audit_log_filters,
-    bind_ledger_filters, bind_logs_export_filters, bind_usage_filters, canonical_total,
-    event_query, ledger_query, logs_export_query, rollup_query,
+    bind_ledger_filters, bind_logs_export_filters, bind_tenant_audit_visibility,
+    bind_usage_filters, canonical_total, event_query, ledger_query, logs_export_query,
+    rollup_query, tenant_audit_visibility,
 };
 #[doc(hidden)]
 pub use users_and_auth::load_sealer;
 pub(crate) use users_and_auth::*;
 
 #[cfg(test)]
-mod catalog_sync_tests;
-#[cfg(test)]
 mod audit_visibility_tests;
+#[cfg(test)]
+mod catalog_sync_tests;
 #[cfg(test)]
 mod log_detail_drawer_tests;

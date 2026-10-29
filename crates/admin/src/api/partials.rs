@@ -847,25 +847,24 @@ pub(crate) async fn get_partial_user_audit_handler(
         .ok_or_else(|| map_auth_error(AuthError::Unauthorized))?;
 
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    let rows = sqlx::query(
-        "SELECT seq, ts, action, target_type, target_id, detail_json
-         FROM audit_log
-         WHERE (actor_user_id = ?
-                OR (target_type = 'user' AND target_id = ?)
-                OR (target_type = 'share' AND target_id IN (
-                    SELECT id FROM provider_shares WHERE owner_user_id = ? OR grantee_user_id = ?
-                )))
-           AND (? IS NULL OR action = ?)
-           AND (? IS NULL OR target_type = ?)
-           AND (? IS NULL OR ts >= ?)
-           AND (? IS NULL OR ts <= ?)
-           AND (? IS NULL OR seq < ?)
-         ORDER BY seq DESC LIMIT ?",
+    // Same predicate macro as `get_user_audit_log_handler` -- the two handlers differ only in the
+    // columns they select, never in who may see what (`ISSUE-0172`).
+    let rows = bind_tenant_audit_visibility!(
+        sqlx::query(concat!(
+            "SELECT seq, ts, action, target_type, target_id, detail_json
+             FROM audit_log
+             WHERE ",
+            tenant_audit_visibility!(),
+            "
+               AND (? IS NULL OR action = ?)
+               AND (? IS NULL OR target_type = ?)
+               AND (? IS NULL OR ts >= ?)
+               AND (? IS NULL OR ts <= ?)
+               AND (? IS NULL OR seq < ?)
+             ORDER BY seq DESC LIMIT ?"
+        )),
+        user_id.to_string()
     )
-    .bind(user_id.to_string())
-    .bind(user_id.to_string())
-    .bind(user_id.to_string())
-    .bind(user_id.to_string())
     .bind(query.action.as_deref())
     .bind(query.action.as_deref())
     .bind(query.target_type.as_deref())

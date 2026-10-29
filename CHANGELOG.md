@@ -35,6 +35,46 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- **A tenant's audit log omitted every admin action on their own resources (ISSUE-0172).**
+  `/api/user/audit-log` and `/app/partials/audit-log` decide what a tenant may see in an
+  instance-wide table, and the predicate reached only `user` and `share` targets. So a user's own
+  `client_key` being disabled, revoked or rotated — by an admin or a system task, which writes
+  `actor_user_id IS NULL` — was recorded and then invisible to the only person it concerned. The
+  same held for `upstream_key`, `provider` and `service_account`.
+
+  The boundary is now an **allow-list of target types, each with its own ownership test**: `user`
+  (own), `share` (owned or granted), `client_key`, `upstream_key`, `provider`, `service_account`,
+  plus `session`/`web_session`/`trace` resolved through their owning row. `setting`, `instance`,
+  `instance_meta` and `http_path` stay invisible because they are instance-wide facts — a tenant
+  must not learn about the instance's master-key rotations or another tenant's settings — and an
+  unrecognised target type gets no visibility at all, so a type added later defaults to invisible
+  until someone decides otherwise. That is the safe direction for a boundary to fail.
+
+  **The obvious implementation is the dangerous one.** "Any event whose `target_id` resolves to a
+  row I own" passes every positive *and* every negative ownership test, because those all use
+  ownership-scoped types — while exposing operator activity on `setting` and `instance`, whose ids
+  can collide with a user's. `a_user_does_not_see_operator_events` exists specifically for that and
+  is why the predicate is a list rather than a catch-all.
+
+  Nullable owners are handled by plain equality rather than a special case:
+  `providers.owner_user_id` and `upstream_keys.owner_user_id` are nullable, and NULL there means
+  "global / unowned", so `NULL = ?` is never true and an unowned row matches no tenant. An
+  `IS NULL OR owner_user_id = ?` would be the bug, and `an_unowned_resource_event_is_invisible_to_
+  every_user` pins it.
+
+  **The predicate is written once.** The two handlers had already drifted on columns (8 vs 5), which
+  is what happens when two copies of a query differ only by whoever edited one of them; a second
+  copy of *this* predicate would drift the same way, and a wrong copy is a leak rather than an ugly
+  response. It now lives as `tenant_audit_visibility!` / `bind_tenant_audit_visibility!` in
+  `usage_filters.rs`, beside the other shared query fragments and following the same house pattern,
+  spliced into both call sites with `concat!` so no user data reaches the SQL text.
+  `both_audit_endpoints_return_the_same_event_set` makes "one predicate" enforceable: forking the
+  two handlers is caught by that test alone.
+
+  The placeholder count is pinned by the module's existing `count_binds!` harness, which earned its
+  keep immediately — the fragment has 12 placeholders and the first binder copied 11, which surfaced
+  only as a bare `datatype mismatch` at runtime naming no column.
+
 - **The diagnostics export leaked nested provider credentials (ISSUE-0184).** `export-diagnostics`
   exists to be handable to a support engineer, and its redactor walked exactly two hardcoded paths
   (`add_headers`, `header_edits`). Everything else passed through verbatim, so a provider config

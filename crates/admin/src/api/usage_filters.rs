@@ -271,6 +271,123 @@ macro_rules! bind_audit_log_filters {
 }
 pub(crate) use bind_audit_log_filters;
 
+/// The **tenant** visibility predicate for `audit_log` (`ISSUE-0172`).
+///
+/// `audit_log` is instance-wide; `/api/user/audit-log` and `/app/partials/audit-log` are its
+/// tenant-facing views. This fragment is the security boundary between them, so it is written
+/// **once** here and spliced into both call sites. The two handlers had already drifted on
+/// columns (8 vs 5), which is what happens when two copies of a query differ only by whoever last
+/// edited one of them; a second copy of *this* predicate would drift the same way, and a wrong
+/// copy is a data leak rather than an ugly response.
+///
+/// ## Shape: an allow-list of target types, each with its own ownership test
+///
+/// Never "any event whose `target_id` resolves to a row I own". That is the obvious implementation
+/// and it leaks: `setting`, `instance`, `instance_meta` and `http_path` are instance-wide facts
+/// with ids that can collide with a user's, so a catch-all would hand a tenant the instance's
+/// master-key rotations. Every clause below names both the type and the ownership path, and a
+/// type that is not named is invisible — which is the safe direction for a boundary to fail, and
+/// what makes a target type added by a future change default to invisible.
+///
+/// | `target_type` | Visible to a tenant? | Ownership path |
+/// | --- | --- | --- |
+/// | `user` | yes, own | `target_id = caller` |
+/// | `share` | yes, own or granted | `provider_shares.owner_user_id / grantee_user_id` |
+/// | `client_key` | yes, own | `client_keys.owner_user_id` (NOT NULL) |
+/// | `upstream_key` | yes, own | `upstream_keys.owner_user_id` (nullable) |
+/// | `provider` | yes, own | `providers.owner_user_id` (nullable) |
+/// | `service_account` | yes, own | `service_accounts.owner_user_id` (NOT NULL) |
+/// | `session`, `web_session`, `trace` | yes, own | via `usage_events.owner_user_id` |
+/// | `setting`, `instance`, `instance_meta`, `http_path` | **no** | instance-wide / operator-only |
+/// | anything else | **no** | allow-list |
+///
+/// ## Nullable owners
+///
+/// `upstream_keys.owner_user_id` and `providers.owner_user_id` are nullable, and NULL there means
+/// "global / unowned" — a shared provider's config change is not any one tenant's event. Plain
+/// equality handles that correctly without a special case: `NULL = ?` is never true in SQL, so an
+/// unowned row matches no caller. An `IS NULL OR owner_user_id = ?` would be a bug.
+///
+/// ## Why `trace` and `session` are here
+///
+/// A trace is an admin's *view of a user's conversation*, and a `session`-targeted `trace.viewed`
+/// row is the same event keyed by session hash. Both resolve to an owner through `usage_events`,
+/// so a tenant sees activity on their own traffic and nothing else. Deciding this deliberately
+/// (rather than letting it fall out of whatever the SQL happens to join) is the point: a user
+/// seeing "an admin inspected your session" is a legitimate audit fact about their own data.
+///
+/// `web_session` is keyed on `id_hash` of the caller's own login session, so it is visible through
+/// `web_sessions.user_id`.
+///
+/// ## Bind order
+///
+/// **Twelve** placeholders, all the caller's own user id. See
+/// [`bind_tenant_audit_visibility`], which is the only place the bind chain is written, and the
+/// placeholder-count test which keeps the two in step.
+macro_rules! tenant_audit_visibility {
+    () => {
+        "
+           (actor_user_id = ?
+            OR (target_type = 'user' AND target_id = ?)
+            OR (target_type = 'share' AND target_id IN (
+                SELECT id FROM provider_shares WHERE owner_user_id = ? OR grantee_user_id = ?
+            ))
+            OR (target_type = 'client_key' AND target_id IN (
+                SELECT id FROM client_keys WHERE owner_user_id = ?
+            ))
+            OR (target_type = 'upstream_key' AND target_id IN (
+                SELECT id FROM upstream_keys WHERE owner_user_id = ?
+            ))
+            OR (target_type = 'provider' AND target_id IN (
+                SELECT id FROM providers WHERE owner_user_id = ?
+            ))
+            OR (target_type = 'service_account' AND target_id IN (
+                SELECT id FROM service_accounts WHERE owner_user_id = ?
+            ))
+            OR (target_type = 'web_session' AND target_id IN (
+                SELECT id_hash FROM web_sessions WHERE user_id = ?
+            ))
+            OR (target_type = 'trace' AND target_id IN (
+                SELECT session_hash FROM trace_records WHERE owner_user_id = ?
+                UNION
+                SELECT request_id FROM trace_records WHERE owner_user_id = ?
+            ))
+            OR (target_type = 'session' AND target_id IN (
+                SELECT session_hash FROM usage_events WHERE owner_user_id = ?
+            )))"
+    };
+}
+pub(crate) use tenant_audit_visibility;
+
+/// Bind [`tenant_audit_visibility`]: **12** placeholders, all the caller's user id.
+///
+/// One macro rather than twelve `.bind(..)` calls per handler, because a mis-spliced predicate
+/// is **not** a compile error and not necessarily a SQL error either — it shifts every later bind
+/// by one, and the query then returns a plausible but wrong set, or fails with a bare
+/// "datatype mismatch" that names no column. That is exactly what happened while writing this:
+/// the fragment has 12 placeholders (actor, user target, 2× share, client_key, upstream_key,
+/// provider, service_account, web_session, 2× trace, session) and the first binder copied 11.
+/// `tenant_audit_visibility_placeholder_count_matches_binder` in this module's tests now pins the
+/// two together so the next edit cannot repeat it.
+macro_rules! bind_tenant_audit_visibility {
+    ($query:expr, $user_id:expr) => {
+        $query
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+            .bind($user_id)
+    };
+}
+pub(crate) use bind_tenant_audit_visibility;
+
 /// The canonical token total: the four priced classes.
 ///
 /// The same definition the Overview KPI, the Usage Ledger, `calculate_cost_micro_usd`, and cycle
@@ -379,6 +496,21 @@ mod tests {
             placeholders(audit),
             count_binds!(bind_audit_log_filters, &f),
             "audit clause vs bind_audit_log_filters!:\n{audit}"
+        );
+
+        // The tenant-visibility predicate binds the caller's id once per placeholder, so its
+        // binder takes a plain string rather than a filter struct.
+        let tenant = tenant_audit_visibility!();
+        assert_eq!(
+            placeholders(tenant),
+            count_binds!(bind_tenant_audit_visibility, "user-id"),
+            "tenant visibility clause vs bind_tenant_audit_visibility!:\n{tenant}"
+        );
+        assert_eq!(
+            placeholders(tenant),
+            12,
+            "the tenant predicate has 12 placeholders; if this number changed, the binder must \
+             change with it and the visibility test must still cover every target type:\n{tenant}"
         );
     }
 

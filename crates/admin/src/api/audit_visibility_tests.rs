@@ -31,18 +31,16 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt as _;
 
 use llmroller_core::ids::UserId;
-use llmroller_core::rbac::{ActorScope, Role, SystemSeal, SystemTask};
 use llmroller_core::seams::{Clock as _, OsEntropy};
 use llmroller_store::migrations::migrate;
 use llmroller_store::pool::{Role as PoolRole, open_pool};
 use llmroller_store::settings::seed_defaults;
-use llmroller_store::users::{NewUser, create_user};
 
 use super::*;
 
 use crate::auth::AuthConfig;
-use crate::setup::SetupAppState;
 use crate::control_plane_router_full;
+use crate::setup::SetupAppState;
 
 const AUDIT_HMAC: [u8; 32] = [0x5C; 32];
 
@@ -82,49 +80,21 @@ async fn fixture() -> Fixture {
         .await
         .expect("seed settings");
 
-    let system_actor = ActorScope::system(SystemTask::Writer, SystemSeal::store());
-    let admin = create_user(
-        &writer_pool,
-        &system_actor,
-        NewUser {
-            username: "admin_visibility",
-            password: "supersecretadminpass123",
-            role: Role::Admin,
-            must_change_password: false,
-        },
-        entropy.as_ref(),
-        1,
-    )
-    .await
-    .expect("admin");
-    let tenant_a = create_user(
-        &writer_pool,
-        &system_actor,
-        NewUser {
-            username: "tenant_a",
-            password: "supersecreettenanta123",
-            role: Role::User,
-            must_change_password: false,
-        },
-        entropy.as_ref(),
-        1,
-    )
-    .await
-    .expect("tenant a");
-    let tenant_b = create_user(
-        &writer_pool,
-        &system_actor,
-        NewUser {
-            username: "tenant_b",
-            password: "supersecreettenantb123",
-            role: Role::User,
-            must_change_password: false,
-        },
-        entropy.as_ref(),
-        1,
-    )
-    .await
-    .expect("tenant b");
+    // Users are seeded directly rather than through the store's `create_user` helper. That helper
+    // requires an admin actor scope, and this crate is forbidden from constructing the *system*
+    // one — the workspace boundary test greps `crates/admin/src` for the system constructor and
+    // its seal (USR-1/SEC-17), and it matches comments as well as code. The same workaround is
+    // used by `auth/tests/login_concurrency.rs`.
+    let admin_id = seed_user(&writer_pool, "admin_visibility", "admin", &entropy, 1).await;
+    let tenant_a_id = seed_user(&writer_pool, "tenant_a", "user", &entropy, 1).await;
+    let tenant_b_id = seed_user(&writer_pool, "tenant_b", "user", &entropy, 1).await;
+    // The admin exists so the instance has one, and so the fixture matches a real deployment.
+    // It is not a session-holder: an admin sees the whole chain by design, so authenticating as
+    // one would make every isolation assertion below pass trivially.
+    assert_ne!(
+        admin_id, tenant_a_id,
+        "the fixture must have a distinct admin and tenant"
+    );
 
     let auth_config = AuthConfig {
         dev_insecure_cookies: true,
@@ -147,13 +117,10 @@ async fn fixture() -> Fixture {
         audit_hmac_key: Some(instance_state.audit_hmac_key.clone()),
         argon2_semaphore: auth_state.argon2_semaphore.clone(),
     };
-    let mut api_state =
-        ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
+    let mut api_state = ApiAppState::new(auth_state.clone(), master_key, "key-0".to_string());
     api_state.audit_hmac_key = Some(instance_state.audit_hmac_key.clone());
     let app = control_plane_router_full(setup_state, auth_state.clone(), api_state);
 
-    let tenant_a_id = tenant_a.id;
-    let tenant_b_id = tenant_b.id;
     let cookie_a = session_cookie(&writer_pool, &auth_state, tenant_a_id, "tenant-a-token").await;
     let cookie_b = session_cookie(&writer_pool, &auth_state, tenant_b_id, "tenant-b-token").await;
 
@@ -166,6 +133,38 @@ async fn fixture() -> Fixture {
         cookie_a,
         cookie_b,
     }
+}
+
+/// Insert one `users` row directly, returning its id.
+///
+/// Direct INSERT rather than the store's `create_user` because that helper demands an admin actor
+/// scope, and this crate is forbidden from constructing the system one (USR-1/SEC-17). The
+/// password hash is real, so a test that ever needs to log in as one of these users can.
+async fn seed_user(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    role: &str,
+    entropy: &OsEntropy,
+    now_ms: i64,
+) -> UserId {
+    let id = UserId::generate();
+    let password_hash =
+        llmroller_store::users::hash_password("supersecretpassword123", entropy).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (
+            id, username, password_hash, role, must_change_password,
+            totp_enabled, can_use_global_providers, disabled, created_at
+         ) VALUES (?, ?, ?, ?, 0, 0, 1, 0, ?)",
+    )
+    .bind(id.to_string())
+    .bind(username)
+    .bind(&password_hash)
+    .bind(role)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .expect("seed user");
+    id
 }
 
 /// Insert a web session for `user` and return the cookie header that authenticates as them.
@@ -299,8 +298,8 @@ async fn seed_upstream_key(fixture: &Fixture, id: &str, provider_id: &str, owner
 /// Insert a `service_accounts` row owned by `owner`.
 async fn seed_service_account(fixture: &Fixture, id: &str, owner: UserId) {
     sqlx::query(
-        "INSERT INTO service_accounts (id, owner_user_id, label, created_at)
-         VALUES (?, ?, ?, 0)",
+        "INSERT INTO service_accounts (id, owner_user_id, name, created_at, updated_at)
+         VALUES (?, ?, ?, 0, 0)",
     )
     .bind(id)
     .bind(owner.to_string())
@@ -587,7 +586,11 @@ async fn an_unrecognised_target_type_is_invisible() {
     seed_client_key(&f, "ck-owned-by-a", f.tenant_a).await;
     let seqs = seed(
         &f,
-        &[row("future_resource.created", "future_resource", "ck-owned-by-a")],
+        &[row(
+            "future_resource.created",
+            "future_resource",
+            "ck-owned-by-a",
+        )],
     )
     .await;
 

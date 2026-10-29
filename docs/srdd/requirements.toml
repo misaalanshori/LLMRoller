@@ -603,7 +603,12 @@ priority = "P0"
 milestone = "M5"
 delivering_subphase = "6.3"
 partial_subphases = ["6.4"]
-tests = ["crates/store/src/audit/tests.rs", "crates/server/tests/integration_service_accounts_and_pause.rs", "crates/server/tests/e2e_dashboard_htmx.rs"]
+tests = [
+    "crates/store/src/audit/tests.rs",
+    "crates/server/tests/integration_service_accounts_and_pause.rs",
+    "crates/server/tests/e2e_dashboard_htmx.rs",
+    "crates/admin/src/api/audit_visibility_tests.rs",
+]
 
 # --- 7. Non-functional requirements (PERF, REL, TRN, COM, POR, MNT, OBS, PRIV) ---
 [requirements.PERF-1]
