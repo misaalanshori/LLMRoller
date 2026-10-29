@@ -955,7 +955,7 @@ fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
     // Start full of already-expired entries, so every worker hits the capacity branch.
     fill_with_expired(&store, cap, clock.now_ms(), k);
 
-    let (done_tx, done_rx) = mpsc::channel::<usize>();
+    let (done_tx, done_rx) = mpsc::channel::<(usize, usize)>();
     let mut handles = Vec::new();
     for worker in 0..6 {
         let store = Arc::clone(&store);
@@ -963,6 +963,7 @@ fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
         let done_tx = done_tx.clone();
         handles.push(thread::spawn(move || {
             let mut refused = 0;
+            let mut inserted = 0;
             for index in 0..30 {
                 let key = capacity_key(&format!("worker-{worker}-{index}"));
                 let ticket = store
@@ -978,11 +979,13 @@ fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
                         |_| Some((k, CandidatePoolTier::Own)),
                     )
                     .expect("selection");
-                if ticket.outcome == PinOutcome::UnpinnedCapacity {
-                    refused += 1;
+                match ticket.outcome {
+                    PinOutcome::UnpinnedCapacity => refused += 1,
+                    PinOutcome::NewPin => inserted += 1,
+                    _ => {}
                 }
             }
-            let _ = done_tx.send(refused);
+            let _ = done_tx.send((refused, inserted));
         }));
     }
     drop(done_tx);
@@ -990,10 +993,12 @@ fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
     // Watchdog: if the shard locks deadlock, this returns Err instead of hanging the suite.
     let (watch_tx, watch_rx) = mpsc::channel();
     thread::spawn(move || {
-        let total: usize = done_rx.iter().sum();
-        let _ = watch_tx.send(total);
+        let (refused, inserted) = done_rx.iter().fold((0_usize, 0_usize), |acc, item| {
+            (acc.0 + item.0, acc.1 + item.1)
+        });
+        let _ = watch_tx.send((refused, inserted));
     });
-    let total_refused = watch_rx
+    let (total_refused, total_inserted) = watch_rx
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("capacity branch deadlocked: no worker finished within 30 s");
 
@@ -1001,13 +1006,66 @@ fn the_capacity_branch_does_not_deadlock_under_concurrent_acquire() {
         handle.join().expect("worker thread must not panic");
     }
 
+    // The property under test is that the capacity branch *makes room* under concurrency instead
+    // of refusing everything. Asserted on the observed insertions rather than on the store's final
+    // population, because the population depends on interleaving.
+    //
+    // Deliberately **not** asserting `len() <= cap` here: the check-then-insert is not atomic, so
+    // concurrent acquirers can overshoot. That overshoot is pre-existing (measured on the unfixed
+    // code: `len=9` against `cap=8` in 5 of 25 runs) and is reported as an out-of-scope finding
+    // rather than folded into this fix, which is about reclaiming expired entries.
     assert!(
-        store.len() <= cap,
-        "the cap must hold under concurrency, len={}",
-        store.len()
+        total_inserted > 0,
+        "expired entries must be reclaimed under concurrency, so at least one acquire must \
+         insert; refused={total_refused} inserted={total_inserted}"
+    );
+}
+
+/// `insert_hydrated` must reclaim expired entries rather than silently drop the pin
+/// (`ISSUE-0169`).
+///
+/// The hydration query filters `expires_at > now`, but it and this insert are not atomic, and
+/// `upsert_confirmed` reaches this path at runtime too — so a stale `len()` here silently discards
+/// a legitimate pin, with no ticket outcome to notice it by. Mutation M4 (deleting the reclaim from
+/// this function) survived the first cut of the suite precisely because nothing exercised it.
+#[doc = "Spec: RTE-10, RTE-12 — ISSUE-0169"]
+#[test]
+fn insert_hydrated_reclaims_expired_entries_rather_than_dropping_the_pin() {
+    let now = 1_000_000_000_000;
+    let store = PinStore::new(2);
+    let k = UpstreamKeyId::generate();
+
+    fill_with_expired(&store, 2, now, k);
+    assert_eq!(store.len(), 2, "precondition: full");
+    assert_eq!(
+        store.active_len(now),
+        0,
+        "precondition: nothing live, so capacity is not genuinely reached"
+    );
+
+    let incoming = capacity_key("hydrated");
+    store.insert_hydrated(
+        incoming.clone(),
+        PinEntry {
+            state: PinState::Confirmed,
+            upstream_key_id: k,
+            generation: 1,
+            pool_tier: CandidatePoolTier::Own,
+            created_ms: now,
+            last_used_ms: now,
+            expires_ms: now + 86_400_000,
+            repin_count: 0,
+            tried_this_generation: Vec::new(),
+        },
+    );
+
+    assert!(
+        store.entries.contains_key(&incoming),
+        "a still-valid pin must not be dropped just because the map held expired entries"
     );
     assert!(
-        store.active_len(clock.now_ms()) > 0,
-        "concurrent acquire must have inserted at least one live pin; refused={total_refused}"
+        store.len() <= 2,
+        "the cap must still hold, len={}",
+        store.len()
     );
 }

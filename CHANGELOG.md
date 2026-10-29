@@ -33,6 +33,41 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   synthetic clicks to confirm the dispatcher still routes. It passes identically against the
   pre-split file, which is the evidence that behaviour did not change.
 
+### Fixed
+
+- **A pin store full of expired entries reported itself as full and refused new sessions
+  (ISSUE-0169).** `acquire`'s capacity branch consults `entries.len()`, which counts entries whose
+  `expires_ms` has passed but which the 30 s background sweep has not collected yet. So a store
+  holding **nothing live** — measured at `active_len(now) == 0` — still returned
+  `UnpinnedCapacity`, and every new session in that window lost its affinity to the upstream key
+  holding the prompt cache. Under six concurrent threads it refused **180 of 180** acquisitions.
+
+  The capacity branch now runs the existing `sweep(now)` before concluding the cap is reached, and
+  then re-checks. `sweep` removes exactly the entries whose `expires_ms <= now` — the state
+  machine's own rule (`10.4`, the `Sweep` row) — so this reclaims precisely what the background
+  sweep would and nothing else. `insert_hydrated` gets the same treatment: the hydration query
+  filters expired rows but it and the insert are not atomic, and `upsert_confirmed` reaches that
+  path at runtime too, so a stale count there silently dropped a legitimate pin with no ticket
+  outcome to notice it by.
+
+  **Deliberately not the design the issue implies.** Evicting live pins — provisional before
+  confirmed, then LRU — was considered and rejected against the specification:
+  `15. SRDD` rejects eviction for this structure *by name* ("TinyLFU eviction would silently drop
+  confirmed pins"), and `10.4` mandates the refusal as intended behaviour ("routes via WRR without
+  inserting a pin"). Dropping a live confirmed pin would break an in-flight stream's affinity,
+  which is a worse failure than the bounded window being fixed. `capacity_is_still_reported_when_
+  nothing_can_be_freed` pins that: with nothing expired, `RTE-10`'s fallback still fires and no live
+  entry is touched.
+
+  The issue's stated mechanism does not exist — `insert_bounded`, `max_entries` and 8-random-sample
+  eviction are all absent — and neither does its central claim that nothing ever removes an expired
+  entry: `sweep()` is at `pins.rs:574` and is wired at `serve.rs` every 30 s. The degradation is
+  therefore **bounded by the sweep interval rather than permanent**, which is narrower than filed and
+  still real inside the window.
+
+  The concurrency test is bounded by a watchdog rather than a bare join, because the capacity branch
+  touches the same `DashMap` and a deadlock would hang the suite instead of failing it.
+
 ### Tests
 
 - **A doc comment cited a guard test by a name that did not resolve (ISSUE-0172, follow-up).**

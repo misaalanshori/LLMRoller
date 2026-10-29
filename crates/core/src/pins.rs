@@ -178,7 +178,28 @@ impl PinStore {
             Arc::clone(&arc)
         } else {
             if self.entries.len() >= self.max_active_pins {
-                // Capacity overflow -> route unpinned without inserting into PinStore (RTE-10)
+                // Reclaim expired entries before treating capacity as exhausted (`ISSUE-0169`).
+                //
+                // `entries.len()` counts entries whose `expires_ms` has passed but which the 30 s
+                // background sweep (`serve.rs`) has not collected yet. Without this, a store whose
+                // live population is zero still reports as full, and every new session in that
+                // window loses affinity despite there being nothing to preserve — measured at
+                // `active_len() == 0` while refusing.
+                //
+                // `sweep` only removes entries whose `expires_ms <= now`, which is the state
+                // machine's own rule (`10.4`, the `Sweep` row), so this reclaims exactly what the
+                // background sweep would and nothing else. It deliberately does **not** evict live
+                // pins: `15. SRDD` rejects eviction for this structure by name, because dropping a
+                // confirmed pin silently breaks an in-flight stream's affinity. If nothing expired,
+                // the cap is genuinely reached and `RTE-10`'s fallback below still applies.
+                //
+                // Cost: only on the capacity branch, which is rare by construction; `retain` walks
+                // the shards internally rather than through an iterator we hold, so there is no
+                // mutation-during-iteration.
+                self.sweep(now);
+            }
+            if self.entries.len() >= self.max_active_pins {
+                // Still full after reclaiming -> route unpinned without inserting (RTE-10)
                 let (k, tier) = select_fn(&[])?;
                 return Some(PinTicket {
                     upstream_key_id: k,
@@ -531,7 +552,14 @@ impl PinStore {
     /// Insert an already-confirmed pin loaded from SQLite at startup (RTE-10).
     pub fn insert_hydrated(&self, pin_key: PinKey, entry: PinEntry) {
         if self.entries.len() >= self.max_active_pins {
-            return;
+            // Reclaim expired entries first, for the same reason `acquire` does (`ISSUE-0169`).
+            // The hydration query already filters `expires_at > now`, but it and this insert are
+            // not atomic, and `upsert_confirmed` reaches here at runtime too — so a stale count
+            // would silently drop a legitimate pin.
+            self.sweep(entry.last_used_ms.max(0));
+            if self.entries.len() >= self.max_active_pins {
+                return;
+            }
         }
         self.entries.insert(pin_key, Arc::new(Mutex::new(entry)));
     }
