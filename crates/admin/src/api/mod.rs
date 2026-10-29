@@ -107,4 +107,6 @@ pub(crate) use users_and_auth::*;
 #[cfg(test)]
 mod catalog_sync_tests;
 #[cfg(test)]
+mod audit_visibility_tests;
+#[cfg(test)]
 mod log_detail_drawer_tests;
