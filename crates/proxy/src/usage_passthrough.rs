@@ -1331,4 +1331,128 @@ mod tests {
              was widened to the permissive default (got {resolved:?})"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // `ISSUE-0160` — usage-URL resolution must never invent an endpoint.
+    //
+    // The issue reported that a `Custom` provider is polled at `/key`, producing a 404 on every tick.
+    // The mechanism does not exist: `ProviderKind::Custom => None` plus the trailing `?` makes the
+    // whole function return `None`, and `usage_poller` treats that as "skip this key entirely" — no
+    // request is built at all.
+    //
+    // The behaviour was correct but unpinned, which is one refactor away from being wrong. These three
+    // tests are the receipt, and the third is the census: it makes the kind -> endpoint contract a
+    // single reviewable table rather than a five-arm `match` whose arms are asserted in scattered
+    // places.
+    // -----------------------------------------------------------------------
+
+    /// `Custom` with no declared endpoint must resolve to **no URL at all**.
+    ///
+    /// `None` is not "use the default"; for a custom provider there is no default, and inventing one
+    /// (`/key`, `/usage`, anything) produces a polling loop issuing a request the provider never
+    /// advertised, which surfaces as a 404 on every tick forever.
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1; ISSUE-0160"]
+    fn a_custom_provider_without_a_usage_endpoint_is_not_polled() {
+        for config in ["{}", r#"{"usage_endpoint":""}"#, r#"{"usage_path":"   "}"#] {
+            let resolved = resolve_provider_usage_url(
+                "https://custom.example/v1",
+                ProviderKind::Custom,
+                config,
+            );
+            assert_eq!(
+                resolved, None,
+                "a Custom provider with {config} declares no usage endpoint, so nothing may be \
+             polled; got {resolved:?}"
+            );
+        }
+    }
+
+    /// The other direction: a `Custom` provider that **does** declare an endpoint is polled.
+    ///
+    /// Without this, the fix above could be "never poll Custom", which would silently disable a
+    /// supported configuration — `usage_endpoint` on a custom provider is a documented field.
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1; ISSUE-0160"]
+    fn a_custom_provider_that_declares_a_usage_endpoint_is_polled() {
+        let resolved = resolve_provider_usage_url(
+            "https://custom.example/v1",
+            ProviderKind::Custom,
+            r#"{"usage_endpoint":"/billing/usage"}"#,
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("https://custom.example/v1/billing/usage"),
+            "a declared endpoint must be honoured for a Custom provider"
+        );
+
+        // The precedence that makes the whole thing work: the declared endpoint is consulted *first*,
+        // so a non-Custom provider declaring one overrides its built-in default rather than being
+        // pinned to it.
+        let overriding = resolve_provider_usage_url(
+            "https://openrouter.ai/api/v1",
+            ProviderKind::Openrouter,
+            r#"{"usage_endpoint":"/api/v1/credits"}"#,
+        );
+        assert_eq!(
+            overriding.as_deref(),
+            Some("https://openrouter.ai/api/v1/credits"),
+            "a declared endpoint must take precedence over the provider kind's default"
+        );
+    }
+
+    /// The census: every `ProviderKind` resolves a path only if its contract says it should.
+    ///
+    /// One table, so a change to any arm of the `match` is a visible edit to an expectation rather than
+    /// a silent behaviour change. `ProviderKind::ALL` drives it, so a new variant cannot be added
+    /// without this test failing to compile — the compiler, not discipline, keeps the census complete.
+    #[test]
+    #[doc = "Spec: USG-6, USG-7, PRV-1, F019; ISSUE-0160"]
+    fn no_provider_kind_resolves_a_url_it_did_not_declare() {
+        const BASE: &str = "https://upstream.example/v1";
+
+        // The contract, one row per kind. `None` means "no default endpoint exists".
+        let expected: [(ProviderKind, Option<&str>); 5] = [
+            (ProviderKind::OpencodeGo, Some("/usage")),
+            (ProviderKind::CommandCode, Some("/billing/credits")),
+            (ProviderKind::OpenDesignAmr, Some("/usage")),
+            (ProviderKind::Openrouter, Some("/key")),
+            (ProviderKind::Custom, None),
+        ];
+
+        assert_eq!(
+            expected.len(),
+            ProviderKind::ALL.len(),
+            "the census must cover every ProviderKind variant"
+        );
+
+        for (kind, suffix) in expected {
+            assert!(
+                ProviderKind::ALL.contains(&kind),
+                "{kind:?} is not in ProviderKind::ALL; the census table is stale"
+            );
+
+            let resolved = resolve_provider_usage_url(BASE, kind, "{}");
+            match suffix {
+                None => assert_eq!(
+                    resolved, None,
+                    "{kind:?} has no default endpoint, so it must not resolve a URL"
+                ),
+                Some(suffix) => {
+                    let url = resolved
+                        .unwrap_or_else(|| panic!("{kind:?} must resolve its default endpoint"));
+                    assert!(
+                        url.ends_with(suffix),
+                        "{kind:?} resolved {url}, which does not end with its contract path {suffix}"
+                    );
+                    // A provider kind must never be polled at a path another kind owns: that is how a
+                    // wrong arm in the `match` becomes a 404 loop instead of a compile error.
+                    assert!(
+                        !url.ends_with("/key") || kind == ProviderKind::Openrouter,
+                        "{kind:?} must not be polled at OpenRouter's /key path: {url}"
+                    );
+                }
+            }
+        }
+    }
 }
