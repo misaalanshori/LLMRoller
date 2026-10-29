@@ -808,7 +808,157 @@ mod tests {
             row.try_get::<Option<String>, _>("client_location")
                 .expect("client_location column")
                 .as_deref(),
-            Some("US")
+            None,
+            "#158: a geo header in request_headers_json is client-controlled and must never \
+             become client_location. This fixture used to assert Some(\"US\"); that expectation \
+             was the vulnerability."
         );
+    }
+
+    /// Build a minimal event whose location can only come from `request_headers_json`.
+    fn event_with_headers(
+        request_headers_json: Option<&str>,
+        metadata_json: Option<&str>,
+    ) -> UsageEventRecord {
+        UsageEventRecord {
+            id: ulid::Ulid::generate().to_string(),
+            ts: 600_000,
+            request_id: RequestId::generate(),
+            client_key_id: ClientKeyId::generate(),
+            owner_user_id: UserId::generate(),
+            upstream_key_id: None,
+            provider_id: None,
+            provider_scope: Some("none".to_string()),
+            share_id: None,
+            canonical_id: Some("gpt-4o".to_string()),
+            upstream_model_id: Some("gpt-4o".to_string()),
+            endpoint: "chat".to_string(),
+            protocol: Some("chat".to_string()),
+            session_hash: None,
+            status: 200,
+            stream: false,
+            incomplete: false,
+            termination: "completed".to_string(),
+            trace_dropped: false,
+            input_uncached_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cost_micro_usd: 0,
+            cost_source: CostSource::PriceBook,
+            latency_ms: None,
+            ttfb_ms: None,
+            pin_outcome: None,
+            failovers: 0,
+            error_code: None,
+            list_cost_micro_usd: 0,
+            plan_multiplier_bps: 10_000,
+            billing_coverage_mode: "pay_as_you_go".to_string(),
+            service_account_id: None,
+            stop_reason: None,
+            request_headers_json: request_headers_json.map(str::to_string),
+            metadata_json: metadata_json.map(str::to_string),
+        }
+    }
+
+    async fn write_one(event: UsageEventRecord) -> (sqlx::SqlitePool, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir.path().join("geo.db"), Role::Writer)
+            .await
+            .expect("open pool");
+        migrate(&pool).await.expect("migrate");
+        let writer = ThreeQueueUsageWriter::new(100);
+        let req_id = event.request_id.to_string();
+        writer.enqueue(event, Vec::new());
+        let mut tx = pool.begin().await.expect("begin");
+        writer.flush_to_db(&mut tx).await.expect("flush");
+        tx.commit().await.expect("commit");
+        (pool, dir, req_id)
+    }
+
+    async fn stored_location(pool: &sqlx::SqlitePool, request_id: &str) -> Option<String> {
+        sqlx::query("SELECT client_location FROM usage_events WHERE request_id = ?")
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .expect("usage_event row")
+            .try_get::<Option<String>, _>("client_location")
+            .expect("client_location column")
+    }
+
+    /// The security test for `#158`: `request_headers_json` is the inbound client's own bytes,
+    /// so a `cf-ipcountry` there can only be a claim the caller made about itself.
+    #[tokio::test]
+    #[doc = "Spec: USG-9, SEC-6"]
+    async fn an_untrusted_peer_cannot_set_client_location_by_sending_cf_ipcountry() {
+        let event = event_with_headers(Some(r#"{"cf-ipcountry":"ZZ"}"#), None);
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_ne!(
+            stored_location(&pool, &req_id).await.as_deref(),
+            Some("ZZ"),
+            "an untrusted caller must not be able to write its own claimed location"
+        );
+    }
+
+    #[tokio::test]
+    #[doc = "Spec: USG-9, SEC-6"]
+    async fn every_geo_header_name_is_ignored_in_request_headers_json() {
+        let event = event_with_headers(
+            Some(
+                r#"{"cf-ipcountry":"ZZ","x-geo-country":"ZZ","x-geo-city":"Atlantis","x-client-location":"ZZ"}"#,
+            ),
+            None,
+        );
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_eq!(
+            stored_location(&pool, &req_id).await,
+            None,
+            "widening the extraction list would re-open #158; all four names must be inert here"
+        );
+    }
+
+    /// The admission-decided value is the one that is trusted, and it arrives via
+    /// `metadata_json` because the writer cannot see the peer (`#158`, option (b)).
+    #[tokio::test]
+    #[doc = "Spec: USG-9"]
+    async fn an_admission_decided_location_is_stored() {
+        let event = event_with_headers(None, Some(r#"{"client_location":"Singapore, SG"}"#));
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_eq!(
+            stored_location(&pool, &req_id).await.as_deref(),
+            Some("Singapore, SG"),
+            "a trusted edge's location must still be attributed, or observability is lost"
+        );
+    }
+
+    /// The carrier wins over anything the client could have put in its own headers.
+    #[tokio::test]
+    #[doc = "Spec: USG-9, SEC-6"]
+    async fn the_admission_decided_location_beats_a_client_supplied_header() {
+        let event = event_with_headers(
+            Some(r#"{"cf-ipcountry":"ZZ"}"#),
+            Some(r#"{"client_location":"US"}"#),
+        );
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_eq!(stored_location(&pool, &req_id).await.as_deref(), Some("US"));
+    }
+
+    /// A malformed carrier is ignored rather than crashing the writer, and yields no location.
+    #[tokio::test]
+    #[doc = "Spec: USG-9"]
+    async fn a_corrupt_metadata_carrier_yields_no_location() {
+        let event = event_with_headers(None, Some("{not json"));
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_eq!(stored_location(&pool, &req_id).await, None);
+    }
+
+    /// Absent stays absent: the column is NULL, not an empty string or a placeholder.
+    #[tokio::test]
+    #[doc = "Spec: USG-9"]
+    async fn no_source_at_all_stores_null() {
+        let event = event_with_headers(Some(r#"{"user-agent":"x"}"#), None);
+        let (pool, _dir, req_id) = write_one(event).await;
+        assert_eq!(stored_location(&pool, &req_id).await, None);
     }
 }

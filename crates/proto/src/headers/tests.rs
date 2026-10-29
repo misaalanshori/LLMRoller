@@ -637,3 +637,78 @@ fn test_apply_provider_header_transparent_vs_required() {
     );
     assert_eq!(out.get("anthropic-beta").expect("beta"), "a,b");
 }
+
+/// `#158`: geo headers are *our* metadata, never the provider's business.
+///
+/// A client-supplied privacy header forwarded upstream tells the provider something about the
+/// caller that the caller chose to assert, and a provider may then treat it as trustworthy. The
+/// upstream has no legitimate use for any of these, so the strip rule must not depend on a
+/// per-provider setting: it holds for every tier and every configuration.
+#[test]
+#[doc = "Spec: SEC-6, SEC-15"]
+fn geo_headers_are_not_forwarded_upstream() {
+    let val = |v: &str| HeaderValue::from_str(v).expect("header value");
+    let mut headers = HeaderMap::new();
+    headers.insert("cf-ipcountry", val("US"));
+    headers.insert("x-geo-country", val("SG"));
+    headers.insert("x-geo-city", val("Singapore"));
+    headers.insert("x-client-location", val("Berlin, DE"));
+    headers.insert("user-agent", val("claude-cli/1.0"));
+
+    let strip_tokens = StripHeaderTokens::default();
+    for tier in [PoolTier::Own, PoolTier::Shared, PoolTier::Global] {
+        let out = apply_request_header_pipeline(
+            &headers,
+            tier,
+            Some(("authorization", "Bearer sk-upstream")),
+            &[],
+            &strip_tokens,
+        )
+        .expect("apply pipeline");
+
+        for name in [
+            "cf-ipcountry",
+            "x-geo-country",
+            "x-geo-city",
+            "x-client-location",
+        ] {
+            assert!(
+                out.get(name).is_none(),
+                "{name} must never reach the upstream (tier {tier:?})"
+            );
+        }
+        assert_eq!(
+            out.get(header::USER_AGENT).expect("user-agent"),
+            "claude-cli/1.0",
+            "stripping geo headers must not disturb the rest of the pipeline"
+        );
+    }
+}
+
+/// The `cf-` prefix rule alone already catches `cf-ipcountry`; the two generic names needed
+/// their own entry. This pins all four so a later edit to the list cannot half-undo the fix.
+#[test]
+#[doc = "Spec: SEC-6"]
+fn every_geo_header_name_is_on_the_unconditional_strip_list() {
+    let val = |v: &str| HeaderValue::from_str(v).expect("header value");
+    let mut headers = HeaderMap::new();
+    for name in crate::geo::GEO_HEADERS {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("name"),
+            val("XX"),
+        );
+    }
+    headers.insert("x-client-location", val("XX"));
+    let out = apply_request_header_pipeline(
+        &headers,
+        PoolTier::Own,
+        None,
+        &[],
+        &StripHeaderTokens::default(),
+    )
+    .expect("apply pipeline");
+    assert!(
+        out.is_empty(),
+        "every geo header must be stripped unconditionally, got: {out:?}"
+    );
+}

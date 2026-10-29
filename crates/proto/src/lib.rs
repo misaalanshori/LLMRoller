@@ -8,6 +8,7 @@ pub mod affinity;
 pub mod body_edit;
 pub mod discovery;
 pub mod fingerprint;
+pub mod geo;
 pub mod headers;
 pub mod json_usage;
 pub mod providers;
